@@ -1,0 +1,32 @@
+{
+  "name": "schedule-cap",
+  "description": "exp(1s, x2, max 4s) caps: waits are 1s, 2s, 4s, 4s across five attempts.",
+  "policy": {
+    "target": {
+      "api.example.com": {
+        "retry": { "attempts": 5, "schedule": "exp(1s, x2, max 4s)", "on": ["timeout"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/slow", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 5,
+          "waits_ms": [1000, 2000, 4000, 4000],
+          "error": { "code": "KEEL-E010", "class": "timeout" }
+        }
+      }
+    }
+  ]
+}

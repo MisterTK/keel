@@ -1,0 +1,44 @@
+{
+  "name": "rate-limit-storm",
+  "description": "Calls beyond the configured rate are delayed, never failed: the third call in the same second is throttled but still succeeds. Exact wait is implementation-defined, so only `throttled` is asserted.",
+  "policy": {
+    "target": {
+      "api.limited.internal": {
+        "rate": "2/s"
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 1 }],
+        "expect": { "result": "ok", "throttled": false }
+      }
+    },
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 2 }],
+        "expect": { "result": "ok", "throttled": false }
+      }
+    },
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 3 }],
+        "expect": { "result": "ok", "throttled": true, "attempts": 1 }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.limited.internal": { "calls": 3, "attempts": 3, "throttled": 1, "successes": 3 }
+        }
+      }
+    }
+  ]
+}

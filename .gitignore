@@ -1,0 +1,19 @@
+# rust
+/target/
+Cargo.lock
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+
+# node
+node_modules/
+
+# keel runtime state
+.keel/
+
+# generated fixture databases
+conformance/fixtures/journal/.gen/

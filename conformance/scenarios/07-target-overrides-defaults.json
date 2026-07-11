@@ -1,0 +1,34 @@
+{
+  "name": "target-overrides-defaults",
+  "description": "A target-level retry table replaces the default retry table wholesale (per-layer replacement, no deep merge): 2 attempts with its own schedule.",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    },
+    "target": {
+      "api.example.com": {
+        "retry": { "attempts": 2, "schedule": "exp(100ms, x3, max 1s)" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/items", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "conn", "message": "refused" },
+          { "status": "error", "class": "conn", "message": "refused" }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 2,
+          "waits_ms": [100],
+          "error": { "code": "KEEL-E010", "class": "conn" }
+        }
+      }
+    }
+  ]
+}

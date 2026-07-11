@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/keel-core-api", "crates/keel-core-stub"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/MisterTK/Keel"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

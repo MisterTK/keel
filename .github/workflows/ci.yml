@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # contracts/ is frozen: changes land only through an approved
+  # contract-change request (CCR), signalled by the PR label below.
+  contract-freeze:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail if contracts/ changed without CCR approval
+        env:
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'contract-change-approved') }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch origin "$BASE_REF" --depth=50
+          CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD -- contracts/ | wc -l)
+          if [ "$CHANGED" -gt 0 ] && [ "$APPROVED" != "true" ]; then
+            echo "::error::contracts/ changed without the 'contract-change-approved' label."
+            echo "File a contract-change request (see contracts/README.md); the orchestrator applies the label on approval."
+            git diff --name-only "origin/$BASE_REF"...HEAD -- contracts/
+            exit 1
+          fi
+          echo "contracts/ unchanged or change approved."
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+      - name: Conformance (Rust stub, verbose)
+        run: cargo test -p keel-core-stub --test conformance -- --nocapture
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Conformance (Python stub)
+        run: python3 conformance/runner.py
+      - name: Policy schema check
+        run: |
+          pip install jsonschema
+          python3 conformance/check_schema.py
+      - name: Journal fixtures build
+        run: python3 conformance/fixtures/journal/build_fixtures.py
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Conformance (Node stub)
+        working-directory: node/keel-core-stub
+        run: node --test

@@ -1,0 +1,13 @@
+{
+  "name": "policy-invalid",
+  "description": "A malformed policy (retry.attempts = 0) is rejected at configure time with KEEL-E001 — bad config fails loudly at startup, never silently at call time.",
+  "policy": {
+    "target": {
+      "api.example.com": {
+        "retry": { "attempts": 0 }
+      }
+    }
+  },
+  "expect_configure_error": "KEEL-E001",
+  "steps": []
+}

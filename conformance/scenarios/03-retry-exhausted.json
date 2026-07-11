@@ -1,0 +1,41 @@
+{
+  "name": "retry-exhausted",
+  "description": "Every attempt times out; the outcome is KEEL-E010 and the ORIGINAL last error is carried unchanged for the front end to re-raise (DX invariant 5).",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.slow.internal",
+        "request": { "op": "GET api.slow.internal/report", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "timeout", "message": "read timeout" },
+          { "status": "error", "class": "timeout", "message": "read timeout" },
+          { "status": "error", "class": "timeout", "message": "read timeout", "original": { "py_exc": "httpx.ReadTimeout", "token": 42 } }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 3,
+          "waits_ms": [200, 400],
+          "error": {
+            "code": "KEEL-E010",
+            "class": "timeout",
+            "original": { "py_exc": "httpx.ReadTimeout", "token": 42 }
+          }
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.slow.internal": { "calls": 1, "attempts": 3, "retries": 2, "successes": 0, "failures": 1 }
+        }
+      }
+    }
+  ]
+}

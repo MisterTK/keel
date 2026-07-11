@@ -1,0 +1,15 @@
+{
+  "name": "@keel/core-stub",
+  "version": "0.1.0",
+  "description": "In-memory fake keel-core for front-end development (Sprint 0 contract artifact).",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

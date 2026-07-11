@@ -1,0 +1,40 @@
+{
+  "name": "non-idempotent-not-retried",
+  "description": "Level 0 hard rule: a POST without an idempotency key fails with a retryable class but is observed, not retried (KEEL-E014). Exactly one attempt.",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "POST api.example.com/orders", "idempotent": false },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 503, "message": "service unavailable", "original": { "py_exc": "httpx.HTTPStatusError" } }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 1,
+          "waits_ms": [],
+          "error": {
+            "code": "KEEL-E014",
+            "class": "http",
+            "http_status": 503,
+            "original": { "py_exc": "httpx.HTTPStatusError" }
+          }
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.example.com": { "calls": 1, "attempts": 1, "retries": 0, "failures": 1 }
+        }
+      }
+    }
+  ]
+}

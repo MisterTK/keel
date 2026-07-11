@@ -1,0 +1,39 @@
+{
+  "name": "retry-5xx-then-success",
+  "description": "A transient 503 on an idempotent GET is retried once with the default exponential backoff and succeeds.",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "timeout": "30s",
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/items", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 503, "message": "service unavailable" },
+          { "status": "ok", "payload": { "items": 3 } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "items": 3 },
+          "attempts": 2,
+          "from_cache": false,
+          "waits_ms": [200],
+          "throttled": false
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.example.com": { "calls": 1, "attempts": 2, "retries": 1, "successes": 1, "failures": 0 }
+        }
+      }
+    }
+  ]
+}

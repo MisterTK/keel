@@ -1,0 +1,54 @@
+{
+  "name": "report-metrics",
+  "description": "keel_report aggregates per-target counters deterministically, and backoff waits advance the core clock (virtual in the stub).",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.a.internal",
+        "request": { "op": "GET api.a.internal/1", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "conn" },
+          { "status": "ok", "payload": 1 }
+        ],
+        "expect": { "result": "ok", "attempts": 2 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.a.internal",
+        "request": { "op": "GET api.a.internal/2", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 2 }],
+        "expect": { "result": "ok", "attempts": 1 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.b.internal",
+        "request": { "op": "GET api.b.internal/1", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 503 },
+          { "status": "error", "class": "http", "http_status": 503 },
+          { "status": "error", "class": "http", "http_status": 503 }
+        ],
+        "expect": { "result": "error", "attempts": 3, "error": { "code": "KEEL-E010" } }
+      }
+    },
+    {
+      "report_expect": {
+        "v": 1,
+        "clock_ms": 800,
+        "targets": {
+          "api.a.internal": { "calls": 2, "attempts": 3, "retries": 1, "successes": 2, "failures": 0 },
+          "api.b.internal": { "calls": 1, "attempts": 3, "retries": 2, "successes": 0, "failures": 1 }
+        }
+      }
+    }
+  ]
+}

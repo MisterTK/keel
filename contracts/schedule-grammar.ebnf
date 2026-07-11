@@ -1,0 +1,40 @@
+(* Keel schedule algebra — contracts-v1.
+   Retry schedules live in config (keel.toml), never in code.
+   A schedule maps attempt number n (1-based; the wait happens AFTER attempt n
+   fails) to a wait duration. Schedules compose left-to-right.
+
+   Examples:
+     exp(200ms, x2, max 30s, jitter)
+     fixed(1s)
+     exp(1s, x2, max 5m) upTo 10m andThen fixed(1m)
+
+   v0.1 conformance scope: the stub and Tier-1 core MUST implement `exp` and
+   `fixed` primaries; `upTo` / `andThen` composition is part of the frozen
+   grammar but its implementation may land after the weekend (scenarios do not
+   exercise it yet).
+
+   jitter: when present, each wait w is drawn uniformly from [w/2, w] ("equal
+   jitter"). Conformance scenarios use jitter-free schedules so exact waits are
+   assertable across implementations. *)
+
+schedule    = sequence ;
+sequence    = bounded , { ws , "andThen" , ws , bounded } ;
+bounded     = primary , [ ws , "upTo" , ws , duration ] ;
+primary     = exp | fixed ;
+
+exp         = "exp(" , ows , duration , ows , "," , ows , factor , ows ,
+              [ "," , ows , "max" , ws , duration , ows ] ,
+              [ "," , ows , "jitter" , ows ] , ")" ;
+(* exp(base, xF, max cap): wait after failed attempt n = min(base * F^(n-1), cap) *)
+
+fixed       = "fixed(" , ows , duration , ows , ")" ;
+
+factor      = "x" , number ;
+duration    = integer , unit ;
+unit        = "ms" | "s" | "m" | "h" ;
+
+integer     = digit , { digit } ;
+number      = integer , [ "." , integer ] ;
+digit       = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+ws          = " " , { " " } ;
+ows         = { " " } ;

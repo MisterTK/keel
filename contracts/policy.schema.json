@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://keel.dev/contracts/policy.schema.json",
+  "title": "keel.toml policy document",
+  "description": "The complete schema for keel.toml, expressed over its TOML-as-JSON form. This is contracts-v1: changes require an approved contract-change request (CCR). The same document, parsed to JSON, is what front ends pass to keel_configure(). Schedule strings follow contracts/schedule-grammar.ebnf. Target keys follow the target grammar in $defs.targetKey.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Baseline policy applied to any target that does not override a given layer. Resolution is per-layer replacement: a target that sets `retry` replaces the whole default `retry` table, never a deep merge.",
+      "properties": {
+        "outbound": { "$ref": "#/$defs/targetPolicy" },
+        "llm": {
+          "$ref": "#/$defs/targetPolicy",
+          "description": "Defaults for all `llm:*` targets; resolved between target-specific config and defaults.outbound."
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "description": "Per-target policy tables, keyed by the target grammar.",
+      "propertyNames": { "$ref": "#/$defs/targetKey" },
+      "additionalProperties": { "$ref": "#/$defs/targetPolicy" }
+    },
+    "flows": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Tier 2: durable flow designation. Config-only; never a code decorator (NFR1).",
+      "properties": {
+        "entrypoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entrypointRef" }
+        },
+        "on_nondeterminism": {
+          "type": "string",
+          "enum": ["fail", "warn", "branch"],
+          "default": "fail"
+        }
+      }
+    },
+    "journal": {
+      "type": "string",
+      "description": "Journal location. Default `file:.keel/journal.db`. Changing this string is the entire laptop-to-enterprise migration.",
+      "pattern": "^(file:.+|postgres://.+)$",
+      "default": "file:.keel/journal.db"
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "otlp_endpoint": { "type": "string" },
+        "console": { "type": "boolean", "default": true }
+      }
+    }
+  },
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "description": "Duration literal: integer + unit (ms, s, m, h).",
+      "pattern": "^[0-9]+(ms|s|m|h)$"
+    },
+    "rate": {
+      "type": "string",
+      "description": "Rate literal: N per unit window. Units: s|sec, min, h|hour.",
+      "pattern": "^[0-9]+/(s|sec|min|h|hour)$"
+    },
+    "schedule": {
+      "type": "string",
+      "description": "Retry schedule expression per contracts/schedule-grammar.ebnf, e.g. `exp(200ms, x2, max 30s, jitter)`, `fixed(1s)`, `exp(1s, x2, max 5m) upTo 10m andThen fixed(1m)`.",
+      "minLength": 1
+    },
+    "errorCondition": {
+      "type": "string",
+      "description": "Structured error class a retry condition can match: transport classes, HTTP status classes (5xx/4xx), or an exact 3-digit status.",
+      "pattern": "^(conn|timeout|cancelled|other|[45]xx|[1-5][0-9][0-9])$"
+    },
+    "targetKey": {
+      "type": "string",
+      "description": "Target grammar. One of: bare host or host/path glob (optionally METHOD-prefixed), `py:`/`ts:`/`rs:` function-path glob, `llm:<provider>`, `tool:<name>`, `mcp:<server>`.",
+      "pattern": "^((GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) )?[A-Za-z0-9*][A-Za-z0-9.*-]*(:[0-9]+)?(/[^\\s]*)?$|^(py|ts|rs):[A-Za-z0-9_][A-Za-z0-9_.:/#*-]*$|^(llm|tool|mcp):[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    },
+    "entrypointRef": {
+      "type": "string",
+      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`.",
+      "pattern": "^(py|ts|rs):[^\\s]+$"
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "Maximum total attempts (first call included)."
+        },
+        "schedule": {
+          "$ref": "#/$defs/schedule",
+          "default": "exp(200ms, x2, max 30s, jitter)"
+        },
+        "on": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/errorCondition" },
+          "default": ["conn", "timeout", "429", "5xx"],
+          "description": "Error conditions that are retryable. Non-idempotent requests are NEVER retried regardless of this list (DX Level 0 hard rule); they terminate with KEEL-E014."
+        }
+      }
+    },
+    "breaker": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Circuit breaker. Two modes: consecutive-failure count (`failures`) or windowed failure rate (`window` + `failure_rate`). Setting `failures` selects count mode. The breaker observes post-retry call outcomes (layer order: cache, rate, breaker, timeout, retry).",
+      "properties": {
+        "failures": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Count mode: consecutive terminal failures before the breaker opens."
+        },
+        "window": { "$ref": "#/$defs/duration" },
+        "failure_rate": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "min_calls": { "type": "integer", "minimum": 1, "default": 10 },
+        "cooldown": { "$ref": "#/$defs/duration", "default": "15s" }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ttl": { "$ref": "#/$defs/duration" },
+        "scope": {
+          "type": "string",
+          "enum": ["memory", "persistent"],
+          "default": "memory"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["always", "dev"],
+          "default": "always",
+          "description": "`dev` caches only when KEEL_ENV != prod — the LLM dev-loop cache."
+        },
+        "key": {
+          "type": "string",
+          "enum": ["args", "url"],
+          "default": "args"
+        }
+      }
+    },
+    "idempotency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "header": { "type": "string" }
+      },
+      "required": ["header"]
+    },
+    "budget": {
+      "type": "string",
+      "description": "Per-run spend/token budget for llm: targets, e.g. `$5/run`. Exceeding it trips the breaker.",
+      "pattern": "^\\$[0-9]+(\\.[0-9]+)?/run$"
+    },
+    "targetPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout": { "$ref": "#/$defs/duration" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "breaker": { "$ref": "#/$defs/breaker" },
+        "rate": { "$ref": "#/$defs/rate" },
+        "cache": { "$ref": "#/$defs/cache" },
+        "idempotency": { "$ref": "#/$defs/idempotency" },
+        "fallback": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Model fallback chain for llm: targets."
+        },
+        "budget": { "$ref": "#/$defs/budget" }
+      }
+    }
+  }
+}

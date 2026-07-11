@@ -1,0 +1,45 @@
+{
+  "name": "cache-hit-and-expiry",
+  "description": "A cached response is served without invoking the effect (attempts 0); after the TTL elapses the call goes live again.",
+  "policy": {
+    "target": {
+      "api.catalog.internal": {
+        "cache": { "ttl": "10m" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/products", "idempotent": true, "args_hash": "q1" },
+        "effect": [{ "status": "ok", "payload": "v1" }],
+        "expect": { "result": "ok", "attempts": 1, "from_cache": false, "payload": "v1" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/products", "idempotent": true, "args_hash": "q1" },
+        "effect": [],
+        "expect": { "result": "ok", "attempts": 0, "from_cache": true, "payload": "v1" }
+      }
+    },
+    { "advance_ms": 600000 },
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/products", "idempotent": true, "args_hash": "q1" },
+        "effect": [{ "status": "ok", "payload": "v2" }],
+        "expect": { "result": "ok", "attempts": 1, "from_cache": false, "payload": "v2" }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.catalog.internal": { "calls": 3, "attempts": 2, "cache_hits": 1, "successes": 3 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "name": "breaker-trip-and-recover",
+  "description": "Three consecutive terminal failures open the breaker; while open, calls fail fast with KEEL-E012 and zero attempts; after cooldown a half-open probe succeeds and closes it.",
+  "policy": {
+    "target": {
+      "api.flaky.internal": {
+        "retry": { "attempts": 1 },
+        "breaker": { "failures": 3, "cooldown": "15s" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "attempts": 1, "error": { "code": "KEEL-E010" }, "breaker": "closed" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "attempts": 1, "breaker": "closed" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "attempts": 1, "breaker": "open" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [],
+        "expect": {
+          "result": "error",
+          "attempts": 0,
+          "breaker": "open",
+          "error": { "code": "KEEL-E012" }
+        }
+      }
+    },
+    { "advance_ms": 15000 },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": "recovered" }],
+        "expect": { "result": "ok", "attempts": 1, "payload": "recovered", "breaker": "closed" }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.flaky.internal": {
+            "calls": 5,
+            "attempts": 4,
+            "successes": 1,
+            "failures": 4,
+            "breaker_opens": 1,
+            "breaker_state": "closed"
+          }
+        }
+      }
+    }
+  ]
+}

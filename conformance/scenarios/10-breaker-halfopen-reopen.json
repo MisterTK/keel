@@ -1,0 +1,62 @@
+{
+  "name": "breaker-halfopen-reopen",
+  "description": "After cooldown, the half-open probe fails and the breaker re-opens for another full cooldown.",
+  "policy": {
+    "target": {
+      "api.flaky.internal": {
+        "retry": { "attempts": 1 },
+        "breaker": { "failures": 3, "cooldown": "15s" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "breaker": "open" }
+      }
+    },
+    { "advance_ms": 15000 },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "attempts": 1, "error": { "code": "KEEL-E010" }, "breaker": "open" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [],
+        "expect": { "result": "error", "attempts": 0, "error": { "code": "KEEL-E012" }, "breaker": "open" }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.flaky.internal": { "breaker_opens": 2, "breaker_state": "open" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "cache-key-varies-by-args",
+  "description": "The cache key is (target, args_hash): different args miss, identical args hit.",
+  "policy": {
+    "target": {
+      "api.catalog.internal": {
+        "cache": { "ttl": "10m" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/p?id=a", "idempotent": true, "args_hash": "a" },
+        "effect": [{ "status": "ok", "payload": "va" }],
+        "expect": { "result": "ok", "from_cache": false }
+      }
+    },
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/p?id=b", "idempotent": true, "args_hash": "b" },
+        "effect": [{ "status": "ok", "payload": "vb" }],
+        "expect": { "result": "ok", "from_cache": false, "payload": "vb" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.catalog.internal",
+        "request": { "op": "GET api.catalog.internal/p?id=a", "idempotent": true, "args_hash": "a" },
+        "effect": [],
+        "expect": { "result": "ok", "from_cache": true, "attempts": 0, "payload": "va" }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.catalog.internal": { "calls": 3, "attempts": 2, "cache_hits": 1 }
+        }
+      }
+    }
+  ]
+}

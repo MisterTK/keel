@@ -1,0 +1,28 @@
+{
+  "name": "non-retryable-4xx",
+  "description": "A 400 is a client bug, not a transient fault: not in retry.on, so one attempt and KEEL-E015.",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/items?bad=param", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 400, "message": "bad request" }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 1,
+          "waits_ms": [],
+          "error": { "code": "KEEL-E015", "class": "http", "http_status": 400 }
+        }
+      }
+    }
+  ]
+}

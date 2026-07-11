@@ -1,0 +1,38 @@
+{
+  "name": "llm-429-retry-after",
+  "description": "An llm:* target resolves through defaults.llm, and a provider Retry-After overrides the schedule upward: wait = max(schedule, retry_after).",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      },
+      "llm": {
+        "retry": { "attempts": 6, "schedule": "exp(500ms, x2, max 60s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "llm:openai",
+        "request": { "op": "openai chat.completions gpt-4.1", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 429, "retry_after_ms": 1500, "message": "rate limited" },
+          { "status": "ok", "payload": { "text": "hello" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "attempts": 2,
+          "waits_ms": [1500]
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "llm:openai": { "calls": 1, "attempts": 2, "retries": 1, "successes": 1 }
+        }
+      }
+    }
+  ]
+}
