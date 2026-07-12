@@ -72,6 +72,24 @@ class FaultServer:
             def log_message(self, *args: Any) -> None:  # silence
                 pass
 
+            def _drain_request_body(self) -> None:
+                # Read and discard any request body so a keep-alive connection is
+                # left clean for the next request. Without this, an unread POST
+                # body corrupts framing when the connection is reused (e.g. after
+                # a 200 that httpx returns to its pool).
+                length = self.headers.get("Content-Length")
+                if not length:
+                    return
+                try:
+                    remaining = int(length)
+                except ValueError:
+                    return
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+
             def _serve(self) -> None:
                 directive = server._next()
                 server.requests.append((self.command, self.path))
@@ -83,6 +101,7 @@ class FaultServer:
                     self.connection.close()
                     self.close_connection = True
                     return
+                self._drain_request_body()
                 sleep_s = directive.get("sleep")
                 if sleep_s:
                     time.sleep(sleep_s)
