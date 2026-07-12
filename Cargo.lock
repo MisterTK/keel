@@ -808,6 +808,7 @@ dependencies = [
  "serde_path_to_error",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

@@ -33,6 +33,10 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 # Parse the user's keel.toml for `doctor` validation and `init --diff`.
 toml = "0.8"
+# Surgical keel.toml edits for applyable policy diffs (dx-spec §5): operate on
+# the TOML *document*, so user formatting/comments outside touched regions
+# survive byte-for-byte. Already in-tree as toml's own backend.
+toml_edit = "0.22"
 
 [dev-dependencies]
 tempfile = "3.23"
