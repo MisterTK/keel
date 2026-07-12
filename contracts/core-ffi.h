@@ -43,6 +43,8 @@ typedef enum KeelErrorCode {
   KEEL_E002_TARGET_UNKNOWN = 2,        /* reserved: strict-mode unknown target */
   KEEL_E003_ENVELOPE_DECODE = 3,       /* request/outcome failed to decode    */
   KEEL_E004_ENVELOPE_VERSION = 4,      /* unsupported envelope "v"            */
+  KEEL_E005_UNSUPPORTED_CONFIGURATION = 5, /* policy is valid but requests something
+                                          this build/configuration cannot provide */
 
   /* resilience-layer terminal outcomes */
   KEEL_E010_ATTEMPTS_EXHAUSTED = 10,   /* retryable failure on final attempt  */
@@ -84,8 +86,17 @@ KeelCore *keel_new(void);
 void keel_free(KeelCore *core);
 
 /* Configure (or reconfigure) with a policy document: the keel.toml content
- * parsed to JSON (UTF-8), matching contracts/policy.schema.json. The built-in
- * smart-defaults pack (contracts/defaults.toml) applies underneath it.
+ * parsed to JSON (UTF-8), matching contracts/policy.schema.json.
+ *
+ * The document passed here is the EFFECTIVE policy: composition of the built-in
+ * smart-defaults pack (contracts/defaults.toml), any adapter-pack defaults, and
+ * the user's keel.toml — precedence defaults < packs < user, per-layer wholesale
+ * replacement (the merge rule in contracts/defaults.toml) — is the job of the
+ * language front ends and the CLI, which perform it BEFORE calling this
+ * function. The core interprets exactly the document it is given (no pack is
+ * layered underneath), which is what the conformance corpus normatively assumes:
+ * its scenarios drive this entry point with bare policies.
+ *
  * Returns KEEL_OK or KEEL_E001; on error *err_out (if non-NULL) receives a
  * UTF-8 JSON diagnostic {code, message}. */
 int32_t keel_configure(KeelCore *core, const uint8_t *policy_json,
