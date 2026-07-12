@@ -1,0 +1,44 @@
+{
+  "breaker_opens": 1,
+  "cache_hit_rate": 0.2143,
+  "cache_hits": 30,
+  "calls": 140,
+  "discovery_present": true,
+  "failures": 2,
+  "flows": {
+    "completed": 1,
+    "dead": 1,
+    "failed": 0,
+    "resumable": 1,
+    "running": 1,
+    "total": 3
+  },
+  "journal_present": true,
+  "retries": 12,
+  "success_rate": 0.9818,
+  "successes": 108,
+  "targets": [
+    {
+      "breaker_opens": 1,
+      "cache_hits": 10,
+      "calls": 100,
+      "failures": 2,
+      "retries": 12,
+      "successes": 88,
+      "target": "api.example.com",
+      "throttled": 3
+    },
+    {
+      "breaker_opens": 0,
+      "cache_hits": 20,
+      "calls": 40,
+      "failures": 0,
+      "retries": 0,
+      "successes": 20,
+      "target": "llm:openai",
+      "throttled": 0
+    }
+  ],
+  "targets_wrapped": 2,
+  "throttled": 3
+}

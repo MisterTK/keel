@@ -1,0 +1,8 @@
+{
+  "code": "KEEL-E014",
+  "docs": "https://keel.dev/errors/KEEL-E014",
+  "name": "non-idempotent-not-retried",
+  "next": "If the API supports idempotency keys, configure `idempotency = { header = \"...\" }` for the target; then retries become safe.",
+  "what": "The call failed with a retryable error, but Keel did not retry it because repeating it is not provably safe.",
+  "why": "Level 0 hard rule: non-idempotent calls (e.g. POST without an idempotency key) are observed, never retried."
+}
