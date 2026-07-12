@@ -24,3 +24,6 @@ conformance/fixtures/journal/.gen/
 
 # semantex local index
 .semantex/
+
+# macOS Finder artifacts
+.DS_Store
