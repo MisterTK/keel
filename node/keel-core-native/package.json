@@ -1,6 +1,7 @@
 {
   "name": "@keel/core-native",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source only — binaries are built locally and never committed.",
   "type": "module",
   "main": "index.mjs",

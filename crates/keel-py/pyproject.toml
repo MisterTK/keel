@@ -13,6 +13,7 @@ build-backend = "maturin"
 [project]
 # Distribution name; the IMPORT name is `keel_core` (the cdylib `[lib].name`).
 name = "keel-core"
+license = "Apache-2.0"
 version = "0.1.0"
 description = "Keel native core (keel_core): PyO3 binding over keel-core::Engine."
 requires-python = ">=3.11"

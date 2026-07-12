@@ -4,6 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keel"
+license = "Apache-2.0"
 version = "0.1.0"
 description = "Keel — resilience as a zero-config Python front end (Tier 1 bootstrap, import hook, discovery)."
 requires-python = ">=3.11"

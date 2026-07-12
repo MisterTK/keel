@@ -60,9 +60,8 @@ crates/keel-py` for the native Python module). Postgres/fleet journal (Level 3),
 KEEL-E001 currently covers both policy-validation failures and v0.1
 unsupported-configuration limits (async-in-flow, flows-without-journal); a CCR
 to split these into a dedicated code is deliberately deferred.
-The **license is undecided** (architecture-spec §10 — TK's call); the repo carries
-no `LICENSE`, `node/keel/package.json` says `UNLICENSED`, and other manifests omit
-the field — see `LICENSE-PENDING.md`. **OTel export is opt-in**: the OTLP exporter
+Licensed **Apache-2.0** (decided by TK 2026-07-12; `LICENSE` at repo root, SPDX
+fields in every manifest). **OTel export is opt-in**: the OTLP exporter
 is behind the `otel` cargo feature (off by default; the shipped wheel/addon have no
 OpenTelemetry dep) and only initializes when a front end is built `--features otel`
 (forwarded by `keel-py`/`keel-node` → `keel-core/otel`) *and* `KEEL_OTEL=1` is set

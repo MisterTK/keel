@@ -16,7 +16,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-repository = "https://github.com/MisterTK/Keel"
+repository = "https://github.com/MisterTK/keel"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish = false
 # Only the explicitly declared `overhead` bench is a target; `benches/support.rs`
 # is a module of it (and of tests/overhead_guard.rs), not a bench of its own.
