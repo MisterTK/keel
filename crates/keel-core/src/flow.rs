@@ -25,7 +25,8 @@
 //! so an async effect inside a flow would be silently downgraded to Tier 1
 //! (never journaled, never replayed). Rather than let that happen quietly (a
 //! Level 0 surprise), the binding *refuses* an async intercepted call while a
-//! flow is open with a precise KEEL-E001 (`keel-py`'s `execute_async` guard).
+//! flow is open with a precise KEEL-E005 — unsupported-configuration, the policy
+//! is valid but this build cannot honor it (`keel-py`'s `execute_async` guard).
 //! v0.1 durable flows are therefore synchronous-only; lifting this is future
 //! work (an async `execute_step` bridge in each binding).
 //!

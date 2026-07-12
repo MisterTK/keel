@@ -233,7 +233,7 @@ class RunAsFlowTest(unittest.TestCase):
 
     def test_native_backend_without_journal_is_precise_error_before_enter(self) -> None:
         """Carried fix #2: a native-shaped backend with no journal must be
-        refused by the FRONT END (config-level KEEL-E001), before `enter_flow`
+        refused by the FRONT END (config-level KEEL-E005), before `enter_flow`
         is ever called — so the backend's last-resort KEEL-E040 is unreachable
         from `keel run`."""
         entry = FlowEntrypoint("py:pipeline:main", "pipeline", "main")
@@ -303,7 +303,7 @@ class NativeFlowReplayTest(unittest.TestCase):
 
     def test_async_effect_in_flow_is_refused(self) -> None:
         """Carried fix #1: an async intercepted call while a flow is open must be
-        refused (KEEL-E001), synchronously, rather than silently downgraded to
+        refused (KEEL-E005), synchronously, rather than silently downgraded to
         Tier 1 by running on the bare engine outside the FlowHandle."""
         core = self._core()
 
@@ -316,7 +316,7 @@ class NativeFlowReplayTest(unittest.TestCase):
                 core.execute_async(
                     {"v": 1, "target": "api.x", "op": "api.x", "idempotent": True}, eff
                 )
-            self.assertEqual(ctx.exception.code, "KEEL-E001")
+            self.assertEqual(ctx.exception.code, "KEEL-E005")
             self.assertIn("durable flow", str(ctx.exception).lower())
         finally:
             core.exit_flow("completed")

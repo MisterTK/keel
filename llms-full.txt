@@ -70,7 +70,7 @@ same values.
 
 v0.1 limits (precise, never silent): a flow needs a journal (native core), and
 flow bodies are synchronous-only — an async intercepted call inside a flow is
-refused (KEEL-E001) rather than silently downgraded to Tier 1.
+refused (KEEL-E005) rather than silently downgraded to Tier 1.
 
 ### Level 3 — fleet
 
@@ -135,10 +135,11 @@ timestamps) instead of prose. Same command, two audiences.
 Every user-facing error carries a `KEEL-E0NN` code, a first line (what/why/next),
 a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
 
-- KEEL-E001 policy-invalid — keel.toml failed validation (wrong type / unknown key / bad literal), or a `[flows]` designation cannot be honored (no journal, or an async effect inside a flow). Next: `keel doctor`; validate against policy.schema.json.
+- KEEL-E001 policy-invalid — keel.toml failed validation (wrong type / unknown key / bad literal). Next: `keel doctor`; validate against policy.schema.json.
 - KEEL-E002 policy-target-unknown — strict mode only; unknown target with no entry.
 - KEEL-E003 envelope-decode — a request/attempt-result envelope could not be decoded at the FFI boundary (version mismatch / corruption).
 - KEEL-E004 envelope-version-unsupported — language package and core binary are incompatible releases.
+- KEEL-E005 unsupported-configuration — the policy is valid but asks for a capability this build/configuration cannot provide: an async effect inside a durable flow (flows are synchronous-only in v0.1), or a `[flows]` designation with no journal / no native backend. Next: run the flow synchronously or drop it from `[flows]`; build the native module and make `.keel/` writable; `keel doctor`.
 - KEEL-E010 attempts-exhausted — failed on the final permitted attempt; original error re-raised unchanged.
 - KEEL-E011 timeout — exceeded the policy timeout.
 - KEEL-E012 breaker-open — the breaker is open; the call failed fast, unattempted.

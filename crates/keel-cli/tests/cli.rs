@@ -227,6 +227,15 @@ fn explain_e014_json_matches_golden() {
     check_golden("explain_e014.json", &json_string(&r.json));
 }
 
+/// KEEL-E005 (unsupported-configuration, added by the defaults/E005 CCR) is the
+/// code the flow gates raise; `keel explain` must carry its frozen copy.
+#[test]
+fn explain_e005_json_matches_golden() {
+    let r = explain::run("KEEL-E005");
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("explain_e005.json", &json_string(&r.json));
+}
+
 // ---- --json parity: every human-visible fact has a JSON counterpart ----
 
 #[test]

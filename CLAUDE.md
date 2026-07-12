@@ -57,9 +57,14 @@ resume**. Done:
 published — build from source (README quickstart; `maturin develop -m
 crates/keel-py` for the native Python module). Postgres/fleet journal (Level 3),
 `keel mcp`, `keel record test`, and further adapter packs are future work.
-KEEL-E001 currently covers both policy-validation failures and v0.1
-unsupported-configuration limits (async-in-flow, flows-without-journal); a CCR
-to split these into a dedicated code is deliberately deferred.
+An approved CCR (branch `claude/ccr-defaults-e005`) resolved two contract
+questions: **KEEL-E005 unsupported-configuration** now carries the v0.1
+"valid policy, missing capability" cases (async-in-flow, flows-without-journal,
+`KEEL_BACKEND=native` with no native module), so KEEL-E001 is pure policy
+validation again; and `keel_configure` is contractually given the **effective
+policy** — front ends/CLI compose defaults < packs < user *before* calling the
+core, which layers no pack underneath (`keel doctor --effective-policy` is
+follow-up: the Rust CLI has no merge implementation yet).
 Licensed **Apache-2.0** (decided by TK 2026-07-12; `LICENSE` at repo root, SPDX
 fields in every manifest). **OTel export is opt-in**: the OTLP exporter
 is behind the `otel` cargo feature (off by default; the shipped wheel/addon have no

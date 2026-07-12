@@ -131,9 +131,11 @@ def load_backend(
             return native
         if choice == "native":
             # A missing build/install is a user-environment problem, not a Keel
-            # bug — E001 with a concrete next step, never E040 ("file an issue").
+            # bug, and not a malformed policy: the configuration is valid, the
+            # capability is absent — E005 (unsupported-configuration) with a
+            # concrete next step, never E040 ("file an issue").
             raise KeelError(
-                "KEEL-E001",
+                "KEEL-E005",
                 "KEEL_BACKEND=native requires the keel_core native module, which is not "
                 "installed; build it (`maturin develop -m crates/keel-py/Cargo.toml`) or "
                 "unset KEEL_BACKEND to use the pure-Python stub",

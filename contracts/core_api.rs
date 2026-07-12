@@ -29,6 +29,11 @@ pub enum ErrorCode {
     EnvelopeDecode,
     #[serde(rename = "KEEL-E004")]
     EnvelopeVersion,
+    /// The policy is valid, but it asks for a capability this build/configuration
+    /// cannot provide (v0.1: async effects inside a durable flow; durable flows
+    /// with no journal attached).
+    #[serde(rename = "KEEL-E005")]
+    UnsupportedConfiguration,
     #[serde(rename = "KEEL-E010")]
     AttemptsExhausted,
     #[serde(rename = "KEEL-E011")]
@@ -60,6 +65,7 @@ impl ErrorCode {
             ErrorCode::TargetUnknown => "KEEL-E002",
             ErrorCode::EnvelopeDecode => "KEEL-E003",
             ErrorCode::EnvelopeVersion => "KEEL-E004",
+            ErrorCode::UnsupportedConfiguration => "KEEL-E005",
             ErrorCode::AttemptsExhausted => "KEEL-E010",
             ErrorCode::Timeout => "KEEL-E011",
             ErrorCode::BreakerOpen => "KEEL-E012",
