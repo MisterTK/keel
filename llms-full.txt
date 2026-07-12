@@ -139,7 +139,7 @@ a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
 - KEEL-E002 policy-target-unknown — strict mode only; unknown target with no entry.
 - KEEL-E003 envelope-decode — a request/attempt-result envelope could not be decoded at the FFI boundary (version mismatch / corruption).
 - KEEL-E004 envelope-version-unsupported — language package and core binary are incompatible releases.
-- KEEL-E005 unsupported-configuration — the policy is valid but asks for a capability this build/configuration cannot provide: an async effect inside a durable flow (flows are synchronous-only in v0.1), or a `[flows]` designation with no journal / no native backend. Next: run the flow synchronously or drop it from `[flows]`; build the native module and make `.keel/` writable; `keel doctor`.
+- KEEL-E005 unsupported-configuration — the policy is valid but asks for a capability this build/configuration cannot provide: a `[flows]` designation with no journal / no native backend, or `KEEL_BACKEND=native` with no native module. (Async effects inside a flow are supported — serialized in await order, per conformance/README.md's Tier 2 ordering rule — and no longer trigger this code.) Next: build the native module and make `.keel/` writable; `keel doctor`.
 - KEEL-E010 attempts-exhausted — failed on the final permitted attempt; original error re-raised unchanged.
 - KEEL-E011 timeout — exceeded the policy timeout.
 - KEEL-E012 breaker-open — the breaker is open; the call failed fast, unattempted.
