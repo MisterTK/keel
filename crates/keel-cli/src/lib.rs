@@ -1,9 +1,10 @@
 //! `keel` — the command-line face of the product (dx-spec §1–2, §5–6).
 //!
-//! Five subcommands: [`run`] (dispatch a script into a language front end),
+//! Subcommands: [`run`] (dispatch a script into a language front end),
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
-//! report), [`status`] (the "what is Keel doing for me" screen), and
-//! [`explain`] (the frozen error taxonomy).
+//! report), [`status`] (the "what is Keel doing for me" screen),
+//! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
+//! [`flows`] (list durable flows) and [`flows::trace`] (`keel trace`).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -12,6 +13,7 @@
 
 pub mod doctor;
 pub mod explain;
+pub mod flows;
 pub mod init;
 pub mod render;
 pub mod run;

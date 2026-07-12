@@ -9,7 +9,8 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, explain, init, run, status};
+use keel_cli::{doctor, explain, flows, init, run, status};
+use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
 #[derive(Debug, Parser)]
@@ -52,6 +53,17 @@ enum Command {
     Doctor,
     /// Show one screen of coverage and flow state.
     Status,
+    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age.
+    Flows {
+        /// Show only `dead` flows (those that exhausted their resume cap).
+        #[arg(long)]
+        dead: bool,
+    },
+    /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
+    Trace {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        flow: String,
+    },
     /// Explain a `KEEL-E0NN` error code (what / why / next).
     Explain {
         /// The error code, e.g. `KEEL-E014`.
@@ -82,6 +94,8 @@ fn main() {
         }
         Command::Doctor => emit(&doctor::run(&project), json),
         Command::Status => emit(&status::run(&project), json),
+        Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };
     exit(code);
