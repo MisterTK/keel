@@ -103,6 +103,7 @@ mod bindings {
 
     use keel_core_api::{AttemptResult, KeelError, Request};
     use keel_engine::Engine;
+    use keel_journal::{SqliteJournal, SystemClock};
     use napi::bindgen_prelude::*;
     use napi::threadsafe_function::ThreadsafeFunction;
     use napi_derive::napi;
@@ -110,6 +111,24 @@ mod bindings {
     use tokio::runtime::Runtime;
 
     use super::{build_runtime, decode_attempt, request_from_value, synth_other};
+
+    /// Open (creating the parent dir + file as needed) a WAL SQLite journal at
+    /// `path` on the wall clock and attach it — enabling the `scope = persistent`
+    /// dev cache so identical prompts replay across separate `keel` runs (Task 14
+    /// item 1). `SystemClock` is correct here: production runs on real time, so
+    /// cache-TTL expiry is measured in wall-clock ms.
+    fn attach_journal(engine: &mut Engine, path: &str) -> std::result::Result<(), String> {
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("journal dir {}: {e}", parent.display()))?;
+        }
+        let journal = SqliteJournal::open(path, SystemClock)
+            .map_err(|e| format!("journal open {path}: {e}"))?;
+        engine.attach_journal(journal);
+        Ok(())
+    }
 
     /// The async-effect callback shape: JS `(attempt: number) => Promise<object>`.
     /// `CalleeHandled = false` (5th generic) means napi passes only `attempt` —
@@ -156,6 +175,10 @@ mod bindings {
         /// Harness-only: run on tokio's virtual clock so `advanceClock` and
         /// auto-advanced timer waits are deterministic.
         pub paused: Option<bool>,
+        /// Production: attach a SQLite journal at this path (enables the
+        /// `scope = persistent` dev cache — cross-run LLM replay). Absent/empty
+        /// ⇒ an in-memory core. Not combined with `paused` by any caller.
+        pub journal_path: Option<String>,
     }
 
     /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
@@ -165,6 +188,8 @@ mod bindings {
     pub struct KeelCore {
         engine: Arc<Engine>,
         runtime: Mutex<Runtime>,
+        /// True when a journal is attached (the persistent dev-cache scope is live).
+        persistent: bool,
     }
 
     #[napi]
@@ -173,16 +198,34 @@ mod bindings {
         /// virtual clock; the default is real time.
         #[napi(constructor)]
         pub fn new(options: Option<KeelCoreOptions>) -> Result<Self> {
-            let paused = options.and_then(|o| o.paused).unwrap_or(false);
+            let paused = options.as_ref().and_then(|o| o.paused).unwrap_or(false);
+            let journal_path = options.and_then(|o| o.journal_path);
             let runtime = build_runtime(paused)
                 .map_err(|e| Error::from_reason(format!("KEEL-E040: runtime build failed: {e}")))?;
             // `Engine::new` reads `tokio::time::Instant::now()`; build it inside
             // the runtime so a paused clock's epoch is anchored (see `keel-ffi`).
-            let engine = runtime.block_on(async { Engine::new() });
+            let mut engine = runtime.block_on(async { Engine::new() });
+            let persistent = match journal_path {
+                Some(path) if !path.is_empty() => {
+                    attach_journal(&mut engine, &path)
+                        .map_err(|e| Error::from_reason(format!("KEEL-E040: {e}")))?;
+                    true
+                }
+                _ => false,
+            };
             Ok(Self {
                 engine: Arc::new(engine),
                 runtime: Mutex::new(runtime),
+                persistent,
             })
+        }
+
+        /// Whether a persistent journal is attached (the `scope = persistent`
+        /// dev cache is live). The front end reads this to decide whether to emit
+        /// `scope = "persistent"` for the LLM dev cache (cross-run replay).
+        #[napi(getter)]
+        pub fn persistent(&self) -> bool {
+            self.persistent
         }
 
         /// Apply a policy document (object, per `policy.schema.json`). Throws a JS
@@ -232,34 +275,39 @@ mod bindings {
         }
 
         /// Run one intercepted call asynchronously, returning a `Promise` that
-        /// resolves to the outcome object. `effect(attempt)` is an `async` JS
-        /// function awaited on the caller's libuv loop, so it may perform real
-        /// async IO. Runs on napi's runtime (real time), not the paused handle
-        /// clock.
+        /// resolves to the outcome object. The request is decoded in a SYNC
+        /// prelude that still holds `Env`, so a malformed envelope rejects with a
+        /// proper `.code = "KEEL-E003"` (parity with the sync `execute` — Task 14
+        /// item 2); only then is the engine future spawned on napi's runtime via
+        /// `Env::spawn_future`. `effect(attempt)` is an `async` JS function
+        /// awaited on the caller's libuv loop, so it may perform real async IO.
+        /// Runs on napi's runtime (real time), not the paused handle clock.
         #[napi(ts_args_type = "request: object, effect: (attempt: number) => Promise<object>")]
-        pub async fn execute_async(&self, request: Value, effect: AsyncEffect) -> Result<Value> {
-            // On napi's runtime we have no `Env`; a request-decode failure can
-            // only surface as a rejection carrying the code in its message (the
-            // sync path throws a proper `.code`). Engine-level errors always come
-            // back inside the outcome, with codes, on both paths.
-            let request = request_from_value(request).map_err(|e| {
-                Error::from_reason(format!("KEEL-E003: request envelope invalid: {e}"))
-            })?;
+        pub fn execute_async<'env>(
+            &self,
+            env: &'env Env,
+            request: Value,
+            effect: AsyncEffect,
+        ) -> Result<PromiseRaw<'env, Value>> {
+            // Sync prelude (holds `Env`): a bad envelope throws a proper `.code`.
+            let request = decode_request(*env, request)?;
             let engine = Arc::clone(&self.engine);
             // `ThreadsafeFunction` is not `Clone`; wrap it once in an `Arc` so each
             // attempt gets an owned handle. A plain `FnMut` returning an
             // owned-capture `async move` future keeps every per-attempt future
-            // `'static` + `Send`, as napi's multi-threaded runtime requires
-            // (mirrors keel-py's async closure shape).
-            let effect = Arc::new(effect);
-            let outcome = engine
-                .execute(&request, move |attempt: u32| {
-                    let effect = Arc::clone(&effect);
-                    async move { invoke_async_effect(&effect, attempt).await }
+            // `'static` + `Send`, as napi's runtime requires (mirrors keel-py).
+            env.spawn_future(async move {
+                let effect = Arc::new(effect);
+                let outcome = engine
+                    .execute(&request, move |attempt: u32| {
+                        let effect = Arc::clone(&effect);
+                        async move { invoke_async_effect(&effect, attempt).await }
+                    })
+                    .await;
+                serde_json::to_value(&outcome).map_err(|e| {
+                    Error::from_reason(format!("KEEL-E040: outcome not encodable: {e}"))
                 })
-                .await;
-            serde_json::to_value(&outcome)
-                .map_err(|e| Error::from_reason(format!("KEEL-E040: outcome not encodable: {e}")))
+            })
         }
 
         /// The deterministic per-target metrics/discovery report. Read inside the

@@ -21,6 +21,9 @@ crate-type = ["cdylib", "rlib"]
 # `keel_core`, which would otherwise collide with keel-core's lib name.
 keel_engine = { package = "keel-core", path = "../keel-core" }
 keel-core-api = { path = "../keel-core-api" }
+# The persistent journal (SQLite) attached on demand for the dev-cache
+# `scope = persistent` (Task 14 item 1) — enables cross-RUN LLM dev replay.
+keel-journal = { path = "../keel-journal" }
 # abi3-py311: one wheel imports on CPython 3.11+ (built here with 3.14). The
 # `extension-module` feature (no libpython link) is enabled only for the wheel
 # build, via the `extension-module` crate feature below — NOT by default, so

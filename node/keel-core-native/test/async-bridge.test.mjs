@@ -72,3 +72,40 @@ test("async bridge: non-idempotent failure is not retried (KEEL-E014)", gate, as
   assert.equal(outcome.attempts, 1);
   assert.equal(calls, 1);
 });
+
+// Task 14 item 2: the disclosed asymmetry is fixed — a malformed request
+// envelope on the ASYNC path now rejects with a proper `.code` (parity with the
+// sync `execute` throw), because the request is decoded in a sync prelude that
+// still holds `Env` before the engine future is spawned.
+test("async bridge: malformed request rejects with .code = KEEL-E003", gate, async () => {
+  const core = new KeelCore();
+  core.configure({});
+  let called = false;
+  // The sync prelude validates before returning the Promise, so the decode error
+  // surfaces as a synchronous throw — which an `await`ing caller (the front end)
+  // sees as a rejection carrying `.code`. Wrap in `async` to normalize either way.
+  await assert.rejects(
+    async () =>
+      core.executeAsync({ bad: true }, async () => ((called = true), { status: "ok", payload: null })),
+    (err) => err.code === "KEEL-E003"
+  );
+  assert.equal(called, false, "effect must not run when the envelope is rejected");
+});
+
+// Task 14 item 1: the constructor attaches a journal at journalPath and exposes
+// `persistent`; the persistent dev-cache scope (cross-run replay) rides on it.
+test("journal attach: `persistent` reflects a journalPath option", gate, async () => {
+  const { mkdtempSync, existsSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "keel-native-journal-"));
+  try {
+    assert.equal(new KeelCore().persistent, false, "in-memory core is not persistent");
+    const path = join(dir, ".keel", "journal.db");
+    const core = new KeelCore({ journalPath: path });
+    assert.equal(core.persistent, true, "journalPath ⇒ persistent");
+    assert.ok(existsSync(path), "journal file + parent dir created on demand");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

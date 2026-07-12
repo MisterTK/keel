@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use keel_core_api::{AttemptResult, ErrorClass, KeelError, Outcome, Request};
 use keel_engine::Engine;
+use keel_journal::{SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
@@ -166,6 +167,23 @@ fn build_runtime(paused: bool) -> std::io::Result<Runtime> {
     builder.build()
 }
 
+/// Open (creating the parent dir + file as needed) a WAL SQLite journal at
+/// `path` on the wall clock and attach it — enabling the `scope = persistent`
+/// dev cache so identical prompts replay across separate `keel run` processes
+/// (Task 14 item 1). `SystemClock` is correct here: production runs on real
+/// time, so cache-TTL expiry is measured in wall-clock ms.
+fn attach_journal(engine: &mut Engine, path: &str) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("journal dir {}: {e}", parent.display()))?;
+    }
+    let journal =
+        SqliteJournal::open(path, SystemClock).map_err(|e| format!("journal open {path}: {e}"))?;
+    engine.attach_journal(journal);
+    Ok(())
+}
+
 /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
 /// `runtime` (behind a `Mutex`) drives the synchronous/paused-clock paths.
 #[pyclass(module = "keel_core")]
@@ -173,24 +191,45 @@ fn build_runtime(paused: bool) -> std::io::Result<Runtime> {
 struct KeelCore {
     engine: Arc<Engine>,
     runtime: Mutex<Runtime>,
+    /// True when a journal is attached (the persistent dev-cache scope is live).
+    persistent: bool,
 }
 
 #[pymethods]
 impl KeelCore {
     /// Create a core. `paused=True` (harness-only) runs it on tokio's virtual
     /// clock so `advance_clock` and auto-advanced timer waits are deterministic.
+    /// `journal_path` attaches a SQLite journal (production: the persistent
+    /// dev-cache scope); leave it `None` (the harness default) for an in-memory
+    /// core. `paused` + a journal are not combined by any caller (two clocks).
     #[new]
-    #[pyo3(signature = (paused = false))]
-    fn new(py: Python<'_>, paused: bool) -> PyResult<Self> {
+    #[pyo3(signature = (paused = false, journal_path = None))]
+    fn new(py: Python<'_>, paused: bool, journal_path: Option<String>) -> PyResult<Self> {
         let runtime = build_runtime(paused)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("runtime build failed: {e}")))?;
         // `Engine::new` reads `tokio::time::Instant::now()`; build it inside the
         // runtime so the paused clock's epoch is anchored (see `keel-ffi`).
-        let engine = runtime.block_on(async { Engine::new() });
+        let mut engine = runtime.block_on(async { Engine::new() });
+        let persistent = match journal_path {
+            Some(path) if !path.is_empty() => {
+                attach_journal(&mut engine, &path).map_err(|e| keel_error(py, "KEEL-E040", &e))?;
+                true
+            }
+            _ => false,
+        };
         Ok(Self {
             engine: Arc::new(engine),
             runtime: Mutex::new(runtime),
+            persistent,
         })
+    }
+
+    /// Whether a persistent journal is attached — the front end reads this to
+    /// decide whether to emit `scope = "persistent"` for the LLM dev cache
+    /// (cross-run replay). `False` for an in-memory core.
+    #[getter]
+    fn persistent(&self) -> bool {
+        self.persistent
     }
 
     /// Apply a policy document (dict, per `policy.schema.json`). Raises

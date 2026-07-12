@@ -891,6 +891,7 @@ version = "0.1.0"
 dependencies = [
  "keel-core",
  "keel-core-api",
+ "keel-journal",
  "napi",
  "napi-build",
  "napi-derive",
@@ -904,6 +905,7 @@ version = "0.1.0"
 dependencies = [
  "keel-core",
  "keel-core-api",
+ "keel-journal",
  "pyo3",
  "pyo3-async-runtimes",
  "pythonize",
