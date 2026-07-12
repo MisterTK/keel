@@ -225,6 +225,21 @@ pub fn run(project: &Path) -> Rendered {
     Rendered::ok(human, to_json(&report)).with_exit(exit)
 }
 
+/// An unsupported journal backend is an error finding: the app would fail to
+/// configure with KEEL-E005, so doctor must not read clean.
+fn journal_finding(journal: &JournalReport) -> Option<Finding> {
+    (!journal.supported).then(|| Finding {
+        action: "Use a `file:` location (or drop the key for the default .keel/journal.db); Postgres support is future work — see docs.".to_owned(),
+        detail: format!(
+            "keel.toml sets `journal` to a {} location, but this build has no {} backend — the app will fail to configure with KEEL-E005.",
+            journal.backend, journal.backend
+        ),
+        fix: None,
+        level: "error",
+        topic: "journal",
+    })
+}
+
 /// Assemble the report from the four evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3`.
 fn build_report(
@@ -317,18 +332,7 @@ fn build_report(
             topic: "policy",
         });
     }
-    if !journal.supported {
-        findings.push(Finding {
-            action: "Use a `file:` location (or drop the key for the default .keel/journal.db); Postgres support is future work — see docs.".to_owned(),
-            detail: format!(
-                "keel.toml sets `journal` to a {} location, but this build has no {} backend — the app will fail to configure with KEEL-E005.",
-                journal.backend, journal.backend
-            ),
-            fix: None,
-            level: "error",
-            topic: "journal",
-        });
-    }
+    findings.extend(journal_finding(&journal));
 
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
