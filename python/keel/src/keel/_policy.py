@@ -76,3 +76,42 @@ def extract_function_targets(policy: dict[str, Any]) -> list[FunctionTarget]:
             continue  # mid-path globs unsupported in v0.1
         out.append(FunctionTarget(key=key, module=module, func_glob=func_glob))
     return out
+
+
+class FlowEntrypoint(NamedTuple):
+    """A Tier 2 durable-flow entrypoint from `[flows] entrypoints`, parsed from
+    the `py:<module>:<function>` grammar into the module to import and the
+    function to run as the flow body."""
+
+    raw: str  # the declared entrypoint, e.g. "py:pipeline:main"
+    module: str  # the module to import, e.g. "pipeline"
+    function: str  # the function to run as the flow, e.g. "main"
+
+
+def extract_flow_entrypoints(policy: dict[str, Any]) -> list[FlowEntrypoint]:
+    """The `py:<module>:<function>` flow entrypoints declared in
+    `[flows] entrypoints`.
+
+    v0.1 rule (documented): the module portion is a concrete importable module
+    (single component in v0.1, e.g. `pipeline`); a colon separates it from the
+    function name. Malformed or non-`py:` entries are skipped, not guessed —
+    designating a flow is an explicit, load-bearing assertion.
+    """
+    flows = policy.get("flows")
+    if not isinstance(flows, dict):
+        return []
+    entrypoints = flows.get("entrypoints")
+    if not isinstance(entrypoints, list):
+        return []
+    out: list[FlowEntrypoint] = []
+    for raw in entrypoints:
+        if not isinstance(raw, str) or not raw.startswith("py:"):
+            continue
+        body = raw[3:]
+        if ":" not in body:
+            continue  # need module:function
+        module, function = body.rsplit(":", 1)
+        if not module or not function:
+            continue
+        out.append(FlowEntrypoint(raw=raw, module=module, function=function))
+    return out

@@ -42,9 +42,10 @@ def run_target(
 
     from .bootstrap import install_keel, is_disabled
 
+    state: dict | None = None
     if not is_disabled(env):
         try:
-            install_keel(cwd=cwd, env=env)
+            state = install_keel(cwd=cwd, env=env)
         except BaseException as exc:  # config error: loud, then exit 1
             if is_keel_error(exc):
                 code = getattr(exc, "code", "KEEL-E040")
@@ -63,6 +64,18 @@ def run_target(
     # Present argv exactly as `python <target> [args...]` would, so the script
     # sees the same argv[0] and byte-identical behavior.
     sys.argv = [target, *args]
+
+    # Tier 2: if this script is a designated flow entrypoint, run it as a durable
+    # flow (enter/replay/complete via the native backend) rather than a plain
+    # script. Otherwise fall through to normal `python <target>` execution.
+    if state is not None and state.get("enabled"):
+        from ._flow import match_flow, run_as_flow
+
+        entry = match_flow(target, state.get("flow_entrypoints") or [])
+        if entry is not None:
+            run_as_flow(target, entry, state["backend"], args, env=env)
+            return
+
     runpy.run_path(target, run_name="__main__")
 
 

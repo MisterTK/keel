@@ -23,7 +23,7 @@ from ._backend import load_backend
 from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
-from ._policy import extract_function_targets, load_policy
+from ._policy import extract_flow_entrypoints, extract_function_targets, load_policy
 from ._runtime import clear_runtime, set_runtime
 from .adapters import Detection, install_adapters, uninstall_adapters
 from .packs import present_provider_defaults, resolve_dev_cache
@@ -79,6 +79,11 @@ def install_keel(
     targets = extract_function_targets(policy)
     _STATE.finder = install_import_hook(targets)
 
+    # Tier 2 flow entrypoints (`[flows] entrypoints`, py:module:function) — the
+    # runner consults these to decide whether `keel run <script>` is a durable
+    # flow. Parsing only; running one requires the native backend.
+    flow_entrypoints = extract_flow_entrypoints(policy)
+
     # Library adapters (httpx/requests/…): armed lazily — each patches its
     # library only when the program imports it. Present-but-unused libraries
     # cost nothing, so `keel run` startup stays cheap.
@@ -93,6 +98,7 @@ def install_keel(
         "discovery": discovery,
         "source": source,
         "function_targets": targets,
+        "flow_entrypoints": flow_entrypoints,
         "adapters": adapters,
     }
 
