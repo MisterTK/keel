@@ -165,6 +165,42 @@ class RunAsFlowTest(unittest.TestCase):
             )
         self.assertEqual(backend.exited, ["failed"])
 
+    def test_clean_sys_exit_completes_not_fails(self) -> None:
+        # sys.exit(0) is the ordinary success exit — it must complete the flow,
+        # not mark it 'failed' (which would march a working script to 'dead').
+        entry = self._module(
+            "flowmod_exit0",
+            """
+            import sys
+            def main():
+                sys.exit(0)
+            """,
+        )
+        backend = _FakeFlowBackend()
+        with self.assertRaises(SystemExit):
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_exit0.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+            )
+        self.assertEqual(backend.exited, ["completed"])
+
+    def test_replayed_flow_is_not_demoted_on_error(self) -> None:
+        # A rerun of an already-COMPLETED flow that raises (e.g. a replay-miss
+        # after a code change) must NOT be stamped 'failed' — that would re-open a
+        # finished flow for live re-execution.
+        entry = self._module(
+            "flowmod_replay_err",
+            """
+            def main():
+                raise RuntimeError("changed code / replay miss")
+            """,
+        )
+        backend = _FakeFlowBackend(replay=True)  # already completed → replay path
+        with self.assertRaises(RuntimeError):
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_replay_err.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+            )
+        self.assertEqual(backend.exited, [], "completed flow must not be demoted to failed")
+
     def test_time_random_restored_after_flow(self) -> None:
         import random
         import time

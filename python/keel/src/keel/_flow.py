@@ -174,8 +174,19 @@ def run_as_flow(
 ) -> None:
     """Run `entry`'s function as a durable flow through `backend`. Opens/resumes
     the flow, runs the body with time/random virtualized, and stamps the terminal
-    status on exit. A raised exception marks the flow `failed` and propagates
-    unchanged (DX invariant 5)."""
+    status on exit.
+
+    Terminal status is chosen carefully so a rerun never bricks a working script:
+      * a clean ``SystemExit`` (code 0/None) — the ordinary ``main()`` success
+        exit ``_run.py`` passes through — completes the flow (not `failed`);
+      * a real exception on a fresh (non-replayed) run marks it `failed` and
+        propagates unchanged (DX invariant 5);
+      * an already-COMPLETED (replayed) flow is NEVER demoted to `failed` — a
+        designed replay-miss (KEEL-E031) after a code change, or any error while
+        re-running finished code, must not re-open a done flow for live
+        re-execution (nor march it toward `dead`);
+      * ``KeyboardInterrupt`` leaves the flow `running` so it can be resumed,
+        rather than burning an attempt."""
     env = env if env is not None else os.environ
     if not backend_supports_flows(backend):
         _unsupported_on_stub(entry)  # exits
@@ -203,12 +214,19 @@ def run_as_flow(
     if env.get("KEEL_QUIET", "").strip().lower() not in {"1", "true", "yes"}:
         sys.stderr.write(f"keel ▸ {verb} flow {entry.raw} [{info.get('flow_id')}]\n")
 
-    status = "completed"
     try:
         with virtualize_time_random(backend):
             func()
-    except BaseException:
-        status = "failed"
-        backend.exit_flow(status)
+    except SystemExit as exc:
+        if exc.code in (None, 0):  # clean exit == success (common main() shape)
+            backend.exit_flow("completed")
+        elif not replayed:
+            backend.exit_flow("failed")
         raise
-    backend.exit_flow(status)
+    except KeyboardInterrupt:
+        raise  # leave the flow 'running' for resume; don't stamp 'failed'
+    except BaseException:
+        if not replayed:  # never demote an already-completed (replayed) flow
+            backend.exit_flow("failed")
+        raise
+    backend.exit_flow("completed")
