@@ -151,19 +151,29 @@ export function makeWrappedRequest(original, deps = {}) {
     const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
 
     const started = performance.now();
+    // Live result/error held side-band so the core payload stays JSON — the
+    // native core serde-round-trips it and cannot carry a live MCP result (which
+    // may hold functions/streams) or the original McpError. MCP calls are never
+    // cached (args_hash null), so on success we always hand back the real result
+    // by identity; on failure we re-raise the ORIGINAL error unchanged (DX
+    // invariant 5).
+    let liveResult;
+    let haveResult = false;
+    let liveErr;
     const outcome = await backend.execute(req, async () => {
       const deadline = armDeadline(options?.signal, timeoutMs);
       const attemptOptions = deadline.signal ? { ...options, signal: deadline.signal } : options;
       try {
         const call = original.call(this, request, resultSchema, attemptOptions);
-        const result = deadline.expired ? await Promise.race([call, deadline.expired]) : await call;
-        return { status: "ok", payload: result };
+        liveResult = deadline.expired ? await Promise.race([call, deadline.expired]) : await call;
+        haveResult = true;
+        return { status: "ok", payload: null };
       } catch (err) {
+        liveErr = err;
         return {
           status: "error",
           class: classifyMcpError(err),
           message: err?.message ?? String(err),
-          original: err,
         };
       } finally {
         deadline.cancel();
@@ -171,9 +181,9 @@ export function makeWrappedRequest(original, deps = {}) {
     });
 
     (deps.discovery ?? getDiscovery())?.observe(target, outcome, performance.now() - started);
-    if (outcome.result === "ok") return outcome.payload;
-    const orig = outcome.error?.original;
-    if (orig instanceof Error) throw attachOutcome(orig, outcome);
+    if (outcome.result === "ok") return attachOutcome(haveResult ? liveResult : outcome.payload, outcome);
+    if (liveErr instanceof Error) throw attachOutcome(liveErr, outcome);
+    if (liveErr !== undefined) throw liveErr;
     const e = new KeelError(outcome.error?.code ?? "KEEL-E040", outcome.error?.message ?? "keel MCP failure");
     throw attachOutcome(e, outcome);
   };
