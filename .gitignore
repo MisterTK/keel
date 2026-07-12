@@ -17,3 +17,6 @@ node_modules/
 
 # generated fixture databases
 conformance/fixtures/journal/.gen/
+
+# superpowers SDD scratch
+.superpowers/
