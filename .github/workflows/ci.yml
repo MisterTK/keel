@@ -165,3 +165,58 @@ jobs:
           maturin develop -m crates/keel-py/Cargo.toml
           python3 conformance/runner.py --impl native
           (cd python/keel && python3 -m unittest discover)
+
+  # Node native leg (the twin of `native-conformance` for Python). Builds the
+  # napi addon so node/keel-core-native discovers it in target/release, then runs
+  # the native Node conformance (17 scenarios against the addon) AND the front-end
+  # suite with the native-gated legs (ai-sdk/mcp/journal/persistent-cache) live —
+  # they auto-skip in the stub `node-frontend` job. NON-REQUIRED (heavier build):
+  # the required Node gate stays the stub `node` + `node-frontend` jobs.
+  node-native-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the napi addon (keel-core-native)
+        run: cargo build -p keel-node --release --locked
+      - name: Native Node conformance (addon) + async bridge
+        working-directory: node/keel-core-native
+        run: node --test
+      - name: Node front-end suite on the native core (native legs run)
+        working-directory: node/keel
+        run: node --test
+
+  # DX invariant 8 (second half): `keel run` adds <100ms to process startup at
+  # p50. Runs the existing StartupBudgetTest and echoes the measured deltas into
+  # the job summary. Publishing the number in the README stays a deliberate manual
+  # step (kept honest — CI measures, the README is updated on purpose). Timing on
+  # shared runners is noisy, so the test's own assert budget is generous (250ms)
+  # and this is a NON-REQUIRED check; the number in the summary is the signal.
+  startup-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Measure `keel run` startup overhead (no wheel → native leg skips)
+        working-directory: python/keel
+        run: |
+          status=0
+          python3 -m unittest tests.test_run.StartupBudgetTest -v > budget.log 2>&1 || status=$?
+          cat budget.log
+          {
+            echo "### \`keel run\` startup budget (DX invariant 8)"
+            echo ""
+            echo '```'
+            grep -F "[startup budget]" budget.log || echo "(no measurement line captured)"
+            echo '```'
+            echo ""
+            echo "_Target <100ms at p50; publishing this number in the README is a manual step._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
