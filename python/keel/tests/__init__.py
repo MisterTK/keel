@@ -32,7 +32,7 @@ def child_env(**extra: str) -> dict[str, str]:
     env = dict(os.environ)
     for k in ("KEEL_DISABLE", "KEEL_BACKEND", "KEEL_QUIET"):
         env.pop(k, None)
-    parts = [str(PKG_SRC), str(STUB)]
+    parts = [str(PKG_SRC), str(STUB), str(FIXTURES)]
     if env.get("PYTHONPATH"):
         parts.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(parts)
