@@ -62,7 +62,12 @@ unsupported-configuration limits (async-in-flow, flows-without-journal); a CCR
 to split these into a dedicated code is deliberately deferred.
 The **license is undecided** (architecture-spec §10 — TK's call); the repo carries
 no `LICENSE`, `node/keel/package.json` says `UNLICENSED`, and other manifests omit
-the field — see `LICENSE-PENDING.md`.
+the field — see `LICENSE-PENDING.md`. **OTel export is opt-in**: the OTLP exporter
+is behind the `otel` cargo feature (off by default; the shipped wheel/addon have no
+OpenTelemetry dep) and only initializes when a front end is built `--features otel`
+(forwarded by `keel-py`/`keel-node` → `keel-core/otel`) *and* `KEEL_OTEL=1` is set
+(`OTEL_*` env configures the exporter). CI's `otel-build` job compiles it; live
+collector export is a manual step.
 
 ## Commands (run all before any push that touches behavior)
 

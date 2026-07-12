@@ -263,6 +263,41 @@ fn build_runtime(paused: bool) -> std::io::Result<Runtime> {
     builder.build()
 }
 
+/// Best-effort OTLP span export, gated by the `otel` build feature AND the
+/// `KEEL_OTEL` env var. OFF by default: a wheel built without `--features otel`
+/// links no OpenTelemetry dependency and this is a no-op. When both are on, the
+/// FIRST core constructed installs the global OTLP exporter (endpoint + settings
+/// from the standard `OTEL_*` env vars) so the engine's `keel.call`/`keel.attempt`
+/// spans reach a collector. Init failures never break the process — they warn and
+/// export stays off. Best-effort: buffered spans flush as the core's runtime runs
+/// (architecture spec §4.5, otel.rs).
+#[cfg(feature = "otel")]
+static OTEL_GUARD: std::sync::OnceLock<Option<keel_engine::otel::OtelGuard>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "otel")]
+fn maybe_init_otel(runtime: &Runtime) {
+    if std::env::var_os("KEEL_OTEL").is_none() {
+        return;
+    }
+    OTEL_GUARD.get_or_init(|| {
+        // init_otlp builds the OTLP exporter (needs a tokio runtime context) and
+        // installs the global tracing subscriber exactly once per process.
+        match runtime.block_on(async { keel_engine::otel::init_otlp(None) }) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!("keel: KEEL_OTEL set but OTLP init failed ({e}); span export disabled");
+                None
+            }
+        }
+    });
+}
+
+/// No-op when the `otel` feature is off (the default): no OpenTelemetry
+/// dependency is linked and the core never touches telemetry.
+#[cfg(not(feature = "otel"))]
+fn maybe_init_otel(_runtime: &Runtime) {}
+
 /// Open (creating the parent dir + file as needed) a WAL SQLite journal at
 /// `path` on the wall clock and attach it — enabling the `scope = persistent`
 /// dev cache so identical prompts replay across separate `keel run` processes
@@ -333,6 +368,10 @@ impl KeelCore {
     fn new(py: Python<'_>, paused: bool, journal_path: Option<String>) -> PyResult<Self> {
         let runtime = build_runtime(paused)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("runtime build failed: {e}")))?;
+        // Install OTLP export if this build enabled `--features otel` AND KEEL_OTEL
+        // is set (a no-op otherwise). Before `Engine::new` so the subscriber is up
+        // before any span is emitted.
+        maybe_init_otel(&runtime);
         // `Engine::new` reads `tokio::time::Instant::now()`; build it inside the
         // runtime so the paused clock's epoch is anchored (see `keel-ffi`).
         let mut engine = runtime.block_on(async { Engine::new() });

@@ -47,6 +47,11 @@ tokio = { version = "1.47", features = ["rt", "time", "test-util"] }
 # link libpython, as required for a loadable extension module. Off under
 # `cargo test`, so the test binary links libpython and runs.
 extension-module = ["pyo3/extension-module"]
+# Forward keel-core's optional OTLP span export. OFF by default (the shipped
+# wheel has no OpenTelemetry dependency). Build the wheel `--features otel` and
+# set `KEEL_OTEL=1` at runtime to export the engine's spans over OTLP; the
+# standard `OTEL_*` env vars configure the exporter (see crates/keel-core/otel.rs).
+otel = ["keel_engine/otel"]
 
 # This crate cannot inherit `[workspace.lints]`: the workspace FORBIDS
 # unsafe_code (an absolute level no inner attribute can relax), but the pyo3

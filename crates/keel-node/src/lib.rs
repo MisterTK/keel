@@ -130,6 +130,41 @@ mod bindings {
         Ok(())
     }
 
+    /// Best-effort OTLP span export, gated by the `otel` build feature AND the
+    /// `KEEL_OTEL` env var. OFF by default: an addon built without `--features
+    /// otel` links no OpenTelemetry dependency and this is a no-op. When both are
+    /// on, the FIRST core constructed installs the global OTLP exporter (endpoint +
+    /// settings from the standard `OTEL_*` env vars) so the engine's
+    /// `keel.call`/`keel.attempt` spans reach a collector. Init failures never
+    /// break the process — they warn and export stays off. Best-effort: buffered
+    /// spans flush as the core's runtime runs (architecture spec §4.5, otel.rs).
+    #[cfg(feature = "otel")]
+    static OTEL_GUARD: std::sync::OnceLock<Option<keel_engine::otel::OtelGuard>> =
+        std::sync::OnceLock::new();
+
+    #[cfg(feature = "otel")]
+    fn maybe_init_otel(runtime: &Runtime) {
+        if std::env::var_os("KEEL_OTEL").is_none() {
+            return;
+        }
+        OTEL_GUARD.get_or_init(|| {
+            match runtime.block_on(async { keel_engine::otel::init_otlp(None) }) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    eprintln!(
+                        "keel: KEEL_OTEL set but OTLP init failed ({e}); span export disabled"
+                    );
+                    None
+                }
+            }
+        });
+    }
+
+    /// No-op when the `otel` feature is off (the default): no OpenTelemetry
+    /// dependency is linked and the addon never touches telemetry.
+    #[cfg(not(feature = "otel"))]
+    fn maybe_init_otel(_runtime: &Runtime) {}
+
     /// The async-effect callback shape: JS `(attempt: number) => Promise<object>`.
     /// `CalleeHandled = false` (5th generic) means napi passes only `attempt` —
     /// no leading `err` argument — matching the documented effect signature; the
@@ -215,6 +250,10 @@ mod bindings {
             let journal_path = options.and_then(|o| o.journal_path);
             let runtime = build_runtime(paused)
                 .map_err(|e| Error::from_reason(format!("KEEL-E040: runtime build failed: {e}")))?;
+            // Install OTLP export if built `--features otel` AND KEEL_OTEL is set
+            // (a no-op otherwise). Before `Engine::new` so the subscriber is up
+            // before any span is emitted.
+            maybe_init_otel(&runtime);
             // `Engine::new` reads `tokio::time::Instant::now()`; build it inside
             // the runtime so a paused clock's epoch is anchored (see `keel-ffi`).
             let mut engine = runtime.block_on(async { Engine::new() });

@@ -220,3 +220,24 @@ jobs:
             echo "_Target <100ms at p50; publishing this number in the README is a manual step._"
           } >> "$GITHUB_STEP_SUMMARY"
           exit $status
+
+  # Guard the optional `otel` feature against silent rot and prove it is reachable
+  # from a shipped artifact. Builds + clippy keel-core with `--features otel`, and
+  # builds the two native front-end crates with their forwarded `otel` feature —
+  # the exact build a user makes to get span export. Compile/link only (no live
+  # OTLP collector in CI); activation is `KEEL_OTEL=1` at runtime (see README).
+  # Without this job the exporter code is unguarded and can silently stop
+  # compiling. NON-REQUIRED (off-by-default feature).
+  otel-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # keel-py links libpython under a non-wheel build
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p keel-core --features otel --all-targets --locked -- -D warnings
+      - run: cargo build -p keel-node --features otel --locked
+      - run: cargo build -p keel-py --features otel --locked

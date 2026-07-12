@@ -21,8 +21,9 @@ the CLI and **Tier 2 durable flows with crash resume**:
 
 - **Real Rust core** (`crates/keel-core`): async tokio engine, layer chain
   cache → rate → breaker → timeout → retry, per-attempt timeouts, equal-jitter
-  backoff, SQLite discovery + flow journal, OTel spans, and an FFI facade
-  (`crates/keel-ffi`, MessagePack over a C ABI) with PyO3 + napi async bridges.
+  backoff, SQLite discovery + flow journal, opt-in OTel spans (off by default —
+  see below), and an FFI facade (`crates/keel-ffi`, MessagePack over a C ABI)
+  with PyO3 + napi async bridges.
 - **Python front end** (`python/keel`): `keel run`, import-hook wrapping, httpx +
   requests adapters, `llm:openai`/`llm:anthropic` packs with the dev cache, and
   durable-flow designation from `[flows]`.
@@ -43,6 +44,15 @@ against the **10 µs** budget (DX invariant 8), emitted as a CI artifact by
 The native Python module builds with `maturin`; the CLI with `cargo build`.
 
 **License is undecided** — the choice belongs to TK ([architecture-spec §10](docs/architecture-spec.md)); until it lands, treat the code as all-rights-reserved (see [LICENSE-PENDING.md](LICENSE-PENDING.md)).
+
+**OTel export is opt-in and off by default.** The OTLP exporter lives behind the
+`otel` cargo feature; the shipped wheel/addon carry no OpenTelemetry dependency.
+To export the engine's `keel.call`/`keel.attempt` spans, build a native front end
+with the feature and set `KEEL_OTEL=1` (the standard `OTEL_*` env vars configure
+the endpoint) — e.g. `maturin develop -m crates/keel-py/Cargo.toml --features otel`
+or `cargo build -p keel-node --release --features otel`. CI compiles `--features
+otel` so it can't silently rot; end-to-end export against a live collector is a
+manual verification step.
 
 The guiding documents:
 
