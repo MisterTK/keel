@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/keel-cli",
     "crates/keel-conformance",
     "crates/keel-core",
     "crates/keel-core-api",

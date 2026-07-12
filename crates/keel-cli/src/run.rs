@@ -1,0 +1,330 @@
+//! `keel run <script> [args…]` — dispatch a program into its language front end.
+//!
+//! The heavy lifting (bootstrap, import hook, adapters, discovery) lives in the
+//! Python and Node packages; `run` is only the dispatcher (dx-spec §1, Level 0):
+//!
+//! - `*.py`                     → `python3 -m keel run <script> [args…]`
+//! - `*.{mjs,js,ts,cjs,…}`      → `node --import keel/hook <script> [args…]`
+//! - a dir / `package.json`     → resolve its `main`, then the Node path
+//! - anything else              → a precise what/why/next error, exit 2
+//!
+//! The child inherits the environment (so every `KEEL_*` var passes through);
+//! `--disable` layers `KEEL_DISABLE=1` on top. The child's exit code is the
+//! process's exit code — wrapping is invisible on the success path.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Serialize;
+
+use crate::{EXIT_FAILURE, EXIT_USAGE, Rendered};
+
+/// Node's resolver name for the preload hook (the `keel` package's `./hook`
+/// export). Resolved from the project's `node_modules`, exactly as
+/// `node --import keel/hook` would in a project that installed `keel`.
+const NODE_HOOK: &str = "keel/hook";
+
+/// The concrete plan: which interpreter to exec with which argv, and whether to
+/// disable Keel in the child. Pure data, so dispatch is unit-testable without
+/// spawning anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlan {
+    /// The program to exec (`python3` or `node`).
+    pub program: String,
+    /// Its full argument vector (excluding `program` itself).
+    pub argv: Vec<String>,
+    /// Whether to set `KEEL_DISABLE=1` in the child.
+    pub disable: bool,
+}
+
+/// Why a target could not be dispatched — each rendered as what/why/next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The target file/dir does not exist.
+    NotFound { target: String },
+    /// The extension is not one `keel run` knows how to dispatch.
+    UnknownKind { target: String },
+    /// A Node package dir/`package.json` had no resolvable entry file.
+    NoEntry { target: String },
+}
+
+impl RunError {
+    fn render(&self) -> Rendered {
+        let (what, why, next, kind) = match self {
+            Self::NotFound { target } => (
+                format!("Cannot run `{target}`: no such file or directory."),
+                "The path does not exist relative to the current directory.".to_owned(),
+                "Check the path; `keel run` takes a script file, a package.json, or a project directory.".to_owned(),
+                "not-found",
+            ),
+            Self::UnknownKind { target } => (
+                format!("Cannot run `{target}`: unrecognized program type."),
+                "`keel run` dispatches Python (.py) and Node (.mjs/.js/.ts/.cjs/.mts/.cts/.jsx/.tsx, or a package.json main); this target is neither.".to_owned(),
+                "Rename to a supported extension, point at the project's package.json, or invoke the interpreter directly.".to_owned(),
+                "unknown-kind",
+            ),
+            Self::NoEntry { target } => (
+                format!("Cannot run `{target}`: no entry file found."),
+                "The directory/package.json has no resolvable `main` (and no index.js).".to_owned(),
+                "Add a `main` to package.json, or pass the entry script directly.".to_owned(),
+                "no-entry",
+            ),
+        };
+        let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
+        let report = RunErrorReport {
+            error: kind,
+            next: &next,
+            what: &what,
+            why: &why,
+        };
+        Rendered {
+            human,
+            json: crate::render::to_json(&report),
+            exit: EXIT_USAGE,
+            to_stderr: true,
+        }
+    }
+}
+
+/// The machine twin of a dispatch failure.
+#[derive(Debug, Serialize)]
+struct RunErrorReport<'a> {
+    error: &'static str,
+    next: &'a str,
+    what: &'a str,
+    why: &'a str,
+}
+
+/// Node source extensions `keel run` dispatches.
+const NODE_EXTS: &[&str] = &["mjs", "js", "ts", "cjs", "mts", "cts", "jsx", "tsx"];
+
+/// Build the [`RunPlan`] for `target` and `args`. Reads the filesystem to
+/// classify the target and (for a package) to resolve its entry file.
+pub fn plan(target: &str, args: &[String], disable: bool) -> Result<RunPlan, RunError> {
+    let path = Path::new(target);
+
+    // package.json passed explicitly, or a directory containing one.
+    if path.file_name().is_some_and(|n| n == "package.json") {
+        return node_package(path, args, disable);
+    }
+    if path.is_dir() {
+        let manifest = path.join("package.json");
+        if manifest.exists() {
+            return node_package(&manifest, args, disable);
+        }
+        return Err(RunError::UnknownKind {
+            target: target.to_owned(),
+        });
+    }
+    if !path.exists() {
+        return Err(RunError::NotFound {
+            target: target.to_owned(),
+        });
+    }
+
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("py") => Ok(python_plan(target, args, disable)),
+        Some(ext) if NODE_EXTS.contains(&ext) => Ok(node_plan(target, args, disable)),
+        _ => Err(RunError::UnknownKind {
+            target: target.to_owned(),
+        }),
+    }
+}
+
+fn python_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
+    let mut argv = vec![
+        "-m".to_owned(),
+        "keel".to_owned(),
+        "run".to_owned(),
+        target.to_owned(),
+    ];
+    argv.extend_from_slice(extra);
+    RunPlan {
+        program: "python3".to_owned(),
+        argv,
+        disable,
+    }
+}
+
+fn node_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
+    let mut argv = vec![
+        "--import".to_owned(),
+        NODE_HOOK.to_owned(),
+        target.to_owned(),
+    ];
+    argv.extend_from_slice(extra);
+    RunPlan {
+        program: "node".to_owned(),
+        argv,
+        disable,
+    }
+}
+
+/// Resolve a package's entry file from its `package.json` `main` (default
+/// `index.js`), then dispatch it via the Node path.
+fn node_package(manifest: &Path, args: &[String], disable: bool) -> Result<RunPlan, RunError> {
+    let dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    let text = std::fs::read_to_string(manifest).map_err(|_| RunError::NoEntry {
+        target: manifest.display().to_string(),
+    })?;
+    let main = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("main").and_then(|m| m.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "index.js".to_owned());
+    let entry: PathBuf = dir.join(main);
+    if !entry.exists() {
+        return Err(RunError::NoEntry {
+            target: manifest.display().to_string(),
+        });
+    }
+    Ok(node_plan(&entry.to_string_lossy(), args, disable))
+}
+
+/// Execute a [`RunPlan`], inheriting the environment (so `KEEL_*` passes
+/// through). Returns the child's exit code, or a rendered spawn error.
+pub fn exec(plan: &RunPlan) -> Result<i32, Rendered> {
+    let mut cmd = Command::new(&plan.program);
+    cmd.args(&plan.argv);
+    if plan.disable {
+        cmd.env("KEEL_DISABLE", "1");
+    }
+    match cmd.status() {
+        Ok(status) => Ok(status.code().unwrap_or(EXIT_FAILURE)),
+        Err(err) => {
+            let what = format!("Cannot run `{}`: {err}.", plan.program);
+            let why = format!(
+                "`{}` was not found on PATH or could not be started.",
+                plan.program
+            );
+            let next = if plan.program == "python3" {
+                "Install Python 3 and the `keel` package (`pip install keel`)."
+            } else {
+                "Install Node.js and the `keel` package (`npm i -D keel`)."
+            };
+            let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
+            let report = RunErrorReport {
+                error: "spawn-failed",
+                next,
+                what: &what,
+                why: &why,
+            };
+            Err(Rendered {
+                human,
+                json: crate::render::to_json(&report),
+                exit: EXIT_FAILURE,
+                to_stderr: true,
+            })
+        }
+    }
+}
+
+/// The whole `keel run` command: plan, then exec. On a dispatch error render it;
+/// on success return the child's exit code.
+pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i32) {
+    match plan(target, args, disable) {
+        Err(e) => {
+            let r = e.render();
+            let code = r.exit;
+            (Some(r), code)
+        }
+        Ok(plan) => match exec(&plan) {
+            Ok(code) => (None, code),
+            Err(r) => {
+                let code = r.exit;
+                (Some(r), code)
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn python_target_dispatches_to_python_module() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("app.py");
+        fs::write(&script, "print('hi')\n").unwrap();
+        let plan = plan(&script.to_string_lossy(), &["--flag".into()], false).unwrap();
+        assert_eq!(plan.program, "python3");
+        assert_eq!(
+            plan.argv,
+            vec![
+                "-m",
+                "keel",
+                "run",
+                script.to_string_lossy().as_ref(),
+                "--flag"
+            ]
+        );
+    }
+
+    #[test]
+    fn node_target_dispatches_with_hook_import() {
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("app.mjs");
+        fs::write(&script, "console.log('hi')\n").unwrap();
+        let plan = plan(&script.to_string_lossy(), &[], true).unwrap();
+        assert_eq!(plan.program, "node");
+        assert_eq!(plan.argv[0], "--import");
+        assert_eq!(plan.argv[1], "keel/hook");
+        assert!(plan.disable);
+    }
+
+    #[test]
+    fn package_json_main_is_resolved() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "{ \"main\": \"start.mjs\" }",
+        )
+        .unwrap();
+        fs::write(dir.path().join("start.mjs"), "// entry\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert_eq!(plan.program, "node");
+        assert!(plan.argv[2].ends_with("start.mjs"));
+    }
+
+    #[test]
+    fn package_json_defaults_to_index_js() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("index.js"), "// entry\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert!(plan.argv[2].ends_with("index.js"));
+    }
+
+    #[test]
+    fn missing_file_is_not_found() {
+        assert_eq!(
+            plan("does-not-exist.py", &[], false),
+            Err(RunError::NotFound {
+                target: "does-not-exist.py".into()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_extension_is_a_precise_error() {
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("script.rb");
+        fs::write(&f, "puts 1\n").unwrap();
+        let err = plan(&f.to_string_lossy(), &[], false).unwrap_err();
+        assert!(matches!(err, RunError::UnknownKind { .. }));
+        let rendered = err.render();
+        assert_eq!(rendered.exit, EXIT_USAGE);
+        assert!(rendered.human.contains("next:"));
+        assert_eq!(rendered.json["error"], "unknown-kind");
+    }
+
+    #[test]
+    fn package_dir_without_entry_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("package.json"), "{ \"main\": \"nope.js\" }").unwrap();
+        let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NoEntry { .. }));
+    }
+}

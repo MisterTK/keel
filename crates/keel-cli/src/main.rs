@@ -1,0 +1,88 @@
+//! `keel` — the binary. A thin clap front over [`keel_cli`]: parse, dispatch,
+//! print the right half of the [`Rendered`](keel_cli::Rendered) result, exit
+//! with its code. All behavior lives in the library so it is unit-testable
+//! without spawning a process.
+
+use std::path::PathBuf;
+use std::process::exit;
+
+use clap::{Parser, Subcommand};
+
+use keel_cli::render::emit;
+use keel_cli::{doctor, explain, init, run, status};
+
+/// Production-grade resilience for anything, with zero code changes.
+#[derive(Debug, Parser)]
+#[command(name = "keel", version, about, long_about = None)]
+struct Cli {
+    /// Emit byte-deterministic JSON instead of prose (sorted keys, no
+    /// wall-clock timestamps). Humans get prose; machines get structure.
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run a script under Keel, dispatching to its language front end.
+    Run {
+        /// Disable Keel for this run (sets `KEEL_DISABLE=1`); the program runs
+        /// byte-identically to having no Keel installed.
+        #[arg(long)]
+        disable: bool,
+        /// The script (`.py`, `.mjs`/`.js`/`.ts`…), a `package.json`, or a
+        /// project directory to run.
+        target: String,
+        /// Arguments passed through to the program unchanged.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Generate `keel.toml` from static + observed evidence.
+    Init {
+        /// Preview changes against an existing `keel.toml` without writing.
+        #[arg(long)]
+        diff: bool,
+        /// Stamp today's date into the header (off by default for determinism).
+        #[arg(long)]
+        stamp: bool,
+    },
+    /// Report coverage, adapters, and policy validity (the honesty report).
+    Doctor,
+    /// Show one screen of coverage and flow state.
+    Status,
+    /// Explain a `KEEL-E0NN` error code (what / why / next).
+    Explain {
+        /// The error code, e.g. `KEEL-E014`.
+        code: String,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let json = cli.json;
+    let project = PathBuf::from(".");
+
+    let code = match cli.command {
+        Command::Run {
+            disable,
+            target,
+            args,
+        } => {
+            let (rendered, code) = run::run(&target, &args, disable);
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        Command::Init { diff, stamp } => {
+            let r = init::run(&project, init::InitOptions { diff, stamp });
+            emit(&r, json)
+        }
+        Command::Doctor => emit(&doctor::run(&project), json),
+        Command::Status => emit(&status::run(&project), json),
+        Command::Explain { code } => emit(&explain::run(&code), json),
+    };
+    exit(code);
+}
