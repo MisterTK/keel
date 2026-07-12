@@ -89,12 +89,33 @@ function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+/** Reject any key not in `allowed`, mirroring the real core / Rust stub's
+ *  `#[serde(deny_unknown_fields)]`: the frozen schema is additionalProperties:
+ *  false at every level, and KEEL-E001's "why" includes "an unknown key was
+ *  used" — so a typo'd key fails loudly with its path, never silently drops to a
+ *  default the user never asked for. */
+function rejectUnknownKeys(path, obj, allowed) {
+  for (const k of Object.keys(obj))
+    if (!allowed.includes(k)) throw invalid(`${path}.${k}`, "unknown key");
+}
+
 function validateTargetPolicy(path, v) {
   if (!isTable(v)) throw invalid(path, "expected a table");
+  rejectUnknownKeys(path, v, [
+    "timeout",
+    "retry",
+    "breaker",
+    "rate",
+    "cache",
+    "idempotency",
+    "fallback",
+    "budget",
+  ]);
   if (v.timeout !== undefined && parseDuration(v.timeout) === null)
     throw invalid(path, "bad timeout duration");
   if (v.retry !== undefined) {
     if (!isTable(v.retry)) throw invalid(path, "retry must be a table");
+    rejectUnknownKeys(`${path}.retry`, v.retry, ["attempts", "schedule", "on"]);
     const { attempts, schedule, on } = v.retry;
     if (attempts !== undefined && (!Number.isInteger(attempts) || attempts < 1))
       throw invalid(path, "retry.attempts must be an integer >= 1");
@@ -113,6 +134,13 @@ function validateTargetPolicy(path, v) {
   }
   if (v.breaker !== undefined) {
     if (!isTable(v.breaker)) throw invalid(path, "breaker must be a table");
+    rejectUnknownKeys(`${path}.breaker`, v.breaker, [
+      "failures",
+      "cooldown",
+      "window",
+      "failure_rate",
+      "min_calls",
+    ]);
     const { failures, cooldown } = v.breaker;
     if (failures !== undefined && (!Number.isInteger(failures) || failures < 1))
       throw invalid(path, "breaker.failures must be an integer >= 1");
@@ -123,8 +151,15 @@ function validateTargetPolicy(path, v) {
     throw invalid(path, "unparseable rate");
   if (v.cache !== undefined) {
     if (!isTable(v.cache)) throw invalid(path, "cache must be a table");
+    rejectUnknownKeys(`${path}.cache`, v.cache, ["ttl", "scope", "mode", "key"]);
     if (v.cache.ttl !== undefined && parseDuration(v.cache.ttl) === null)
       throw invalid(path, "bad cache.ttl");
+  }
+  if (v.idempotency !== undefined) {
+    if (!isTable(v.idempotency)) throw invalid(path, "idempotency must be a table");
+    rejectUnknownKeys(`${path}.idempotency`, v.idempotency, ["header"]);
+    if (typeof v.idempotency.header !== "string")
+      throw invalid(`${path}.idempotency.header`, "header must be a string");
   }
 }
 
@@ -139,8 +174,12 @@ export class KeelCoreStub {
 
   configure(policy) {
     if (!isTable(policy)) throw invalid("$", "policy document must be a table");
+    // Top-level keys are the frozen schema's document properties (journal /
+    // telemetry / flows are accepted here and inert in the stub, as in the core).
+    rejectUnknownKeys("$", policy, ["defaults", "target", "flows", "journal", "telemetry"]);
     if (policy.defaults !== undefined) {
       if (!isTable(policy.defaults)) throw invalid("defaults", "expected a table");
+      rejectUnknownKeys("defaults", policy.defaults, ["outbound", "llm"]);
       for (const key of ["outbound", "llm"])
         if (policy.defaults[key] !== undefined)
           validateTargetPolicy(`defaults.${key}`, policy.defaults[key]);

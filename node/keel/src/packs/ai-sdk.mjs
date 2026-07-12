@@ -68,6 +68,23 @@ function hashParams(params) {
   return createHash("sha256").update(s).digest("hex");
 }
 
+/**
+ * A JSON-safe deep clone for the core `payload` (cache-store material only). The
+ * native core serde-round-trips the payload, so a live object — a `ReadableStream`,
+ * an `Error`, a provider `response` with a `Date`, or anything holding a function —
+ * cannot cross it. We clone what CAN be stored and keep the live result side-band;
+ * a non-serializable result simply becomes uncacheable (the live object is still
+ * delivered by identity on the success path). Returns `null` on failure.
+ */
+function jsonClone(v) {
+  try {
+    const s = JSON.stringify(v);
+    return s === undefined ? null : JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 function headerGet(headers, name) {
   if (!headers) return undefined;
   if (typeof headers.get === "function") return headers.get(name);
@@ -95,11 +112,19 @@ export function classifyModelError(err) {
   return { class: "other", message: err?.message ?? String(err) };
 }
 
-function settle(outcome, target, discovery, latencyMs) {
+function settle(outcome, target, discovery, latencyMs, held) {
   discovery?.observe(target, outcome, latencyMs);
-  if (outcome.result === "ok") return attachOutcome(outcome.payload, outcome);
-  const orig = outcome.error?.original;
-  if (orig instanceof Error) throw attachOutcome(orig, outcome);
+  if (outcome.result === "ok") {
+    // Live call → the real provider result unchanged (identity + a live stream
+    // preserved, byte-transparent). Cache hit → the round-tripped JSON payload
+    // replayed by the core (in-process, or across runs under the journal).
+    const value = held.haveResult && !outcome.from_cache ? held.liveResult : outcome.payload;
+    return attachOutcome(value, outcome);
+  }
+  // Terminal failure: re-raise the ORIGINAL provider error, held side-band (DX
+  // invariant 5) — the core carries no live error object.
+  if (held.liveErr instanceof Error) throw attachOutcome(held.liveErr, outcome);
+  if (held.liveErr !== undefined) throw held.liveErr;
   const e = new KeelError(outcome.error?.code ?? "KEEL-E040", outcome.error?.message ?? "keel llm failure");
   throw attachOutcome(e, outcome);
 }
@@ -127,14 +152,23 @@ export function keelMiddleware(options = {}) {
       args_hash: cacheable ? hashParams(params) : null,
     };
     const started = performance.now();
+    // Live result/error held side-band so the core payload stays JSON: the native
+    // core cannot round-trip a live stream/Date/Error. On the success path we
+    // hand back the real object (identity + streams preserved); only a cache HIT
+    // uses the JSON payload. A stream result must NEVER cross the core, so a
+    // non-cacheable effect (streams) sends no payload at all.
+    const held = { liveResult: undefined, haveResult: false, liveErr: undefined };
     const outcome = await backend.execute(request, async () => {
       try {
-        return { status: "ok", payload: await effect() };
+        held.liveResult = await effect();
+        held.haveResult = true;
+        return { status: "ok", payload: cacheable ? jsonClone(held.liveResult) : null };
       } catch (err) {
-        return { status: "error", ...classifyModelError(err), original: err };
+        held.liveErr = err;
+        return { status: "error", ...classifyModelError(err) };
       }
     });
-    return settle(outcome, target, discoveryOf(), performance.now() - started);
+    return settle(outcome, target, discoveryOf(), performance.now() - started, held);
   };
 
   return {

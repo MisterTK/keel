@@ -123,10 +123,17 @@ export async function loadBackend({
   cwd = process.cwd(),
   env = process.env,
 } = {}) {
-  if (preferred !== "stub") {
+  // Normalize + validate the selection, matching the Python twin: unset/empty →
+  // "auto"; anything other than auto|native|stub is a loud KEEL-E040, never a
+  // silent fall-back to auto.
+  const choice = (preferred ?? "auto") || "auto";
+  if (choice !== "auto" && choice !== "native" && choice !== "stub")
+    throw new KeelError("KEEL-E040", `KEEL_BACKEND must be auto|native|stub, got ${JSON.stringify(choice)}`);
+
+  if (choice !== "stub") {
     const native = await tryLoadNative({ journalPath: resolveJournalPath(cwd, env) });
     if (native) return native;
-    if (preferred === "native")
+    if (choice === "native")
       throw new KeelError(
         "KEEL-E040",
         "KEEL_BACKEND=native requested but keel-core-native is not loadable"
