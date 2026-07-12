@@ -38,6 +38,9 @@ _DEFAULT_BREAKER_COOLDOWN_MS = 15_000
 _DURATION_RE = re.compile(r"^([0-9]+)(ms|s|m|h)$")
 _RATE_RE = re.compile(r"^([0-9]+)/(s|sec|min|h|hour)$")
 _FACTOR_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+# Exact-status retry.on literal: the frozen schema errorCondition grammar
+# `[1-5][0-9][0-9]` (100–599), ASCII digits only.
+_STATUS_CONDITION_RE = re.compile(r"[1-5][0-9][0-9]")
 _DURATION_MULT = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000}
 _RATE_WINDOW = {"s": 1_000, "sec": 1_000, "min": 60_000, "h": 3_600_000, "hour": 3_600_000}
 _CLASSES = ("conn", "timeout", "http", "cancelled", "other")
@@ -243,7 +246,10 @@ class KeelCoreStub:
                 for c in on:
                     known = isinstance(c, str) and (
                         c in ("conn", "timeout", "cancelled", "other", "4xx", "5xx")
-                        or (len(c) == 3 and c.isdigit())
+                        # Frozen schema errorCondition grammar: [1-5][0-9][0-9]
+                        # (100–599), ASCII digits only. `str.isdigit()` also
+                        # matched unicode digits and any 3-digit value (099/999).
+                        or _STATUS_CONDITION_RE.fullmatch(c) is not None
                     )
                     if not known:
                         raise cls._invalid(path, "unknown retry.on condition")

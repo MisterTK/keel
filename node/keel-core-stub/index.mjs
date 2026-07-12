@@ -127,7 +127,9 @@ function validateTargetPolicy(path, v) {
         const known =
           typeof c === "string" &&
           (["conn", "timeout", "cancelled", "other", "4xx", "5xx"].includes(c) ||
-            /^\d{3}$/.test(c));
+            // Frozen schema errorCondition grammar: [1-5][0-9][0-9] (100–599),
+            // not any 3-digit string (which accepted 099/999/600).
+            /^[1-5][0-9][0-9]$/.test(c));
         if (!known) throw invalid(path, "unknown retry.on condition");
       }
     }
@@ -154,6 +156,14 @@ function validateTargetPolicy(path, v) {
     rejectUnknownKeys(`${path}.cache`, v.cache, ["ttl", "scope", "mode", "key"]);
     if (v.cache.ttl !== undefined && parseDuration(v.cache.ttl) === null)
       throw invalid(path, "bad cache.ttl");
+    // Closed enums (parity with the core's serde enums + the Python stub): a
+    // typo like scope="persistant" must fail, not silently fall back to a default.
+    if (v.cache.scope !== undefined && v.cache.scope !== "memory" && v.cache.scope !== "persistent")
+      throw invalid(path, "cache.scope must be memory|persistent");
+    if (v.cache.mode !== undefined && v.cache.mode !== "always" && v.cache.mode !== "dev")
+      throw invalid(path, "cache.mode must be always|dev");
+    if (v.cache.key !== undefined && v.cache.key !== "args" && v.cache.key !== "url")
+      throw invalid(path, "cache.key must be args|url");
   }
   if (v.idempotency !== undefined) {
     if (!isTable(v.idempotency)) throw invalid(path, "idempotency must be a table");

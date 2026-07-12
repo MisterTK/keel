@@ -258,10 +258,19 @@ impl FromStr for Condition {
             "other" => Ok(Self::Other),
             "4xx" => Ok(Self::Class4xx),
             "5xx" => Ok(Self::Class5xx),
-            exact if exact.len() == 3 => exact
-                .parse()
-                .map(Self::Status)
-                .map_err(|_| ParseError::new("retry condition", s)),
+            // Frozen schema errorCondition grammar is `[1-5][0-9][0-9]` (100–599):
+            // require three ASCII digits in range, not any 3-char u16 (which
+            // accepted `099`→99 and `999`, outside the contract).
+            exact if exact.len() == 3 && exact.bytes().all(|b| b.is_ascii_digit()) => {
+                let code: u16 = exact
+                    .parse()
+                    .map_err(|_| ParseError::new("retry condition", s))?;
+                if (100..=599).contains(&code) {
+                    Ok(Self::Status(code))
+                } else {
+                    Err(ParseError::new("retry condition", s))
+                }
+            }
             _ => Err(ParseError::new("retry condition", s)),
         }
     }
@@ -610,6 +619,13 @@ mod tests {
         assert!(!matches(ErrorClass::Http, Some(400)));
         assert!(!matches(ErrorClass::Cancelled, None));
         assert!("teapot".parse::<Condition>().is_err());
+        // Exact-status literals follow the frozen schema grammar [1-5][0-9][0-9].
+        assert_eq!("429".parse::<Condition>(), Ok(Condition::Status(429)));
+        assert_eq!("100".parse::<Condition>(), Ok(Condition::Status(100)));
+        assert_eq!("599".parse::<Condition>(), Ok(Condition::Status(599)));
+        for bad in ["999", "099", "600", "000", "12", "1234", "1x9"] {
+            assert!(bad.parse::<Condition>().is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]
