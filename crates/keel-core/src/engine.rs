@@ -653,18 +653,25 @@ impl Engine {
         }
     }
 
-    /// Serves a fresh cached payload, if any (attempts stays 0).
+    /// Serves a fresh cached payload, if any (attempts stays 0). An entry found
+    /// expired is *removed* here, not just skipped — combined with the sweep on
+    /// write ([`settle`](Self::settle)) this bounds the in-memory map to the live
+    /// working set rather than every distinct key ever cached.
     fn serve_from_cache(&self, key: &CacheKey, out: &mut Outcome) -> bool {
         let now = Instant::now();
         let mut state = self.state();
-        let Some(entry) = state.cache.get(key) else {
-            return false;
+        let payload = match state.cache.get(key) {
+            Some(entry) if now < entry.expires_at => entry.payload.clone(),
+            Some(_) => {
+                // Expired: evict so a per-call-varying key set cannot grow the
+                // map without bound for the life of the process.
+                state.cache.remove(key);
+                return false;
+            }
+            None => return false,
         };
-        if now >= entry.expires_at {
-            return false;
-        }
         out.result = String::from("ok");
-        out.payload = Some(entry.payload.clone());
+        out.payload = Some(payload);
         out.from_cache = true;
         let metrics = state.metrics_for(&key.target);
         metrics.cache_hits += 1;
@@ -793,6 +800,14 @@ impl Engine {
                     if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
                         && let Some(ttl) = cache.ttl
                     {
+                        // Sweep expired entries before inserting so the map is
+                        // bounded by the live working set, not the total distinct
+                        // keys ever seen. O(n) in current entries per cacheable
+                        // write — cheap for the small working sets caching targets
+                        // in practice, and it keeps a long-lived process from
+                        // leaking every payload it ever cached (no LRU/size cap in
+                        // v0.1; a `keel fsck`-style bound is future work).
+                        state.cache.retain(|_, entry| entry.expires_at > now);
                         state.cache.insert(
                             key,
                             CacheEntry {
@@ -892,9 +907,19 @@ impl Engine {
     /// instrumented with `attempt_span`, so any tracing it emits nests under the
     /// attempt; the timeout branch synthesizes the same `KEEL-E011`-class error
     /// the retry loop diagnoses.
+    ///
+    /// `timeout` is the effective per-attempt wall-clock deadline, already gated
+    /// by the caller: it is `None` for a non-idempotent request (Level 0 hard
+    /// rule — never inject a synthetic failure into a call that may already have
+    /// committed server-side; the front ends make the same judgment). Note that
+    /// on the synchronous bindings (keel-py/keel-ffi/keel-node sync `execute`) a
+    /// blocking effect completes within a single poll, so this timer cannot
+    /// preempt it — sync callers get their HTTP client's adapter timeout, not the
+    /// policy layer's. The policy per-attempt timeout is effective on the async
+    /// path (and in-core futures) where the effect actually awaits.
     async fn run_one_attempt<F>(
         &self,
-        resolved: &ResolvedPolicy,
+        timeout: Option<DurationMs>,
         effect: &mut F,
         attempt: u32,
         attempt_span: &tracing::Span,
@@ -902,7 +927,7 @@ impl Engine {
     where
         F: AsyncFnMut(u32) -> AttemptResult,
     {
-        match resolved.timeout {
+        match timeout {
             Some(limit) => {
                 match tokio::time::timeout(
                     Duration::from_millis(limit.0),
@@ -947,6 +972,13 @@ impl Engine {
     {
         let target = request.target.as_str();
         let max_attempts = retry.attempts.get();
+        // Level 0: never arm the per-attempt wall-clock timeout on a
+        // non-idempotent request. Firing it would drop the in-flight effect
+        // future while the underlying POST may still commit server-side, then
+        // hand the caller a synthetic timeout for a call that actually
+        // succeeded. The front ends refuse to impose a deadline here for the
+        // same reason; the core must not defeat that guard.
+        let attempt_timeout = resolved.timeout.filter(|_| request.idempotent);
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
@@ -964,7 +996,7 @@ impl Engine {
             );
 
             let attempt_outcome = self
-                .run_one_attempt(resolved, effect, attempt, &attempt_span)
+                .run_one_attempt(attempt_timeout, effect, attempt, &attempt_span)
                 .await;
 
             match attempt_outcome.result {
@@ -1061,5 +1093,64 @@ impl Engine {
             targets,
         })
         .expect("report serialization is infallible")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttemptResult, ENVELOPE_VERSION, Engine, Request};
+    use core::time::Duration;
+    use serde_json::json;
+
+    fn req(target: &str, args_hash: &str) -> Request {
+        Request {
+            v: ENVELOPE_VERSION,
+            target: target.to_owned(),
+            op: format!("GET {target}"),
+            idempotent: true,
+            args_hash: Some(args_hash.to_owned()),
+        }
+    }
+
+    /// The in-memory cache does not grow without bound: an expired entry is
+    /// swept when the next cacheable success writes, so a per-call-varying key
+    /// set leaves only the live working set behind (finding: unbounded growth).
+    #[tokio::test(start_paused = true)]
+    async fn in_memory_cache_evicts_expired_entries() {
+        let engine = Engine::new();
+        engine
+            .configure(&json!({
+                "target": { "api.catalog.internal": { "cache": { "ttl": "60s" } } }
+            }))
+            .expect("valid policy");
+
+        engine
+            .execute(&req("api.catalog.internal", "k1"), async |_a| {
+                AttemptResult::Ok { payload: json!(1) }
+            })
+            .await;
+        assert_eq!(engine.state().cache.len(), 1, "k1 cached");
+
+        // Past k1's 60s TTL: the write for a NEW key sweeps the expired k1.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        engine
+            .execute(&req("api.catalog.internal", "k2"), async |_a| {
+                AttemptResult::Ok { payload: json!(2) }
+            })
+            .await;
+        assert_eq!(
+            engine.state().cache.len(),
+            1,
+            "expired k1 evicted on write; only the live k2 remains"
+        );
+
+        // A read of the now-swept k1 is a miss (re-runs live), and reading an
+        // expired key also evicts it on the read path.
+        let out = engine
+            .execute(&req("api.catalog.internal", "k1"), async |_a| {
+                AttemptResult::Ok { payload: json!(3) }
+            })
+            .await;
+        assert!(!out.from_cache, "expired/evicted key re-runs live");
     }
 }

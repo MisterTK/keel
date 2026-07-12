@@ -78,10 +78,14 @@ async fn policy_timeout_is_retried_then_e011() {
     );
 }
 
-/// The Level 0 rule outranks the timeout diagnosis: a non-idempotent call
-/// that hits the policy timeout is still reported as observed-not-retried.
+/// Level 0 hard rule: the policy per-attempt timeout is NEVER armed on a
+/// non-idempotent call. Firing it would drop the in-flight effect while the
+/// POST may still commit server-side and hand back a synthetic timeout for a
+/// call that actually succeeded. So a slow-but-succeeding non-idempotent call
+/// runs to completion rather than being cut off (mirrors the front ends'
+/// judgment; the core must not defeat their guard).
 #[tokio::test(start_paused = true)]
-async fn non_idempotent_timeout_keeps_e014() {
+async fn non_idempotent_call_is_never_cut_off_by_policy_timeout() {
     let engine = Engine::new();
     engine
         .configure(&json!({
@@ -94,6 +98,41 @@ async fn non_idempotent_timeout_keeps_e014() {
 
     let outcome = engine
         .execute(&request("api.hung.internal", false), async |_attempt| {
+            // Far longer than the 50ms policy timeout: if the timeout were
+            // (wrongly) armed here it would fire and drop this future.
+            tokio::time::sleep(Duration::from_hours(1)).await;
+            AttemptResult::Ok {
+                payload: json!("committed"),
+            }
+        })
+        .await;
+
+    assert_eq!(
+        outcome.result, "ok",
+        "non-idempotent success is not cut off"
+    );
+    assert_eq!(outcome.attempts, 1);
+    assert_eq!(outcome.payload, Some(json!("committed")));
+    assert!(outcome.error.is_none());
+}
+
+/// An idempotent call, by contrast, IS protected by the policy timeout: a hung
+/// GET is cut off at the deadline (the guard above is idempotency-gated, not a
+/// blanket disable).
+#[tokio::test(start_paused = true)]
+async fn idempotent_call_still_honors_policy_timeout() {
+    let engine = Engine::new();
+    engine
+        .configure(&json!({
+            "target": { "api.hung.internal": {
+                "timeout": "50ms",
+                "retry": { "attempts": 1 }
+            } }
+        }))
+        .expect("valid policy");
+
+    let outcome = engine
+        .execute(&request("api.hung.internal", true), async |_attempt| {
             tokio::time::sleep(Duration::from_hours(1)).await;
             AttemptResult::Ok {
                 payload: json!("too late"),
@@ -101,10 +140,10 @@ async fn non_idempotent_timeout_keeps_e014() {
         })
         .await;
 
-    assert_eq!(outcome.attempts, 1);
+    assert_eq!(outcome.result, "error");
     assert_eq!(
         outcome.error.expect("terminal error").code.as_str(),
-        "KEEL-E014"
+        "KEEL-E011"
     );
 }
 
