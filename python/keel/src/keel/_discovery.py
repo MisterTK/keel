@@ -24,9 +24,14 @@ Python front end is readable by the same tools as one written by the core:
     ) WITHOUT ROWID;
 
 Accounting mirrors the crate: a cache hit is a `call` and a `cache_hit` only
-(no upstream attempt), so `calls == successes + failures + cache_hits`. Every
-mutation is a single UPSERT, so two processes recording into one file
-accumulate correctly without a transaction (WAL, `busy_timeout`).
+(no upstream attempt), so `calls == successes + failures + cache_hits`.
+`breaker_opens` counts calls that FAILED FAST on an open breaker — outcomes with
+error code `KEEL-E012` — matching the Rust core (`error.code == BreakerOpen`,
+crates/keel-journal/src/discovery.rs) and the Node twin, NOT every outcome whose
+`breaker` field reads "open" (that field is also stamped on the terminal failure
+that trips the breaker and on a cache hit served while open). Every mutation is a
+single UPSERT, so two processes recording into one file accumulate correctly
+without a transaction (WAL, `busy_timeout`).
 
 Discovery is best-effort: it must never throw into, slow, or add output to
 the user's program (DX invariant 4). Every public method swallows its own
@@ -166,7 +171,9 @@ def _row_from_outcome(
         1 if failure else 0,
         1 if cache_hit else 0,
         1 if outcome.get("throttled") else 0,
-        1 if outcome.get("breaker") == "open" else 0,
+        # breaker_opens = fail-fast rejections only (KEEL-E012), the canonical
+        # rule shared with the Rust core and Node — NOT any breaker=="open" stamp.
+        1 if err.get("code") == "KEEL-E012" else 0,
         latency_ms,  # total_latency_ms
         latency_ms,  # max_latency_ms
         now,  # first_seen_ms
