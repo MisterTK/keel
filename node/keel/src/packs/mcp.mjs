@@ -91,7 +91,11 @@ function safeServerName(client) {
 /** Classify a thrown MCP/transport error into a core error class. */
 export function classifyMcpError(err) {
   const name = err?.name;
-  if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  // A deadline abort is a `timeout` (retryable); a caller's AbortController fires
+  // `AbortError`, which is `cancelled` — immediately terminal, so an aborted
+  // tool call propagates at once (mirrors judge.mjs classifyThrow + the fetch seam).
+  if (name === "TimeoutError") return "timeout";
+  if (name === "AbortError") return "cancelled";
   const code = err?.code;
   if (code === -32001) return "timeout"; // MCP RequestTimeout JSON-RPC code
   if (typeof code === "string" && /^(ECONNREFUSED|ECONNRESET|EPIPE|ENOTFOUND)$/.test(code))

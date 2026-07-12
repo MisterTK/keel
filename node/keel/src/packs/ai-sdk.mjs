@@ -107,7 +107,13 @@ export function classifyModelError(err) {
     return out;
   }
   const name = err?.name;
-  if (name === "AbortError" || name === "TimeoutError") return { class: "timeout", message: err?.message };
+  // Split what the fetch seam splits (judge.mjs classifyThrow): a deadline abort
+  // is a `timeout` (retryable by default), but a CALLER's AbortController fires
+  // an `AbortError` — that is `cancelled` (excluded from the default retry.on →
+  // immediately terminal, so an aborted generate/stream propagates at once
+  // instead of grinding through the backoff schedule).
+  if (name === "TimeoutError") return { class: "timeout", message: err?.message };
+  if (name === "AbortError") return { class: "cancelled", message: err?.message };
   if (name === "TypeError") return { class: "conn", message: err?.message };
   return { class: "other", message: err?.message ?? String(err) };
 }

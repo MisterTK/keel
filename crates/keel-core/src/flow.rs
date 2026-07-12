@@ -832,7 +832,9 @@ impl FlowHandle {
     }
 
     /// Move the flow to a terminal status on scope exit. Idempotent-ish: a
-    /// second call re-stamps the status.
+    /// second call re-stamps the status — except a `completed` flow is immutable
+    /// at the journal (`complete_flow` refuses to demote it), so re-running a
+    /// finished flow can never flip it to `failed`/`dead`.
     pub fn complete(&mut self, status: FlowStatus) {
         if let Err(e) = self.journal.complete_flow(&self.flow_id, status) {
             warn!(flow = %self.flow_id, error = %e, "complete_flow failed");

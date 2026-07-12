@@ -322,8 +322,28 @@ pub struct BreakerPolicy {
     pub failures: NonZeroU64,
     pub cooldown: DurationMs,
     pub window: Option<DurationMs>,
+    #[serde(default, deserialize_with = "de_failure_rate")]
     pub failure_rate: Option<f64>,
     pub min_calls: Option<NonZeroU32>,
+}
+
+/// Validate `breaker.failure_rate` against the frozen schema range
+/// (`exclusiveMinimum: 0, maximum: 1`) at deserialize time, so an out-of-range or
+/// NaN value fails configuration with a precise field path (`KEEL-E001`) instead
+/// of being silently accepted — the bare `f64` used to take any value.
+fn de_failure_rate<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if let Some(rate) = value
+        && !(rate > 0.0 && rate <= 1.0)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "breaker.failure_rate must be greater than 0 and at most 1 (got {rate})"
+        )));
+    }
+    Ok(value)
 }
 
 impl Default for BreakerPolicy {
@@ -597,6 +617,30 @@ mod tests {
         let doc = json!({ "target": { "x": { "retry": { "attempts": 0 } } } });
         let err = serde_path_to_error::deserialize::<_, Policy>(&doc).unwrap_err();
         assert_eq!(err.path().to_string(), "target.x.retry.attempts");
+    }
+
+    #[test]
+    fn breaker_failure_rate_range_is_enforced() {
+        // Frozen schema: breaker.failure_rate is exclusiveMinimum 0, maximum 1.
+        let bad = |rate: serde_json::Value| {
+            let doc = json!({ "target": { "x": { "breaker": { "failure_rate": rate } } } });
+            serde_path_to_error::deserialize::<_, Policy>(&doc)
+        };
+        for rate in [json!(0.0), json!(-0.1), json!(1.5), json!(2.0)] {
+            let err = bad(rate.clone()).unwrap_err();
+            assert_eq!(
+                err.path().to_string(),
+                "target.x.breaker.failure_rate",
+                "out-of-range failure_rate {rate} must fail at its path"
+            );
+        }
+        // In-range values (0, 1] deserialize fine.
+        for rate in [0.01_f64, 0.5, 1.0] {
+            let doc = json!({ "target": { "x": { "breaker": { "failure_rate": rate } } } });
+            let policy = serde_path_to_error::deserialize::<_, Policy>(&doc).unwrap();
+            let breaker = policy.target["x"].breaker.as_ref().unwrap();
+            assert_eq!(breaker.failure_rate, Some(rate));
+        }
     }
 
     #[test]

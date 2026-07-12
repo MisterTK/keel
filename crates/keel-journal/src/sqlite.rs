@@ -192,9 +192,18 @@ impl<C: Clock> Journal for SqliteJournal<C> {
     fn complete_flow(&self, flow: &FlowId, status: FlowStatus) -> Result<()> {
         let now = self.now();
         let conn = self.lock();
+        // A `completed` flow is terminal-success and immutable: never let a later
+        // rerun demote it (a designed replay-miss after a code change, or an error
+        // while re-running already-finished code) to `failed`/`dead`/`running`,
+        // which would reopen a done flow for live re-execution. The front ends
+        // already avoid this, but the durable source-of-truth enforces it for any
+        // caller (root cause of the completed→failed flow findings). Failed→
+        // completed (a resume that finally succeeds) and every other transition
+        // stay allowed; a redundant complete(Completed) is a harmless no-op.
         conn.execute(
             "UPDATE flows SET status = ?2, updated_at = ?3, \
-             lease_holder = NULL, lease_expires = NULL WHERE flow_id = ?1",
+             lease_holder = NULL, lease_expires = NULL \
+             WHERE flow_id = ?1 AND status != 'completed'",
             params![flow.as_str(), status.as_str(), now],
         )?;
         Ok(())
@@ -580,6 +589,53 @@ mod tests {
         assert_eq!(stored.updated_at, T0 + 1_000);
         assert!(j.incomplete_flows(true).unwrap().is_empty());
         assert!(j.incomplete_flows(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_flow_is_never_demoted() {
+        let dir = TempDir::new().unwrap();
+        let clock = ManualClock::new(T0);
+        let j = journal(&dir, clock.clone());
+
+        // A completed flow must never be reopened by a later rerun.
+        let done = FlowId::new("01DONE");
+        j.begin_flow(&sample_flow("01DONE")).unwrap();
+        clock.advance(1_000);
+        j.complete_flow(&done, FlowStatus::Completed).unwrap();
+        // A rerun that errors (or a replay-miss) tries to mark it failed…
+        clock.advance(5_000);
+        j.complete_flow(&done, FlowStatus::Failed).unwrap();
+        let stored = j.get_flow(&done).unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            FlowStatus::Completed,
+            "completed must stay completed"
+        );
+        assert_eq!(
+            stored.updated_at,
+            T0 + 1_000,
+            "blocked demotion must not bump updated_at"
+        );
+        assert!(
+            j.incomplete_flows(true).unwrap().is_empty(),
+            "must not reopen for recovery"
+        );
+        // …and a `dead` demotion is refused too.
+        j.complete_flow(&done, FlowStatus::Dead).unwrap();
+        assert_eq!(
+            j.get_flow(&done).unwrap().unwrap().status,
+            FlowStatus::Completed
+        );
+
+        // Failed → completed (a resume that finally succeeds) is still allowed.
+        let retried = FlowId::new("02RETRY");
+        j.begin_flow(&sample_flow("02RETRY")).unwrap();
+        j.complete_flow(&retried, FlowStatus::Failed).unwrap();
+        j.complete_flow(&retried, FlowStatus::Completed).unwrap();
+        assert_eq!(
+            j.get_flow(&retried).unwrap().unwrap().status,
+            FlowStatus::Completed
+        );
     }
 
     #[test]

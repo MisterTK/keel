@@ -24,9 +24,11 @@ function clientWith(original, backend, name = "svc") {
   return { getServerVersion: () => ({ name, version: "0" }), request: makeWrappedRequest(original, { backend }) };
 }
 
-test("classifyMcpError maps timeout/conn/other", () => {
+test("classifyMcpError maps timeout/cancelled/conn/other", () => {
   assert.equal(classifyMcpError(Object.assign(new Error(), { name: "TimeoutError" })), "timeout");
-  assert.equal(classifyMcpError(Object.assign(new Error(), { name: "AbortError" })), "timeout");
+  // Caller cancellation (AbortController) is `cancelled`, not `timeout`: it is
+  // excluded from the default retry.on so an aborted tool call ends immediately.
+  assert.equal(classifyMcpError(Object.assign(new Error(), { name: "AbortError" })), "cancelled");
   assert.equal(classifyMcpError(Object.assign(new Error("x"), { code: -32001 })), "timeout");
   assert.equal(classifyMcpError(Object.assign(new Error("x"), { code: "ECONNREFUSED" })), "conn");
   assert.equal(classifyMcpError(new Error("transport closed")), "conn");

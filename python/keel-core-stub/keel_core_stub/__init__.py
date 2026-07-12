@@ -8,6 +8,14 @@ Simplifications (deliberate, documented): virtual clock (waits recorded, not
 slept), no jitter, consecutive-failure breaker only, fixed-window rate
 limiter, exact-match target resolution with defaults.llm / defaults.outbound
 fallback, `timeout` validated but not enforced.
+
+Tier 2 parity note: this stub is Tier 1 only — it has no journal and no durable
+flows (conformance scenarios 16-17 are skipped on the stub). Durable-flow
+time/random *virtualization* (journaled, replayed on resume) is therefore a
+native-core-only behavior: an effect run under this stub sees real `time`/
+`random`, never the recorded values the native core substitutes on replay. This
+is an intentional Tier-2 gap, not a call-path semantics drift — Tier 1 outcomes
+stay bit-identical to the native core (that is what the conformance suite pins).
 """
 
 from __future__ import annotations

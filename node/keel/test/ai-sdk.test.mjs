@@ -33,6 +33,9 @@ test("classifyModelError maps provider errors like the fetch seam", () => {
   assert.equal(rl.http_status, 429);
   assert.equal(rl.retry_after_ms, 2000);
   assert.equal(classifyModelError(Object.assign(new Error(), { name: "TimeoutError" })).class, "timeout");
+  // Caller cancellation (AbortController) is `cancelled`, not `timeout`: excluded
+  // from the default retry.on so an aborted generate/stream ends immediately.
+  assert.equal(classifyModelError(Object.assign(new Error(), { name: "AbortError" })).class, "cancelled");
   assert.equal(classifyModelError(new TypeError("fetch failed")).class, "conn");
   assert.equal(classifyModelError(new Error("weird")).class, "other");
 });
