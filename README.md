@@ -27,8 +27,10 @@ component. The specs are the source of truth:
 ```
 contracts/            frozen interfaces (policy schema, FFI, journal, adapter packs) — CCR to change
 crates/
-  keel-core-api/      contract types as a Rust crate (includes contracts/core_api.rs verbatim)
+  keel-core-api/      contract types (includes contracts/core_api.rs verbatim) + shared typed policy model
+  keel-core/          THE REAL CORE (Tier 1): tokio engine — cache/rate/breaker/timeout/retry
   keel-core-stub/     in-memory fake core (Rust) — the reference stub semantics
+  keel-conformance/   shared harness pieces (typed scenario model, subset matcher)
 python/keel-core-stub/  the same stub, pure Python (unblocks Team B/E)
 node/keel-core-stub/    the same stub, pure Node (unblocks Team C/E)
 conformance/          scenario matrix + runners; green here is the definition of done
@@ -41,8 +43,9 @@ docs/                 the specs
 Every implementation interprets the same `conformance/scenarios/*.json`:
 
 ```
-$ python3 conformance/runner.py                  # Python stub   → 15/15
+$ cargo test -p keel-core --test conformance     # REAL core     → 15/15 (paused tokio clock)
 $ cargo test -p keel-core-stub                   # Rust stub     → 15/15
+$ python3 conformance/runner.py                  # Python stub   → 15/15
 $ cd node/keel-core-stub && node --test          # Node stub     → 15/15
 $ python3 conformance/check_schema.py            # policies vs. policy.schema.json
 $ python3 conformance/fixtures/journal/build_fixtures.py   # golden journal DBs

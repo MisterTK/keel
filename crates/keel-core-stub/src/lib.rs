@@ -7,10 +7,12 @@
 //! `conformance/README.md` and are shared bit-for-bit with the Python and
 //! Node stubs; the real core must pass the same conformance scenarios.
 //!
-//! The policy document is deserialized into the typed model in [`policy`]
-//! (structs all the way down — `NonZero*` counts, newtype-parsed literals,
-//! closed condition enums), so "validates" and "deserializes" are the same
-//! thing and every rejection carries a precise field path.
+//! The policy document is deserialized into the shared typed model in
+//! [`keel_core_api::policy`] (structs all the way down — `NonZero*` counts,
+//! newtype-parsed literals, closed condition enums), so "validates" and
+//! "deserializes" are the same thing, every rejection carries a precise
+//! field path, and the stub and the real core cannot drift on configuration
+//! semantics.
 //!
 //! Simplifications relative to the real core (documented, deliberate):
 //! - virtual clock: waits are recorded and advance an internal ms counter,
@@ -23,7 +25,7 @@
 //! - `timeout` is validated but not enforced (scenarios inject `timeout`
 //!   error classes instead)
 
-pub mod policy;
 mod runtime;
 
+pub use keel_core_api::policy;
 pub use runtime::KeelCoreStub;
