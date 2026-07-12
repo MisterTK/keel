@@ -188,6 +188,132 @@ fn init_agents_snippet_matches_golden() {
     check_golden("init_agents.md", &init::agents_block());
 }
 
+// ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
+
+/// Two-target project for the `--diff` fixtures: `api.example.com` is already
+/// in keel.toml (kept, untouched), `api.new.example` is new (added block).
+const DIFF_APP_MJS: &str = "\
+// two targets, one already in keel.toml
+const KEPT = await fetch(\"https://api.example.com/v1/x\");
+const ADDED = await fetch(\"https://api.new.example/v2/y\");
+";
+
+/// The pre-existing keel.toml: one kept target with user tuning + comments,
+/// one stale target the scan no longer finds (removed block).
+const DIFF_KEEL_TOML: &str = "\
+# hand-tuned: keep this comment
+
+[target.\"api.example.com\"]
+timeout = \"9s\"   # user tuning survives
+
+[target.\"api.gone.example\"]  # stale
+timeout = \"5s\"
+";
+
+fn diff_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.mjs"), DIFF_APP_MJS).unwrap();
+    std::fs::write(dir.path().join("keel.toml"), DIFF_KEEL_TOML).unwrap();
+    dir
+}
+
+fn init_diff(project: &Path) -> keel_cli::Rendered {
+    let r = init::run(
+        project,
+        init::InitOptions {
+            diff: true,
+            stamp: false,
+            agents: false,
+        },
+    );
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    r
+}
+
+/// The whole `--json` twin of `keel init --diff` — summary, structured
+/// `changes`, and the unified `patch` — is byte-golden (dx-spec §5).
+#[test]
+fn init_diff_json_matches_golden() {
+    let dir = diff_project();
+    let r = init_diff(dir.path());
+    check_golden("init_diff.json", &json_string(&r.json));
+}
+
+fn git_present() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// The lingua-franca property, checked against the real tool: `git apply`
+/// applies the emitted patch cleanly, the result parses to the proposed
+/// policy, and every byte outside the touched blocks survives.
+#[test]
+fn init_diff_patch_applies_cleanly_with_git_apply() {
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let dir = diff_project();
+    let r = init_diff(dir.path());
+    let patch = r.json["patch"].as_str().unwrap();
+    assert!(patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"), "{patch}");
+
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    let value: toml::Value = applied.parse().expect("applied file parses");
+    let targets = value["target"].as_table().unwrap();
+    assert!(targets.contains_key("api.example.com"));
+    assert!(targets.contains_key("api.new.example"));
+    assert!(!targets.contains_key("api.gone.example"));
+    // Untouched regions byte-preserved: header comment + user tuning.
+    assert!(applied.contains("# hand-tuned: keep this comment"));
+    assert!(applied.contains("timeout = \"9s\"   # user tuning survives"));
+}
+
+/// With no keel.toml, the patch is a `/dev/null` creation diff; `git apply`
+/// creates a file byte-identical to what `keel init` itself would write.
+#[test]
+fn init_diff_creation_patch_matches_a_real_init_write() {
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.mjs"), DIFF_APP_MJS).unwrap();
+    let r = init_diff(dir.path());
+    let patch = r.json["patch"].as_str().unwrap();
+    assert!(patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"), "{patch}");
+
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let created = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    let expected = init::render_keel_toml(&scan::scan(dir.path()), &[], None);
+    assert_eq!(created, expected, "creation patch reproduces init's write");
+}
+
 // ---- status / doctor / explain: --json golden-tested ----
 
 #[test]
