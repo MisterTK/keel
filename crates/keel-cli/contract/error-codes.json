@@ -1,0 +1,102 @@
+{
+  "v": 1,
+  "description": "Frozen error taxonomy. Source for `keel explain <code>` and the docs corpus. Every message shown to a user must carry: what happened, why, what to do next, and a trace reference (DX invariant 4).",
+  "codes": {
+    "KEEL-E001": {
+      "name": "policy-invalid",
+      "what": "The policy document (keel.toml) failed validation.",
+      "why": "A field has the wrong type, an unknown key was used, or a schedule/duration/rate literal does not parse.",
+      "next": "Run `keel doctor` to see the exact path and expected type; validate against contracts/policy.schema.json."
+    },
+    "KEEL-E002": {
+      "name": "policy-target-unknown",
+      "what": "A call referenced a target with no policy entry while strict mode was enabled.",
+      "why": "Reserved for strict mode; by default unknown targets fall back to the smart-defaults pack.",
+      "next": "Add a [target.\"...\"] entry or disable strict mode."
+    },
+    "KEEL-E003": {
+      "name": "envelope-decode",
+      "what": "A request or attempt-result envelope could not be decoded at the FFI boundary.",
+      "why": "Adapter/core version mismatch or a corrupted payload.",
+      "next": "Run `keel doctor` to check adapter/core version pins; reinstall the language package."
+    },
+    "KEEL-E004": {
+      "name": "envelope-version-unsupported",
+      "what": "The envelope's version field is not supported by this core.",
+      "why": "The language package and the core binary are from incompatible releases.",
+      "next": "Upgrade both the CLI and the language package to matching versions."
+    },
+    "KEEL-E005": {
+      "name": "unsupported-configuration",
+      "what": "The policy is valid, but it requests a capability this build or runtime configuration does not provide.",
+      "why": "Two things trigger this in v0.1: an async effect inside a durable flow (flows are synchronous-only — an async call would bypass the journal), and a durable flow with no journal to record to (Tier 2 needs the native backend with a journal attached).",
+      "next": "For the async case, run the flow body synchronously or remove its entrypoint from [flows]. For the journal case, build/install the native module (`maturin develop -m crates/keel-py/Cargo.toml`) and make sure `.keel/` is writable. `keel doctor` reports which backend and journal are in play."
+    },
+    "KEEL-E010": {
+      "name": "attempts-exhausted",
+      "what": "The call failed on its final permitted attempt; the original error was re-raised unchanged.",
+      "why": "Every attempt hit a retryable error (per retry.on) and the attempt budget ran out.",
+      "next": "Inspect the trace (`keel trace <id>`); consider a larger attempt budget, a longer schedule cap, or fixing the upstream dependency."
+    },
+    "KEEL-E011": {
+      "name": "timeout",
+      "what": "The call exceeded the policy timeout.",
+      "why": "The target did not respond within `timeout` for the resolved policy.",
+      "next": "Raise `timeout` for this target, or investigate the slow dependency."
+    },
+    "KEEL-E012": {
+      "name": "breaker-open",
+      "what": "The circuit breaker for this target is open; the call failed fast without being attempted.",
+      "why": "Recent calls to the target failed at or above the configured threshold.",
+      "next": "The breaker retries automatically after `cooldown`. See `keel status` for breaker state; fix or shed load from the failing dependency."
+    },
+    "KEEL-E013": {
+      "name": "rate-budget-exceeded",
+      "what": "The call could not be queued under the target's rate limit within its wait budget.",
+      "why": "Sustained request volume above the configured rate.",
+      "next": "Raise the `rate` for the target or reduce call volume; check `keel status` for throttle counts."
+    },
+    "KEEL-E014": {
+      "name": "non-idempotent-not-retried",
+      "what": "The call failed with a retryable error, but Keel did not retry it because repeating it is not provably safe.",
+      "why": "Level 0 hard rule: non-idempotent calls (e.g. POST without an idempotency key) are observed, never retried.",
+      "next": "If the API supports idempotency keys, configure `idempotency = { header = \"...\" }` for the target; then retries become safe."
+    },
+    "KEEL-E015": {
+      "name": "non-retryable-error",
+      "what": "The call failed with an error class the policy does not retry; the original error was re-raised unchanged.",
+      "why": "The error class (e.g. a 4xx client error) is not listed in retry.on — retrying would not help.",
+      "next": "This is usually a bug in the request itself. Add the class to retry.on only if the target is known to return it transiently."
+    },
+    "KEEL-E020": {
+      "name": "cache-codec",
+      "what": "A response could not be serialized into (or out of) the cache.",
+      "why": "The value contains language-native objects with no registered codec.",
+      "next": "Disable `cache` for this target or register a codec in the adapter."
+    },
+    "KEEL-E030": {
+      "name": "flow-lease-held",
+      "what": "This flow is already being executed by another process.",
+      "why": "A live lease exists in the journal (lease_holder/lease_expires).",
+      "next": "Wait for the lease to expire or for the other process to finish; `keel flows` shows the holder."
+    },
+    "KEEL-E031": {
+      "name": "flow-nondeterminism",
+      "what": "During replay, the code took a different path than the journal recorded.",
+      "why": "Nondeterminism between effects, or the code changed since the flow was recorded (code_hash mismatch downgrades separately).",
+      "next": "See the divergence diagnostic (expected vs. actual step). Set flows.on_nondeterminism = \"warn\" or \"branch\" to continue anyway."
+    },
+    "KEEL-E032": {
+      "name": "flow-dead",
+      "what": "This flow failed on every resume attempt and was marked dead.",
+      "why": "The resume attempt cap was reached (poison flow).",
+      "next": "Inspect with `keel flows --dead` and `keel trace <flow>`; fix the cause, then `keel replay <flow>`."
+    },
+    "KEEL-E040": {
+      "name": "internal",
+      "what": "An internal Keel error. This is a Keel bug, not an application bug.",
+      "why": "Invariant violation inside the core.",
+      "next": "File an issue with the trace id and `keel doctor --json` output."
+    }
+  }
+}

@@ -6,7 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-publish = false
+readme.workspace = true
+# Publishable (`cargo install keel-cli` → the `keel` binary). The contract
+# files the binary embeds are vendored into contract/ (drift-checked by
+# build.rs); tests/ is excluded from the package because the integration
+# tests embed repo-level conformance fixtures.
+exclude = ["tests/"]
 
 [lib]
 name = "keel_cli"
@@ -17,8 +22,8 @@ name = "keel"
 path = "src/main.rs"
 
 [dependencies]
-keel-core-api = { path = "../keel-core-api" }
-keel-journal = { path = "../keel-journal" }
+keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
+keel-journal = { path = "../keel-journal", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 # Read `.keel/journal.db` for `keel status` directly. The schema is frozen
 # (contracts/journal.sql); keel-journal owns writes, the CLI only reads.

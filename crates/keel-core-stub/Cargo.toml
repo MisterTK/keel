@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Sprint-0 development artifact; the real core supersedes it. Never published.
 publish = false
 
 [dependencies]

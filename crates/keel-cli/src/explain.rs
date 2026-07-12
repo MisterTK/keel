@@ -14,7 +14,7 @@ use crate::render::to_json;
 use crate::{EXIT_USAGE, Rendered};
 
 /// The frozen taxonomy, embedded so the binary and the contract never drift.
-const ERROR_CODES_JSON: &str = include_str!("../../../contracts/error-codes.json");
+const ERROR_CODES_JSON: &str = include_str!("../contract/error-codes.json");
 
 /// The base for the per-code docs URL stub (dx-spec §5, "docs built for
 /// retrieval").
