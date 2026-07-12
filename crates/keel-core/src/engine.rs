@@ -22,7 +22,7 @@ use keel_journal::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{Instrument, debug, warn};
 
 /// Count-mode circuit breaker (consecutive terminal failures). Observes
 /// post-retry call outcomes — layer order puts it outside the retry loop.
@@ -43,6 +43,19 @@ enum Admission {
     Rejected,
 }
 
+/// A breaker state change worth surfacing as a telemetry event. Pure
+/// observability — the value never influences an outcome or the report; it
+/// exists only so the caller can emit a `tracing` event off the state lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerTransition {
+    /// No edge was crossed by this call.
+    None,
+    /// The breaker tripped OPEN (threshold reached, or a probe failed).
+    Opened,
+    /// A successful probe closed a previously-open breaker.
+    Closed,
+}
+
 impl Breaker {
     fn admit(&self, now: Instant) -> Admission {
         match self.open_until {
@@ -59,12 +72,26 @@ impl Breaker {
         }
     }
 
-    fn on_success(&mut self) {
+    fn on_success(&mut self) -> BreakerTransition {
+        // A live success is only reached while closed or half-open; an open
+        // breaker fails fast (never runs the effect). So `open_until.is_some()`
+        // here means a probe just closed the breaker.
+        let closed_a_probe = self.open_until.is_some();
         self.consecutive = 0;
         self.open_until = None;
+        if closed_a_probe {
+            BreakerTransition::Closed
+        } else {
+            BreakerTransition::None
+        }
     }
 
-    fn on_terminal_failure(&mut self, now: Instant, config: &BreakerPolicy, admission: Admission) {
+    fn on_terminal_failure(
+        &mut self,
+        now: Instant,
+        config: &BreakerPolicy,
+        admission: Admission,
+    ) -> BreakerTransition {
         let should_trip = if admission == Admission::HalfOpen {
             true // failed probe: re-open for another full cooldown
         } else {
@@ -75,6 +102,9 @@ impl Breaker {
             self.open_until = Some(now + Duration::from_millis(config.cooldown.0));
             self.opens += 1;
             self.consecutive = 0;
+            BreakerTransition::Opened
+        } else {
+            BreakerTransition::None
         }
     }
 }
@@ -286,6 +316,46 @@ fn class_str(class: ErrorClass) -> &'static str {
     }
 }
 
+/// Static label for a breaker state, matching its `snake_case` serialized form,
+/// so a span field reads the same as the report/journal.
+fn breaker_str(state: BreakerState) -> &'static str {
+    match state {
+        BreakerState::Closed => "closed",
+        BreakerState::Open => "open",
+        BreakerState::HalfOpen => "half_open",
+    }
+}
+
+/// Stamps the terminal outcome onto the `keel.call` span. Every field was
+/// declared `Empty` at span open, so on a disabled span each `record` is a
+/// no-op and the trivial accessors below cost effectively nothing — the
+/// disabled-callsite fast path telemetry must not perturb.
+fn record_call_fields(span: &tracing::Span, out: &Outcome) {
+    span.record("trace_id", out.trace_id.as_str());
+    span.record("result", out.result.as_str());
+    if let Some(error) = out.error.as_ref() {
+        span.record("error_code", error.code.as_str());
+    }
+    span.record("attempts", out.attempts);
+    span.record("from_cache", out.from_cache);
+    span.record("throttled", out.throttled);
+    span.record("breaker", breaker_str(out.breaker));
+}
+
+/// Emits a breaker state change at debug level (architecture spec §4.5).
+/// Called off the state lock; a no-op when nothing changed.
+fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
+    match transition {
+        BreakerTransition::Opened => {
+            debug!(target = %target, transition = "opened", "breaker transition");
+        }
+        BreakerTransition::Closed => {
+            debug!(target = %target, transition = "closed", "breaker transition");
+        }
+        BreakerTransition::None => {}
+    }
+}
+
 fn terminal_message(
     code: ErrorCode,
     request: &Request,
@@ -409,7 +479,28 @@ impl Engine {
         F: AsyncFnMut(u32) -> AttemptResult,
     {
         let started = Instant::now();
-        let out = self.run_chain(request, &mut effect).await;
+        // One span per wrapped call (architecture spec §4.5). Terminal fields
+        // are declared `Empty` and recorded from the finished outcome; the
+        // per-attempt child spans are opened inside the instrumented chain.
+        // `%request.target`/`%request.op` are only formatted when a subscriber
+        // is active — the disabled callsite evaluates nothing.
+        let span = tracing::info_span!(
+            "keel.call",
+            target = %request.target,
+            op = %request.op,
+            trace_id = tracing::field::Empty,
+            result = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+            attempts = tracing::field::Empty,
+            from_cache = tracing::field::Empty,
+            throttled = tracing::field::Empty,
+            breaker = tracing::field::Empty,
+        );
+        let out = self
+            .run_chain(request, &mut effect)
+            .instrument(span.clone())
+            .await;
+        record_call_fields(&span, &out);
         self.observe(request, &out, started);
         out
     }
@@ -557,6 +648,7 @@ impl Engine {
         metrics.cache_hits += 1;
         metrics.successes += 1;
         out.breaker = state.breaker_state(&key.target, now);
+        debug!(target = %key.target, scope = "memory", "cache hit");
         true
     }
 
@@ -599,6 +691,7 @@ impl Engine {
         metrics.cache_hits += 1;
         metrics.successes += 1;
         out.breaker = state.breaker_state(target, now);
+        debug!(target = %target, scope = "persistent", "cache hit");
         true
     }
 
@@ -625,22 +718,29 @@ impl Engine {
             return Admission::Closed;
         }
         let now = Instant::now();
-        let mut state = self.state();
-        let admission = state
-            .breakers
-            .entry(target.to_owned())
-            .or_default()
-            .admit(now);
-        if admission == Admission::Rejected {
-            out.error = Some(OutcomeError {
-                code: ErrorCode::BreakerOpen,
-                class: ErrorClass::Other,
-                http_status: None,
-                message: format!("breaker OPEN for {target}: failed fast, call not attempted"),
-                original: None,
-            });
-            out.breaker = BreakerState::Open;
-            state.metrics_for(target).failures += 1;
+        let admission = {
+            let mut state = self.state();
+            let admission = state
+                .breakers
+                .entry(target.to_owned())
+                .or_default()
+                .admit(now);
+            if admission == Admission::Rejected {
+                out.error = Some(OutcomeError {
+                    code: ErrorCode::BreakerOpen,
+                    class: ErrorClass::Other,
+                    http_status: None,
+                    message: format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                    original: None,
+                });
+                out.breaker = BreakerState::Open;
+                state.metrics_for(target).failures += 1;
+            }
+            admission
+        };
+        // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
+        if admission == Admission::HalfOpen {
+            debug!(target = %target, transition = "half_open", "breaker transition");
         }
         admission
     }
@@ -657,40 +757,48 @@ impl Engine {
         out: &mut Outcome,
     ) {
         let now = Instant::now();
-        let mut state = self.state();
-        match result {
-            Ok(payload) => {
-                state.metrics_for(target).successes += 1;
-                if resolved.breaker.is_some()
-                    && let Some(breaker) = state.breakers.get_mut(target)
-                {
-                    breaker.on_success();
+        let transition = {
+            let mut state = self.state();
+            let transition = match result {
+                Ok(payload) => {
+                    state.metrics_for(target).successes += 1;
+                    let mut transition = BreakerTransition::None;
+                    if resolved.breaker.is_some()
+                        && let Some(breaker) = state.breakers.get_mut(target)
+                    {
+                        transition = breaker.on_success();
+                    }
+                    if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
+                        && let Some(ttl) = cache.ttl
+                    {
+                        state.cache.insert(
+                            key,
+                            CacheEntry {
+                                expires_at: now + Duration::from_millis(ttl.0),
+                                payload: payload.clone(),
+                            },
+                        );
+                    }
+                    out.result = String::from("ok");
+                    out.payload = Some(payload);
+                    transition
                 }
-                if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
-                    && let Some(ttl) = cache.ttl
-                {
-                    state.cache.insert(
-                        key,
-                        CacheEntry {
-                            expires_at: now + Duration::from_millis(ttl.0),
-                            payload: payload.clone(),
-                        },
-                    );
+                Err(error) => {
+                    state.metrics_for(target).failures += 1;
+                    let mut transition = BreakerTransition::None;
+                    if let Some(config) = &resolved.breaker
+                        && let Some(breaker) = state.breakers.get_mut(target)
+                    {
+                        transition = breaker.on_terminal_failure(now, config, admission);
+                    }
+                    out.error = Some(error);
+                    transition
                 }
-                out.result = String::from("ok");
-                out.payload = Some(payload);
-            }
-            Err(error) => {
-                state.metrics_for(target).failures += 1;
-                if let Some(config) = &resolved.breaker
-                    && let Some(breaker) = state.breakers.get_mut(target)
-                {
-                    breaker.on_terminal_failure(now, config, admission);
-                }
-                out.error = Some(error);
-            }
-        }
-        out.breaker = state.breaker_state(target, now);
+            };
+            out.breaker = state.breaker_state(target, now);
+            transition
+        };
+        emit_breaker_transition(target, transition);
     }
 
     /// Writes a live success into the journal's persistent cache (called after
@@ -757,6 +865,52 @@ impl Engine {
         }
     }
 
+    /// Runs a single effect invocation through the timeout layer, tagging the
+    /// origin of a failure (adapter vs. policy timeout). The effect future is
+    /// instrumented with `attempt_span`, so any tracing it emits nests under the
+    /// attempt; the timeout branch synthesizes the same `KEEL-E011`-class error
+    /// the retry loop diagnoses.
+    async fn run_one_attempt<F>(
+        &self,
+        resolved: &ResolvedPolicy,
+        effect: &mut F,
+        attempt: u32,
+        attempt_span: &tracing::Span,
+    ) -> AttemptOutcome
+    where
+        F: AsyncFnMut(u32) -> AttemptResult,
+    {
+        match resolved.timeout {
+            Some(limit) => {
+                match tokio::time::timeout(
+                    Duration::from_millis(limit.0),
+                    effect(attempt).instrument(attempt_span.clone()),
+                )
+                .await
+                {
+                    Ok(result) => AttemptOutcome {
+                        result,
+                        timed_out_by_layer: false,
+                    },
+                    Err(_elapsed) => AttemptOutcome {
+                        result: AttemptResult::Error {
+                            class: ErrorClass::Timeout,
+                            http_status: None,
+                            retry_after_ms: None,
+                            message: format!("no response within {}ms", limit.0),
+                            original: None,
+                        },
+                        timed_out_by_layer: true,
+                    },
+                }
+            }
+            None => AttemptOutcome {
+                result: effect(attempt).instrument(attempt_span.clone()).await,
+                timed_out_by_layer: false,
+            },
+        }
+    }
+
     /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error.
     async fn run_attempts<F>(
         &self,
@@ -775,35 +929,27 @@ impl Engine {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
 
-            let attempt_outcome = match resolved.timeout {
-                Some(limit) => {
-                    match tokio::time::timeout(Duration::from_millis(limit.0), effect(attempt))
-                        .await
-                    {
-                        Ok(result) => AttemptOutcome {
-                            result,
-                            timed_out_by_layer: false,
-                        },
-                        Err(_elapsed) => AttemptOutcome {
-                            result: AttemptResult::Error {
-                                class: ErrorClass::Timeout,
-                                http_status: None,
-                                retry_after_ms: None,
-                                message: format!("no response within {}ms", limit.0),
-                                original: None,
-                            },
-                            timed_out_by_layer: true,
-                        },
-                    }
-                }
-                None => AttemptOutcome {
-                    result: effect(attempt).await,
-                    timed_out_by_layer: false,
-                },
-            };
+            // Child span per attempt (spec §4.5): `class`/`http_status`/`wait_ms`
+            // are filled in below once the attempt resolves. The effect future
+            // runs inside this span so any adapter tracing nests correctly.
+            let attempt_span = tracing::debug_span!(
+                "keel.attempt",
+                attempt,
+                result = tracing::field::Empty,
+                class = tracing::field::Empty,
+                http_status = tracing::field::Empty,
+                wait_ms = tracing::field::Empty,
+            );
+
+            let attempt_outcome = self
+                .run_one_attempt(resolved, effect, attempt, &attempt_span)
+                .await;
 
             match attempt_outcome.result {
-                AttemptResult::Ok { payload } => return Ok(payload),
+                AttemptResult::Ok { payload } => {
+                    attempt_span.record("result", "ok");
+                    return Ok(payload);
+                }
                 AttemptResult::Error {
                     class,
                     http_status,
@@ -811,6 +957,11 @@ impl Engine {
                     message,
                     original,
                 } => {
+                    attempt_span.record("result", "error");
+                    attempt_span.record("class", class_str(class));
+                    if let Some(status) = http_status {
+                        attempt_span.record("http_status", status);
+                    }
                     let retryable = retry.is_retryable(class, http_status);
                     if let Some(code) =
                         terminal_code(retryable, attempt, max_attempts, request.idempotent)
@@ -848,6 +999,7 @@ impl Engine {
                     if let Some(server_says) = retry_after_ms {
                         wait = wait.max(server_says);
                     }
+                    attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
                     tokio::time::sleep(Duration::from_millis(wait)).await;

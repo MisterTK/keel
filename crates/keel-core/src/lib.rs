@@ -16,9 +16,17 @@
 //! - is `&self`-concurrent: interior state behind a mutex, never held
 //!   across an await
 //!
+//! Every call and attempt is also emitted as a `tracing` span
+//! (`keel.call` / `keel.attempt`, architecture spec §4.5), with breaker
+//! transitions and cache hits as debug events. Spans cost effectively
+//! nothing when no subscriber is active. Enabling the optional `otel`
+//! feature adds [`otel::init_otlp`] to export those spans over OTLP.
+//!
 //! Tier 2 (journal, flows, replay) and the FFI facade land in later slices;
 //! the async surface here is what the PyO3/napi bridges will wrap.
 
 mod engine;
+#[cfg(feature = "otel")]
+pub mod otel;
 
 pub use engine::{DiscoveryRecorder, Engine};
