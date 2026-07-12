@@ -53,6 +53,8 @@ export function loadScenarios() {
  * (empty ⇒ pass).
  */
 export function runScenario(core, isKeelError, scenario) {
+  // Tier 2 (durable flows) is real-core only; the Node cores skip it cleanly.
+  if ((scenario.tier ?? 1) !== 1) return [];
   const wantCfgErr = scenario.expect_configure_error;
   try {
     core.configure(scenario.policy);
@@ -106,6 +108,17 @@ export function runScenario(core, isKeelError, scenario) {
  */
 export function registerConformance(test, { label, makeCore, isKeelError }) {
   for (const scenario of loadScenarios()) {
+    // Tier 2 (durable flows) is real-core only; the Node cores don't implement
+    // it, so mark those scenarios SKIPPED (visible in the run, like the Python
+    // runner's "N tier-2 skipped") rather than trivially passing.
+    if ((scenario.tier ?? 1) !== 1) {
+      test(
+        `${label} conformance: ${scenario.name} (tier ${scenario.tier})`,
+        { skip: "tier 2 durable flows: real-core only" },
+        () => {}
+      );
+      continue;
+    }
     test(`${label} conformance: ${scenario.name}`, () => {
       const failures = runScenario(makeCore(), isKeelError, scenario);
       assert.deepEqual(failures, [], `\n${failures.join("\n")}`);

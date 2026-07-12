@@ -21,6 +21,32 @@
 //! encountered on replay must match the journal. A `seq` recorded under a
 //! *different* key is nondeterminism ([`ErrorCode::FlowNondeterminism`],
 //! KEEL-E031), handled per the `flows.on_nondeterminism` policy.
+//!
+//! # Re-entering a completed flow is pure replay
+//!
+//! A rerun of a flow that already reached `completed` is a *pure replay*: no
+//! lease is taken, no flow-level attempt is consumed, no heartbeat runs, and no
+//! effect ever fires — every step is substituted from the journal and the
+//! function reconstructs its result from the recorded values. This is what makes
+//! `keel run` on a finished pipeline instant and side-effect-free, and it is why
+//! re-entry must never surface a lease error (a completed flow is not `running`,
+//! so a naive `acquire_lease WHERE status='running'` would wrongly report
+//! KEEL-E030). A replay-only handle reaching a step with no recorded outcome is
+//! itself a divergence (the code grew a step since completion) and is refused
+//! with KEEL-E031 rather than run live.
+//!
+//! # Step-key convention (who names steps)
+//!
+//! Step keys are *front-end supplied*, never minted by this manager, so the key
+//! a live run records and the key a replay observes are produced by the same
+//! code path. Effect steps key on the request as `"(target)#(args_hash)"`
+//! ([`FlowHandle::step_key`]). Virtualized value steps (time/random) take an
+//! explicit caller key following the same `"<callable>#<args_hash>"` shape with
+//! the front end's language prefix and `-` for a niladic read — e.g. the Python
+//! front end and the golden fixtures both use `py:time.time#-`,
+//! `py:time.time_ns#-`, `py:random.random#-`. Keeping the convention in the
+//! caller means the fixtures, the live front end, and replay all agree on one
+//! key per read.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -46,10 +72,6 @@ const BRANCH_SEQ_BASE: u64 = 1_000_000;
 const ATTEMPT_SEQ: u64 = 0;
 /// The step key of the reserved resume-counter marker.
 const ATTEMPT_KEY: &str = "flow:attempt";
-/// The step key virtualized clock reads journal under (spec §4.4).
-const TIME_KEY: &str = "keel:time#-";
-/// The step key virtualized random draws journal under.
-const RANDOM_KEY: &str = "keel:random#-";
 
 use crate::engine::Engine;
 
@@ -221,33 +243,36 @@ impl FlowManager {
             });
         }
 
+        // Re-entering a completed flow is PURE REPLAY (see module docs): hand
+        // back a replay-only handle that substitutes every step, takes no lease,
+        // spawns no heartbeat, and consumes no attempt. A naive lease acquire
+        // here would fail (a completed flow is not `running`) and wrongly report
+        // KEEL-E030; instead the rerun reconstructs its result from the journal.
+        if status == FlowStatus::Completed {
+            return Ok(self.new_handle(flow_id.clone(), status, false, None, true));
+        }
+
         // Flow-level attempt cap (distinct from Tier 1 step attempts): each
         // resume of a not-yet-completed flow consumes one attempt from the
-        // reserved seq-0 counter; exceeding the cap marks the flow dead. A
-        // completed flow's re-entry is pure replay and consumes nothing.
-        let attempt = if status == FlowStatus::Completed {
-            None
-        } else {
-            let prior = self
-                .journal
-                .step_at(flow_id, ATTEMPT_SEQ)
-                .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
-                .map_or(0, |(_, o)| o.attempt);
-            let attempt = prior.saturating_add(1);
-            if attempt > self.config.max_attempts {
-                self.journal
-                    .complete_flow(flow_id, FlowStatus::Dead)
-                    .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
-                return Err(KeelError {
-                    code: ErrorCode::FlowDead,
-                    message: format!(
-                        "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
-                        self.config.max_attempts
-                    ),
-                });
-            }
-            Some(attempt)
-        };
+        // reserved seq-0 counter; exceeding the cap marks the flow dead.
+        let prior = self
+            .journal
+            .step_at(flow_id, ATTEMPT_SEQ)
+            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
+            .map_or(0, |(_, o)| o.attempt);
+        let attempt = prior.saturating_add(1);
+        if attempt > self.config.max_attempts {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Dead)
+                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
+            return Err(KeelError {
+                code: ErrorCode::FlowDead,
+                message: format!(
+                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
+                    self.config.max_attempts
+                ),
+            });
+        }
 
         // A cleanly-failed flow is put back to `running` before re-leasing so a
         // resume can proceed (and so a re-crash lands it in the recovery scan).
@@ -270,23 +295,21 @@ impl FlowManager {
             });
         }
 
-        if let Some(attempt) = attempt {
-            let now = self.clock.now_ms();
-            let marker = StepOutcome {
-                kind: StepKind::Marker,
-                attempt,
-                status: StepStatus::Ok,
-                payload: None,
-                error_class: None,
-                started_at: now,
-                ended_at: Some(now),
-            };
-            if let Err(e) =
-                self.journal
-                    .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
-            {
-                warn!(flow = %flow_id, error = %e, "attempt-counter record failed");
-            }
+        let now = self.clock.now_ms();
+        let marker = StepOutcome {
+            kind: StepKind::Marker,
+            attempt,
+            status: StepStatus::Ok,
+            payload: None,
+            error_class: None,
+            started_at: now,
+            ended_at: Some(now),
+        };
+        if let Err(e) =
+            self.journal
+                .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
+        {
+            warn!(flow = %flow_id, error = %e, "attempt-counter record failed");
         }
 
         // Replay is fenced when the recorded code differs from what is running
@@ -303,17 +326,34 @@ impl FlowManager {
             self.config.lease_ttl,
         );
 
-        Ok(FlowHandle {
+        Ok(self.new_handle(flow_id.clone(), status, code_hash_fenced, heartbeat, false))
+    }
+
+    /// Assemble a [`FlowHandle`] over this manager's shared engine/journal/clock.
+    /// `replay_only` marks a completed-flow re-entry (pure replay: every step is
+    /// substituted, no effect fires) — the handle is born already `completed` so
+    /// dropping it is quiet and a front-end `exit_flow` is a harmless re-stamp.
+    fn new_handle(
+        &self,
+        flow_id: FlowId,
+        entry_status: FlowStatus,
+        code_hash_fenced: bool,
+        heartbeat: Option<tokio::task::AbortHandle>,
+        replay_only: bool,
+    ) -> FlowHandle {
+        FlowHandle {
             engine: Arc::clone(&self.engine),
             journal: Arc::clone(&self.journal),
             clock: Arc::clone(&self.clock),
-            flow_id: flow_id.clone(),
+            flow_id,
             seq: 0,
             code_hash_fenced,
             replay_abandoned: false,
-            completed: false,
+            replay_only,
+            completed: replay_only,
+            entry_status,
             heartbeat,
-        })
+        }
     }
 }
 
@@ -322,6 +362,11 @@ impl FlowManager {
 ///
 /// Dropping a handle without [`complete`](Self::complete) leaves the flow
 /// `running` with its lease — exactly the crash shape recovery resumes.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent per-handle replay/lease predicate, not a \
+              packed state enum: code_hash_fenced, replay_abandoned, replay_only, completed"
+)]
 pub struct FlowHandle {
     engine: Arc<Engine>,
     journal: Arc<dyn Journal>,
@@ -330,6 +375,13 @@ pub struct FlowHandle {
     seq: u64,
     code_hash_fenced: bool,
     replay_abandoned: bool,
+    /// A completed-flow re-entry (pure replay): every step is substituted from
+    /// the journal and no effect fires; a step with no record is a divergence.
+    replay_only: bool,
+    /// The flow's status when this handle was opened (`completed` for a pure
+    /// replay handle, `running`/`failed` for a live entry) — the front end reads
+    /// it to distinguish "resumed" from "already finished".
+    entry_status: FlowStatus,
     completed: bool,
     /// The lease-renewal task; aborted when the handle drops so a completed or
     /// crashed flow stops heart-beating.
@@ -341,6 +393,8 @@ impl core::fmt::Debug for FlowHandle {
         f.debug_struct("FlowHandle")
             .field("flow_id", &self.flow_id)
             .field("seq", &self.seq)
+            .field("entry_status", &self.entry_status)
+            .field("replay_only", &self.replay_only)
             .field("completed", &self.completed)
             .finish_non_exhaustive()
     }
@@ -372,6 +426,22 @@ impl FlowHandle {
     #[must_use]
     pub fn flow_id(&self) -> &FlowId {
         &self.flow_id
+    }
+
+    /// The flow's status when this handle was opened. `completed` means this is a
+    /// pure-replay handle (a rerun of an already-finished flow); `running` or
+    /// `failed` means a live entry/resume. The front end reads this to tell the
+    /// user "resumed" vs. "already completed".
+    #[must_use]
+    pub fn entry_status(&self) -> FlowStatus {
+        self.entry_status
+    }
+
+    /// Whether this handle is a completed-flow pure replay — every step is
+    /// substituted from the journal and no effect will fire.
+    #[must_use]
+    pub fn is_replay_only(&self) -> bool {
+        self.replay_only
     }
 
     fn now(&self) -> i64 {
@@ -429,7 +499,17 @@ impl FlowHandle {
         self.seq += 1;
         let seq = self.seq;
         let key = Self::step_key(request);
-        match self.plan_step(seq, &key) {
+        let plan = self.plan_step(seq, &key);
+        // A completed-flow replay never runs an effect: substitute a recorded
+        // step, and treat a missing/diverging record as nondeterminism (the code
+        // grew or changed a step since the flow completed) rather than firing it.
+        if self.replay_only {
+            return match plan {
+                StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
+                _ => replay_miss_outcome(&self.flow_id, seq, &key),
+            };
+        }
+        match plan {
             StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
             StepPlan::Diverged { recorded } => {
                 self.on_divergence(seq, &recorded, &key, request, effect)
@@ -543,27 +623,29 @@ impl FlowHandle {
         self.seq = marker_seq + 1;
     }
 
-    /// Journal (or replay) a virtualized clock read. On replay the recorded
-    /// value is substituted so a resumed flow sees the same time; live, `now_ms`
-    /// is recorded and returned (spec §4.4).
+    /// Journal (or replay) a virtualized clock read under the front-end-supplied
+    /// `key` (the module-docs convention, e.g. `py:time.time#-`). On replay the
+    /// recorded value is substituted so a resumed flow sees the same time; live,
+    /// `now_ms` is recorded and returned (spec §4.4).
     ///
     /// # Errors
     /// `KEEL-E031` if this step diverges from the journal under `fail`.
-    pub fn journal_time(&mut self, now_ms: i64) -> Result<i64, KeelError> {
+    pub fn journal_time(&mut self, key: &str, now_ms: i64) -> Result<i64, KeelError> {
         let bytes = encode_payload(&json!(now_ms)).unwrap_or_default();
-        let recorded = self.resolve_value_step(TIME_KEY, StepKind::Time, bytes)?;
+        let recorded = self.resolve_value_step(key, StepKind::Time, bytes)?;
         Ok(decode_payload(&recorded)
             .and_then(|v| v.as_i64())
             .unwrap_or(now_ms))
     }
 
-    /// Journal (or replay) a virtualized random draw. On replay the recorded
-    /// bytes are substituted; live, `bytes` are recorded and returned.
+    /// Journal (or replay) a virtualized random draw under the front-end-supplied
+    /// `key` (e.g. `py:random.random#-`). On replay the recorded bytes are
+    /// substituted; live, `bytes` are recorded and returned.
     ///
     /// # Errors
     /// `KEEL-E031` if this step diverges from the journal under `fail`.
-    pub fn journal_random(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>, KeelError> {
-        self.resolve_value_step(RANDOM_KEY, StepKind::Random, bytes)
+    pub fn journal_random(&mut self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, KeelError> {
+        self.resolve_value_step(key, StepKind::Random, bytes)
     }
 
     /// The shared replay/live machinery for a pure value step (time/random):
@@ -577,7 +659,15 @@ impl FlowHandle {
         self.seq += 1;
         let seq = self.seq;
         let key = StepKey::new(key_str);
-        match self.plan_step(seq, &key) {
+        let plan = self.plan_step(seq, &key);
+        // Pure replay: substitute the recorded value; never re-draw/re-read.
+        if self.replay_only {
+            return match plan {
+                StepPlan::Replay(outcome) => Ok(outcome.payload.unwrap_or_default()),
+                _ => Err(replay_miss_error(&self.flow_id, seq, &key)),
+            };
+        }
+        match plan {
             StepPlan::Replay(outcome) => Ok(outcome.payload.unwrap_or_default()),
             StepPlan::Live => {
                 self.record_value(seq, &key, kind, &live_bytes);
@@ -825,6 +915,37 @@ fn diverged_error(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKe
     KeelError {
         code: ErrorCode::FlowNondeterminism,
         message: divergence_message(flow, seq, recorded, observed),
+    }
+}
+
+/// A completed-flow replay reached step `seq` (`observed`) with no matching
+/// recorded outcome — the code grew or reordered a step since the flow finished.
+/// Refused as nondeterminism (KEEL-E031) so no effect fires on a replay handle.
+fn replay_miss_message(flow: &FlowId, seq: u64, observed: &StepKey) -> String {
+    format!(
+        "flow {flow} replay reached unrecorded step {seq} ({observed}); \
+         the completed flow's code changed (KEEL-E031)"
+    )
+}
+
+/// The KEEL-E031 outcome for a replay-only miss on an effect step.
+fn replay_miss_outcome(flow: &FlowId, seq: u64, observed: &StepKey) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.error = Some(OutcomeError {
+        code: ErrorCode::FlowNondeterminism,
+        class: ErrorClass::Other,
+        http_status: None,
+        message: replay_miss_message(flow, seq, observed),
+        original: None,
+    });
+    outcome
+}
+
+/// The KEEL-E031 error for a replay-only miss on a value step.
+fn replay_miss_error(flow: &FlowId, seq: u64, observed: &StepKey) -> KeelError {
+    KeelError {
+        code: ErrorCode::FlowNondeterminism,
+        message: replay_miss_message(flow, seq, observed),
     }
 }
 

@@ -668,21 +668,141 @@ async fn journal_time_and_random_replay_recorded_values() {
     // Run 1: record a virtualized time read and a random draw, then crash.
     {
         let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
-        assert_eq!(handle.journal_time(1_000).unwrap(), 1_000);
-        assert_eq!(handle.journal_random(vec![1, 2, 3]).unwrap(), vec![1, 2, 3]);
+        assert_eq!(handle.journal_time("py:time.time#-", 1_000).unwrap(), 1_000);
+        assert_eq!(
+            handle
+                .journal_random("py:random.random#-", vec![1, 2, 3])
+                .unwrap(),
+            vec![1, 2, 3]
+        );
     }
     r.clock.advance(31_000);
 
     // Run 2: resume — the recorded values are substituted, not the new args, so
     // the resumed flow observes the same "now" and randomness (spec §4.4).
     let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
-    assert_eq!(handle.journal_time(9_999).unwrap(), 1_000, "time replays");
     assert_eq!(
-        handle.journal_random(vec![9, 9, 9]).unwrap(),
+        handle.journal_time("py:time.time#-", 9_999).unwrap(),
+        1_000,
+        "time replays"
+    );
+    assert_eq!(
+        handle
+            .journal_random("py:random.random#-", vec![9, 9, 9])
+            .unwrap(),
         vec![1, 2, 3],
         "random replays"
     );
     handle.complete_success();
+}
+
+#[tokio::test(start_paused = true)]
+async fn re_entering_a_completed_flow_is_pure_replay() {
+    // Carried review item 1: re-entering a completed flow must be pure replay —
+    // no lease error (KEEL-E030), no attempt consumed, no effect re-fired — with
+    // every recorded step substituted verbatim.
+    let r = rig("host-a:pid-1");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let steps = [("api.a.internal", "1"), ("api.b.internal", "2")];
+
+    let fid;
+    {
+        let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+        fid = handle.flow_id().clone();
+        assert_eq!(handle.entry_status(), FlowStatus::Running);
+        assert!(!handle.is_replay_only());
+        for (target, hash) in steps {
+            handle
+                .execute_step(
+                    &request(target, hash),
+                    counting_ok(&calls, json!({ "t": target })),
+                )
+                .await;
+        }
+        handle.complete_success();
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "both effects ran live once"
+    );
+
+    // Re-enter the SAME identity: the flow is completed, so this is pure replay.
+    let mut replay = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    assert_eq!(*replay.flow_id(), fid);
+    assert_eq!(replay.entry_status(), FlowStatus::Completed);
+    assert!(replay.is_replay_only(), "completed re-entry is replay-only");
+    for (target, hash) in steps {
+        let out = replay
+            .execute_step(
+                &request(target, hash),
+                counting_ok(&calls, json!({ "SHOULD_NOT_RUN": true })),
+            )
+            .await;
+        assert_eq!(out.result, "ok");
+        assert_eq!(
+            out.payload,
+            Some(json!({ "t": target })),
+            "recorded payload substituted"
+        );
+    }
+    replay.complete_success();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "replay fired NO effects (still 2 from run 1)"
+    );
+    // The seq-0 attempt counter still reads 1 (the single initial entry): the
+    // completed re-entry consumed no additional attempt.
+    let (_k, marker) = r.journal.step_at(&fid, 0).unwrap().expect("attempt marker");
+    assert_eq!(marker.attempt, 1, "completed re-entry consumes no attempt");
+    assert_eq!(
+        r.journal.get_flow(&fid).unwrap().unwrap().status,
+        FlowStatus::Completed
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn replay_only_refuses_an_unrecorded_step_with_e031() {
+    // A completed flow whose code grew a step: the replay handle reaches an
+    // unrecorded seq and refuses it (KEEL-E031) rather than firing the effect.
+    let r = rig("host-a:pid-1");
+    let calls = Arc::new(AtomicUsize::new(0));
+    {
+        let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+        handle
+            .execute_step(
+                &request("api.a.internal", "1"),
+                counting_ok(&calls, json!(1)),
+            )
+            .await;
+        handle.complete_success();
+    }
+
+    let mut replay = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    // Step 1 replays fine.
+    let ok = replay
+        .execute_step(
+            &request("api.a.internal", "1"),
+            counting_ok(&calls, json!(9)),
+        )
+        .await;
+    assert_eq!(ok.payload, Some(json!(1)));
+    // Step 2 has no record on this completed flow → refused, effect not run.
+    let miss = replay
+        .execute_step(
+            &request("api.new.internal", "2"),
+            counting_ok(&calls, json!(9)),
+        )
+        .await;
+    assert_eq!(miss.result, "error");
+    assert_eq!(miss.error.expect("miss error").code.as_str(), "KEEL-E031");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only run-1's effect ever ran"
+    );
 }
 
 #[test]

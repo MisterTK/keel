@@ -443,6 +443,14 @@ impl Engine {
         self
     }
 
+    /// The attached journal, if any — shared (`Arc`) so a [`FlowManager`] can run
+    /// its Tier 2 steps over the *same* store the engine caches through. `None`
+    /// for an in-memory engine (Tier 2 requires a durable journal).
+    #[must_use]
+    pub fn journal(&self) -> Option<Arc<dyn Journal>> {
+        self.journal.clone()
+    }
+
     /// Attach a discovery store; each `execute` then records one observation.
     /// Optional and failure-isolated — recording never affects an outcome.
     pub fn attach_discovery(&mut self, discovery: impl DiscoveryRecorder + 'static) -> &mut Self {

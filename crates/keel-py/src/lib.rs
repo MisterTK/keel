@@ -46,12 +46,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keel_core_api::{AttemptResult, ErrorClass, KeelError, Outcome, Request};
-use keel_engine::Engine;
-use keel_journal::{SqliteJournal, SystemClock};
+use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
+use keel_journal::{FlowStatus, Journal, ProcessId, SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use pythonize::{depythonize, pythonize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
 
 pyo3::create_exception!(
@@ -185,15 +186,40 @@ fn attach_journal(engine: &mut Engine, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The status token the front end reads back from `enter_flow`.
+fn status_str(status: FlowStatus) -> &'static str {
+    status.as_str()
+}
+
 /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
 /// `runtime` (behind a `Mutex`) drives the synchronous/paused-clock paths.
+///
+/// Tier 2 flow state (native-only): `journal` is the shared store a
+/// [`FlowManager`] runs steps over (the same journal the engine caches through),
+/// and `active_flow` holds the [`FlowHandle`] between `enter_flow` and
+/// `exit_flow`. While a flow is active, `execute` routes each intercepted call
+/// through the handle's `execute_step` (journaled, replayable) instead of the
+/// bare engine — the front end drives the *same* `execute` API either way.
 #[pyclass(module = "keel_core")]
-#[derive(Debug)]
 struct KeelCore {
     engine: Arc<Engine>,
     runtime: Mutex<Runtime>,
     /// True when a journal is attached (the persistent dev-cache scope is live).
     persistent: bool,
+    /// The shared journal for Tier 2 flows, if one is attached (`None` for an
+    /// in-memory core — flows then raise a precise KEEL-E040 unsupported error).
+    journal: Option<Arc<dyn Journal>>,
+    /// The flow currently open (between `enter_flow`/`exit_flow`), if any.
+    active_flow: Mutex<Option<FlowHandle>>,
+}
+
+impl core::fmt::Debug for KeelCore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeelCore")
+            .field("persistent", &self.persistent)
+            .field("has_journal", &self.journal.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[pymethods]
@@ -218,10 +244,15 @@ impl KeelCore {
             }
             _ => false,
         };
+        // Share the engine's journal (if any) with Tier 2 flows: steps + the
+        // persistent cache live in one file, one clock.
+        let journal = engine.journal();
         Ok(Self {
             engine: Arc::new(engine),
             runtime: Mutex::new(runtime),
             persistent,
+            journal,
+            active_flow: Mutex::new(None),
         })
     }
 
@@ -255,14 +286,21 @@ impl KeelCore {
         let request = decode_request(py, request)?;
         let engine = Arc::clone(&self.engine);
         let runtime = &self.runtime;
+        let active = &self.active_flow;
         // Release the GIL across the (possibly blocking) engine run; re-acquire
         // per attempt inside the effect. Holding the runtime mutex across the
-        // synchronous `block_on` serializes calls on this handle.
+        // synchronous `block_on` serializes calls on this handle. While a flow is
+        // open, route the call through its `execute_step` so it is journaled and
+        // replayable; otherwise run the bare engine (identical to before).
         let outcome = py.detach(move || {
             let guard = runtime.lock().expect("keel-py runtime mutex poisoned");
-            guard.block_on(engine.execute(&request, async |attempt: u32| {
-                Python::attach(|py| invoke_sync_effect(py, &effect, attempt))
-            }))
+            let mut flow = active.lock().expect("keel-py active-flow mutex poisoned");
+            let effect_fn =
+                async |attempt: u32| Python::attach(|py| invoke_sync_effect(py, &effect, attempt));
+            match flow.as_mut() {
+                Some(handle) => guard.block_on(handle.execute_step(&request, effect_fn)),
+                None => guard.block_on(engine.execute(&request, effect_fn)),
+            }
         });
         outcome_to_py(py, &outcome)
     }
@@ -313,6 +351,137 @@ impl KeelCore {
         guard.block_on(async move {
             tokio::time::advance(Duration::from_millis(ms)).await;
         });
+    }
+
+    /// Open (begin or resume) a Tier 2 durable flow with this identity and make
+    /// it the active flow: subsequent `execute` calls are journaled steps and
+    /// `journal_time`/`journal_random` virtualize reads, until `exit_flow`.
+    ///
+    /// Returns `{"flow_id", "status", "replay"}` — `status` is the flow's state
+    /// at entry (`"completed"` ⇒ a pure replay of a finished run), `replay` is
+    /// that predicate as a bool. Raises `KeelCoreError`: `KEEL-E030` if another
+    /// live holder leases the flow, `KEEL-E032` if it is dead, `KEEL-E040` if
+    /// this core has no journal (Tier 2 requires the native core + a journal).
+    #[pyo3(signature = (entrypoint, args_hash, code_hash=None, explicit_key=None, lease_ms=None))]
+    fn enter_flow(
+        &self,
+        py: Python<'_>,
+        entrypoint: String,
+        args_hash: String,
+        code_hash: Option<String>,
+        explicit_key: Option<String>,
+        lease_ms: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        let journal = self.journal.clone().ok_or_else(|| {
+            keel_error(
+                py,
+                "KEEL-E040",
+                "Tier 2 durable flows require a native core with a journal; this core is \
+                 in-memory. Pass a journal_path (the front end attaches one under .keel/).",
+            )
+        })?;
+        let desc = FlowDescriptor {
+            entrypoint,
+            args_hash,
+            explicit_key,
+            code_hash,
+        };
+        let default = FlowConfig::default();
+        let config = FlowConfig {
+            lease_ttl: lease_ms.map_or(default.lease_ttl, Duration::from_millis),
+            max_attempts: default.max_attempts,
+        };
+        let holder = ProcessId::new(format!("pid-{}", std::process::id()));
+        let manager = FlowManager::with_config(
+            Arc::clone(&self.engine),
+            journal,
+            Arc::new(SystemClock),
+            holder,
+            config,
+        );
+        // Enter inside the runtime so the lease heartbeat can spawn (it no-ops
+        // outside a runtime); the enter itself is synchronous journal work.
+        let handle = {
+            let guard = self.runtime.lock().expect("keel-py runtime mutex poisoned");
+            guard.block_on(async { manager.enter_flow(&desc) })
+        }
+        .map_err(|e| keel_error_from(py, &e))?;
+
+        let info = json!({
+            "flow_id": handle.flow_id().to_string(),
+            "status": status_str(handle.entry_status()),
+            "replay": handle.is_replay_only(),
+        });
+        *self
+            .active_flow
+            .lock()
+            .expect("keel-py active-flow mutex poisoned") = Some(handle);
+        pythonize(py, &info)
+            .map(Bound::unbind)
+            .map_err(|e| keel_error(py, "KEEL-E040", &format!("flow info not encodable: {e}")))
+    }
+
+    /// Close the active flow, stamping its terminal `status` (`"completed"` or
+    /// `"failed"`) and aborting the lease heartbeat. A no-op if no flow is open,
+    /// so the front end can call it unconditionally on scope exit.
+    fn exit_flow(&self, py: Python<'_>, status: &str) -> PyResult<()> {
+        let final_status = match status {
+            "completed" => FlowStatus::Completed,
+            "failed" => FlowStatus::Failed,
+            other => {
+                return Err(keel_error(
+                    py,
+                    "KEEL-E040",
+                    &format!("exit_flow status must be \"completed\" or \"failed\", got {other:?}"),
+                ));
+            }
+        };
+        let handle = self
+            .active_flow
+            .lock()
+            .expect("keel-py active-flow mutex poisoned")
+            .take();
+        if let Some(mut handle) = handle {
+            handle.complete(final_status);
+            // `handle` drops here, aborting the heartbeat task.
+        }
+        Ok(())
+    }
+
+    /// Journal (or, on replay, substitute) a virtualized clock read under `key`
+    /// (the front-end convention, e.g. `py:time.time#-`). Must be inside a flow.
+    fn journal_time(&self, py: Python<'_>, key: &str, now_ms: i64) -> PyResult<i64> {
+        let mut guard = self
+            .active_flow
+            .lock()
+            .expect("keel-py active-flow mutex poisoned");
+        let handle = guard
+            .as_mut()
+            .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_time called outside a flow"))?;
+        handle
+            .journal_time(key, now_ms)
+            .map_err(|e| keel_error_from(py, &e))
+    }
+
+    /// Journal (or substitute) a virtualized random draw under `key` (e.g.
+    /// `py:random.random#-`). Must be inside a flow.
+    fn journal_random<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        data: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut guard = self
+            .active_flow
+            .lock()
+            .expect("keel-py active-flow mutex poisoned");
+        let handle = guard
+            .as_mut()
+            .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_random called outside a flow"))?;
+        let out = handle
+            .journal_random(key, data)
+            .map_err(|e| keel_error_from(py, &e))?;
+        Ok(PyBytes::new(py, &out))
     }
 }
 
