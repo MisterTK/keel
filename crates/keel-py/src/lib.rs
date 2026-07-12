@@ -466,8 +466,9 @@ impl KeelCore {
     /// resolves to the outcome dict. `effect(attempt)` is awaited on the caller's
     /// asyncio loop, so it may be an `async def` performing real async IO.
     ///
-    /// Refuses (KEEL-E001) if a durable flow is open: async effects inside a flow
-    /// are unsupported in v0.1 and would bypass the journal (Tier 1 downgrade).
+    /// Refuses (KEEL-E005, unsupported-configuration) if a durable flow is open:
+    /// async effects inside a flow are unsupported in v0.1 and would bypass the
+    /// journal (Tier 1 downgrade).
     fn execute_async<'py>(
         &self,
         py: Python<'py>,
@@ -485,7 +486,7 @@ impl KeelCore {
         if lock_recover(&self.active_flow).is_some() {
             return Err(keel_error(
                 py,
-                "KEEL-E001",
+                "KEEL-E005",
                 "async effects inside durable flows are not supported in v0.1; this call would \
                  bypass the flow journal and silently run as Tier 1. Run the flow synchronously \
                  (no async def / await for intercepted calls inside the flow), or remove this \

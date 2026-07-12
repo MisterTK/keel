@@ -13,10 +13,12 @@ cannot journal/replay, and a native core with no journal has nothing to resume
 from — either case is a precise, actionable error (never a silent Tier-1
 downgrade — a Level 0 surprise is a P0). Both gates are checked *here*, before
 `enter_flow`, so the backend's last-resort KEEL-E040 ("pass a journal_path") is
-unreachable from `keel run`; the front-end error is config-level (KEEL-E001).
+unreachable from `keel run`. The policy itself is valid — what is missing is a
+capability of this build/configuration — so the front-end error is KEEL-E005
+(unsupported-configuration), not the validation code E001.
 
 Durable flows are synchronous-only in v0.1: an async intercepted call inside a
-flow would bypass the journal, so the native backend refuses it (KEEL-E001).
+flow would bypass the journal, so the native backend refuses it (KEEL-E005).
 Keep flow bodies synchronous, or drop the entrypoint from `[flows]`.
 """
 
@@ -138,10 +140,11 @@ def _import_flow_function(target: str, entry: FlowEntrypoint) -> Any:
 
 
 def _unsupported_on_stub(entry: FlowEntrypoint) -> None:
-    """Emit the precise what/why/next error for a flow under a non-native
-    backend and exit 1 (Tier 2 requires the native core)."""
+    """Emit the precise what/why/next error (KEEL-E005) for a flow under a
+    non-native backend and exit 1 (Tier 2 requires the native core). The policy
+    is valid; the capability is missing — unsupported-configuration, not E001."""
     sys.stderr.write(
-        f"keel ▸ Tier 2 durable flow {entry.raw!r} needs the native core.\n"
+        f"keel ▸ KEEL-E005: Tier 2 durable flow {entry.raw!r} needs the native core.\n"
         "  why:  crash-safe resume journals and replays each step; the pure-Python "
         "stub backend cannot do that.\n"
         "  next: build the native module (`maturin develop` in crates/keel-py) or set "
@@ -157,12 +160,13 @@ def backend_has_journal(backend: Any) -> bool:
 
 
 def _unsupported_without_journal(entry: FlowEntrypoint) -> None:
-    """Emit the precise config-level error (KEEL-E001) for a native backend with
-    no journal, and exit 1. Checked *before* `enter_flow`, so the backend's
-    last-resort KEEL-E040 ("pass a journal_path") is never reached from `keel
-    run` — the front end owns this diagnosis at the correct (policy) altitude."""
+    """Emit the precise config-level error (KEEL-E005, unsupported-configuration)
+    for a native backend with no journal, and exit 1. Checked *before*
+    `enter_flow`, so the backend's last-resort KEEL-E040 ("pass a journal_path")
+    is never reached from `keel run` — the front end owns this diagnosis at the
+    correct (policy) altitude."""
     sys.stderr.write(
-        f"keel ▸ KEEL-E001: durable flow {entry.raw!r} needs a journal, but none is attached.\n"
+        f"keel ▸ KEEL-E005: durable flow {entry.raw!r} needs a journal, but none is attached.\n"
         "  why:  Tier 2 journals and replays each step; with no journal there is nothing "
         "to record to or resume from.\n"
         "  next: let the native core open .keel/journal.db (check KEEL_JOURNAL and directory "

@@ -159,6 +159,7 @@ mod tests {
     fn taxonomy_parses_and_has_the_frozen_codes() {
         let t = taxonomy();
         assert!(t.codes.contains_key("KEEL-E001"));
+        assert!(t.codes.contains_key("KEEL-E005"));
         assert!(t.codes.contains_key("KEEL-E014"));
         assert!(t.codes.contains_key("KEEL-E040"));
     }

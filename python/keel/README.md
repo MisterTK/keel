@@ -49,12 +49,13 @@ of these are hard, actionable errors rather than a quiet fallback:
 
 - **A journal is required.** Tier 2 replay lives in `.keel/journal.db`. If the
   native core can't attach one (e.g. `KEEL_JOURNAL=""` or an unwritable dir), a
-  designated flow fails at startup with a config-level **KEEL-E001** naming the
-  cause and fix — it does not run un-journaled. (The stub backend, which has no
+  designated flow fails at startup with a config-level **KEEL-E005**
+  (unsupported-configuration) naming the cause and fix — it does not run
+  un-journaled. (The stub backend, which has no
   journal at all, reports the same class of error, pointing you at the native
   core.)
 - **Flows are synchronous-only.** An `async` intercepted call inside a flow
-  would bypass the journal, so the native backend refuses it with **KEEL-E001**
+  would bypass the journal, so the native backend refuses it with **KEEL-E005**
   ("async effects inside durable flows are not supported in v0.1"). Keep flow
   bodies synchronous, or drop the entrypoint from `[flows]`.
 
