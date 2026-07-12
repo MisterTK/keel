@@ -181,6 +181,13 @@ fn init_observed_llm_matches_golden() {
     check_golden("init_llm_observed.toml", &out);
 }
 
+/// `keel init --agents` drops a fixed, agent-facing section (dx-spec §5); its
+/// bytes are golden so an agent can diff it across versions.
+#[test]
+fn init_agents_snippet_matches_golden() {
+    check_golden("init_agents.md", &init::agents_block());
+}
+
 // ---- status / doctor / explain: --json golden-tested ----
 
 #[test]

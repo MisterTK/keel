@@ -65,3 +65,20 @@ Permanent roles: contract steward (guards `contracts/` — the compatibility pro
 ## Risk register (weekend-specific)
 
 Top three ways this weekend fails, and the countermeasure baked in: **(1) contract churn mid-Saturday** → CCR-only changes, orchestrator arbitration, stub insulates teams; **(2) async FFI bridging eats Sunday** → Team A builds the PyO3-async/napi-tokio bridge *Saturday* as part of the FFI surface with a dedicated bridge conformance test, not discovered Sunday; **(3) scope creep toward Tier 2 glamour** → the midday gate is binary and the orchestrator enforces it; the DX spec's Level 0 polish list is the pre-agreed definition of "what we polish instead."
+
+---
+
+## Completion annotation (2026-07-12)
+
+The weekend's plan was executed as 17 tasks; all landed. What shipped against the plan:
+
+- **Sprint 0 (contracts + stubs + conformance):** shipped as planned — `contracts-v1` frozen, three-language stubs, conformance corpus (grown from 15 to **17** scenarios with the two Tier 2 additions).
+- **Sprint 1 (the real core + both front ends + CLI):** shipped. `crates/keel-core` (engine + `keel-journal` discovery/flow journal + OTel), `crates/keel-ffi` (C ABI + MessagePack) with **PyO3 and napi async bridges** (risk #2 retired with a bridge conformance test, as planned). Python + Node front ends with httpx/requests/fetch adapters and `llm:`/`mcp:`/AI-SDK packs. CLI `run·init·doctor·status·explain` — plus `flows·trace` (below).
+- **Sprint 2 midday gate — Tier 2: GO.** Durable flows shipped beyond the "Python demo only" floor: flow journaling, resume-on-rerun with step substitution, `fail`/`warn`/`branch` nondeterminism responses, leases + attempt cap, and time/random virtualization, all in the real core; the Python front end designates flows from `[flows]`; `keel flows`/`keel trace` expose them. The `kill -9` → resume demo is a real subprocess test.
+- **Overhead:** measured **~0.56 µs** worst-case wrapped call vs the 10 µs budget (DX invariant 8), emitted as a CI artifact.
+
+Delivered beyond / deferred from the RC-1 evening list:
+- **Delivered:** four runnable demos + `tools/faultproxy` (deterministic, no network), the 40-second storyboard as a script, `llms.txt`/`llms-full.txt`, and `keel init --agents`.
+- **Deferred (honest gaps):** wheels/npm/brew are **not published** — everything builds from source; the asciinema is a shooting script, not a recording; Postgres/fleet journal (Level 3), `keel mcp`, `keel record test`, and further adapter packs remain future work per the standing structure above.
+
+The referee held throughout: conformance green in every harness at each step, `contracts/` unchanged since freeze.

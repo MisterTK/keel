@@ -1,0 +1,43 @@
+# Keel
+
+> The SQLite of durable execution: production-grade resilience (retry, backoff,
+> timeout, circuit breaker, rate limit, LLM dev-cache) and opt-in crash-resumable
+> durable flows, as an in-process library with zero code changes. Policy lives in
+> one `keel.toml`; state is files in `.keel/`. No daemon, no port, no login.
+
+Keel intercepts a program's outbound calls (httpx/requests/fetch, LLM SDKs,
+`py:`/`ts:` function targets) and applies a policy at the call boundary. Adding
+it is `keel run app.py` / `keel run app.mjs` — no imports, no context objects, no
+base classes. Uninstalling the package removes the behavior and nothing else.
+
+Status (2026-07-12): Tier 1 works end-to-end in Python + Node on the real Rust
+core, plus the CLI and Tier 2 durable flows with `kill -9` resume. Wrapped-call
+overhead ~0.56 µs vs a 10 µs budget. Wheels/npm are not published yet — build
+from source.
+
+## Start here
+
+- [README](README.md): status, quickstart per language, demo + conformance tables, repo layout.
+- [Architecture spec](docs/architecture-spec.md): the two-tier model (Tier 1 resilience, Tier 2 durability), core, journal, front ends.
+- [DX spec](docs/dx-spec.md): the "just works" ladder (Levels 0–3), DX invariants, agent-framework packs, the agent-facing surface.
+
+## Concepts (one canonical example each)
+
+- [Level 0 — zero config](docs/dx-spec.md): `keel run app.py` → conservative production defaults on every discovered call. Never changes success-path semantics; never retries non-idempotent calls by default.
+- [Level 1 — `keel init`](docs/dx-spec.md): generate a `keel.toml` from static + observed evidence; every entry cites `file:line`. `keel init --diff` previews changes.
+- [Level 2 — durable flows](demos/durable-pipeline/README.md): list `py:mod:fn` under `[flows]`; a crashed run resumes and replays completed steps without re-firing effects.
+- [Targets](contracts/policy.schema.json): `host` (e.g. `api.stripe.com`), `py:`/`ts:` functions, and semantic `llm:<provider>` / `tool:<name>` / `mcp:<server>`.
+- [LLM dev-cache](demos/agent-demo/README.md): `cache = { mode = "dev" }` replays identical prompts off `KEEL_ENV=prod`; with the native core it persists across runs (~0 API calls on a repeat).
+
+## Reference
+
+- [Policy schema](contracts/policy.schema.json) and [smart defaults](contracts/defaults.toml).
+- [Error codes](contracts/error-codes.json): the frozen `KEEL-E0NN` taxonomy. `keel explain <code>` prints what/why/next.
+- [CLI](crates/keel-cli): `run · init · doctor · status · explain · flows · trace`; every command has a deterministic `--json` twin.
+- [llms-full.txt](llms-full.txt): the full corpus (all of the above expanded, with the CLI + error-code reference inline).
+
+## For coding agents
+
+- Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
+- `keel init --agents` drops a Keel section into `AGENTS.md`/`CLAUDE.md`.
+- Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.

@@ -31,6 +31,119 @@ pub struct InitOptions {
     pub diff: bool,
     /// Stamp today's date into the header (off by default for determinism).
     pub stamp: bool,
+    /// Drop the Keel section into `AGENTS.md` (dx-spec §5) instead of generating
+    /// a policy — so every future coding-agent session inherits Keel context.
+    pub agents: bool,
+}
+
+/// Marker fencing the Keel-managed region in `AGENTS.md`, so a re-run updates the
+/// section in place (idempotent) instead of appending a duplicate.
+const AGENTS_BEGIN: &str = "<!-- keel:begin -->";
+const AGENTS_END: &str = "<!-- keel:end -->";
+
+/// The concise, agent-facing Keel section (dx-spec §5). Deterministic: no dates
+/// or versions, so an agent can diff it. Bytes are golden-tested.
+const AGENTS_SNIPPET: &str = "\
+## Keel (resilience & durable execution)
+
+This project uses **Keel** for production-grade resilience (retries, timeouts,
+circuit breakers, rate limits) and opt-in durable flows — applied at intercepted
+call boundaries with **zero code changes**. Policy lives in one file: `keel.toml`.
+
+Before changing any resilience behavior:
+- Run `keel doctor --json` to see what is wrapped, what is not, and why.
+- Propose policy edits as a diff: `keel init --diff` shows adds/removes from evidence.
+- Every command has a `--json` twin with deterministic, sorted output — diff it to detect change.
+
+Useful commands (all support `--json`):
+- `keel status` — coverage, retries saved, breaker events, resumable flows.
+- `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
+- `keel flows` / `keel trace <flow>` — durable (Tier 2) flow state and step ledger.
+
+Do not hand-write retry loops or backoff around calls Keel already wraps; edit
+`keel.toml` instead. Uninstalling Keel removes the behavior and nothing else —
+the code runs identically without it.";
+
+/// The full fenced block written into `AGENTS.md` (begin marker, snippet, end
+/// marker, trailing newline). Public so the golden test can pin its bytes.
+#[must_use]
+pub fn agents_block() -> String {
+    format!("{AGENTS_BEGIN}\n{AGENTS_SNIPPET}\n{AGENTS_END}\n")
+}
+
+/// The machine twin of `--agents`.
+#[derive(Debug, Serialize)]
+struct AgentsReport {
+    already_current: bool,
+    path: String,
+    updated: bool,
+    wrote: bool,
+}
+
+/// `keel init --agents`: create/update the Keel section in `AGENTS.md`. Idempotent
+/// — a marker-fenced region is replaced in place on re-run, so it never appends a
+/// duplicate and reflects the current snippet exactly.
+fn run_agents(project: &Path) -> Rendered {
+    let path = project.join("AGENTS.md");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return config_error(&format!("could not read {}: {e}", path.display())),
+    };
+    let block = agents_block();
+    let (new_content, replaced, wrote) = splice_agents_block(&existing, &block);
+    let already_current = !wrote;
+    // `updated` = we replaced an existing region AND its bytes changed; a fresh
+    // create is `wrote` but not `updated`, and a no-op re-run is neither.
+    let updated = wrote && replaced;
+    if wrote
+        && let Err(e) = std::fs::write(&path, &new_content)
+    {
+        return config_error(&format!("could not write {}: {e}", path.display()));
+    }
+    let verb = if already_current {
+        "already current"
+    } else if updated {
+        "updated the Keel section in"
+    } else {
+        "wrote the Keel section to"
+    };
+    let human = format!("keel \u{25b8} {verb} {}", path.display());
+    let report = AgentsReport {
+        already_current,
+        path: path.display().to_string(),
+        updated,
+        wrote,
+    };
+    Rendered::ok(human, to_json(&report))
+}
+
+/// Compute the new `AGENTS.md` content given the existing text and the desired
+/// block. Returns `(content, replaced_existing, needs_write)`. Pure — unit
+/// tested. Replaces a marker-fenced region in place; else appends (or creates).
+fn splice_agents_block(existing: &str, block: &str) -> (String, bool, bool) {
+    if let (Some(start), Some(end_idx)) = (existing.find(AGENTS_BEGIN), existing.find(AGENTS_END)) {
+        let end = end_idx + AGENTS_END.len();
+        // Consume a single trailing newline after the end marker so re-splicing
+        // is stable (the block already ends in one).
+        let tail_start = existing[end..].strip_prefix('\n').map_or(end, |_| end + 1);
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..start]);
+        out.push_str(block);
+        out.push_str(&existing[tail_start..]);
+        let needs_write = out != existing;
+        return (out, true, needs_write);
+    }
+    if existing.is_empty() {
+        return (block.to_owned(), false, true);
+    }
+    let mut out = existing.to_owned();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(block);
+    (out, false, true)
 }
 
 /// The machine twin of a write.
@@ -53,6 +166,9 @@ struct DiffReport {
 
 /// Run `keel init` for `project`.
 pub fn run(project: &Path, opts: InitOptions) -> Rendered {
+    if opts.agents {
+        return run_agents(project);
+    }
     let scan = scan::scan(project);
     let discovery = match evidence::read_discovery(project) {
         Ok(d) => d,
@@ -821,6 +937,7 @@ mod tests {
             InitOptions {
                 diff: true,
                 stamp: false,
+                agents: false,
             },
         );
 
@@ -841,6 +958,44 @@ mod tests {
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             "[target.\"api.gone.example\"]\ntimeout = \"30s\"\n"
         );
+    }
+
+    // ---- keel init --agents ----
+
+    #[test]
+    fn agents_creates_then_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let opts = InitOptions {
+            agents: true,
+            ..InitOptions::default()
+        };
+        let r1 = run(dir.path(), opts);
+        assert_eq!(r1.exit, crate::EXIT_OK);
+        assert!(r1.json["wrote"].as_bool().unwrap());
+        let path = dir.path().join("AGENTS.md");
+        let c1 = fs::read_to_string(&path).unwrap();
+        assert!(c1.contains("## Keel (resilience & durable execution)"));
+        assert!(c1.contains("keel doctor --json"));
+
+        // Re-run: nothing to change → already current, file byte-identical.
+        let r2 = run(dir.path(), opts);
+        assert!(r2.json["already_current"].as_bool().unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), c1);
+    }
+
+    #[test]
+    fn splice_appends_then_replaces_region_without_duplicating() {
+        let block = agents_block();
+        // Append below existing prose.
+        let (out, replaced, wrote) = splice_agents_block("# My project\n", &block);
+        assert!(!replaced && wrote);
+        assert!(out.starts_with("# My project\n\n"));
+        assert!(out.contains(AGENTS_BEGIN) && out.contains(AGENTS_END));
+        // Re-splicing the same block replaces in place and is a no-op write.
+        let (out2, replaced2, wrote2) = splice_agents_block(&out, &block);
+        assert!(replaced2 && !wrote2);
+        assert_eq!(out2, out);
+        assert_eq!(out2.matches(AGENTS_BEGIN).count(), 1, "exactly one Keel block");
     }
 
     #[test]

@@ -48,6 +48,10 @@ enum Command {
         /// Stamp today's date into the header (off by default for determinism).
         #[arg(long)]
         stamp: bool,
+        /// Drop the Keel section into AGENTS.md for coding agents (dx-spec §5),
+        /// instead of generating a policy.
+        #[arg(long)]
+        agents: bool,
     },
     /// Report coverage, adapters, and policy validity (the honesty report).
     Doctor,
@@ -88,8 +92,12 @@ fn main() {
             }
             code
         }
-        Command::Init { diff, stamp } => {
-            let r = init::run(&project, init::InitOptions { diff, stamp });
+        Command::Init {
+            diff,
+            stamp,
+            agents,
+        } => {
+            let r = init::run(&project, init::InitOptions { diff, stamp, agents });
             emit(&r, json)
         }
         Command::Doctor => emit(&doctor::run(&project), json),
