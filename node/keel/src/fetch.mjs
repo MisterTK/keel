@@ -86,6 +86,7 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     // memory leak), and the success path is untouched.
     let held = null;
 
+    const started = performance.now();
     const outcome = await backend.execute(request, async () => {
       const { signal, cancel } = withTimeout(init?.signal, timeoutMs);
       const attemptInit = signal ? { ...init, signal } : init;
@@ -118,7 +119,7 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
       }
     });
 
-    discovery?.observe(target, hostname);
+    discovery?.observe(target, outcome, performance.now() - started);
 
     if (outcome.result === "ok") return attachOutcome(outcome.payload, outcome);
 

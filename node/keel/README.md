@@ -195,20 +195,33 @@ dropped by the clone — expected, documented.
 ## Discovery — `.keel/discovery.db`
 
 An always-on, cheap aggregate of observed traffic (DX §2), written with Node's
-builtin `node:sqlite` (`DatabaseSync`, zero native deps). Counters come from the
-backend's own per-target report (single source of truth) and accumulate across
-runs; the set of hosts seen per target is unioned. Best-effort: discovery never
-throws into, slows, or adds output to your program. Schema:
+builtin `node:sqlite` (`DatabaseSync`, zero native deps). Each intercepted call's
+Outcome is folded into a per-target aggregate in memory on the hot path and
+written once at exit. The table is the **canonical discovery schema** owned by
+`crates/keel-journal` (`src/discovery.rs`) — byte-for-byte the same across the
+Rust core and both front ends, so one `.keel/discovery.db` is inspectable the
+same way everywhere. Best-effort: discovery never throws into, slows, or adds
+output to your program. Schema (WAL, `WITHOUT ROWID`, single self-contained
+UPSERT):
 
 ```sql
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, envelope_version
 CREATE TABLE discovery (
-  target TEXT PRIMARY KEY,
+  target            TEXT PRIMARY KEY,
   calls, attempts, retries, successes, failures,
-  cache_hits, throttled, breaker_opens INTEGER,
-  breaker_state TEXT, hosts TEXT /* JSON */, last_seen_ms INTEGER
-);
+  cache_hits, throttled, breaker_opens INTEGER NOT NULL DEFAULT 0,
+  total_latency_ms  INTEGER NOT NULL DEFAULT 0,  -- Σ latency, for the mean
+  max_latency_ms    INTEGER NOT NULL DEFAULT 0,
+  first_seen_ms     INTEGER NOT NULL,
+  last_seen_ms      INTEGER NOT NULL,
+  last_error_class  TEXT,                         -- most recent error's class
+  last_error_status INTEGER                       -- …and its HTTP status
+) WITHOUT ROWID;
 ```
+
+Accounting matches the canonical store: a cache hit is a `call` and a `cache_hit`
+only (no upstream attempt), so `calls == successes + failures + cache_hits`;
+`breaker_opens` counts calls that saw an OPEN breaker (fail-fast, KEEL-E012);
+`last_error_*` is never erased by a later success.
 
 ## `KEEL_DISABLE=1`
 

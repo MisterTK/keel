@@ -60,18 +60,18 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
     });
   }
 
-  installExitFlush(backend, discovery);
+  installExitFlush(discovery);
   banner(env, source, wrappable.length, mcp);
   return { enabled: true, backend, discovery, functionTargets, uninstallFetch, mcp };
 }
 
-function installExitFlush(backend, discovery) {
+function installExitFlush(discovery) {
   let flushed = false;
   process.once("exit", () => {
     if (flushed) return;
     flushed = true;
     try {
-      discovery.flushSync(backend.report());
+      discovery.flushSync();
     } catch {
       /* best-effort */
     }
