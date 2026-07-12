@@ -95,8 +95,8 @@ export function classifyModelError(err) {
   return { class: "other", message: err?.message ?? String(err) };
 }
 
-function settle(outcome, target, discovery) {
-  discovery?.observe(target, null);
+function settle(outcome, target, discovery, latencyMs) {
+  discovery?.observe(target, outcome, latencyMs);
   if (outcome.result === "ok") return attachOutcome(outcome.payload, outcome);
   const orig = outcome.error?.original;
   if (orig instanceof Error) throw attachOutcome(orig, outcome);
@@ -126,6 +126,7 @@ export function keelMiddleware(options = {}) {
       idempotent: true,
       args_hash: cacheable ? hashParams(params) : null,
     };
+    const started = performance.now();
     const outcome = await backend.execute(request, async () => {
       try {
         return { status: "ok", payload: await effect() };
@@ -133,7 +134,7 @@ export function keelMiddleware(options = {}) {
         return { status: "error", ...classifyModelError(err), original: err };
       }
     });
-    return settle(outcome, target, discoveryOf());
+    return settle(outcome, target, discoveryOf(), performance.now() - started);
   };
 
   return {

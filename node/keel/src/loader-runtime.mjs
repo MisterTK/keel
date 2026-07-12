@@ -33,6 +33,7 @@ export function wrapExport(target, fn) {
     if (!backend) return fn.apply(this, args); // disabled: transparent passthrough
     const request = { v: 1, target, op: target, idempotent: true, args_hash: hashArgs(args) };
     const self = this;
+    const started = performance.now();
     const outcome = await backend.execute(request, async () => {
       try {
         return { status: "ok", payload: await fn.apply(self, args) };
@@ -40,7 +41,7 @@ export function wrapExport(target, fn) {
         return { status: "error", class: "other", message: err?.message ?? String(err), original: err };
       }
     });
-    getDiscovery()?.observe(target, null);
+    getDiscovery()?.observe(target, outcome, performance.now() - started);
     if (outcome.result === "ok") return outcome.payload;
     const orig = outcome.error?.original;
     if (orig instanceof Error) throw attachOutcome(orig, outcome);

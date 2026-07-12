@@ -150,6 +150,7 @@ export function makeWrappedRequest(original, deps = {}) {
     // side-effecting call (the SDK still applies its own timeout as a backstop).
     const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
 
+    const started = performance.now();
     const outcome = await backend.execute(req, async () => {
       const deadline = armDeadline(options?.signal, timeoutMs);
       const attemptOptions = deadline.signal ? { ...options, signal: deadline.signal } : options;
@@ -169,7 +170,7 @@ export function makeWrappedRequest(original, deps = {}) {
       }
     });
 
-    (deps.discovery ?? getDiscovery())?.observe(target, null);
+    (deps.discovery ?? getDiscovery())?.observe(target, outcome, performance.now() - started);
     if (outcome.result === "ok") return outcome.payload;
     const orig = outcome.error?.original;
     if (orig instanceof Error) throw attachOutcome(orig, outcome);

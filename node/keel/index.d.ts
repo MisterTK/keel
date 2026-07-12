@@ -86,8 +86,10 @@ export interface Backend {
 
 export interface Discovery {
   dbPath: string;
-  observe(target: string, host: string | null): void;
-  flushSync(report: ReturnType<Backend["report"]>): boolean;
+  /** Fold one intercepted call's Outcome into its target aggregate. */
+  observe(target: string, outcome: Outcome, latencyMs?: number): void;
+  /** Write accumulated aggregates to `.keel/discovery.db` (canonical schema). */
+  flushSync(): boolean;
 }
 
 export declare class KeelError extends Error {
