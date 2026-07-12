@@ -94,12 +94,57 @@ const SCENARIOS = [
       { request: req("svc", { args_hash: "h" }), script: [] },
     ],
   },
+  // --- Time-dependent scenarios (advanceMs jumps the virtual clock BEFORE the
+  // call, on BOTH the stub and the engine identically). Their whole point is to
+  // guard the clock-driven transitions — breaker cooldown, cache TTL expiry,
+  // rate window boundaries — that the time-independent scenarios above never
+  // reach, so a divergence in how either side reads/advances its clock fails
+  // here rather than shipping.
+  {
+    name: "breaker half-open recovers after cooldown, then serves normally",
+    policy: { target: { svc: { retry: { attempts: 1 }, breaker: { failures: 1, cooldown: "1s" } } } },
+    calls: [
+      { request: req("svc"), script: [err({ class: "http", http_status: 500 })] }, // trips breaker
+      { request: req("svc"), script: [] }, // E012 fail-fast while open
+      // Advance past the 1s cooldown: the next call is a half-open probe.
+      { request: req("svc"), advanceMs: 1000, script: [ok("probe")] }, // probe succeeds → closes
+      { request: req("svc"), script: [ok("after")] }, // breaker closed again
+    ],
+  },
+  {
+    name: "cache entry expires after its TTL and the effect re-fires",
+    policy: { target: { svc: { cache: { ttl: "60s" }, retry: { attempts: 1 } } } },
+    calls: [
+      { request: req("svc", { args_hash: "h" }), script: [ok({ v: 1 })] }, // miss → cached
+      { request: req("svc", { args_hash: "h" }), script: [] }, // hit (effect skipped)
+      // Advance to exactly the expiry boundary (now == expires ⇒ expired): miss.
+      { request: req("svc", { args_hash: "h" }), advanceMs: 60000, script: [ok({ v: 2 })] },
+      { request: req("svc", { args_hash: "h" }), script: [] }, // hit on the re-cached value
+    ],
+  },
+  {
+    name: "rate window resets after the window elapses",
+    policy: { target: { svc: { rate: "1/min", retry: { attempts: 1 } } } },
+    calls: [
+      { request: req("svc"), script: [ok("a")] }, // window 0, count 1
+      // Jump to the next 60s window: the second call is NOT throttled.
+      { request: req("svc"), advanceMs: 60000, script: [ok("b")] },
+    ],
+  },
+  {
+    name: "unsupported envelope version → E004 (effect never runs)",
+    policy: level0Defaults(),
+    calls: [
+      { request: req("api.example.com", { v: 2 }), script: [ok("never")] },
+    ],
+  },
 ];
 
 function runStub(policy, calls) {
   const s = new KeelCoreStub();
   s.configure(policy);
   const outcomes = calls.map((c) => {
+    if (c.advanceMs) s.advanceClock(c.advanceMs);
     let i = 0;
     return s.execute(c.request, () => c.script[i++]);
   });
@@ -111,6 +156,7 @@ async function runEngine(policy, calls) {
   e.configure(policy);
   const outcomes = [];
   for (const c of calls) {
+    if (c.advanceMs) e.advanceClock(c.advanceMs);
     let i = 0;
     outcomes.push(await e.execute(c.request, async () => c.script[i++]));
   }
