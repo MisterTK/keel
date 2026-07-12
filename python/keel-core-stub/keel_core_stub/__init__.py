@@ -203,6 +203,12 @@ class KeelCoreStub:
                 return llm[key]
         return defaults.get("outbound", {}).get(key)
 
+    def layer(self, target: str, key: str) -> Any:
+        """Public accessor for a resolved policy layer (front ends read this to
+        honor `idempotency.header` and gate cache buffering). Parity with Node's
+        `AsyncEngine.layer`."""
+        return self._layer(target, key)
+
     # -- execution ---------------------------------------------------------
 
     def _met(self, target: str) -> dict[str, int]:

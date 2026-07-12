@@ -187,7 +187,7 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     host = url.host
     target = _http.resolve_target(host)
     op = f"{method} {host}{url.path}"
-    idem_header = _idempotency_header(target)
+    idem_header = _http.idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
     hash_ = _http.derive_args_hash(target, method, str(url), _buffered_body(request))
     return target, op, idempotent, hash_
@@ -201,15 +201,6 @@ def _buffered_body(request: Any) -> bytes | None:
     # empty (no-body) GET collapses to None so it hashes identically to the
     # requests/Node judges (no trailing separator).
     return (request.content or None) if hasattr(request, "_content") else None
-
-
-def _idempotency_header(target: str) -> str | None:
-    backend = _runtime.get_backend()
-    layer = getattr(backend, "layer", None)
-    if not callable(layer):
-        return None
-    idem = layer(target, "idempotency")
-    return idem.get("header") if isinstance(idem, dict) else None
 
 
 def _is_response(obj: Any) -> bool:
@@ -279,7 +270,10 @@ def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    cacheable = hash_ is not None
+    # Buffer the body ONLY when a cache ttl is actually configured for the target
+    # (mirrors Node's fetch gate): with no cache there is nothing to store, so a
+    # streaming/SSE GET must pass through unbuffered at Level 0.
+    cacheable = hash_ is not None and _http.cache_configured(target)
     # Live objects kept side-band so the core payload stays JSON: the ok winner,
     # the last superseded transient (closed on supersede), and a thrown error.
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
@@ -355,7 +349,10 @@ async def _run_async(make_coro: Callable[[], Any], request: Any) -> Any:
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    cacheable = hash_ is not None
+    # Buffer the body ONLY when a cache ttl is actually configured for the target
+    # (mirrors Node's fetch gate): with no cache there is nothing to store, so a
+    # streaming/SSE GET must pass through unbuffered at Level 0.
+    cacheable = hash_ is not None and _http.cache_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
     exec_async = getattr(backend, "execute_async", None)
 

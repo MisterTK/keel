@@ -53,17 +53,19 @@ class _FunctionTargetContract:
     KIND = "stub"
 
     def _install(self, policy: dict[str, Any]) -> Any:
-        backend = load_backend(self.KIND, cwd=self.cwd)
-        backend.configure(policy)
-        _runtime.set_runtime(backend, None)  # discovery not needed here
-        return backend
+        self.backend = load_backend(self.KIND, cwd=self.cwd)
+        self.backend.configure(policy)
+        _runtime.set_runtime(self.backend, None)  # discovery not needed here
+        return self.backend
 
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
+        self.backend: Any = None
 
     def tearDown(self) -> None:
         _runtime.clear_runtime()
+        self.backend = None
         gc.collect()  # let the native core drop its journal connection now
         self._tmp.cleanup()
 
