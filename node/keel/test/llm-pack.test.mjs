@@ -64,6 +64,28 @@ test("resolveDevCache: mode=dev → ttl off-prod, removed in prod, explicit ttl 
   assert.deepEqual(resolveDevCache(plain, { KEEL_ENV: "prod" }), plain);
 });
 
+test("resolveDevCache: persistent flag adds scope=persistent off-prod (Task 14 item 1)", () => {
+  const raw = () => ({ target: { "llm:openai": { cache: { mode: "dev" } } } });
+  // native + journal ⇒ cross-run replay: the dev cache resolves to a persistent scope.
+  assert.deepEqual(resolveDevCache(raw(), {}, { persistent: true }).target["llm:openai"].cache, {
+    ttl: DEV_CACHE_TTL,
+    scope: "persistent",
+  });
+  // default (stub / in-memory) is unchanged: no scope key.
+  assert.deepEqual(resolveDevCache(raw(), {}).target["llm:openai"].cache, { ttl: DEV_CACHE_TTL });
+  // still inert in prod even when persistent is available.
+  assert.equal(
+    resolveDevCache(raw(), { KEEL_ENV: "prod" }, { persistent: true }).target["llm:openai"].cache,
+    undefined
+  );
+  // an explicitly-set scope is preserved, not overwritten.
+  const scoped = { defaults: { llm: { cache: { mode: "dev", scope: "memory" } } } };
+  assert.deepEqual(resolveDevCache(scoped, {}, { persistent: true }).defaults.llm.cache, {
+    ttl: DEV_CACHE_TTL,
+    scope: "memory",
+  });
+});
+
 test("resolveDevCache treats KEEL_ENV with surrounding whitespace/case as prod (Python parity)", () => {
   const raw = () => ({ target: { "llm:openai": { cache: { mode: "dev" } } } });
   for (const env of [" prod ", "PROD", "  Prod\t"]) {

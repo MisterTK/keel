@@ -33,11 +33,13 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   installed = true;
 
   const { policy: raw, source } = loadPolicy(cwd); // throws KEEL-E001 on bad syntax
+  // Backend first: whether it's persistent (native + attached journal) decides
+  // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
+  const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
   // Layer the embedded pack defaults UNDER user config, then resolve the LLM
-  // dev cache (mode:"dev" → concrete ttl off-prod, inert when KEEL_ENV=prod).
-  // Both steps mirror the Python front end's policy-merge behavior exactly.
-  const policy = resolveDevCache(applyPackDefaults(raw), env);
-  const backend = await loadBackend({ preferred: env.KEEL_BACKEND });
+  // dev cache (mode:"dev" → concrete ttl off-prod, inert when KEEL_ENV=prod;
+  // scope=persistent when the backend can persist). Mirrors the Python front end.
+  const policy = resolveDevCache(applyPackDefaults(raw), env, { persistent: backend.persistent });
   backend.configure(policy); // throws KEEL-E001 on invalid policy
 
   const discovery = createDiscovery(cwd);

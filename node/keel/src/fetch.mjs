@@ -30,11 +30,15 @@ import {
   parseRetryAfter,
   classifyThrow,
   isTransientStatus,
+  responseEnvelope,
+  rebuildResponse,
 } from "./judge.mjs";
 import { attachOutcome } from "./runtime.mjs";
 import { KeelError } from "./engine.mjs";
 
-const isResponse = (v) => typeof Response !== "undefined" && v instanceof Response;
+function isTable(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
 
 /** Cancel a response body we are discarding, quietly. */
 function cancelBody(resp) {
@@ -80,11 +84,19 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     // non-idempotent success path.
     const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
 
-    // Track the last transient (5xx/429) response. On a retry it is superseded
-    // and its body cancelled; only the response we actually return keeps its
-    // body — so retries never leave an undrained body (no undici warnings, no
-    // memory leak), and the success path is untouched.
-    let held = null;
+    // Only a call the core may actually cache needs its body buffered into the
+    // payload envelope (for a cross-call / cross-run replay). Everything else
+    // sends a cheap status/headers envelope and hands back the LIVE response.
+    const cacheCfg = backend.layer(target, "cache");
+    const cacheable = hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined;
+
+    // Live objects kept side-band so the core payload can stay JSON: the winning
+    // ok response, the last superseded transient (5xx/429), and the last thrown
+    // transport error. The response we hand back keeps its body; superseded
+    // transients are cancelled so retries never leave an undrained body.
+    let heldOk = null;
+    let heldTransient = null;
+    let heldErr = null;
 
     const started = performance.now();
     const outcome = await backend.execute(request, async () => {
@@ -92,28 +104,25 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
       const attemptInit = signal ? { ...init, signal } : init;
       try {
         const resp = await original.call(this, input, attemptInit);
+        heldErr = null;
         if (isTransientStatus(resp.status)) {
-          if (held && held !== resp) cancelBody(held);
-          held = resp;
+          if (heldTransient && heldTransient !== resp) cancelBody(heldTransient);
+          heldTransient = resp;
           return {
             status: "error",
             class: "http",
             http_status: resp.status,
             retry_after_ms: parseRetryAfter(resp.headers.get("retry-after")),
             message: `HTTP ${resp.status}`,
-            original: resp,
           };
         }
-        cancelBody(held); // a good response supersedes any held transient
-        held = null;
-        return { status: "ok", payload: resp };
+        cancelBody(heldTransient); // a good response supersedes any held transient
+        heldTransient = null;
+        heldOk = resp;
+        return { status: "ok", payload: await responseEnvelope(resp, { withBody: cacheable }) };
       } catch (err) {
-        return {
-          status: "error",
-          class: classifyThrow(err),
-          message: err?.message ?? String(err),
-          original: err,
-        };
+        heldErr = err;
+        return { status: "error", class: classifyThrow(err), message: err?.message ?? String(err) };
       } finally {
         cancel();
       }
@@ -121,12 +130,22 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
 
     discovery?.observe(target, outcome, performance.now() - started);
 
-    if (outcome.result === "ok") return attachOutcome(outcome.payload, outcome);
+    if (outcome.result === "ok") {
+      // A cache hit (in-process or, under the persistent journal, across runs)
+      // rebuilds the response from the envelope; a live call returns the real,
+      // unchanged response object (byte-transparency, DX invariant).
+      if (outcome.from_cache) return attachOutcome(rebuildResponse(outcome.payload), outcome);
+      return attachOutcome(heldOk, outcome);
+    }
 
-    const orig = outcome.error?.original;
-    if (isResponse(orig)) return attachOutcome(orig, outcome); // last real HTTP response, unchanged
-    cancelBody(held); // dangling transient before a thrown transport error
-    if (orig instanceof Error) throw attachOutcome(orig, outcome); // original transport error, unchanged
+    // Error: the LAST attempt's live object decides delivery. A thrown transport
+    // error (heldErr set on the final attempt) is re-thrown unchanged; otherwise
+    // the last real 5xx/429 response is returned unchanged (retries exhausted).
+    if (heldErr instanceof Error) {
+      cancelBody(heldTransient); // dangling transient before a thrown transport error
+      throw attachOutcome(heldErr, outcome);
+    }
+    if (heldTransient) return attachOutcome(heldTransient, outcome);
     // No captured original (e.g. breaker open before any attempt): surface a KeelError.
     const e = new KeelError(outcome.error?.code ?? "KEEL-E040", outcome.error?.message ?? "keel failure");
     throw attachOutcome(e, outcome);

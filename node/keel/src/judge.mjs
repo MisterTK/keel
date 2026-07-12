@@ -119,3 +119,49 @@ export function classifyThrow(err) {
 export function isTransientStatus(status) {
   return status === 429 || status >= 500;
 }
+
+// --- response (de)serialization for the core payload -------------------------
+//
+// The core `payload` MUST be JSON (contracts/core_api.rs: `payload: Value`) — the
+// stub tolerates opaque objects, the real native core does not. So a `Response`
+// never crosses the boundary as the payload: we send a JSON ENVELOPE and keep the
+// live `Response` side-band. On the live success path the front end returns the
+// held live object (byte-transparent); only a CACHE HIT (in-process or, under the
+// persistent journal, across runs) rebuilds a `Response` from the envelope.
+
+/** Marker key identifying a serialized HTTP response envelope. */
+export const HTTP_ENVELOPE_MARK = "__keel_http__";
+
+/**
+ * A JSON-serializable envelope of a `Response` for the core payload. `withBody`
+ * (only for cacheable calls) clones the response and buffers the body base64 so
+ * a cache hit can rebuild it; otherwise it's a cheap status/headers envelope and
+ * the body is never read (the live response is returned on the success path).
+ */
+export async function responseEnvelope(resp, { withBody = false } = {}) {
+  const headers = [];
+  for (const [k, v] of resp.headers) headers.push([k, v]);
+  const env = { [HTTP_ENVELOPE_MARK]: 1, status: resp.status, status_text: resp.statusText, headers };
+  if (withBody) {
+    try {
+      const buf = await resp.clone().arrayBuffer();
+      env.body_b64 = Buffer.from(buf).toString("base64");
+    } catch {
+      // Unbuffered/streaming body: leave it out (such calls are not replayable;
+      // the live response is still returned byte-transparently on success).
+    }
+  }
+  return env;
+}
+
+// Statuses that WHATWG forbids a body on; rebuild them with a null body.
+const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+/** Rebuild a `Response` from an envelope (cache-hit replay). */
+export function rebuildResponse(env) {
+  const status = env?.status ?? 200;
+  const headers = Array.isArray(env?.headers) ? env.headers : [];
+  const bytes = env?.body_b64 != null ? Buffer.from(env.body_b64, "base64") : null;
+  const body = NULL_BODY_STATUS.has(status) || !bytes || bytes.length === 0 ? null : bytes;
+  return new Response(body, { status, statusText: env?.status_text ?? "", headers });
+}

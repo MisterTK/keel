@@ -81,13 +81,16 @@ export const llmPack = Object.freeze({
  * (`defaults.llm`, `defaults.outbound`, and each `[target."…"]`):
  *
  *   - `cache = { mode = "dev" }`  → off-prod: `cache = { ttl = "<DEV_CACHE_TTL>" }`
- *                                   (preserving an explicit user ttl if present);
+ *                                   (preserving an explicit user ttl if present),
+ *                                   plus `scope = "persistent"` when `persistent`
+ *                                   is set (native + journal) so identical prompts
+ *                                   replay across RUNS, not just within one;
  *                                 → prod:    the cache layer is removed (inert).
  *   - any other cache layer is left exactly as-is.
  *
  * Returns a NEW policy; the input is never mutated.
  */
-export function resolveDevCache(policy, env = process.env) {
+export function resolveDevCache(policy, env = process.env, { persistent = false } = {}) {
   const prod = isProd(env);
   const out = structuredClone(isTable(policy) ? policy : {});
 
@@ -100,6 +103,7 @@ export function resolveDevCache(policy, env = process.env) {
     const next = { ...owner.cache };
     delete next.mode;
     if (next.ttl === undefined) next.ttl = DEV_CACHE_TTL;
+    if (persistent && next.scope === undefined) next.scope = "persistent";
     owner.cache = next;
   };
 
