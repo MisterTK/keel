@@ -45,6 +45,20 @@ pub trait Journal: Send + Sync {
     /// (KEEL-E031) is the flow manager's concern, not the store's.
     fn lookup_step(&self, flow: &FlowId, seq: u64, key: &StepKey) -> Result<Option<StepOutcome>>;
 
+    /// The recorded step at `seq` regardless of its key: the replay cursor the
+    /// flow manager reads to decide replay-hit vs. `(seq, step_key)` divergence
+    /// (KEEL-E031). It must be consulted *before* [`record_step`](Self::record_step),
+    /// which overwrites `step_key` on a `(flow_id, seq)` conflict. `None` means
+    /// nothing is recorded at that seq yet (normal live progress, not a
+    /// divergence); `Some((key, outcome))` carries the recorded key to compare
+    /// against and the outcome to substitute on a match.
+    fn step_at(&self, flow: &FlowId, seq: u64) -> Result<Option<(StepKey, StepOutcome)>>;
+
+    /// Read one flow by id, if it exists — a status/recovery read (`keel
+    /// status`, and the flow manager's dead/mode check on entry) that sits
+    /// outside the recovery-scoped [`incomplete_flows`](Self::incomplete_flows).
+    fn get_flow(&self, flow: &FlowId) -> Result<Option<FlowDescriptor>>;
+
     /// Move a flow to a terminal (or otherwise final) status, stamping
     /// `updated_at` and clearing any lease.
     fn complete_flow(&self, flow: &FlowId, status: FlowStatus) -> Result<()>;

@@ -267,6 +267,16 @@ impl Journal for FailingJournal {
     ) -> keel_journal::Result<Option<StepOutcome>> {
         Err(injected_failure())
     }
+    fn step_at(
+        &self,
+        _flow: &FlowId,
+        _seq: u64,
+    ) -> keel_journal::Result<Option<(StepKey, StepOutcome)>> {
+        Err(injected_failure())
+    }
+    fn get_flow(&self, _flow: &FlowId) -> keel_journal::Result<Option<FlowDescriptor>> {
+        Err(injected_failure())
+    }
     fn complete_flow(&self, _flow: &FlowId, _status: FlowStatus) -> keel_journal::Result<()> {
         Err(injected_failure())
     }

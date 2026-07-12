@@ -76,20 +76,6 @@ impl<C: Clock> SqliteJournal<C> {
         })
     }
 
-    /// Read one flow by id, if it exists — a status/tooling read (`keel status`)
-    /// that intentionally sits outside the recovery-scoped `incomplete_flows`.
-    pub fn get_flow(&self, flow: &FlowId) -> Result<Option<FlowDescriptor>> {
-        let conn = self.lock();
-        let row = conn
-            .query_row(
-                &format!("SELECT {FLOW_COLUMNS} FROM flows WHERE flow_id = ?1"),
-                params![flow.as_str()],
-                flow_row,
-            )
-            .optional()?;
-        row.map(flow_from_row).transpose()
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("journal connection mutex poisoned")
     }
@@ -167,6 +153,33 @@ impl<C: Clock> Journal for SqliteJournal<C> {
             )
             .optional()?;
         row.map(step_from_row).transpose()
+    }
+
+    fn step_at(&self, flow: &FlowId, seq: u64) -> Result<Option<(StepKey, StepOutcome)>> {
+        let seq = to_i64("seq", seq)?;
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT step_key, kind, attempt, outcome, payload, error_class, started_at, ended_at \
+                 FROM steps WHERE flow_id = ?1 AND seq = ?2",
+                params![flow.as_str(), seq],
+                |row| Ok((row.get::<_, String>(0)?, step_row_from(row, 1)?)),
+            )
+            .optional()?;
+        row.map(|(key, raw)| Ok((StepKey::new(key), step_from_row(raw)?)))
+            .transpose()
+    }
+
+    fn get_flow(&self, flow: &FlowId) -> Result<Option<FlowDescriptor>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                &format!("SELECT {FLOW_COLUMNS} FROM flows WHERE flow_id = ?1"),
+                params![flow.as_str()],
+                flow_row,
+            )
+            .optional()?;
+        row.map(flow_from_row).transpose()
     }
 
     fn complete_flow(&self, flow: &FlowId, status: FlowStatus) -> Result<()> {
@@ -284,14 +297,21 @@ fn flow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRowData> {
 }
 
 fn step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRowData> {
+    step_row_from(row, 0)
+}
+
+/// Extract the seven step columns starting at column index `base`, so a query
+/// that prefixes them (e.g. `step_at`, which selects `step_key` first) reuses
+/// the same typing.
+fn step_row_from(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<StepRowData> {
     Ok(StepRowData {
-        kind: row.get(0)?,
-        attempt: row.get(1)?,
-        outcome: row.get(2)?,
-        payload: row.get(3)?,
-        error_class: row.get(4)?,
-        started_at: row.get(5)?,
-        ended_at: row.get(6)?,
+        kind: row.get(base)?,
+        attempt: row.get(base + 1)?,
+        outcome: row.get(base + 2)?,
+        payload: row.get(base + 3)?,
+        error_class: row.get(base + 4)?,
+        started_at: row.get(base + 5)?,
+        ended_at: row.get(base + 6)?,
     })
 }
 
@@ -421,6 +441,34 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn step_at_reads_the_recorded_key_regardless_of_match() {
+        let dir = TempDir::new().unwrap();
+        let j = journal(&dir, ManualClock::new(T0));
+        let flow = FlowId::new("01FLOW");
+        let key = StepKey::new("api.enrich.internal#q2");
+        j.begin_flow(&sample_flow("01FLOW")).unwrap();
+
+        let outcome = StepOutcome {
+            kind: StepKind::Effect,
+            attempt: 1,
+            status: StepStatus::Ok,
+            payload: Some(vec![0x81, 0xA2, 0x6F, 0x6B, 0xC3]),
+            error_class: None,
+            started_at: T0 + 10,
+            ended_at: Some(T0 + 250),
+        };
+        j.record_step(&flow, 3, &key, &outcome).unwrap();
+
+        // Reads the step at that seq and surfaces its true key — the input the
+        // flow manager compares against to detect divergence.
+        let (got_key, got) = j.step_at(&flow, 3).unwrap().expect("step present");
+        assert_eq!(got_key, key);
+        assert_eq!(got, outcome);
+        // An empty seq is a plain miss, not a divergence.
+        assert!(j.step_at(&flow, 9).unwrap().is_none());
     }
 
     #[test]
