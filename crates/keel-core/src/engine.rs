@@ -474,9 +474,10 @@ impl Engine {
         // a user pointing `journal` at a migration target — or setting an OTLP
         // endpoint — is not surprised when it has no effect (finding: frozen keys
         // accepted and silently ignored).
-        if let Some(journal) = policy.journal.as_ref() {
+        if policy.journal.is_some() {
+            // Note the value is intentionally NOT logged: a `postgres://` journal
+            // location can carry credentials, and this is a diagnostic log line.
             warn!(
-                journal = %journal.0,
                 "policy `journal` is validated but not yet wired: v0.1 selects the journal path at \
                  startup (KEEL_JOURNAL env or .keel/journal.db). This value has no effect."
             );
