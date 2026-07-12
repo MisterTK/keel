@@ -105,7 +105,10 @@ async function tryLoadNative({ journalPath } = {}) {
 
 /**
  * Where the native core attaches its journal (persistent dev cache + Tier 2).
- * `KEEL_JOURNAL` overrides the path; an explicit empty value disables it.
+ * `KEEL_JOURNAL` overrides the path; an explicit empty value disables it. This
+ * is the *construction-time* default: keel.toml's `journal` key replaces it at
+ * configure time unless KEEL_JOURNAL is set, in which case the env wins (see
+ * `applyJournalEnvOverride` in bootstrap.mjs).
  */
 function resolveJournalPath(cwd, env) {
   const override = env.KEEL_JOURNAL;

@@ -51,7 +51,7 @@ use keel_core_api::{
     OutcomeError, Request,
 };
 use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
-use keel_journal::{FlowStatus, Journal, ProcessId, SqliteJournal, SystemClock};
+use keel_journal::{FlowStatus, ProcessId, SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -324,12 +324,14 @@ fn status_str(status: FlowStatus) -> &'static str {
 /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
 /// `runtime` (behind a `Mutex`) drives the synchronous/paused-clock paths.
 ///
-/// Tier 2 flow state (native-only): `journal` is the shared store a
-/// [`FlowManager`] runs steps over (the same journal the engine caches through),
-/// and `active_flow` holds the [`FlowHandle`] between `enter_flow` and
-/// `exit_flow`. While a flow is active, `execute` routes each intercepted call
-/// through the handle's `execute_step` (journaled, replayable) instead of the
-/// bare engine — the front end drives the *same* `execute` API either way.
+/// Tier 2 flow state (native-only): the journal a [`FlowManager`] runs steps
+/// over is read *live* from `engine.journal()` (the same store the engine
+/// caches through — a `configure` whose policy carries a `journal` location
+/// replaces it), and `active_flow` holds the [`FlowHandle`] between
+/// `enter_flow` and `exit_flow`. While a flow is active, `execute` routes each
+/// intercepted call through the handle's `execute_step` (journaled, replayable)
+/// instead of the bare engine — the front end drives the *same* `execute` API
+/// either way.
 #[pyclass(module = "keel_core")]
 struct KeelCore {
     engine: Arc<Engine>,
@@ -338,11 +340,6 @@ struct KeelCore {
     /// `advance_clock` is valid only on such a handle — advancing a real-time
     /// runtime panics tokio, so we refuse it precisely instead.
     paused: bool,
-    /// True when a journal is attached (the persistent dev-cache scope is live).
-    persistent: bool,
-    /// The shared journal for Tier 2 flows, if one is attached (`None` for an
-    /// in-memory core — flows then raise a precise KEEL-E040 unsupported error).
-    journal: Option<Arc<dyn Journal>>,
     /// The flow currently open (between `enter_flow`/`exit_flow`), if any.
     active_flow: Mutex<Option<FlowHandle>>,
 }
@@ -350,8 +347,7 @@ struct KeelCore {
 impl core::fmt::Debug for KeelCore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("KeelCore")
-            .field("persistent", &self.persistent)
-            .field("has_journal", &self.journal.is_some())
+            .field("has_journal", &self.engine.journal().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -375,32 +371,24 @@ impl KeelCore {
         // `Engine::new` reads `tokio::time::Instant::now()`; build it inside the
         // runtime so the paused clock's epoch is anchored (see `keel-ffi`).
         let mut engine = runtime.block_on(async { Engine::new() });
-        let persistent = match journal_path {
-            Some(path) if !path.is_empty() => {
-                attach_journal(&mut engine, &path).map_err(|e| keel_error(py, "KEEL-E040", &e))?;
-                true
-            }
-            _ => false,
-        };
-        // Share the engine's journal (if any) with Tier 2 flows: steps + the
-        // persistent cache live in one file, one clock.
-        let journal = engine.journal();
+        if let Some(path) = journal_path.filter(|p| !p.is_empty()) {
+            attach_journal(&mut engine, &path).map_err(|e| keel_error(py, "KEEL-E040", &e))?;
+        }
         Ok(Self {
             engine: Arc::new(engine),
             runtime: Mutex::new(runtime),
             paused,
-            persistent,
-            journal,
             active_flow: Mutex::new(None),
         })
     }
 
     /// Whether a persistent journal is attached — the front end reads this to
     /// decide whether to emit `scope = "persistent"` for the LLM dev cache
-    /// (cross-run replay). `False` for an in-memory core.
+    /// (cross-run replay). `False` for an in-memory core. Live: a `configure`
+    /// whose policy carries a `journal` location attaches one after the fact.
     #[getter]
     fn persistent(&self) -> bool {
-        self.persistent
+        self.engine.journal().is_some()
     }
 
     /// Apply a policy document (dict, per `policy.schema.json`). Raises
@@ -563,7 +551,11 @@ impl KeelCore {
         explicit_key: Option<String>,
         lease_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
-        let journal = self.journal.clone().ok_or_else(|| {
+        // Read the journal LIVE from the engine: a `configure` whose policy
+        // carries a `journal` location replaces the construction attachment,
+        // and Tier 2 steps must land in the same store the engine caches
+        // through (never a stale construction-time snapshot).
+        let journal = self.engine.journal().ok_or_else(|| {
             keel_error(
                 py,
                 "KEEL-E040",
