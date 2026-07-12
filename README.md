@@ -13,13 +13,18 @@ and (opt-in) crash-resumable flows — declared in one `keel.toml`, applied at
 intercepted call boundaries, backed by a single local journal file. No daemon,
 no port, no login.
 
-**Status: Sprint 0 complete — contracts frozen (`contracts-v1`).** This repo
-currently contains the frozen interface contracts, the in-memory core stub in
-three languages, and the conformance suite that referees every future
-component. The specs are the source of truth:
+**Status: contracts frozen (`contracts-v1`) · the real core exists.**
+Sprint 0 is complete (frozen contracts, in-memory core stub in three
+languages, conformance suite), and the first slice of the real Rust kernel —
+`crates/keel-core`, an async tokio engine running the cache → rate →
+breaker → timeout → retry chain with enforced timeouts and jittered
+backoff — passes the same 15-scenario conformance corpus as the stubs.
+Not yet built: discovery journal, OTel, the FFI facade, language front
+ends, CLI, and Tier 2 durable flows. The guiding documents:
 
 - [docs/architecture-spec.md](docs/architecture-spec.md) — what Keel is (two-tier semantics, core, journal, front ends)
 - [docs/dx-spec.md](docs/dx-spec.md) — why anyone will love it (the product's soul; conflicts resolve in its favor)
+- [docs/engineering-manifesto.md](docs/engineering-manifesto.md) — how we build it (repo standards, July 2026 SOTA)
 - [docs/sprint-plan.md](docs/sprint-plan.md) — the parallel-team work breakdown this repo follows
 
 ## Repo layout
@@ -56,6 +61,10 @@ $ python3 conformance/fixtures/journal/build_fixtures.py   # golden journal DBs
 Teams build against the stub and the frozen contracts (see
 [contracts/README.md](contracts/README.md) for the change process). The stub
 is swapped for the real Rust core on integration day; conformance is the
-referee at every step. Next up, per the sprint plan: Team A (real core),
-B (Python front end), C (Node front end), D (CLI + auto-walk), E (LLM/agent
-packs), F (demos, fault-injection proxy, docs).
+referee at every step. Team A (real core) has its first slice landed —
+remaining slices are the SQLite discovery journal, OTel span emission, the
+FFI facade with the PyO3/napi async bridge, and the ≤10µs overhead benchmark
+as a CI artifact. Then, per the sprint plan: B (Python front end), C (Node
+front end), D (CLI + auto-walk), E (LLM/agent packs), F (demos,
+fault-injection proxy, docs). Session context for coding agents lives in
+[CLAUDE.md](CLAUDE.md).

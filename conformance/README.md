@@ -1,18 +1,21 @@
 # conformance/ — the referee
 
 A shared scenario corpus that every Keel core implementation must pass — the
-stub today, the real core on integration day, in every language harness.
-"Done" means green here, not "the author says it works."
+stubs and the real core alike, in every language harness. "Done" means green
+here, not "the author says it works."
 
 ## Running
 
 ```
+$ cargo test -p keel-core --test conformance    # REAL core (paused tokio clock)
+$ cargo test -p keel-core-stub                  # Rust stub (virtual clock)
 $ python3 conformance/runner.py                 # Python stub
-$ cargo test -p keel-core-stub                  # Rust stub
-$ (cd node/keel-core-stub && node --test test/) # Node stub
+$ (cd node/keel-core-stub && node --test)       # Node stub
 ```
 
-All three interpret the same `scenarios/*.json`.
+All four interpret the same `scenarios/*.json`. The Rust harnesses share
+their interpreter (`crates/keel-conformance`: typed scenario model, scripted
+effects, subset matcher) so they cannot drift on scenario semantics.
 
 ## Scenario format
 
