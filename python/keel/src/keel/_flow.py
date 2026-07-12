@@ -42,14 +42,23 @@ _RANDOM_KEY = "py:random.random#-"
 
 
 def match_flow(target: str, entrypoints: Sequence[FlowEntrypoint]) -> FlowEntrypoint | None:
-    """The flow entrypoint whose module is the `target` script, if any. v0.1
-    matches a single-component module against the script's file stem (e.g.
-    `pipeline.py` ⇒ module `pipeline`)."""
+    """The flow entrypoint whose module PATH matches the `target` script, if any.
+
+    Identity is anchored to the file the module imports from: a single-component
+    module (`pipeline`) matches any `…/pipeline.py`, and a dotted module
+    (`jobs.pipeline`) matches ONLY `…/jobs/pipeline.py`. Matching a bare file stem
+    (the old rule) let a different script that merely shares a name — e.g. a
+    scratch `pipeline.py` in another directory — enter and resume the production
+    flow's journal (flow identity never includes which file ran), replaying
+    foreign step outcomes into foreign code. Requiring the module path to match
+    the file's path suffix closes that."""
     if not entrypoints:
         return None
-    stem = Path(target).stem
+    tparts = Path(target).parts
     for entry in entrypoints:
-        if entry.module == stem or entry.module.rsplit(".", 1)[-1] == stem:
+        mod = entry.module.split(".")
+        want = tuple(mod[:-1]) + (mod[-1] + ".py",)
+        if len(want) <= len(tparts) and tparts[-len(want):] == want:
             return entry
     return None
 

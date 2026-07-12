@@ -51,6 +51,14 @@ class MatchFlowTest(unittest.TestCase):
     def test_no_entries_no_match(self) -> None:
         self.assertIsNone(_flow.match_flow("/tmp/pipeline.py", []))
 
+    def test_dotted_module_matches_only_its_path_not_a_bare_stem(self) -> None:
+        # A dotted-module entrypoint must NOT be entered by an unrelated script
+        # that merely shares the last name component (would resume a foreign flow).
+        entries = [FlowEntrypoint("py:jobs.pipeline:main", "jobs.pipeline", "main")]
+        self.assertEqual(_flow.match_flow("/app/jobs/pipeline.py", entries), entries[0])
+        self.assertIsNone(_flow.match_flow("/scratch/pipeline.py", entries))
+        self.assertIsNone(_flow.match_flow("/app/other/pipeline.py", entries))
+
 
 class _FakeFlowBackend:
     """A native-shaped double: records enter/exit and routes execute + value

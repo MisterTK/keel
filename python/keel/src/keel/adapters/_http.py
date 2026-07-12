@@ -191,19 +191,35 @@ def derive_args_hash(
     return None
 
 
+def _parse_http_date(s: str) -> datetime | None:
+    """A Retry-After HTTP-date. RFC 9110 mandates IMF-fixdate (RFC 5322), but
+    servers commonly emit ISO-8601 timestamps too; Node honors those via
+    Date.parse, so we accept both for cross-front-end parity (Node matches)."""
+    try:
+        when = parsedate_to_datetime(s)  # RFC 5322 / IMF-fixdate
+    except (TypeError, ValueError):
+        when = None
+    if when is not None:
+        return when
+    # ISO-8601 fallback (e.g. "2026-07-12T10:00:00Z"); normalize a trailing Z.
+    iso = f"{s[:-1]}+00:00" if s.endswith(("Z", "z")) else s
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
 def parse_retry_after(value: str | None, now: datetime | None = None) -> int | None:
-    """Parse a ``Retry-After`` header to milliseconds. Supports the two RFC
-    9110 forms — delta-seconds (an integer) and an HTTP-date — and returns
-    ``None`` for anything unparseable. A past date clamps to 0."""
+    """Parse a ``Retry-After`` header to milliseconds. Supports delta-seconds (an
+    integer) and an HTTP-date — RFC 5322/IMF-fixdate AND ISO-8601, to match the
+    Node twin — and returns ``None`` for anything unparseable. A past date clamps
+    to 0."""
     if value is None:
         return None
     s = value.strip()
     if s.isascii() and s.isdigit():  # ASCII digits only, matching Node's /^\d+$/
         return int(s) * 1000
-    try:
-        when = parsedate_to_datetime(s)
-    except (TypeError, ValueError):
-        return None
+    when = _parse_http_date(s)
     if when is None:
         return None
     if when.tzinfo is None:
