@@ -25,6 +25,7 @@ from ._errors import KeelError
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_function_targets, load_policy
 from ._runtime import clear_runtime, set_runtime
+from .adapters import Detection, install_adapters, uninstall_adapters
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -67,8 +68,13 @@ def install_keel(
     targets = extract_function_targets(policy)
     _STATE.finder = install_import_hook(targets)
 
+    # Library adapters (httpx/requests/…): armed lazily — each patches its
+    # library only when the program imports it. Present-but-unused libraries
+    # cost nothing, so `keel run` startup stays cheap.
+    adapters = install_adapters()
+
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets])
+    _banner(env, source, [t.key for t in targets], adapters)
 
     return {
         "enabled": True,
@@ -76,6 +82,7 @@ def install_keel(
         "discovery": discovery,
         "source": source,
         "function_targets": targets,
+        "adapters": adapters,
     }
 
 
@@ -87,6 +94,7 @@ def uninstall_keel() -> None:
     """
     remove_import_hook(_STATE.finder)
     _STATE.finder = None
+    uninstall_adapters()
     if _STATE.discovery is not None:
         _STATE.discovery.close()
         _STATE.discovery = None
@@ -107,7 +115,10 @@ def _register_exit_flush() -> None:
 
 
 def _banner(
-    env: Mapping[str, str], source: str, target_keys: list[str]
+    env: Mapping[str, str],
+    source: str,
+    target_keys: list[str],
+    adapters: list[Detection],
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
@@ -118,3 +129,6 @@ def _banner(
     sys.stderr.write(
         f"keel ▸ wrapped {n} {noun}{breakdown} with {desc} — `keel init` to customize\n"
     )
+    if adapters:
+        listed = ", ".join(f"{d.name} {d.version}".strip() for d in adapters)
+        sys.stderr.write(f"keel ▸ adapters ready: {listed}\n")
