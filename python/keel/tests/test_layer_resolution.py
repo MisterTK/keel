@@ -162,6 +162,27 @@ class StreamingBufferGateTest(unittest.TestCase):
                     chunks = list(r.iter_bytes())
         self.assertEqual(b"".join(chunks), body, "body still delivered intact when streamed")
 
+    def test_streaming_get_retries_5xx_without_prebuffering(self) -> None:
+        # Streaming + retry interact: a transient 5xx must retry (the winning
+        # response is a fresh attempt), yet the seam must STILL leave the final
+        # streaming body unconsumed when no cache is configured. This is the path
+        # the pass-through gate is most likely to regress on, since the retry loop
+        # re-fires the effect and swaps the live response.
+        body = b"retried-stream-" + b"y" * 4096
+        with FaultServer([fail(503), ok(body)]) as srv:
+            with httpx.Client() as c:
+                with c.stream("GET", srv.url("/s")) as r:
+                    self.assertEqual(
+                        r.keel_outcome["attempts"], 2, "transient 5xx should have retried once"
+                    )
+                    self.assertEqual(r.status_code, 200, "the winning attempt is the 200")
+                    self.assertFalse(
+                        r.is_stream_consumed,
+                        "seam pre-read the retried streaming GET body with no cache configured",
+                    )
+                    chunks = list(r.iter_bytes())
+        self.assertEqual(b"".join(chunks), body, "retried streamed body delivered intact")
+
 
 if __name__ == "__main__":
     unittest.main()
