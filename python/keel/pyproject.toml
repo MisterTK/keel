@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keel"
+version = "0.1.0"
+description = "Keel — resilience as a zero-config Python front end (Tier 1 bootstrap, import hook, discovery)."
+requires-python = ">=3.11"
+dependencies = []
+
+# Internal run entry. The public `keel run` CLI (Task 8) dispatches here for
+# Python entrypoints; `keel-py-run app.py [args...]` runs a script directly.
+[project.scripts]
+keel-py-run = "keel._run:main_run_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["keel*"]
