@@ -75,6 +75,12 @@ async fn conformance() {
     let scenarios = load_dir(&scenarios_dir(env!("CARGO_MANIFEST_DIR")));
     let mut failed = Vec::new();
     for (_path, scenario) in &scenarios {
+        if scenario.tier != 1 {
+            // Tier 2 (durable flows) is exercised by tests/flows_conformance.rs;
+            // this Tier 1 harness has no flow-step model, so it skips cleanly.
+            println!("skip  {} (tier {})", scenario.name, scenario.tier);
+            continue;
+        }
         let mismatches = run_scenario(scenario).await;
         if mismatches.is_empty() {
             println!("ok    {}", scenario.name);

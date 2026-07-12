@@ -1,0 +1,38 @@
+{
+  "name": "flow-nondeterminism-fail",
+  "tier": 2,
+  "description": "Tier 2: a flow records step 1 under one step key, crashes, and on resume runs a differently-keyed step at seq 1. With on_nondeterminism=fail the replay halts with KEEL-E031, naming the expected vs. observed step, and the divergent effect is never invoked. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-17",
+    "code_hash": "ch-17"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "n": 1 } },
+          "expect": { "result": "ok", "payload": { "n": 1 } }
+        }
+      ]
+    },
+    {
+      "end": "failed",
+      "expect_effect_calls": 0,
+      "steps": [
+        {
+          "target": "api.b.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "n": 2 } },
+          "expect": { "result": "error", "error": { "code": "KEEL-E031" } }
+        }
+      ]
+    }
+  ]
+}

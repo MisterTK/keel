@@ -77,6 +77,9 @@ def subset_mismatches(actual: Any, expected: Any, path: str = "$") -> list[str]:
 
 
 def run_scenario(scenario: dict[str, Any], make_core, error_cls) -> list[str]:
+    if scenario.get("tier", 1) != 1:
+        # Tier 2 (durable flows) is real-core only; the stub skips it cleanly.
+        return []
     core = make_core()
     want_cfg_err = scenario.get("expect_configure_error")
     try:
@@ -150,8 +153,14 @@ def main() -> int:
         return 2
 
     failed = 0
+    skipped = 0
     for f in files:
         scenario = json.loads(f.read_text())
+        if scenario.get("tier", 1) != 1:
+            # Tier 2 (durable flows) is real-core only; the stub skips it.
+            skipped += 1
+            print(f"skip  {scenario['name']}  (tier {scenario['tier']})")
+            continue
         mismatches = run_scenario(scenario, make_core, error_cls)
         if mismatches:
             failed += 1
@@ -160,8 +169,9 @@ def main() -> int:
                 print(f"      {m}")
         else:
             print(f"ok    {scenario['name']}")
-    total = len(files)
-    print(f"\n{total - failed}/{total} scenarios passed  [impl: {args.impl}]")
+    total = len(files) - skipped
+    suffix = f" ({skipped} tier-2 skipped)" if skipped else ""
+    print(f"\n{total - failed}/{total} scenarios passed  [impl: {args.impl}]{suffix}")
     return 1 if failed else 0
 
 

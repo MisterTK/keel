@@ -303,6 +303,11 @@ fn conformance_through_abi() {
     let scenarios = load_dir(&scenarios_dir(env!("CARGO_MANIFEST_DIR")));
     let mut failed = Vec::new();
     for (_path, scenario) in &scenarios {
+        if scenario.tier != 1 {
+            // The ABI facade is Tier 1; durable-flow scenarios are skipped.
+            println!("skip  {} (tier {})", scenario.name, scenario.tier);
+            continue;
+        }
         let mismatches = run_scenario(scenario);
         if mismatches.is_empty() {
             println!("ok    {}", scenario.name);

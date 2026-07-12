@@ -18,6 +18,12 @@ pub struct Scenario {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// The Keel tier this scenario exercises: `1` (default) is the universal
+    /// resilience suite every core passes; `2` is durable flows, which only the
+    /// real core implements. Tier 1 harnesses skip `tier != 1` cleanly; the
+    /// flow harness reads the tier-2 fields (`flow`, `runs`) this model ignores.
+    #[serde(default = "default_tier")]
+    pub tier: u32,
     /// keel.toml as JSON, per contracts/policy.schema.json.
     pub policy: Value,
     /// When set, `configure` must fail with exactly this code and no steps run.
@@ -25,6 +31,10 @@ pub struct Scenario {
     pub expect_configure_error: Option<String>,
     #[serde(default)]
     pub steps: Vec<Step>,
+}
+
+fn default_tier() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
