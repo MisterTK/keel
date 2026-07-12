@@ -33,7 +33,10 @@ function isTable(v) {
 }
 
 function isProd(env) {
-  return String(env?.KEEL_ENV ?? "").toLowerCase() === "prod";
+  // Trim + lowercase before comparing — cross-language parity with the Python
+  // twin's `.strip().lower()`, so `KEEL_ENV=" prod "` disables the dev cache
+  // identically in both front ends.
+  return String(env?.KEEL_ENV ?? "").trim().toLowerCase() === "prod";
 }
 
 /** The `llm:` adapter pack — the four uniform operations (adapter-pack.md). */
