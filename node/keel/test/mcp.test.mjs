@@ -9,10 +9,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { AsyncEngine, virtualClock, realClock } from "../src/engine.mjs";
+import { applyPackDefaults } from "../src/defaults.mjs";
 import {
   makeWrappedRequest,
   patchClientRequest,
   classifyMcpError,
+  isIdempotentMcpMethod,
   mcpPack,
 } from "../src/packs/mcp.mjs";
 
@@ -41,7 +43,24 @@ test("mcpPack implements the adapter-pack four operations", () => {
   assert.deepEqual(p.defaults(), {}); // mcp: inherits [defaults.outbound]
 });
 
-test("mcp: target is mcp:<server>, idempotent, and never cached (args_hash null)", async () => {
+test("isIdempotentMcpMethod: reads retry; tools/call + unknown do not", () => {
+  for (const m of [
+    "initialize",
+    "ping",
+    "tools/list",
+    "resources/list",
+    "resources/templates/list",
+    "resources/read",
+    "prompts/list",
+    "prompts/get",
+    "completion/complete",
+  ])
+    assert.equal(isIdempotentMcpMethod(m), true, m);
+  for (const m of ["tools/call", "logging/setLevel", "resources/subscribe", "frobnicate", "", undefined])
+    assert.equal(isIdempotentMcpMethod(m), false, String(m));
+});
+
+test("mcp: target is mcp:<server>; idempotency is method-keyed; never cached", async () => {
   const captured = [];
   const backend = {
     kind: "fake",
@@ -66,11 +85,65 @@ test("mcp: target is mcp:<server>, idempotent, and never cached (args_hash null)
     },
   };
   const client = clientWith(async () => ({ pong: true }), backend, "weather");
-  const res = await client.request({ method: "tools/call", params: { name: "x" } }, null, {});
-  assert.deepEqual(res, { pong: true });
+  await client.request({ method: "tools/list", params: {} }, null, {});
+  await client.request({ method: "tools/call", params: { name: "x" } }, null, {});
   assert.equal(captured[0].target, "mcp:weather");
-  assert.equal(captured[0].idempotent, true);
+  assert.equal(captured[0].idempotent, true, "tools/list is read-ish → idempotent");
+  assert.equal(captured[1].idempotent, false, "tools/call is side-effecting → non-idempotent");
   assert.equal(captured[0].args_hash, null);
+  assert.equal(captured[1].args_hash, null);
+});
+
+test("mcp: tools/call is observed, not retried (KEEL-E014); original propagates", async () => {
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({
+    target: { "mcp:svc": { retry: { attempts: 3, schedule: "fixed(1ms)", on: ["conn"] } } },
+  });
+  let n = 0;
+  const reset = Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+  const original = async function () {
+    n++;
+    throw reset;
+  };
+  const client = clientWith(original, backend);
+  let caught;
+  try {
+    await client.request({ method: "tools/call", params: { name: "charge" } }, null, {});
+  } catch (e) {
+    caught = e;
+  }
+  assert.equal(n, 1, "a side-effecting tools/call is NOT retried, even with retry configured");
+  assert.equal(caught, reset, "original error propagates unchanged");
+  assert.equal(caught.keelOutcome.error.code, "KEEL-E014");
+  assert.deepStrictEqual(backend.report().targets["mcp:svc"], {
+    attempts: 1,
+    breaker_opens: 0,
+    breaker_state: "closed",
+    cache_hits: 0,
+    calls: 1,
+    failures: 1,
+    retries: 0,
+    successes: 0,
+    throttled: 0,
+  });
+});
+
+test("mcp: resources/list is retried per defaults (read-ish, inherits outbound)", async () => {
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure(applyPackDefaults({})); // mcp:svc inherits defaults.outbound (retry on conn)
+  let n = 0;
+  const original = async function () {
+    if (++n === 1) throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+    return { resources: [] };
+  };
+  const client = clientWith(original, backend);
+  const res = await client.request({ method: "resources/list", params: {} }, null, {});
+  assert.deepEqual(res, { resources: [] });
+  assert.equal(n, 2, "read-ish method retried per defaults.outbound");
+  const t = backend.report().targets["mcp:svc"];
+  assert.equal(t.attempts, 2);
+  assert.equal(t.retries, 1);
+  assert.equal(t.successes, 1);
 });
 
 test("mcp: retries a conn error then succeeds (counters)", async () => {
@@ -217,7 +290,8 @@ test("mcp: hung server times out per policy and degrades gracefully (KEEL-E010)"
   try {
     let caught;
     try {
-      await request.call(client, { method: "slow", params: { mode: "hang" } }, null, {});
+      // a read-ish method → idempotent → Keel imposes its per-attempt timeout.
+      await request.call(client, { method: "tools/list", params: { mode: "hang" } }, null, {});
     } catch (e) {
       caught = e;
     }

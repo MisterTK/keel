@@ -1,0 +1,13 @@
+{
+  "schema_version": 13,
+  "project_path": "/Users/tk/dev/Keel-worktrees/track-node/node/keel",
+  "created_at": "1783830161",
+  "updated_at": "1783830161",
+  "file_count": 39,
+  "chunk_count": 532,
+  "embedding_model": "LateOn-Code-edge",
+  "embedding_dim": 48,
+  "use_bm25_stemmer": true,
+  "dense_backend": "colbert-plaid",
+  "embedder_fingerprint": "8d0993f8e9febf85"
+}

@@ -1,0 +1,10 @@
+{
+  "num_chunks": 1,
+  "nbits": 4,
+  "num_partitions": 2048,
+  "num_embeddings": 41188,
+  "avg_doclen": 77.42105263157895,
+  "num_documents": 532,
+  "embedding_dim": 48,
+  "next_plaid_compatible": true
+}

@@ -162,12 +162,20 @@ one seam covers both. Each request routes through the backend as target
 `mcp:<server-name>` (`client.getServerVersion()?.name`), taking per-server
 `timeout`/`retry`/`breaker` from `[target."mcp:<server>"]` or `[defaults.outbound]`.
 
-- MCP method calls are treated as **retryable** (a fresh JSON-RPC id per attempt);
-  listing an `mcp:` server opts its calls into retry — set `retry = { attempts = 1 }`
-  to disable. Calls are **not cached** (potentially side-effecting).
-- A **hung server** times out per policy (the pack imposes a per-attempt deadline
-  and passes an `AbortSignal` into the request), retries per policy, and finally
-  raises **KEEL-E010** — it degrades gracefully instead of freezing the agent.
+- **Idempotency is judged from the JSON-RPC method** (Level 0 hard rule), not
+  hardcoded: read-ish methods (`initialize`, `ping`, `*/list`, `resources/read`,
+  `prompts/get`, `completion/complete`) are retried per policy; **`tools/call`
+  and any unknown method are observed, not retried** (KEEL-E014) — the MCP
+  analogue of the fetch seam's POST model, so a side-effecting tool is never
+  auto-retried in v0.1 (no per-method opt-in surface is invented). Calls are
+  **not cached** (potentially side-effecting).
+- A **hung server on a read-ish (idempotent) call** times out per policy (the
+  pack imposes a per-attempt deadline and passes an `AbortSignal` into the
+  request), retries per policy, and finally raises **KEEL-E010** — it degrades
+  gracefully instead of freezing the agent. As with the fetch seam, Keel does
+  **not** impose its timeout on non-idempotent calls (e.g. `tools/call`) — it
+  never injects a thrown timeout into a possibly-succeeding side-effecting call;
+  the SDK's own request timeout is the backstop there.
 - The patch is reversible (`uninstall = remove the package`). The real SDK is not
   a dependency; the wrapped shape is pinned in `fixtures/mcp-client.d.ts`
   (mirroring `@modelcontextprotocol/sdk@1.29.0`).

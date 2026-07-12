@@ -16,17 +16,28 @@
  * `client.getServerVersion()?.name` (available after `connect()`; falls back to
  * "unknown" for the pre-handshake initialize request). Per-server policy comes
  * from `[target."mcp:<server>"]`, else `[defaults.outbound]` (mcp: is not an
- * `llm:` target). MCP method calls are treated as retryable (idempotent): the
- * transport assigns a fresh JSON-RPC id per attempt, and listing an mcp: server
- * opts its calls into retry — set `retry = { attempts = 1 }` to disable. Calls
- * are not cached (args_hash null) — MCP tool calls can be side-effecting.
+ * `llm:` target) — so mcp: targets inherit the outbound retry/timeout/breaker
+ * whether or not they are listed.
+ *
+ * Idempotency is judged from the JSON-RPC METHOD, not hardcoded (Level 0 hard
+ * rule, dx-spec §1: "never retry non-idempotent calls by default … a Level 0
+ * surprise is a P0 bug"). Read-ish methods (initialize, ping, resources/read,
+ * prompts/get, completion/complete, and any `…/list`) are idempotent and retry
+ * per policy; `tools/call` (arbitrary side effects) and any unknown method are
+ * non-idempotent → observed, not retried (KEEL-E014) — the MCP analogue of the
+ * fetch seam's POST model. There is no per-method retry opt-in in v0.1 (we do
+ * not invent policy surface): tools/call is simply never auto-retried. Calls are
+ * not cached (args_hash null) — MCP calls can be side-effecting.
  *
  * Timeout: the core does not enforce timeouts, so the pack imposes a per-attempt
- * deadline from the target's `timeout` (both by racing the request AND passing
- * an AbortSignal into the MCP request options, so a cooperative client cancels
- * and a non-cooperative one still unblocks). A hung server therefore times out
- * per policy, retries per policy, and finally raises KEEL-E010 — it degrades
- * gracefully instead of freezing the agent.
+ * deadline from the target's `timeout` (racing the request AND passing an
+ * AbortSignal into the MCP request options, so a cooperative client cancels and
+ * a non-cooperative one still unblocks). Like the fetch seam, this deadline is
+ * imposed ONLY for idempotent methods — we never inject a thrown timeout into a
+ * possibly-succeeding side-effecting call (a real SDK still applies its own
+ * request timeout as a backstop). So a hung server on a read-ish call times out
+ * per policy, retries, and finally raises KEEL-E010 — it degrades gracefully
+ * instead of freezing the agent.
  */
 
 import { createRequire } from "node:module";
@@ -44,6 +55,28 @@ function durationMs(v) {
   if (!m) return null;
   const mult = { ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]];
   return Number(m[1]) * mult;
+}
+
+/**
+ * Read-ish MCP request methods that are safe to auto-retry. Everything else —
+ * notably `tools/call` (runs arbitrary side-effecting tools) and any unknown
+ * method — is treated as non-idempotent: observed, not retried (Level 0 hard
+ * rule, KEEL-E014), mirroring the fetch seam's POST model. Any method ending in
+ * `/list` (tools/list, resources/list, resources/templates/list, prompts/list)
+ * is also a read.
+ */
+const IDEMPOTENT_MCP_METHODS = new Set([
+  "initialize",
+  "ping",
+  "resources/read",
+  "prompts/get",
+  "completion/complete",
+]);
+
+export function isIdempotentMcpMethod(method) {
+  if (typeof method !== "string") return false;
+  if (IDEMPOTENT_MCP_METHODS.has(method)) return true;
+  return method.endsWith("/list"); // list operations are reads
 }
 
 function safeServerName(client) {
@@ -108,8 +141,14 @@ export function makeWrappedRequest(original, deps = {}) {
     const target = `mcp:${server}`;
     const method = request?.method ?? "?";
     const op = `mcp ${server} ${method}`;
-    const req = { v: 1, target, op, idempotent: true, args_hash: null };
-    const timeoutMs = durationMs(backend.layer(target, "timeout"));
+    // Idempotency is keyed off the method (Level 0 hard rule): read-ish methods
+    // retry; tools/call and unknown methods are observed-not-retried (E014).
+    const idempotent = isIdempotentMcpMethod(method);
+    const req = { v: 1, target, op, idempotent, args_hash: null };
+    // Impose a per-attempt deadline only for idempotent methods — like the fetch
+    // seam, never inject a thrown timeout into a possibly-succeeding
+    // side-effecting call (the SDK still applies its own timeout as a backstop).
+    const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
 
     const outcome = await backend.execute(req, async () => {
       const deadline = armDeadline(options?.signal, timeoutMs);
@@ -204,7 +243,7 @@ export function mcpPack({ cwd = process.cwd() } = {}) {
           pattern: "mcp:<server>",
           kind: "mcp",
           idempotencyRule:
-            "MCP method calls are retryable (fresh JSON-RPC id per attempt); listing an mcp: server opts its calls into retry — retry = { attempts = 1 } to disable",
+            "keyed off the JSON-RPC method: read-ish methods (initialize, ping, */list, resources/read, prompts/get, completion/complete) are retryable; tools/call and unknown methods are observed-not-retried (KEEL-E014), never auto-retried in v0.1",
           argsHashRule: "none (MCP calls are not cached — potentially side-effecting)",
         },
       ];
