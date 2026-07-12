@@ -60,6 +60,9 @@ crates/keel-py` for the native Python module). Postgres/fleet journal (Level 3),
 KEEL-E001 currently covers both policy-validation failures and v0.1
 unsupported-configuration limits (async-in-flow, flows-without-journal); a CCR
 to split these into a dedicated code is deliberately deferred.
+The **license is undecided** (architecture-spec §10 — TK's call); the repo carries
+no `LICENSE`, `node/keel/package.json` says `UNLICENSED`, and other manifests omit
+the field — see `LICENSE-PENDING.md`.
 
 ## Commands (run all before any push that touches behavior)
 
