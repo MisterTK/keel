@@ -162,10 +162,20 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
   return undefined;
 }
 
-/** Classify a thrown fetch/transport error into a core error class. */
+/** Classify a thrown fetch/transport error into a core error class.
+ *
+ * Keel's OWN per-attempt deadline aborts the request with a `DOMException` named
+ * "TimeoutError" (see `fetch.mjs`), so that is a `timeout` (in the default
+ * retry.on → retried). A CALLER's `AbortController` fires an `AbortError`: that
+ * is user cancellation, class `cancelled` (excluded from the default retry.on →
+ * immediately terminal, KEEL-E015). Distinguishing them means a stop button
+ * propagates at once with the original AbortError, instead of grinding through
+ * the whole backoff schedule and mis-recording a retried timeout — matching the
+ * Python twin, whose `CancelledError` (a BaseException) escapes retries too. */
 export function classifyThrow(err) {
   const name = err?.name;
-  if (name === "AbortError" || name === "TimeoutError") return "timeout";
+  if (name === "TimeoutError") return "timeout"; // Keel's own deadline abort
+  if (name === "AbortError") return "cancelled"; // caller-initiated cancellation
   if (name === "TypeError") return "conn"; // fetch network failures throw TypeError
   return "other";
 }

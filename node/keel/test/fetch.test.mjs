@@ -257,6 +257,40 @@ test("idempotent PUT with a string body is retried and re-sends the body unchang
   });
 });
 
+test("a caller abort is 'cancelled' — not retried, propagates the original AbortError at once", async () => {
+  // A fake fetch that honors an AbortSignal exactly like the real one (rejects
+  // with the signal's reason), but otherwise never resolves — so the ONLY way the
+  // call ends is the caller's abort. If 'cancelled' were misclassified as
+  // 'timeout' it would be retried through the whole backoff schedule.
+  const globalObj = {
+    fetch: (_input, init) =>
+      new Promise((_resolve, reject) => {
+        const sig = init?.signal;
+        const fail = () => reject(sig?.reason ?? new DOMException("aborted", "AbortError"));
+        if (sig?.aborted) return fail();
+        sig?.addEventListener("abort", fail, { once: true });
+      }),
+  };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure(level0Defaults()); // outbound retry on conn/timeout/429/5xx
+  installFetch(backend, null, { globalObj });
+
+  const controller = new AbortController();
+  const p = globalObj.fetch("http://api.example.com/x", { signal: controller.signal });
+  controller.abort();
+  let caught;
+  try {
+    await p;
+  } catch (e) {
+    caught = e;
+  }
+  assert.equal(caught?.name, "AbortError", "the original AbortError propagates unchanged");
+  assert.equal(caught.keelOutcome.error.class, "cancelled");
+  assert.equal(caught.keelOutcome.error.code, "KEEL-E015", "cancelled is terminal, not retried");
+  assert.equal(caught.keelOutcome.attempts, 1, "no retries after a user abort");
+  assert.deepEqual(caught.keelOutcome.waits_ms, [], "no backoff was waited");
+});
+
 test("an idempotent request with an unbuffered stream body is observed, not retried", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("{}", { status: 200 }) };
