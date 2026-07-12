@@ -64,6 +64,21 @@ test("resolveDevCache: mode=dev → ttl off-prod, removed in prod, explicit ttl 
   assert.deepEqual(resolveDevCache(plain, { KEEL_ENV: "prod" }), plain);
 });
 
+test("resolveDevCache treats KEEL_ENV with surrounding whitespace/case as prod (Python parity)", () => {
+  const raw = () => ({ target: { "llm:openai": { cache: { mode: "dev" } } } });
+  for (const env of [" prod ", "PROD", "  Prod\t"]) {
+    assert.equal(
+      resolveDevCache(raw(), { KEEL_ENV: env }).target["llm:openai"].cache,
+      undefined,
+      `KEEL_ENV=${JSON.stringify(env)} must disable the dev cache (fail-closed toward prod)`
+    );
+  }
+  // a non-prod value still keeps the dev cache active.
+  assert.deepEqual(resolveDevCache(raw(), { KEEL_ENV: " dev " }).target["llm:openai"].cache, {
+    ttl: DEV_CACHE_TTL,
+  });
+});
+
 test("dev-cache replay parity: identical calls → cache hit off-prod (counters)", async () => {
   const policy = resolveDevCache({ target: { "llm:openai": { cache: { mode: "dev" }, retry: { attempts: 1 } } } }, {});
   const e = new AsyncEngine(virtualClock());
