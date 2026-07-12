@@ -46,11 +46,17 @@ Judgments (kept in parity with the Python adapters):
 
 - **Target** = the URL hostname, unless it maps to an LLM provider, then the
   semantic target `llm:<provider>`. The host→provider map (`LLM_HOST_PROVIDERS`)
-  is small and conservative and is a cross-language parity contract.
-- **Idempotency** — `GET/HEAD/OPTIONS/PUT/DELETE` are retryable. `POST/PATCH`
-  are **not** retried (Level 0 hard rule) unless an idempotency header is present
-  (the target's configured `idempotency.header`, or a common default). A
-  non-idempotent transient failure is *observed, not retried* → **KEEL-E014**.
+  is a frozen cross-language parity contract: `api.openai.com → llm:openai`,
+  `api.anthropic.com → llm:anthropic`,
+  `generativelanguage.googleapis.com → llm:google-genai`.
+- **Idempotency** — `GET/HEAD/OPTIONS/PUT/DELETE/TRACE` are retryable (TRACE is
+  in the judgment table for parity even though WHATWG fetch forbids sending it).
+  `POST/PATCH` are **not** retried (Level 0 hard rule) unless an idempotency
+  header is present (the target's configured `idempotency.header`, or a common
+  default). A non-idempotent transient failure is *observed, not retried* →
+  **KEEL-E014**.
+- **args_hash** (cache/journal key material) is derived **only for idempotent
+  GET requests** (sha256 over method+URL); it is `null` for everything else.
 - **Transient vs. success** — only `429` and `≥500` are treated as retryable
   typed errors (`Retry-After` is parsed to ms and overrides the backoff:
   `wait = max(schedule, retry_after)`). **Every other status** (2xx/3xx and
@@ -139,9 +145,9 @@ when loadable (probed by dynamic import; may not exist yet), else the in-repo
 ## Config errors are fatal
 
 A missing `keel.toml` falls back to Level 0 defaults silently. A *present but
-broken* `keel.toml` (bad syntax or invalid policy) fails loudly with
-**KEEL-E001** (with a line number / field path) and the app does not run — a
-broken policy is a bug to fix, not a surprise to paper over.
+broken* `keel.toml` (bad syntax, unreadable, or invalid policy) fails loudly
+with **KEEL-E001** (with a line number / field path) and the app does not run —
+a broken policy is a bug to fix, not a surprise to paper over.
 
 ## Tests
 

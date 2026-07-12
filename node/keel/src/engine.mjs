@@ -357,7 +357,8 @@ export class AsyncEngine {
     return out;
   }
 
-  /** Deterministic per-target counters; same shape as KeelCoreStub.report(). */
+  /** Deterministic report; same contractual shape as KeelCoreStub.report()
+   *  ({v, clock_ms, targets}) — clock_ms comes from the injected clock. */
   report() {
     const targets = {};
     for (const name of [...this.#metrics.keys()].sort()) {
@@ -375,6 +376,6 @@ export class AsyncEngine {
         throttled: m.throttled,
       };
     }
-    return { v: 1, targets };
+    return { v: 1, clock_ms: this.#clock.now(), targets };
   }
 }

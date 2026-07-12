@@ -70,7 +70,9 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     const op = `${method} ${hostname}${parsed.pathname}`;
     const idemHeader = readIdempotencyHeader(backend, target);
     const idempotent = isIdempotent(method, headers, idemHeader);
-    const hash = argsHash(method, parsed.href, body);
+    // args_hash (cache/journal key material) is derived ONLY for idempotent GET
+    // requests, per the brief — cross-language parity with the Python twin.
+    const hash = method === "GET" ? argsHash(method, parsed.href, body) : null;
     const request = { v: 1, target, op, idempotent, args_hash: hash };
 
     // Per-attempt timeout is enforced only for idempotent calls: a timeout we

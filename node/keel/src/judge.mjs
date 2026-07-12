@@ -27,10 +27,13 @@ import { createHash } from "node:crypto";
 export const LLM_HOST_PROVIDERS = Object.freeze({
   "api.openai.com": "openai",
   "api.anthropic.com": "anthropic",
-  "generativelanguage.googleapis.com": "google",
+  "generativelanguage.googleapis.com": "google-genai",
 });
 
-const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]);
+// The idempotent-method set is a cross-language parity contract with the Python
+// twin, so it includes TRACE per the brief's list even though WHATWG fetch
+// forbids actually sending a TRACE request — the *judgment* must still match.
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"]);
 const DEFAULT_IDEMPOTENCY_HEADERS = ["idempotency-key", "x-idempotency-key"];
 
 /** Normalize a fetch(input, init) pair into method + URL + a Headers view. */

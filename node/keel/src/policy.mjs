@@ -237,7 +237,13 @@ export function loadPolicy(cwd = process.cwd()) {
   try {
     text = readFileSync(path, "utf8");
   } catch (e) {
-    return { policy: level0Defaults(), source: "defaults", note: `unreadable keel.toml: ${e.message}` };
+    // A present policy file that cannot be read is a loud failure, never a
+    // silent fall-back to defaults (that would be a surprise, and surprise is
+    // a P0 in Level 0).
+    throw new KeelError(
+      "KEEL-E001",
+      `keel.toml is present but could not be read: ${e.message}. Fix the file's permissions/path, or remove it to fall back to Level 0 defaults.`
+    );
   }
   const policy = parseToml(text); // throws KeelError E001 with line number on bad syntax
   return { policy, source: "keel.toml" };

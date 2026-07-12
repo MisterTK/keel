@@ -4,7 +4,10 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseToml, extractFunctionTargets } from "../src/policy.mjs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseToml, extractFunctionTargets, loadPolicy } from "../src/policy.mjs";
 import { KeelError } from "../src/engine.mjs";
 
 test("parses a representative keel.toml", () => {
@@ -52,6 +55,29 @@ test("throws KEEL-E001 with a line number on bad syntax", () => {
 
 test("rejects array-of-tables (unsupported subset)", () => {
   assert.throws(() => parseToml(`[[target]]\n`), (e) => e instanceof KeelError);
+});
+
+test("loadPolicy falls back to defaults when keel.toml is absent", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keel-nopolicy-"));
+  try {
+    const { source } = loadPolicy(dir);
+    assert.equal(source, "defaults");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a present-but-unreadable keel.toml fails loudly (KEEL-E001)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keel-badpolicy-"));
+  try {
+    mkdirSync(join(dir, "keel.toml")); // a directory here → present but unreadable as a file
+    assert.throws(
+      () => loadPolicy(dir),
+      (e) => e instanceof KeelError && e.code === "KEEL-E001" && /present but could not be read/.test(e.message)
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("extractFunctionTargets parses ts: keys and flags unwrappable ones", () => {

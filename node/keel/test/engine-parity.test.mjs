@@ -103,7 +103,7 @@ function runStub(policy, calls) {
     let i = 0;
     return s.execute(c.request, () => c.script[i++]);
   });
-  return { outcomes, report: s.report().targets };
+  return { outcomes, report: s.report() };
 }
 
 async function runEngine(policy, calls) {
@@ -114,7 +114,7 @@ async function runEngine(policy, calls) {
     let i = 0;
     outcomes.push(await e.execute(c.request, async () => c.script[i++]));
   }
-  return { outcomes, report: e.report().targets };
+  return { outcomes, report: e.report() };
 }
 
 for (const s of SCENARIOS) {
@@ -122,6 +122,8 @@ for (const s of SCENARIOS) {
     const stub = runStub(s.policy, s.calls);
     const eng = await runEngine(s.policy, s.calls);
     assert.deepStrictEqual(eng.outcomes, stub.outcomes, "outcomes diverged from stub");
+    // Compare the WHOLE report ({v, clock_ms, targets}) so shape drift (e.g. a
+    // missing clock_ms) can never hide behind a targets-only comparison.
     assert.deepStrictEqual(eng.report, stub.report, "reports diverged from stub");
   });
 }

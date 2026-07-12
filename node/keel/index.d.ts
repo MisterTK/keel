@@ -66,7 +66,7 @@ export interface Backend {
   configure(policy: Record<string, unknown>): void;
   execute(request: Request, effect: (attempt: number) => Promise<AttemptResult>): Promise<Outcome>;
   layer(target: string, key: string): unknown;
-  report(): { v: number; targets: Record<string, Record<string, unknown>> };
+  report(): { v: number; clock_ms: number; targets: Record<string, Record<string, unknown>> };
 }
 
 export interface Discovery {
@@ -88,7 +88,6 @@ export declare function loadBackend(options?: {
 export declare function loadPolicy(cwd?: string): {
   policy: Record<string, unknown>;
   source: string;
-  note?: string;
 };
 export declare function parseToml(text: string): Record<string, unknown>;
 export declare function extractFunctionTargets(policy: Record<string, unknown>): FunctionTarget[];

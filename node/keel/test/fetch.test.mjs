@@ -110,6 +110,44 @@ test("POST with an idempotency key is retried", async () => {
   });
 });
 
+test("args_hash is derived only for idempotent GET requests", async () => {
+  const captured = [];
+  const backend = {
+    kind: "fake",
+    configure() {},
+    layer() {
+      return undefined;
+    },
+    report() {
+      return { v: 1, clock_ms: 0, targets: {} };
+    },
+    async execute(request, effect) {
+      captured.push(request);
+      const r = await effect(1);
+      return {
+        v: 1,
+        result: "ok",
+        payload: r.payload,
+        attempts: 1,
+        from_cache: false,
+        waits_ms: [],
+        throttled: false,
+        throttle_wait_ms: 0,
+        breaker: "closed",
+        trace_id: "t-1",
+      };
+    },
+  };
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  installFetch(backend, null, { globalObj });
+
+  await globalObj.fetch("http://api.example.com/x");
+  await globalObj.fetch("http://api.example.com/x", { method: "POST", body: "b" });
+
+  assert.match(captured[0].args_hash, /^[0-9a-f]{64}$/, "GET has a sha256 args_hash");
+  assert.equal(captured[1].args_hash, null, "POST has no args_hash");
+});
+
 test("non-transient 4xx passes through unchanged (success path)", async () => {
   const server = await startServer((_req, res) => {
     res.writeHead(404);
