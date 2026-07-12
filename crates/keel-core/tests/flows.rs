@@ -11,6 +11,7 @@ use keel_core::{Engine, FlowConfig, FlowDescriptor, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
 use keel_journal::{
     Clock, FlowId, FlowStatus, Journal, ManualClock, ProcessId, SqliteJournal, StepKey, StepStatus,
+    SystemClock,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -627,29 +628,40 @@ async fn a_dead_flow_from_the_golden_fixture_is_never_resumed() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn the_heartbeat_renews_the_lease() {
-    let r = rig("host-a:pid-1");
-    let handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+/// The lease renewer is a dedicated OS thread on real wall-clock time (so it
+/// works under the synchronous bindings, whose current-thread runtime is not
+/// polled between calls). Proven on a real clock with a tiny ttl and small real
+/// sleeps: a renewal pushes the lease expiry forward while the handle is held.
+#[test]
+fn the_heartbeat_renews_the_lease_on_a_real_clock() {
+    let dir = TempDir::new().unwrap();
+    let journal: Arc<dyn Journal> =
+        Arc::new(SqliteJournal::open(dir.path().join("journal.db"), SystemClock).unwrap());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let manager = FlowManager::with_config(
+        Arc::new(Engine::new()),
+        Arc::clone(&journal),
+        clock,
+        ProcessId::new("host-a:pid-1"),
+        FlowConfig {
+            lease_ttl: Duration::from_millis(80), // period = ttl/2 = 40ms
+            max_attempts: 3,
+        },
+    );
+    let handle = manager.enter_flow(&descriptor("ah-1")).unwrap();
     let fid = handle.flow_id().clone();
-    let initial = r
-        .journal
+    let initial = journal
         .get_flow(&fid)
         .unwrap()
         .unwrap()
         .lease_expires
         .unwrap();
 
-    // Advance the journal clock and tokio time together so the ttl/2 heartbeat
-    // fires and re-stamps the expiry against the moved-forward clock.
-    for _ in 0..3 {
-        r.clock.advance(20_000);
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
-    }
+    // Wait through several renewal periods; the std-thread heartbeat renews
+    // without any runtime being polled.
+    std::thread::sleep(Duration::from_millis(220));
 
-    let renewed = r
-        .journal
+    let renewed = journal
         .get_flow(&fid)
         .unwrap()
         .unwrap()
@@ -658,6 +670,50 @@ async fn the_heartbeat_renews_the_lease() {
     assert!(
         renewed > initial,
         "heartbeat pushed the lease expiry forward: {renewed} > {initial}"
+    );
+    drop(handle);
+}
+
+/// A live step whose lease was stolen by another process fences with KEEL-E030
+/// and does NOT fire the effect — the split-brain double-execution the lease
+/// exists to prevent (findings flow.rs:851/846).
+#[tokio::test(start_paused = true)]
+async fn a_live_step_fences_when_its_lease_was_stolen() {
+    let r = rig("host-a:pid-1");
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let fid = handle.flow_id().clone();
+
+    // The lease lapses and a second process legitimately steals it.
+    r.clock.advance(31_000);
+    assert!(
+        r.journal
+            .acquire_lease(
+                &fid,
+                &ProcessId::new("host-b:pid-2"),
+                Duration::from_secs(30)
+            )
+            .unwrap(),
+        "host-b steals the expired lease"
+    );
+
+    // host-a now tries to run a live effect: it must fence, not double-execute.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let out = handle
+        .execute_step(
+            &request("api.charge.internal", "c1"),
+            counting_ok(&calls, json!({ "charged": true })),
+        )
+        .await;
+
+    assert_eq!(out.result, "error");
+    assert_eq!(
+        out.error.expect("terminal error").code.as_str(),
+        "KEEL-E030"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "effect must not fire once the lease is lost"
     );
     drop(handle);
 }

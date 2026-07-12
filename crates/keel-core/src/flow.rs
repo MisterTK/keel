@@ -350,13 +350,14 @@ impl FlowManager {
         flow_id: FlowId,
         entry_status: FlowStatus,
         code_hash_fenced: bool,
-        heartbeat: Option<tokio::task::AbortHandle>,
+        heartbeat: Option<HeartbeatHandle>,
         replay_only: bool,
     ) -> FlowHandle {
         FlowHandle {
             engine: Arc::clone(&self.engine),
             journal: Arc::clone(&self.journal),
             clock: Arc::clone(&self.clock),
+            holder: self.holder.clone(),
             flow_id,
             seq: 0,
             code_hash_fenced,
@@ -383,6 +384,10 @@ pub struct FlowHandle {
     engine: Arc<Engine>,
     journal: Arc<dyn Journal>,
     clock: Arc<dyn Clock>,
+    /// This handle's lease holder id — checked before every live step so a
+    /// handle that has lost its lease fences (KEEL-E030) instead of running the
+    /// effect a second executor may already be running (double-fire defense).
+    holder: ProcessId,
     flow_id: FlowId,
     seq: u64,
     code_hash_fenced: bool,
@@ -395,9 +400,9 @@ pub struct FlowHandle {
     /// it to distinguish "resumed" from "already finished".
     entry_status: FlowStatus,
     completed: bool,
-    /// The lease-renewal task; aborted when the handle drops so a completed or
-    /// crashed flow stops heart-beating.
-    heartbeat: Option<tokio::task::AbortHandle>,
+    /// The lease-renewal thread; stopped and joined when the handle drops so a
+    /// completed or crashed flow stops heart-beating.
+    heartbeat: Option<HeartbeatHandle>,
 }
 
 impl core::fmt::Debug for FlowHandle {
@@ -458,6 +463,25 @@ impl FlowHandle {
 
     fn now(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// Whether this handle has definitively lost its lease: the flow's recorded
+    /// holder is no longer us, or the lease has expired against our clock (so
+    /// another process may steal and resume it). A missing flow row or a journal
+    /// read error is *not* treated as loss (resilience-first: at-least-once still
+    /// holds via the `running` marker), so a transient hiccup does not stall a
+    /// legitimately-held flow.
+    fn lease_lost(&self) -> bool {
+        match self.journal.get_flow(&self.flow_id) {
+            Ok(Some(flow)) => {
+                let held = flow.lease_holder.as_ref() == Some(&self.holder)
+                    && flow
+                        .lease_expires
+                        .is_some_and(|expires| expires >= self.now());
+                !held
+            }
+            Ok(None) | Err(_) => false,
+        }
     }
 
     /// Decide how the step at `seq` (with `key`) resolves against the journal.
@@ -739,6 +763,17 @@ impl FlowHandle {
     where
         F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
     {
+        // Lease fence: before firing a live effect, confirm we still hold the
+        // lease. If it lapsed (heartbeat starved, clock jump) another process
+        // may have stolen it and be resuming this flow concurrently — running
+        // the effect now would double-fire it (charges, emails, LLM spend) and
+        // interleave step records. Fail the step loudly (KEEL-E030) instead of
+        // silently double-executing. A journal read error is resilience-first
+        // (proceed): only a definitive loss fences.
+        if self.lease_lost() {
+            warn!(flow = %self.flow_id, seq, "lease lost before live step; refusing to double-execute (KEEL-E030)");
+            return lease_lost_outcome(&self.flow_id, seq);
+        }
         let started_at = self.now();
         self.record(
             seq,
@@ -818,9 +853,8 @@ impl FlowHandle {
 
 impl Drop for FlowHandle {
     fn drop(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
-        }
+        // Stop and join the lease-renewal thread (HeartbeatHandle::drop).
+        self.heartbeat = None;
         if !self.completed {
             // A handle dropped without complete() models a crash: the flow stays
             // `running` with its lease and is resumed after the lease expires.
@@ -829,31 +863,66 @@ impl Drop for FlowHandle {
     }
 }
 
-/// Spawn the lease-renewal heartbeat, if a tokio runtime is available (it always
-/// is under the front ends and tests; a bare synchronous caller simply gets no
-/// heartbeat rather than a panic). Renews every `ttl/2` against the journal's
-/// clock, so a paused-clock test drives it deterministically.
+/// A running lease-renewal thread. Dropping this signals the thread to stop (by
+/// disconnecting the channel) and joins it.
+struct HeartbeatHandle {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for HeartbeatHandle {
+    fn drop(&mut self) {
+        // Dropping the sender disconnects the channel, waking the thread's
+        // `recv_timeout` immediately so it exits without waiting out the period.
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Spawn the lease-renewal heartbeat on a dedicated **OS thread** (not a tokio
+/// task). Under the synchronous front-end bindings the ambient runtime is a
+/// current-thread runtime that only makes progress while a `block_on` is in
+/// flight, so a tokio-task heartbeat starves exactly when it is needed — during
+/// a long blocking step or pure-caller compute between steps — letting the lease
+/// lapse while the flow is still alive. A std thread renews on real wall-clock
+/// time regardless of whether any runtime is being polled. Renews every `ttl/2`
+/// against the journal's clock; a lost lease (`Ok(false)`) is logged loudly
+/// (the step-level fence is what actually prevents double execution).
 fn spawn_heartbeat(
     journal: Arc<dyn Journal>,
     flow: FlowId,
     holder: ProcessId,
     ttl: Duration,
-) -> Option<tokio::task::AbortHandle> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        return None;
-    }
+) -> Option<HeartbeatHandle> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
     let period = (ttl / 2).max(Duration::from_millis(1));
-    let task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(period);
-        interval.tick().await; // the immediate first tick is the initial acquire
-        loop {
-            interval.tick().await;
-            if let Err(e) = journal.acquire_lease(&flow, &holder, ttl) {
-                warn!(flow = %flow, error = %e, "lease heartbeat renewal failed");
+    let (stop, rx) = channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name(String::from("keel-lease-heartbeat"))
+        .spawn(move || {
+            // Loop until the sender is dropped/sent (handle closing) —
+            // `recv_timeout` then yields `Ok`/`Disconnected` and the `while let`
+            // ends; a `Timeout` is a renewal tick.
+            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(period) {
+                match journal.acquire_lease(&flow, &holder, ttl) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(flow = %flow, "lease heartbeat: lease lost to another holder");
+                    }
+                    Err(e) => {
+                        warn!(flow = %flow, error = %e, "lease heartbeat renewal failed");
+                    }
+                }
             }
-        }
-    });
-    Some(task.abort_handle())
+        })
+        .ok()?;
+    Some(HeartbeatHandle {
+        stop: Some(stop),
+        thread: Some(thread),
+    })
 }
 
 /// A configuration/internal `KEEL-E040`.
@@ -916,6 +985,23 @@ fn diverged_outcome(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &Step
         class: ErrorClass::Other,
         http_status: None,
         message: divergence_message(flow, seq, recorded, observed),
+        original: None,
+    });
+    outcome
+}
+
+/// The KEEL-E030 outcome for a live step whose lease was lost to another holder
+/// — the step is refused rather than double-executed.
+fn lease_lost_outcome(flow: &FlowId, seq: u64) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.error = Some(OutcomeError {
+        code: ErrorCode::FlowLeaseHeld,
+        class: ErrorClass::Other,
+        http_status: None,
+        message: format!(
+            "flow {flow} lost its lease before step {seq}; another holder may be resuming it \
+             (KEEL-E030). Refusing to run the effect to avoid double execution."
+        ),
         original: None,
     });
     outcome
