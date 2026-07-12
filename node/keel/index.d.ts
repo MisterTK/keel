@@ -12,6 +12,21 @@ export interface InstallResult {
   discovery?: Discovery;
   functionTargets?: FunctionTarget[];
   uninstallFetch?: () => void;
+  mcp?: McpInstallResult;
+}
+
+/** One adapter/framework pack (contracts/adapter-pack.md). */
+export interface AdapterPack {
+  detect(): { matched: boolean; name?: string; version?: string; confidence?: "pinned" | "best_effort" };
+  seams(): { patchPoint: string; upstreamApi: string; whyStable: string }[];
+  targets(): { pattern: string; kind: string; idempotencyRule: string; argsHashRule: string }[];
+  defaults(): Record<string, unknown>;
+}
+
+export interface McpInstallResult {
+  active: boolean;
+  name?: string;
+  uninstall?: () => void;
 }
 
 export interface FunctionTarget {
@@ -92,5 +107,39 @@ export declare function loadPolicy(cwd?: string): {
 export declare function parseToml(text: string): Record<string, unknown>;
 export declare function extractFunctionTargets(policy: Record<string, unknown>): FunctionTarget[];
 export declare function level0Defaults(): Record<string, unknown>;
+export declare function applyPackDefaults(policy: Record<string, unknown>): Record<string, unknown>;
 export declare const LLM_HOST_PROVIDERS: Readonly<Record<string, string>>;
+
+/** The `llm:` provider defaults pack (adapter-pack contract). */
+export declare const llmPack: AdapterPack;
+/** Dev-loop cache lifetime used when resolving `cache = { mode = "dev" }`. */
+export declare const DEV_CACHE_TTL: string;
+/** Resolve LLM dev caches: `mode:"dev"` → concrete ttl off-prod, inert in prod. */
+export declare function resolveDevCache(
+  policy: Record<string, unknown>,
+  env?: Record<string, string | undefined>
+): Record<string, unknown>;
+
+/** Build the `mcp:` transport pack bound to a project directory. */
+export declare function mcpPack(options?: { cwd?: string }): AdapterPack;
+/** Auto-detect the MCP client SDK and wrap its transports (best-effort). */
+export declare function installMcpPack(options?: {
+  cwd?: string;
+  clientModule?: { Client?: unknown };
+}): Promise<McpInstallResult>;
+/** Patch a `Client` class's `request` method; returns an uninstall function. */
+export declare function patchClientRequest(
+  ClientClass: unknown,
+  deps?: { backend?: Backend; discovery?: Discovery }
+): () => void;
+
+/** The Keel Vercel AI SDK middleware (also exported from `keel/ai-sdk`). */
+export declare function keelMiddleware(options?: {
+  backend?: Backend;
+  discovery?: Discovery;
+}): {
+  wrapGenerate(options: { doGenerate: () => PromiseLike<unknown>; params: unknown; model: unknown }): Promise<unknown>;
+  wrapStream(options: { doStream: () => PromiseLike<unknown>; params: unknown; model: unknown }): Promise<unknown>;
+};
+
 export declare const VERSION: string;

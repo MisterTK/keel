@@ -100,6 +100,78 @@ class `other`, which is **not** in the default `retry.on` — so by default
 function failures propagate unchanged; add `"other"` to that target's `retry.on`
 to retry them.
 
+## AI agent packs
+
+Agent code is the densest concentration of flaky effects (LLM calls, MCP
+round-trips), so Keel treats those seams as first-class (DX spec §4). Every pack
+follows the uniform adapter-pack contract (`detect/seams/targets/defaults`,
+`../../contracts/adapter-pack.md`) and carries **zero** resilience logic of its
+own — all behavior flows through the core.
+
+### `llm:` provider defaults + dev cache
+
+Any call that resolves to an `llm:<provider>` target — the fetch host map
+(`api.openai.com → llm:openai`, …) or the AI SDK middleware below — inherits the
+`[defaults.llm]` pack: 120s timeout, 6 retries on `429/5xx/timeout` with
+Retry-After-aware backoff, a per-provider breaker, and a **dev response cache**.
+
+- **Merge semantics.** The pack defaults are merged **under** your `keel.toml`
+  (`applyPackDefaults`): anything you don't set still gets Level 0 protection,
+  and a key you *do* set replaces that key's default wholesale (the same per-key
+  precedence the core uses to resolve `target → defaults.llm → defaults.outbound`).
+- **Dev cache** (`cache = { mode = "dev" }`). Identical prompt+params replay from
+  cache during development (10× faster iteration, ~0 API spend). It resolves to a
+  concrete cache directive off-prod and is **inert when `KEEL_ENV=prod`**
+  (`resolveDevCache`). This behavior is identical to the Python front end.
+
+### Vercel AI SDK — `keel/ai-sdk`
+
+The AI SDK's `wrapLanguageModel` is the cleanest seam of any framework, so Keel
+plugs in through its own middleware hook — the one place "zero code changes" is
+spent on a framework's blessed extension point:
+
+```js
+import { wrapLanguageModel } from "ai";
+import { keelMiddleware } from "keel/ai-sdk";
+
+const model = wrapLanguageModel({ model: base, middleware: keelMiddleware() });
+// use `model` anywhere; every generate/stream is now resilient.
+```
+
+- **Target** = `llm:<provider>` from the wrapped model's provider id (the base
+  segment, e.g. `openai.chat → llm:openai`).
+- **`wrapGenerate`** routes `doGenerate()` through the backend; a thrown provider
+  error is classified (429/5xx retried per policy, `Retry-After` honored) and the
+  result is dev-cache-eligible.
+- **Streaming rule.** `wrapStream` wraps stream **establishment** (the
+  `doStream()` call), **not chunks**: resilience applies to getting the stream
+  started; once established, the stream is returned **unchanged** and its chunks
+  flow through untouched — Keel never buffers, observes, or retries mid-stream
+  (a live stream is not replayable), so streams are never dev-cached.
+
+The real `ai` package is **not** a dependency; the middleware only implements the
+`LanguageModelV2` middleware shape (pinned in `fixtures/ai-sdk-model.d.ts`,
+mirroring `ai@5.0.0`).
+
+### MCP transports — `mcp:<server>`
+
+When the MCP client SDK (`@modelcontextprotocol/sdk`) is present, the bootstrap
+auto-wraps `Client.prototype.request` — the JSON-RPC request/response
+correlation boundary shared by **all** transports (stdio + streamable HTTP), so
+one seam covers both. Each request routes through the backend as target
+`mcp:<server-name>` (`client.getServerVersion()?.name`), taking per-server
+`timeout`/`retry`/`breaker` from `[target."mcp:<server>"]` or `[defaults.outbound]`.
+
+- MCP method calls are treated as **retryable** (a fresh JSON-RPC id per attempt);
+  listing an `mcp:` server opts its calls into retry — set `retry = { attempts = 1 }`
+  to disable. Calls are **not cached** (potentially side-effecting).
+- A **hung server** times out per policy (the pack imposes a per-attempt deadline
+  and passes an `AbortSignal` into the request), retries per policy, and finally
+  raises **KEEL-E010** — it degrades gracefully instead of freezing the agent.
+- The patch is reversible (`uninstall = remove the package`). The real SDK is not
+  a dependency; the wrapped shape is pinned in `fixtures/mcp-client.d.ts`
+  (mirroring `@modelcontextprotocol/sdk@1.29.0`).
+
 ## Errors and the `keelOutcome` attachment
 
 On final failure the original error/response propagates unchanged, with a
