@@ -278,7 +278,7 @@ impl TryFrom<String> for Condition {
 /// `retry = { attempts, schedule, on }`. `attempts` is the TOTAL attempt
 /// budget (first call included) — zero is unrepresentable by type.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
     pub attempts: NonZeroU32,
     pub schedule: Schedule,
@@ -317,7 +317,7 @@ impl Default for RetryPolicy {
 /// (`failures` consecutive terminal failures); the rate-mode knobs are
 /// accepted and validated per the schema but enforced only by the real core.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BreakerPolicy {
     pub failures: NonZeroU64,
     pub cooldown: DurationMs,
@@ -365,7 +365,7 @@ pub enum CacheKeySource {
 
 /// `cache = { ttl, scope, mode, key }`. Caching activates only with a `ttl`.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CachePolicy {
     pub ttl: Option<DurationMs>,
     pub scope: CacheScope,
@@ -375,6 +375,7 @@ pub struct CachePolicy {
 
 /// `idempotency = { header }` — the header is required by the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdempotencyPolicy {
     pub header: String,
 }
@@ -382,7 +383,7 @@ pub struct IdempotencyPolicy {
 /// One target's policy table. Every layer is optional; a layer set at a more
 /// specific level replaces the whole layer table (no deep merge).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TargetPolicy {
     pub timeout: Option<DurationMs>,
     pub retry: Option<RetryPolicy>,
@@ -395,7 +396,7 @@ pub struct TargetPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub outbound: Option<TargetPolicy>,
     pub llm: Option<TargetPolicy>,
@@ -412,20 +413,85 @@ pub enum NondeterminismResponse {
 
 /// Tier 2 flow designation — parsed and carried, enforced by the real core.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FlowsPolicy {
     pub entrypoints: Vec<String>,
     pub on_nondeterminism: NondeterminismResponse,
 }
 
+/// A journal location literal (`policy.journal`), validated against the frozen
+/// schema pattern `^(file:.+|postgres://.+)$` at parse time so a malformed value
+/// fails configuration (KEEL-E001) rather than being silently ignored. Parsed
+/// and carried; the concrete path is selected by the front end / core at
+/// construction (KEEL_JOURNAL or the `.keel/journal.db` default) in v0.1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct JournalLocation(pub String);
+
+impl FromStr for JournalLocation {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let valid = s.strip_prefix("file:").is_some_and(|rest| !rest.is_empty())
+            || s.strip_prefix("postgres://")
+                .is_some_and(|rest| !rest.is_empty());
+        if valid {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(ParseError::new("journal location", s))
+        }
+    }
+}
+
+impl TryFrom<String> for JournalLocation {
+    type Error = ParseError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+/// `[telemetry]` (`otlp_endpoint`, `console`). Parsed and carried, but inert in
+/// v0.1: OTel export is configured from the environment (see `keel-core`'s otel
+/// module), so setting this only validates — `Engine::configure` warns when it
+/// is present so the user is not silently surprised.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryPolicy {
+    pub otlp_endpoint: Option<String>,
+    pub console: bool,
+}
+
+impl Default for TelemetryPolicy {
+    fn default() -> Self {
+        // Schema default: console = true.
+        Self {
+            otlp_endpoint: None,
+            console: true,
+        }
+    }
+}
+
 /// The whole `keel.toml` document (contracts/policy.schema.json), typed.
+///
+/// `deny_unknown_fields` at every object level (here and on the layer structs)
+/// makes a typo'd or unknown key a configuration error (KEEL-E001 with the exact
+/// path via `serde_path_to_error`), honoring the frozen schema's
+/// `additionalProperties: false` and E001's "an unknown key was used" — instead
+/// of the previous silent drop that ran the target on defaults the user never
+/// asked for.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub defaults: Defaults,
     pub target: BTreeMap<String, TargetPolicy>,
     pub flows: Option<FlowsPolicy>,
-    pub journal: Option<String>,
+    /// Journal location (schema-validated). Parsed and carried; path selection
+    /// is construction-time in v0.1 (see [`JournalLocation`]).
+    pub journal: Option<JournalLocation>,
+    /// Telemetry config (schema-validated). Parsed and carried but inert in
+    /// v0.1 (env-driven export); see [`TelemetryPolicy`].
+    pub telemetry: Option<TelemetryPolicy>,
 }
 
 /// The per-layer config resolved for one target: target entry, else
@@ -531,6 +597,58 @@ mod tests {
         let doc = json!({ "target": { "x": { "retry": { "attempts": 0 } } } });
         let err = serde_path_to_error::deserialize::<_, Policy>(&doc).unwrap_err();
         assert_eq!(err.path().to_string(), "target.x.retry.attempts");
+    }
+
+    #[test]
+    fn unknown_key_is_rejected_with_its_path() {
+        // A typo'd nested key: the frozen schema's additionalProperties:false and
+        // E001's "an unknown key was used" mean this must fail, not silently run
+        // on the defaults.
+        let doc = json!({ "target": { "api.stripe.com": { "retry": { "atempts": 10 } } } });
+        let err = serde_path_to_error::deserialize::<_, Policy>(&doc).unwrap_err();
+        assert!(
+            err.inner().to_string().contains("atempts")
+                || err.inner().to_string().contains("unknown field"),
+            "expected an unknown-field error, got {}",
+            err.inner()
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_and_layer_keys_are_rejected() {
+        assert!(
+            serde_path_to_error::deserialize::<_, Policy>(&json!({ "bogus_top": true })).is_err()
+        );
+        assert!(
+            serde_path_to_error::deserialize::<_, Policy>(
+                &json!({ "target": { "api.x": { "retrys": {} } } })
+            )
+            .is_err(),
+            "a mistyped layer table must be rejected, not dropped"
+        );
+    }
+
+    #[test]
+    fn journal_and_telemetry_parse_and_validate() {
+        let doc = json!({
+            "journal": "file:/srv/keel/journal.db",
+            "telemetry": { "otlp_endpoint": "http://collector:4317" }
+        });
+        let policy: Policy = serde_path_to_error::deserialize(&doc).unwrap();
+        assert_eq!(
+            policy.journal.unwrap(),
+            JournalLocation("file:/srv/keel/journal.db".to_owned())
+        );
+        let telemetry = policy.telemetry.unwrap();
+        assert_eq!(
+            telemetry.otlp_endpoint.as_deref(),
+            Some("http://collector:4317")
+        );
+        assert!(telemetry.console, "schema default console = true");
+
+        // A journal string that matches neither `file:` nor `postgres://` fails.
+        let bad = json!({ "journal": "sqlite:/tmp/x.db" });
+        assert!(serde_path_to_error::deserialize::<_, Policy>(&bad).is_err());
     }
 
     #[test]

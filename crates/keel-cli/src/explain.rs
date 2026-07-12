@@ -44,8 +44,35 @@ struct ExplainReport<'a> {
     docs: String,
     name: &'a str,
     next: &'a str,
+    /// An honest "(planned)" qualifier when the frozen `next` guidance points at
+    /// a CLI affordance that does not exist yet (omitted otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planned: Option<&'static str>,
     what: &'a str,
     why: &'a str,
+}
+
+/// The frozen taxonomy references a few CLI affordances that v0.1 does not
+/// implement yet. The taxonomy file is frozen, so rather than edit its `next`
+/// copy we append an honest qualifier at render time (finding: `next` points at
+/// nonexistent affordances — `keel replay`, the lease holder in `keel flows`,
+/// Tier 1 trace ids).
+fn planned_note(code: &str) -> Option<&'static str> {
+    match code {
+        "KEEL-E032" => Some(
+            "`keel replay <flow>` is not implemented in v0.1 (planned). To force a fresh run of a \
+             dead flow now, remove its rows from .keel/journal.db.",
+        ),
+        "KEEL-E030" => Some(
+            "`keel flows` does not display the lease holder in v0.1 (planned); it lists flow id, \
+             entrypoint, status, steps, and age.",
+        ),
+        "KEEL-E010" => Some(
+            "`keel trace <id>` resolves durable-flow ids; Tier 1 trace ids (t-NNNNNN) are not \
+             persisted in v0.1, so they cannot be looked up (planned).",
+        ),
+        _ => None,
+    }
 }
 
 /// The machine twin when the code is unknown.
@@ -79,16 +106,19 @@ pub fn run(code: &str) -> Rendered {
         return unknown(code);
     };
     let docs = format!("{DOCS_BASE}/{code}");
+    let planned = planned_note(code);
     let report = ExplainReport {
         code,
         docs: docs.clone(),
         name: &entry.name,
         next: &entry.next,
+        planned,
         what: &entry.what,
         why: &entry.why,
     };
+    let note = planned.map_or(String::new(), |p| format!("\n\nNote:  {p}"));
     let human = format!(
-        "{code}  {name}\n\nWhat:  {what}\nWhy:   {why}\nNext:  {next}\n\nDocs:  {docs}",
+        "{code}  {name}\n\nWhat:  {what}\nWhy:   {why}\nNext:  {next}{note}\n\nDocs:  {docs}",
         name = entry.name,
         what = entry.what,
         why = entry.why,
@@ -160,6 +190,27 @@ mod tests {
     #[test]
     fn explain_trims_surrounding_whitespace() {
         assert_eq!(run("  KEEL-E011  ").exit, crate::EXIT_OK);
+    }
+
+    #[test]
+    fn planned_affordances_are_qualified_but_the_frozen_copy_stays_verbatim() {
+        // The frozen `next` still points at `keel replay`, verbatim…
+        let r = run("KEEL-E032");
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            r.human.contains("keel replay <flow>"),
+            "frozen copy verbatim"
+        );
+        // …but an honest planned qualifier is appended (human + JSON).
+        assert!(r.human.contains("not implemented in v0.1 (planned)"));
+        assert!(r.json["planned"].as_str().unwrap().contains("keel replay"));
+    }
+
+    #[test]
+    fn a_code_without_a_planned_gap_has_no_note() {
+        let r = run("KEEL-E014");
+        assert!(!r.human.contains("Note:"));
+        assert!(r.json.get("planned").is_none() || r.json["planned"].is_null());
     }
 
     #[test]

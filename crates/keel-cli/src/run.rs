@@ -146,11 +146,27 @@ fn python_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
     }
 }
 
+/// Pin a Node target as a path operand, never a Node option. Node parses any
+/// argv entry beginning with `-` (before the entry point) as a flag, so a file
+/// literally named `--inspect-brk=0.0.0.0:9229.js` — a valid filename that
+/// passes the exists/extension checks — would open an unauthenticated debug port
+/// instead of running as a script. Prefixing a relative target with `./`
+/// (absolute paths and already-dot-prefixed paths are left as-is) makes it
+/// unambiguously a path. The Python path is immune (its target lands after
+/// `-m keel run`).
+fn as_script_operand(target: &str) -> String {
+    if target.starts_with('/') || target.starts_with("./") || target.starts_with("../") {
+        target.to_owned()
+    } else {
+        format!("./{target}")
+    }
+}
+
 fn node_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
     let mut argv = vec![
         "--import".to_owned(),
         NODE_HOOK.to_owned(),
-        target.to_owned(),
+        as_script_operand(target),
     ];
     argv.extend_from_slice(extra);
     RunPlan {
@@ -272,6 +288,21 @@ mod tests {
         assert_eq!(plan.argv[0], "--import");
         assert_eq!(plan.argv[1], "keel/hook");
         assert!(plan.disable);
+    }
+
+    #[test]
+    fn node_dash_named_target_is_pinned_as_a_path_operand() {
+        // A relative target that would parse as a Node option is prefixed with
+        // `./`; absolute and dot-prefixed paths are already unambiguous.
+        assert_eq!(
+            as_script_operand("--inspect-brk=0.0.0.0:9229.js"),
+            "./--inspect-brk=0.0.0.0:9229.js"
+        );
+        assert_eq!(as_script_operand("app.mjs"), "./app.mjs");
+        assert_eq!(as_script_operand("sub/app.mjs"), "./sub/app.mjs");
+        assert_eq!(as_script_operand("/abs/app.mjs"), "/abs/app.mjs");
+        assert_eq!(as_script_operand("./app.mjs"), "./app.mjs");
+        assert_eq!(as_script_operand("../app.mjs"), "../app.mjs");
     }
 
     #[test]

@@ -467,6 +467,26 @@ impl Engine {
                 code: ErrorCode::PolicyInvalid,
                 message: format!("policy invalid at {}: {}", e.path(), e.inner()),
             })?;
+        // The `journal` and `telemetry` keys are schema-legal and now typed +
+        // validated, but v0.1 selects the journal path at construction
+        // (KEEL_JOURNAL / .keel/journal.db) and drives OTel export from the
+        // environment. Warn loudly rather than silently ignoring a set value, so
+        // a user pointing `journal` at a migration target — or setting an OTLP
+        // endpoint — is not surprised when it has no effect (finding: frozen keys
+        // accepted and silently ignored).
+        if let Some(journal) = policy.journal.as_ref() {
+            warn!(
+                journal = %journal.0,
+                "policy `journal` is validated but not yet wired: v0.1 selects the journal path at \
+                 startup (KEEL_JOURNAL env or .keel/journal.db). This value has no effect."
+            );
+        }
+        if policy.telemetry.is_some() {
+            warn!(
+                "policy `telemetry` is validated but inert in v0.1: OTel export is configured from \
+                 the environment (KEEL_OTEL_*). This table has no effect."
+            );
+        }
         *self.policy.write().expect("policy lock poisoned") = policy;
         Ok(())
     }

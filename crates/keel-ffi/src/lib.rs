@@ -310,6 +310,23 @@ pub unsafe extern "C" fn keel_free(core: *mut KeelCore) {
 /// Returns `KEEL_OK` or `KEEL_E001`; on error, `*err_out` (if non-null) receives
 /// a `{code, message}` JSON diagnostic the caller frees with [`keel_buf_free`].
 ///
+/// # Smart-defaults pack (contract note — see report/CCR)
+///
+/// `core-ffi.h` states the built-in smart-defaults pack (`contracts/defaults.toml`)
+/// "applies underneath" the policy here. In v0.1 that layering is performed by
+/// the **callers** — the Python/Node front ends and the CLI pre-merge the pack
+/// before calling this function (`apply_pack_defaults`/`applyPackDefaults`) — not
+/// inside `keel_configure`, which applies the document verbatim over the typed
+/// model's field defaults. This is deliberate and unavoidable in v0.1: the
+/// conformance corpus drives this exact entry point (`keel-ffi`'s
+/// `abi_conformance` and `keel-core`'s conformance) with **bare** policies and
+/// asserts outcomes that assume no pack is layered underneath, so merging the
+/// pack here would break the frozen conformance suite. Reconciling the header's
+/// wording with the corpus (e.g. a `keel_configure_with_defaults` variant, or a
+/// conformance-harness flag) needs a CCR; a direct C-ABI consumer that wants the
+/// Level 0 net today should pre-merge `contracts/defaults.toml` as the front ends
+/// do. (finding: keel_configure does not apply smart-defaults underneath.)
+///
 /// # Safety
 /// `core` must be a valid handle. `policy_json` must be null or valid for
 /// `policy_len` bytes. `err_out` must be null or a writable [`KeelBuf`] slot.

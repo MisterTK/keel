@@ -32,7 +32,10 @@ pub fn read_discovery(project: &Path) -> Result<Vec<TargetStats>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let store = DiscoveryStore::open(&path, SystemClock)
+    // Read-only open: `status`/`init`/`doctor` only read evidence, so they must
+    // not take a write lock or create/mutate the file — that lets them run from a
+    // read-only checkout or mounted volume.
+    let store = DiscoveryStore::open_readonly(&path, SystemClock)
         .map_err(|e| format!("could not open {}: {e}", path.display()))?;
     store
         .snapshot()

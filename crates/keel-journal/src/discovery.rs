@@ -39,7 +39,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use keel_core_api::ErrorClass;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 
 use crate::clock::Clock;
@@ -218,6 +218,20 @@ impl<C: Clock> DiscoveryStore<C> {
         let conn = Connection::open(path)?;
         conn.execute_batch(CONNECTION_PRAGMAS)?;
         conn.execute_batch(DISCOVERY_SCHEMA)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            clock,
+        })
+    }
+
+    /// Open the store **read-only** for the inspection commands (`keel status`,
+    /// `keel init`, `keel doctor`): no `CREATE TABLE`, no WAL/synchronous
+    /// pragmas, no write lock. This lets those nominally read-only commands grade
+    /// evidence from a read-only checkout or mounted volume, and never mutate
+    /// file state (mirrors `keel flows`/`trace`, which open the journal
+    /// `SQLITE_OPEN_READ_ONLY`). `clock` is inert on a read path.
+    pub fn open_readonly(path: impl AsRef<Path>, clock: C) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
