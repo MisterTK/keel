@@ -91,7 +91,14 @@ def virtualize_time_random(backend: Any) -> Iterator[None]:
     """Patch `time.time`/`time.time_ns`/`random.random` to journal-backed values
     for the duration of a flow, then restore the originals. On replay the backend
     substitutes the recorded value, so a resumed flow observes the same clock and
-    randomness it did on its first run."""
+    randomness it did on its first run.
+
+    The backend decides what actually becomes a value step: on the native core a
+    read that happens *inside* an intercepted effect passes through to the live
+    value (it is NOT journaled — only the flow's top-level reads between steps are
+    recorded), which also avoids re-locking the active-flow mutex mid-effect. The
+    pure-Python stub has no such reentrancy and still journals in-effect reads —
+    a known stub/native divergence for flows that read the clock inside an effect."""
     import random as _random
     import time as _time
 
