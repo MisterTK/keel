@@ -288,7 +288,10 @@ fn init_diff_patch_applies_cleanly_with_git_apply() {
     let dir = diff_project();
     let r = init_diff(dir.path());
     let patch = r.json["patch"].as_str().unwrap();
-    assert!(patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"), "{patch}");
+    assert!(
+        patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"),
+        "{patch}"
+    );
 
     std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
     let out = Command::new("git")
@@ -325,7 +328,10 @@ fn init_diff_creation_patch_matches_a_real_init_write() {
     std::fs::write(dir.path().join("app.mjs"), DIFF_APP_MJS).unwrap();
     let r = init_diff(dir.path());
     let patch = r.json["patch"].as_str().unwrap();
-    assert!(patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"), "{patch}");
+    assert!(
+        patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"),
+        "{patch}"
+    );
 
     std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
     let out = Command::new("git")
@@ -374,6 +380,58 @@ fn doctor_json_matches_golden() {
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("doctor_node.json", &json_string(&r.json));
+}
+
+/// An invalid keel.toml turns the doctor policy finding into an applyable fix
+/// (dx-spec §5): the whole `--json` twin — findings, `fix.patch`,
+/// `fix.changes` — is byte-golden, and the patch applies cleanly with the real
+/// `git apply`, preserving every byte outside the removed entry.
+#[test]
+fn doctor_fix_json_matches_golden_and_applies() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "# my tuning\n[target.\"api.example.com\"]\ntimeout = \"30s\" # keep\nretry = { attempts = 0 }\n",
+    )
+    .unwrap();
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_USAGE, "invalid policy exits 2");
+    assert!(r.human.contains("patch (apply with `git apply`)"));
+    check_golden("doctor_fix.json", &json_string(&r.json));
+
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let findings = r.json["findings"].as_array().unwrap();
+    let fix = findings
+        .iter()
+        .find(|f| f["topic"] == "policy")
+        .map(|f| &f["fix"])
+        .expect("policy finding carries a fix");
+    let patch = fix["patch"].as_str().unwrap();
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    assert!(applied.contains("# my tuning"));
+    assert!(applied.contains("timeout = \"30s\" # keep"));
+    assert!(!applied.contains("retry"), "invalid entry removed");
+    // The fixed file passes a re-run: doctor is now ok.
+    let again = doctor::run(dir.path());
+    assert_eq!(
+        again.exit,
+        keel_cli::EXIT_OK,
+        "removal fix heals the policy"
+    );
 }
 
 #[test]

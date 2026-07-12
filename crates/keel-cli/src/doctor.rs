@@ -318,7 +318,11 @@ fn validate_policy(path: &Path) -> PolicyValidation {
     let json_value = match serde_json::to_value(&toml_value) {
         Ok(v) => v,
         Err(e) => {
-            return invalid(None, &format!("keel.toml could not be normalized: {e}"), None);
+            return invalid(
+                None,
+                &format!("keel.toml could not be normalized: {e}"),
+                None,
+            );
         }
     };
     match serde_path_to_error::deserialize::<_, Policy>(&json_value) {
@@ -573,11 +577,9 @@ mod tests {
         let fix = v.fix.expect("fix proposal attached");
         assert!(fix.patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"));
         // The patch is faithful: applying it reproduces the proposed text.
-        let applied = crate::diff::apply_unified(
-            &std::fs::read_to_string(&path).unwrap(),
-            &fix.patch,
-        )
-        .unwrap();
+        let applied =
+            crate::diff::apply_unified(&std::fs::read_to_string(&path).unwrap(), &fix.patch)
+                .unwrap();
         assert_eq!(applied, fix.new_text);
         // The proposed text is a valid policy with the untouched bytes intact.
         std::fs::write(&path, &fix.new_text).unwrap();
@@ -585,7 +587,10 @@ mod tests {
         assert!(after.check.valid, "removal fix yields a valid policy");
         assert!(fix.new_text.contains("# my tuning"));
         assert!(fix.new_text.contains("timeout = \"30s\" # keep"));
-        assert!(!fix.new_text.contains("retry"), "whole invalid entry removed");
+        assert!(
+            !fix.new_text.contains("retry"),
+            "whole invalid entry removed"
+        );
         // The structured form names the removed entry.
         assert_eq!(fix.changes.len(), 1);
         assert_eq!(fix.changes[0].path, "target.\"api.example.com\".retry");

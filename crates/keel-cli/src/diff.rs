@@ -265,7 +265,11 @@ pub fn resolve_dotted_path(text: &str, dotted: &str) -> Option<PolicyPath> {
 fn strip_index_suffix(seg: &str) -> String {
     let mut out = seg;
     while let Some(open) = out.rfind('[') {
-        if out.ends_with(']') && out[open + 1..out.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+        if out.ends_with(']')
+            && out[open + 1..out.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
             out = &out[..open];
         } else {
             break;
@@ -419,7 +423,9 @@ fn reattach_prefix(doc: &mut DocumentMut, removed_position: Option<usize>, detac
                 .unwrap_or("")
                 .trim_start_matches('\n')
                 .to_owned();
-            table.decor_mut().set_prefix(format!("{detached}{existing}"));
+            table
+                .decor_mut()
+                .set_prefix(format!("{detached}{existing}"));
         }
     } else {
         let trailing = doc.trailing().as_str().unwrap_or("").to_owned();
@@ -433,7 +439,7 @@ fn collect_positioned_tables(
     path: &mut Vec<String>,
     visit: &mut dyn FnMut(usize, &[String]),
 ) {
-    for (key, item) in table.iter() {
+    for (key, item) in table {
         if let Item::Table(t) = item {
             path.push(key.to_owned());
             if let Some(position) = t.position() {
@@ -486,10 +492,7 @@ fn policy_json(text: &str) -> Result<serde_json::Value, String> {
 /// hunks. Tables present on both sides recurse; a subtree appearing or
 /// vanishing above the target-name level (depth < 2) is broken into per-child
 /// hunks so adds/removes stay `[target."…"]`-block granular.
-fn structural_changes(
-    before: &serde_json::Value,
-    after: &serde_json::Value,
-) -> Vec<ChangeHunk> {
+fn structural_changes(before: &serde_json::Value, after: &serde_json::Value) -> Vec<ChangeHunk> {
     let mut out = Vec::new();
     walk_changes(&mut Vec::new(), Some(before), Some(after), &mut out);
     out
@@ -511,8 +514,12 @@ fn walk_changes(
     };
     if recurse {
         let empty = serde_json::Map::new();
-        let b = before.and_then(serde_json::Value::as_object).unwrap_or(&empty);
-        let a = after.and_then(serde_json::Value::as_object).unwrap_or(&empty);
+        let b = before
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&empty);
+        let a = after
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&empty);
         let keys: BTreeSet<&String> = b.keys().chain(a.keys()).collect();
         for key in keys {
             path.push(key.clone());
@@ -554,7 +561,14 @@ pub fn unified_diff(old_label: &str, new_label: &str, old: &str, new: &str) -> S
     let mut out = format!("--- {old_label}\n+++ {new_label}\n");
     for range in hunk_ranges(&edits) {
         let (old_pos, new_pos) = cursor_at(&edits, range.start);
-        render_hunk(&mut out, &edits[range], old_pos, new_pos, &old_lines, &new_lines);
+        render_hunk(
+            &mut out,
+            &edits[range],
+            old_pos,
+            new_pos,
+            &old_lines,
+            &new_lines,
+        );
     }
     out
 }
@@ -565,15 +579,12 @@ fn split_keep_newline(text: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        match rest.find('\n') {
-            Some(i) => {
-                lines.push(&rest[..=i]);
-                rest = &rest[i + 1..];
-            }
-            None => {
-                lines.push(rest);
-                rest = "";
-            }
+        if let Some(i) = rest.find('\n') {
+            lines.push(&rest[..=i]);
+            rest = &rest[i + 1..];
+        } else {
+            lines.push(rest);
+            rest = "";
         }
     }
     lines
@@ -741,7 +752,11 @@ mod tests {
         while let Some(header) = lines.next() {
             let (old_start, old_count) = parse_hunk_side(header, '-')?;
             let (_, new_count) = parse_hunk_side(header, '+')?;
-            let hunk_old_index = if old_count == 0 { old_start } else { old_start - 1 };
+            let hunk_old_index = if old_count == 0 {
+                old_start
+            } else {
+                old_start - 1
+            };
             while cursor < hunk_old_index {
                 out.push_str(old_lines[cursor]);
                 cursor += 1;
@@ -950,7 +965,11 @@ timeout = \"10s\"
             path: PolicyPath::new(["target", "b.example"]),
         }];
         let p = propose(Some(generated), &ops).unwrap();
-        assert!(p.new_text.ends_with("timeout = \"30s\"\n"), "{}", p.new_text);
+        assert!(
+            p.new_text.ends_with("timeout = \"30s\"\n"),
+            "{}",
+            p.new_text
+        );
         assert!(!p.new_text.contains("b.example"));
         assert_eq!(apply_unified(generated, &p.patch).unwrap(), p.new_text);
         assert_eq!(p.changes.len(), 1);
@@ -982,10 +1001,17 @@ timeout = \"10s\"
     #[test]
     fn append_block_separates_with_exactly_one_blank_line() {
         let block = "[target.\"api.new.example\"]\ntimeout = \"30s\"\n";
-        let p = propose(Some(TUNED), &[PolicyOp::AppendBlock { text: block.to_owned() }]).unwrap();
+        let p = propose(
+            Some(TUNED),
+            &[PolicyOp::AppendBlock {
+                text: block.to_owned(),
+            }],
+        )
+        .unwrap();
         assert!(
-            p.new_text
-                .ends_with("timeout = \"10s\"\n\n[target.\"api.new.example\"]\ntimeout = \"30s\"\n"),
+            p.new_text.ends_with(
+                "timeout = \"10s\"\n\n[target.\"api.new.example\"]\ntimeout = \"30s\"\n"
+            ),
             "{}",
             p.new_text
         );
@@ -999,7 +1025,13 @@ timeout = \"10s\"
     fn append_to_a_file_without_trailing_newline_still_applies() {
         let old = "[target.\"api.example.com\"]\ntimeout = \"30s\""; // no final newline
         let block = "[target.\"api.new.example\"]\ntimeout = \"5s\"\n";
-        let p = propose(Some(old), &[PolicyOp::AppendBlock { text: block.to_owned() }]).unwrap();
+        let p = propose(
+            Some(old),
+            &[PolicyOp::AppendBlock {
+                text: block.to_owned(),
+            }],
+        )
+        .unwrap();
         assert!(p.patch.contains("\\ No newline at end of file"));
         assert_eq!(apply_unified(old, &p.patch).unwrap(), p.new_text);
         assert!(p.new_text.parse::<DocumentMut>().is_ok());
@@ -1035,9 +1067,18 @@ timeout = \"10s\"
     #[test]
     fn absent_file_proposes_a_dev_null_creation_patch() {
         let content = "# header\n\n[target.\"a.example\"]\ntimeout = \"30s\"\n";
-        let p = propose(None, &[PolicyOp::AppendBlock { text: content.to_owned() }]).unwrap();
+        let p = propose(
+            None,
+            &[PolicyOp::AppendBlock {
+                text: content.to_owned(),
+            }],
+        )
+        .unwrap();
         assert_eq!(p.new_text, content);
-        assert!(p.patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,4 @@\n"));
+        assert!(
+            p.patch
+                .starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,4 @@\n")
+        );
         assert_eq!(apply_unified("", &p.patch).unwrap(), content);
         // Creation hunks stay target-block granular (depth rule).
         assert_eq!(p.changes.len(), 1);
@@ -1056,7 +1097,10 @@ timeout = \"10s\"
         let json = crate::render::to_json(&p);
         assert!(json.get("changes").is_some());
         assert!(json.get("patch").is_some());
-        assert!(json.get("new_text").is_none(), "new_text is not wire format");
+        assert!(
+            json.get("new_text").is_none(),
+            "new_text is not wire format"
+        );
     }
 
     #[test]
@@ -1093,7 +1137,10 @@ timeout = \"10s\"
     fn policy_path_display_quotes_only_non_bare_segments() {
         let path = PolicyPath::new(["target", "api.example.com", "retry"]);
         assert_eq!(path.to_string(), "target.\"api.example.com\".retry");
-        assert_eq!(PolicyPath::new(["flow", "nightly-etl"]).to_string(), "flow.nightly-etl");
+        assert_eq!(
+            PolicyPath::new(["flow", "nightly-etl"]).to_string(),
+            "flow.nightly-etl"
+        );
     }
 
     #[test]
@@ -1106,7 +1153,10 @@ timeout = \"10s\"
         );
         // Array indices are stripped; the path stops at the array's value.
         let resolved = resolve_dotted_path(text, "target.api.example.com.retry.on[1]").unwrap();
-        assert_eq!(resolved.segments(), ["target", "api.example.com", "retry", "on"]);
+        assert_eq!(
+            resolved.segments(),
+            ["target", "api.example.com", "retry", "on"]
+        );
         // Segments beyond a scalar resolve to the scalar (the entry to fix).
         let resolved = resolve_dotted_path(text, "target.api.example.com.retry.attempts.deep");
         assert_eq!(

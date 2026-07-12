@@ -1057,9 +1057,15 @@ timeout = \"5s\"
 
         assert_eq!(r.exit, crate::EXIT_OK);
         let patch = r.json["patch"].as_str().unwrap();
-        assert!(patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"), "{patch}");
+        assert!(
+            patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"),
+            "{patch}"
+        );
         assert!(r.human.contains("apply with `git apply`"));
-        assert!(r.human.contains(patch), "the human output carries the patch verbatim");
+        assert!(
+            r.human.contains(patch),
+            "the human output carries the patch verbatim"
+        );
 
         let applied = crate::diff::apply_unified(old, patch).unwrap();
         let value: toml::Value = applied.parse().expect("applied file parses");
@@ -1112,7 +1118,10 @@ timeout = \"5s\"
 
         assert_eq!(r.exit, crate::EXIT_OK);
         let patch = r.json["patch"].as_str().unwrap();
-        assert!(patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"), "{patch}");
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"),
+            "{patch}"
+        );
         let scanned = scan::scan(dir.path());
         let expected = render_keel_toml(&scanned, &[], None);
         assert_eq!(crate::diff::apply_unified("", patch).unwrap(), expected);
