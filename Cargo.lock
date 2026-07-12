@@ -583,6 +583,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-ffi"
+version = "0.1.0"
+dependencies = [
+ "keel-conformance",
+ "keel-core",
+ "keel-core-api",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "keel-journal"
 version = "0.1.0"
 dependencies = [
