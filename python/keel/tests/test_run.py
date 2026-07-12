@@ -17,6 +17,7 @@ HELLO = str(FIXTURES / "hello_app.py")
 ECHO = str(FIXTURES / "echo_argv.py")
 ENRICH = str(FIXTURES / "enrich_app.py")
 NOOP = str(FIXTURES / "noop_app.py")
+SUBDIR_APP = str(FIXTURES / "subdir_app" / "app.py")
 
 
 def _run(cmd: list[str], *, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess[bytes]:
@@ -41,6 +42,33 @@ class DisableIdentityTest(unittest.TestCase):
         self.assertEqual(baseline.returncode, 7)
         # No `.keel` written under a disabled run.
         self.assertFalse((Path(d) / ".keel").exists())
+
+    def test_sibling_import_byte_identical_for_script_in_subdirectory(self) -> None:
+        # `keel run subdir/app.py` must put the script's directory on sys.path
+        # exactly like `python subdir/app.py`, so a sibling `import helpers`
+        # resolves identically. Proven byte-for-byte for the disabled run.
+        with TemporaryDirectory() as d:
+            baseline = _run([sys.executable, SUBDIR_APP], env=child_env(), cwd=d)
+            disabled = _run(
+                [sys.executable, "-m", "keel", "run", SUBDIR_APP],
+                env=child_env(KEEL_DISABLE="1"),
+                cwd=d,
+            )
+        self.assertEqual(baseline.returncode, 5, baseline.stderr.decode())
+        self.assertEqual(baseline.stdout, b"helper says 99\n")
+        self.assertEqual(disabled.returncode, baseline.returncode)
+        self.assertEqual(disabled.stdout, baseline.stdout)
+        self.assertEqual(disabled.stderr, baseline.stderr)
+
+    def test_sibling_import_resolves_under_enabled_keel_run(self) -> None:
+        with TemporaryDirectory() as d:
+            enabled = _run(
+                [sys.executable, "-m", "keel", "run", SUBDIR_APP],
+                env=child_env(KEEL_QUIET="1"),
+                cwd=d,
+            )
+        self.assertEqual(enabled.returncode, 5, enabled.stderr.decode())
+        self.assertEqual(enabled.stdout, b"helper says 99\n")
 
 
 class BannerAndPassthroughTest(unittest.TestCase):

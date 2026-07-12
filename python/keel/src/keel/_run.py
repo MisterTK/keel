@@ -53,6 +53,13 @@ def run_target(
                 raise SystemExit(1) from exc
             raise
 
+    # Mirror CPython's `python <target>` semantics exactly. runpy.run_path
+    # does NOT put the script's directory on sys.path for a file target, but a
+    # direct interpreter launch does — so without this, sibling imports
+    # (`import helpers` next to app.py) that work under plain python would break
+    # under `keel run`, and byte-identity would fail for any script with a
+    # directory component. Prepend dirname(abspath(target)), like CPython.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(target)))
     # Present argv exactly as `python <target> [args...]` would, so the script
     # sees the same argv[0] and byte-identical behavior.
     sys.argv = [target, *args]
