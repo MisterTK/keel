@@ -1,37 +1,18 @@
 /**
- * AsyncEngine: the runtime resilience backend for the Node front end.
+ * keel-core-stub: an in-memory fake of the keel-core surface (Node form).
  *
- * The `keel-core-stub` (node/keel-core-stub) is a SYNCHRONOUS decision engine
- * on a virtual clock — it drives attempts by calling `effect(attempt)` and
- * inspecting the returned value inline. A real front end intercepts async I/O
- * (fetch, async functions), so the effect cannot be synchronous. Until the
- * native async core lands ("the swap", Task 14) the Node backend runs an async
- * port of the stub's `execute`.
+ * Mirrors crates/keel-core-stub semantics exactly; the shared specification
+ * lives in conformance/README.md. Envelopes are plain objects shaped like the
+ * serde types in contracts/core_api.rs.
  *
- * The decision logic here is a faithful, verbatim-derived port of
- * `keel-core-stub`'s layer chain (cache → rate → breaker → retry), condition
- * matching, terminal codes (KEEL-E010/E012/E014/E015), and Outcome envelope.
- * Parity is not left to trust: `test/engine-parity.test.mjs` runs identical
- * scripted attempt sequences through BOTH this engine (virtual clock) and the
- * real `KeelCoreStub` and asserts byte-identical outcomes. Change the semantics
- * in one place and that test fails.
- *
- * Deliberate additions over the stub, documented and safe:
- *   - clocks are injectable so tests are deterministic (virtualClock) while
- *     production uses realClock (real backoff sleeps, real wall time).
- *   - `configure` is delegated to a `KeelCoreStub` instance so validation and
- *     its KEEL-E001 field-path messages are shared, never re-derived.
+ * Simplifications (deliberate, documented): virtual clock (waits recorded,
+ * not slept), no jitter, consecutive-failure breaker only, fixed-window rate
+ * limiter, exact-match target resolution with defaults.llm / defaults.outbound
+ * fallback, `timeout` validated but not enforced.
  */
 
-// Vendored copy of node/keel-core-stub/index.mjs so the published package is
-// self-contained (npm pack cannot ship files above the package root). It is
-// byte-identical to the source — enforced by test/vendored-stub-parity.test.mjs
-// and scripts/check-release-metadata.sh; refresh with scripts/sync-vendored.sh.
-import { KeelCoreStub, KeelError, ENVELOPE_VERSION } from "./vendor/keel-core-stub/index.mjs";
+export const ENVELOPE_VERSION = 1;
 
-export { KeelError, ENVELOPE_VERSION };
-
-// --- constants (mirror keel-core-stub) ---------------------------------------
 const DEFAULT_SCHEDULE = { base: 200, factor: 2, cap: 30_000 };
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_ON = ["conn", "timeout", "429", "5xx"];
@@ -41,7 +22,13 @@ const DEFAULT_BREAKER_COOLDOWN_MS = 15_000;
 const DURATION_MULT = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
 const RATE_WINDOW = { s: 1_000, sec: 1_000, min: 60_000, h: 3_600_000, hour: 3_600_000 };
 
-// --- ported pure helpers (verbatim from keel-core-stub) ----------------------
+export class KeelError extends Error {
+  constructor(code, message) {
+    super(`${code}: ${message}`);
+    this.code = code;
+  }
+}
+
 function parseDuration(s) {
   const m = /^(\d+)(ms|s|m|h)$/.exec(String(s).trim());
   return m ? Number(m[1]) * DURATION_MULT[m[2]] : null;
@@ -54,6 +41,7 @@ function parseRate(s) {
   return limit >= 1 ? { limit, windowMs: RATE_WINDOW[m[2]] } : null;
 }
 
+/** v0.1 primaries: exp(base, xF[, max D][, jitter]) and fixed(D). */
 function parseSchedule(s) {
   s = String(s).trim();
   if (s.startsWith("exp(") && s.endsWith(")")) {
@@ -93,73 +81,135 @@ function conditionMatches(cond, cls, httpStatus) {
   return /^\d{3}$/.test(cond) && Number(cond) === httpStatus;
 }
 
+function invalid(path, msg) {
+  return new KeelError("KEEL-E001", `policy invalid at ${path}: ${msg}`);
+}
+
 function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-// --- clocks ------------------------------------------------------------------
-/** Production clock: wall time; backoff waits actually sleep. */
-export function realClock() {
-  return {
-    now: () => Date.now(),
-    sleep: (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve()),
-    advance() {},
-  };
+/** Reject any key not in `allowed`, mirroring the real core / Rust stub's
+ *  `#[serde(deny_unknown_fields)]`: the frozen schema is additionalProperties:
+ *  false at every level, and KEEL-E001's "why" includes "an unknown key was
+ *  used" — so a typo'd key fails loudly with its path, never silently drops to a
+ *  default the user never asked for. */
+function rejectUnknownKeys(path, obj, allowed) {
+  for (const k of Object.keys(obj))
+    if (!allowed.includes(k)) throw invalid(`${path}.${k}`, "unknown key");
 }
 
-/** Deterministic clock for tests/parity: waits advance a virtual counter. */
-export function virtualClock() {
-  let t = 0;
-  return {
-    now: () => t,
-    sleep: async (ms) => {
-      t += ms;
-    },
-    advance: (ms) => {
-      t += ms;
-    },
-  };
-}
-
-/**
- * Async port of KeelCoreStub. `kind` identifies the backend in diagnostics.
- * `execute(request, effect)` takes an ASYNC effect: `(attempt) => Promise<AttemptResult>`.
- */
-export class AsyncEngine {
-  kind = "node-stub";
-  #policy = {};
-  #validator = new KeelCoreStub();
-  #clock;
-  #traceSeq = 0;
-  #breakers = new Map();
-  #rateWindows = new Map();
-  #cache = new Map();
-  #metrics = new Map();
-
-  constructor(clock = realClock()) {
-    this.#clock = clock;
+function validateTargetPolicy(path, v) {
+  if (!isTable(v)) throw invalid(path, "expected a table");
+  rejectUnknownKeys(path, v, [
+    "timeout",
+    "retry",
+    "breaker",
+    "rate",
+    "cache",
+    "idempotency",
+    "fallback",
+    "budget",
+  ]);
+  if (v.timeout !== undefined && parseDuration(v.timeout) === null)
+    throw invalid(path, "bad timeout duration");
+  if (v.retry !== undefined) {
+    if (!isTable(v.retry)) throw invalid(path, "retry must be a table");
+    rejectUnknownKeys(`${path}.retry`, v.retry, ["attempts", "schedule", "on"]);
+    const { attempts, schedule, on } = v.retry;
+    if (attempts !== undefined && (!Number.isInteger(attempts) || attempts < 1))
+      throw invalid(path, "retry.attempts must be an integer >= 1");
+    if (schedule !== undefined && parseSchedule(schedule) === null)
+      throw invalid(path, "unparseable retry.schedule");
+    if (on !== undefined) {
+      if (!Array.isArray(on)) throw invalid(path, "retry.on must be an array");
+      for (const c of on) {
+        const known =
+          typeof c === "string" &&
+          (["conn", "timeout", "cancelled", "other", "4xx", "5xx"].includes(c) ||
+            // Frozen schema errorCondition grammar: [1-5][0-9][0-9] (100–599),
+            // not any 3-digit string (which accepted 099/999/600).
+            /^[1-5][0-9][0-9]$/.test(c));
+        if (!known) throw invalid(path, "unknown retry.on condition");
+      }
+    }
   }
+  if (v.breaker !== undefined) {
+    if (!isTable(v.breaker)) throw invalid(path, "breaker must be a table");
+    rejectUnknownKeys(`${path}.breaker`, v.breaker, [
+      "failures",
+      "cooldown",
+      "window",
+      "failure_rate",
+      "min_calls",
+    ]);
+    const { failures, cooldown } = v.breaker;
+    if (failures !== undefined && (!Number.isInteger(failures) || failures < 1))
+      throw invalid(path, "breaker.failures must be an integer >= 1");
+    if (cooldown !== undefined && parseDuration(cooldown) === null)
+      throw invalid(path, "bad breaker.cooldown");
+  }
+  if (v.rate !== undefined && (typeof v.rate !== "string" || parseRate(v.rate) === null))
+    throw invalid(path, "unparseable rate");
+  if (v.cache !== undefined) {
+    if (!isTable(v.cache)) throw invalid(path, "cache must be a table");
+    rejectUnknownKeys(`${path}.cache`, v.cache, ["ttl", "scope", "mode", "key"]);
+    if (v.cache.ttl !== undefined && parseDuration(v.cache.ttl) === null)
+      throw invalid(path, "bad cache.ttl");
+    // Closed enums (parity with the core's serde enums + the Python stub): a
+    // typo like scope="persistant" must fail, not silently fall back to a default.
+    if (v.cache.scope !== undefined && v.cache.scope !== "memory" && v.cache.scope !== "persistent")
+      throw invalid(path, "cache.scope must be memory|persistent");
+    if (v.cache.mode !== undefined && v.cache.mode !== "always" && v.cache.mode !== "dev")
+      throw invalid(path, "cache.mode must be always|dev");
+    if (v.cache.key !== undefined && v.cache.key !== "args" && v.cache.key !== "url")
+      throw invalid(path, "cache.key must be args|url");
+  }
+  if (v.idempotency !== undefined) {
+    if (!isTable(v.idempotency)) throw invalid(path, "idempotency must be a table");
+    rejectUnknownKeys(`${path}.idempotency`, v.idempotency, ["header"]);
+    if (typeof v.idempotency.header !== "string")
+      throw invalid(`${path}.idempotency.header`, "header must be a string");
+  }
+}
 
-  /** Validate + store policy. Validation (and its KEEL-E001 field paths) is
-   *  delegated to KeelCoreStub so the two never diverge. Throws KeelError. */
+export class KeelCoreStub {
+  #policy = {};
+  #nowMs = 0;
+  #traceSeq = 0;
+  #breakers = new Map(); // target -> {consecutive, openUntil, opens}
+  #rateWindows = new Map(); // target -> {window, count}
+  #cache = new Map(); // key -> {expires, payload}
+  #metrics = new Map(); // target -> counters
+
   configure(policy) {
-    this.#validator.configure(policy); // throws KeelError on invalid policy
+    if (!isTable(policy)) throw invalid("$", "policy document must be a table");
+    // Top-level keys are the frozen schema's document properties (journal /
+    // telemetry / flows are accepted here and inert in the stub, as in the core).
+    rejectUnknownKeys("$", policy, ["defaults", "target", "flows", "journal", "telemetry"]);
+    if (policy.defaults !== undefined) {
+      if (!isTable(policy.defaults)) throw invalid("defaults", "expected a table");
+      rejectUnknownKeys("defaults", policy.defaults, ["outbound", "llm"]);
+      for (const key of ["outbound", "llm"])
+        if (policy.defaults[key] !== undefined)
+          validateTargetPolicy(`defaults.${key}`, policy.defaults[key]);
+    }
+    if (policy.target !== undefined) {
+      if (!isTable(policy.target)) throw invalid("target", "expected a table");
+      for (const [name, v] of Object.entries(policy.target))
+        validateTargetPolicy(`target."${name}"`, v);
+    }
     this.#policy = policy;
   }
 
-  /** Public layer resolution (front-end judgments consult this, e.g. to find a
-   *  target's idempotency header). Identical rule to KeelCoreStub#layer. */
-  layer(target, key) {
+  #layer(target, key) {
     const t = this.#policy.target;
-    if (isTable(t) && isTable(t[target]) && t[target][key] !== undefined) return t[target][key];
+    if (isTable(t) && isTable(t[target]) && t[target][key] !== undefined)
+      return t[target][key];
     const defaults = this.#policy.defaults ?? {};
     if (target.startsWith("llm:") && isTable(defaults.llm) && defaults.llm[key] !== undefined)
       return defaults.llm[key];
     return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
-  }
-
-  advanceClock(ms) {
-    this.#clock.advance(ms);
   }
 
   #met(target) {
@@ -178,10 +228,10 @@ export class AsyncEngine {
 
   #breakerState(target) {
     const b = this.#breakers.get(target);
-    return b && b.openUntil !== null && this.#clock.now() < b.openUntil ? "open" : "closed";
+    return b && b.openUntil !== null && this.#nowMs < b.openUntil ? "open" : "closed";
   }
 
-  async execute(request, effect) {
+  execute(request, effect) {
     const target = request.target;
     const op = request.op ?? target;
     const m = this.#met(target);
@@ -209,10 +259,10 @@ export class AsyncEngine {
       return out;
     }
 
-    const retry = this.layer(target, "retry");
-    const breakerCfg = this.layer(target, "breaker");
-    const rate = this.layer(target, "rate");
-    const cacheCfg = this.layer(target, "cache");
+    const retry = this.#layer(target, "retry");
+    const breakerCfg = this.#layer(target, "breaker");
+    const rate = this.#layer(target, "rate");
+    const cacheCfg = this.#layer(target, "cache");
     const cacheTtl =
       isTable(cacheCfg) && cacheCfg.ttl !== undefined ? parseDuration(cacheCfg.ttl) : null;
 
@@ -221,7 +271,7 @@ export class AsyncEngine {
     const cacheKey = cacheTtl !== null && argsHash ? `${target}#${argsHash}` : null;
     if (cacheKey && this.#cache.has(cacheKey)) {
       const { expires, payload } = this.#cache.get(cacheKey);
-      if (this.#clock.now() < expires) {
+      if (this.#nowMs < expires) {
         m.cache_hits += 1;
         m.successes += 1;
         out.result = "ok";
@@ -232,11 +282,10 @@ export class AsyncEngine {
       }
     }
 
-    // rate limiter (fixed windows on the clock)
+    // rate limiter (fixed windows on the virtual clock)
     if (typeof rate === "string") {
       const { limit, windowMs } = parseRate(rate);
-      const now = this.#clock.now();
-      const w = Math.floor(now / windowMs);
+      const w = Math.floor(this.#nowMs / windowMs);
       if (!this.#rateWindows.has(target)) this.#rateWindows.set(target, { window: w, count: 0 });
       const cell = this.#rateWindows.get(target);
       if (cell.window !== w) {
@@ -245,10 +294,10 @@ export class AsyncEngine {
       }
       if (cell.count >= limit) {
         const next = (cell.window + 1) * windowMs;
-        out.throttle_wait_ms = next - now;
+        out.throttle_wait_ms = next - this.#nowMs;
         out.throttled = true;
-        await this.#clock.sleep(next - now);
-        cell.window = Math.floor(this.#clock.now() / windowMs);
+        this.#nowMs = next;
+        cell.window = Math.floor(next / windowMs);
         cell.count = 0;
         m.throttled += 1;
       }
@@ -262,7 +311,7 @@ export class AsyncEngine {
         this.#breakers.set(target, { consecutive: 0, openUntil: null, opens: 0 });
       const b = this.#breakers.get(target);
       if (b.openUntil !== null) {
-        if (this.#clock.now() < b.openUntil) {
+        if (this.#nowMs < b.openUntil) {
           out.error = {
             code: "KEEL-E012",
             class: "other",
@@ -290,7 +339,7 @@ export class AsyncEngine {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       out.attempts = attempt;
       m.attempts += 1;
-      const res = await effect(attempt);
+      const res = effect(attempt);
       if (res.status === "ok") {
         m.successes += 1;
         if (isTable(breakerCfg)) {
@@ -299,7 +348,7 @@ export class AsyncEngine {
           b.openUntil = null;
         }
         if (cacheKey && cacheTtl !== null)
-          this.#cache.set(cacheKey, { expires: this.#clock.now() + cacheTtl, payload: res.payload });
+          this.#cache.set(cacheKey, { expires: this.#nowMs + cacheTtl, payload: res.payload });
         out.result = "ok";
         out.payload = res.payload;
         out.breaker = this.#breakerState(target);
@@ -321,7 +370,8 @@ export class AsyncEngine {
           msg = `${op} failed ${attempt}/${maxAttempts} attempts (last: ${detail}). ${message}`;
         else if (code === "KEEL-E014")
           msg = `${op} failed (${detail}). Not retried: call is not idempotent — observed, not retried. ${message}`;
-        else msg = `${op} failed (${detail}); error class is not retryable per policy. ${message}`;
+        else
+          msg = `${op} failed (${detail}); error class is not retryable per policy. ${message}`;
         terminal = { code, class: cls, message: msg.trimEnd() };
         if (httpStatus != null) terminal.http_status = httpStatus;
         if (res.original !== undefined) terminal.original = res.original;
@@ -330,7 +380,7 @@ export class AsyncEngine {
       let wait = scheduleWait(schedule, attempt);
       if (res.retry_after_ms != null) wait = Math.max(wait, res.retry_after_ms);
       out.waits_ms.push(wait);
-      await this.#clock.sleep(wait);
+      this.#nowMs += wait;
       m.retries += 1;
     }
 
@@ -344,13 +394,13 @@ export class AsyncEngine {
           : DEFAULT_BREAKER_COOLDOWN_MS;
       const b = this.#breakers.get(target);
       if (halfOpen) {
-        b.openUntil = this.#clock.now() + cooldown;
+        b.openUntil = this.#nowMs + cooldown;
         b.opens += 1;
         b.consecutive = 0;
       } else {
         b.consecutive += 1;
         if (b.consecutive >= failures) {
-          b.openUntil = this.#clock.now() + cooldown;
+          b.openUntil = this.#nowMs + cooldown;
           b.opens += 1;
           b.consecutive = 0;
         }
@@ -361,8 +411,6 @@ export class AsyncEngine {
     return out;
   }
 
-  /** Deterministic report; same contractual shape as KeelCoreStub.report()
-   *  ({v, clock_ms, targets}) — clock_ms comes from the injected clock. */
   report() {
     const targets = {};
     for (const name of [...this.#metrics.keys()].sort()) {
@@ -380,6 +428,10 @@ export class AsyncEngine {
         throttled: m.throttled,
       };
     }
-    return { v: 1, clock_ms: this.#clock.now(), targets };
+    return { v: 1, clock_ms: this.#nowMs, targets };
+  }
+
+  advanceClock(ms) {
+    this.#nowMs += ms;
   }
 }
