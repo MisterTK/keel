@@ -13,6 +13,13 @@ from tempfile import TemporaryDirectory
 
 from . import FIXTURES, child_env
 
+try:  # the native leg of the startup budget only runs when the wheel is built
+    import keel_core  # noqa: F401
+
+    _NATIVE = True
+except ImportError:
+    _NATIVE = False
+
 HELLO = str(FIXTURES / "hello_app.py")
 ECHO = str(FIXTURES / "echo_argv.py")
 ENRICH = str(FIXTURES / "enrich_app.py")
@@ -170,19 +177,32 @@ class StartupBudgetTest(unittest.TestCase):
             # real core + journal attach; stub is the pure-Python path. `keel run`
             # via child_env auto-selects native when the wheel is installed.
             stub_ms = self._min_ms(cmd, child_env(KEEL_QUIET="1", KEEL_BACKEND="stub"), d)
-            native_ms = self._min_ms(cmd, child_env(KEEL_QUIET="1", KEEL_BACKEND="native"), d)
+            # The native leg is measured only when the wheel is built; the
+            # no-wheel CI front-end job forces KEEL_BACKEND=native → KEEL-E040,
+            # which _min_ms would (correctly) treat as a hard failure, so gate it.
+            native_added = None
+            if _NATIVE:
+                native_ms = self._min_ms(cmd, child_env(KEEL_QUIET="1", KEEL_BACKEND="native"), d)
+                native_added = native_ms - baseline
         stub_added = stub_ms - baseline
-        native_added = native_ms - baseline
+        native_str = (
+            f"native +{native_added:.1f} ms"
+            if native_added is not None
+            else "native (skipped: no wheel)"
+        )
         print(
             f"[startup budget] baseline {baseline:.1f} ms | "
-            f"stub +{stub_added:.1f} ms | native +{native_added:.1f} ms "
+            f"stub +{stub_added:.1f} ms | {native_str} "
             "(target <100 ms, budget <250 ms)",
             file=sys.stderr,
         )
-        # Both paths must exit 0 (enforced in _min_ms) AND stay under budget —
-        # native is the shipped path, stub is the no-wheel CI path.
-        self.assertLess(native_added, 250.0, f"native startup budget exceeded: {native_added:.1f} ms")
+        # Both measured paths must exit 0 (enforced in _min_ms) AND stay under
+        # budget — native is the shipped path, stub is the no-wheel CI path.
         self.assertLess(stub_added, 250.0, f"stub startup budget exceeded: {stub_added:.1f} ms")
+        if native_added is not None:
+            self.assertLess(
+                native_added, 250.0, f"native startup budget exceeded: {native_added:.1f} ms"
+            )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ jobs:
           fi
           echo "contracts/ unchanged or change approved."
 
+  # Real core + stub conformance + FFI + CLI + Tier 2 all ride `cargo test --all`.
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -42,6 +43,8 @@ jobs:
       - run: cargo test --all --locked
       - name: Conformance (Rust stub, verbose)
         run: cargo test -p keel-core-stub --test conformance -- --nocapture
+      - name: Conformance (real core — Tier 1 + Tier 2 16-17)
+        run: cargo test -p keel-core --test conformance --test flows_conformance -- --nocapture
 
   python:
     runs-on: ubuntu-latest
@@ -58,6 +61,8 @@ jobs:
           python3 conformance/check_schema.py
       - name: Journal fixtures build
         run: python3 conformance/fixtures/journal/build_fixtures.py
+      - name: faultproxy sequencing
+        run: python3 tools/faultproxy/test_faultproxy.py
 
   node:
     runs-on: ubuntu-latest
@@ -69,3 +74,94 @@ jobs:
       - name: Conformance (Node stub)
         working-directory: node/keel-core-stub
         run: node --test
+
+  # Python FRONT-END suite (import hook, adapters, llm packs, flows, demos). Runs
+  # on the pure-Python stub (no wheel here); native-only legs skip cleanly.
+  python-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install adapter deps (httpx + requests)
+        run: python3 -m pip install --upgrade pip httpx requests
+      - name: Front-end suite (stub; native legs skip without the wheel)
+        working-directory: python/keel
+        run: python3 -m unittest discover
+
+  # Node FRONT-END suite (loader, fetch, ai-sdk/mcp/llm packs, node-service demo).
+  node-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Front-end suite
+        working-directory: node/keel
+        run: node --test
+
+  # ≤10µs overhead (DX invariant 8), published as a downloadable artifact.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Overhead benchmark → target/bench-overhead.json
+        run: bash scripts/bench-overhead.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-overhead
+          path: target/bench-overhead.json
+
+  # Build smoke for the Python native module (build only; no publish).
+  maturin-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+      - name: maturin build (keel_core, build only)
+        run: |
+          python3 -m pip install --upgrade pip maturin
+          maturin build -m crates/keel-py/Cargo.toml
+
+  # Build smoke for the napi addon (build only; compiles the cdylib).
+  napi-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build keel-node (build only)
+        run: cargo build -p keel-node --locked
+
+  # Native conformance + native front-end legs. Builds the wheel into a venv, so
+  # it is heavier — intended to be a NON-REQUIRED check (set in branch protection,
+  # not here). The required gate is `rust`, which runs the real core 17/17.
+  native-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native keel_core, run native conformance + front-end legs
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin httpx requests
+          maturin develop -m crates/keel-py/Cargo.toml
+          python3 conformance/runner.py --impl native
+          (cd python/keel && python3 -m unittest discover)

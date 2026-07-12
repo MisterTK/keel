@@ -96,9 +96,7 @@ fn run_agents(project: &Path) -> Rendered {
     // `updated` = we replaced an existing region AND its bytes changed; a fresh
     // create is `wrote` but not `updated`, and a no-op re-run is neither.
     let updated = wrote && replaced;
-    if wrote
-        && let Err(e) = std::fs::write(&path, &new_content)
-    {
+    if wrote && let Err(e) = std::fs::write(&path, &new_content) {
         return config_error(&format!("could not write {}: {e}", path.display()));
     }
     let verb = if already_current {
@@ -995,7 +993,11 @@ mod tests {
         let (out2, replaced2, wrote2) = splice_agents_block(&out, &block);
         assert!(replaced2 && !wrote2);
         assert_eq!(out2, out);
-        assert_eq!(out2.matches(AGENTS_BEGIN).count(), 1, "exactly one Keel block");
+        assert_eq!(
+            out2.matches(AGENTS_BEGIN).count(),
+            1,
+            "exactly one Keel block"
+        );
     }
 
     #[test]

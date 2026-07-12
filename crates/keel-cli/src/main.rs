@@ -97,7 +97,14 @@ fn main() {
             stamp,
             agents,
         } => {
-            let r = init::run(&project, init::InitOptions { diff, stamp, agents });
+            let r = init::run(
+                &project,
+                init::InitOptions {
+                    diff,
+                    stamp,
+                    agents,
+                },
+            );
             emit(&r, json)
         }
         Command::Doctor => emit(&doctor::run(&project), json),

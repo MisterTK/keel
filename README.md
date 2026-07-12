@@ -97,17 +97,21 @@ here is the definition of done (normative semantics: `conformance/README.md`).
 
 | Harness | Command | Result |
 |---------|---------|--------|
-| Real Rust core | `cargo test -p keel-core --test conformance` | 17/17 (paused tokio clock) |
-| Rust stub | `cargo test -p keel-core-stub` | 15/15 Tier 1 (+2 Tier 2 skipped: no journal) |
-| Python stub | `python3 conformance/runner.py` | 15/15 |
-| Node stub | `cd node/keel-core-stub && node --test` | 15/15 |
-| Python / Node native | `runner.py --impl native` / node native | Tier 1 + Tier 2 on the real core |
+| Real Rust core — Tier 1 | `cargo test -p keel-core --test conformance` | 15/15 (paused tokio clock) |
+| Real Rust core — Tier 2 | `cargo test -p keel-core --test flows_conformance` | scenarios 16–17 |
+| Rust stub | `cargo test -p keel-core-stub` | 15/15 (2 Tier 2 skipped: no journal) |
+| Python stub | `python3 conformance/runner.py` | 15/15 (2 Tier 2 skipped) |
+| Node stub | `cd node/keel-core-stub && node --test` | 15/15 (2 Tier 2 skipped) |
+| Python native | `python3 conformance/runner.py --impl native` | 15/15 Tier 1 |
 
 Scenarios 01–15 are Tier 1; **16–17** are Tier 2 (flow resume/substitution and
-`fail`-mode nondeterminism), which need a journal, so the pure stubs skip them
-cleanly. Plus: `python3 conformance/check_schema.py` (policies vs.
-`policy.schema.json`) and `python3 conformance/fixtures/journal/build_fixtures.py`
-(golden journal DBs).
+`fail`-mode nondeterminism), which need a journal — so the stubs *and* the
+`runner.py` harness (both impls) skip them, and the Tier 2 scenarios are driven
+by the real core's `flows_conformance` binary. Tier 2 **through the native front
+end** is covered by `python/keel/tests/test_resume_demo.py` (real `kill -9` +
+resume) and `test_flows.py`. Plus: `python3 conformance/check_schema.py`
+(policies vs. `policy.schema.json`) and
+`python3 conformance/fixtures/journal/build_fixtures.py` (golden journal DBs).
 
 ## Repo layout
 
