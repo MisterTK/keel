@@ -21,12 +21,16 @@
 //! transitions and cache hits as debug events. Spans cost effectively
 //! nothing when no subscriber is active. Enabling the optional `otel`
 //! feature adds [`otel::init_otlp`] to export those spans over OTLP.
+//! Independently of tracing, the [`events`] sink streams a live NDJSON
+//! feed of attempts/backoffs/breaker transitions to `.keel/events/` (for
+//! `keel tail`), and mints the trace refs Tier 1 failure messages carry.
 //!
 //! Tier 2 durable flows ([`FlowManager`]) build on the Tier 1 engine and the
 //! [`keel_journal`] persistence layer; the FFI facade wraps this async surface
 //! (later slices) for the PyO3/napi bridges.
 
 mod engine;
+pub mod events;
 mod flow;
 #[cfg(feature = "otel")]
 pub mod otel;
