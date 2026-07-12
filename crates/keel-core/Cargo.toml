@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish = false
+# Only the explicitly declared `overhead` bench is a target; `benches/support.rs`
+# is a module of it (and of tests/overhead_guard.rs), not a bench of its own.
+autobenches = false
 
 [dependencies]
 fastrand = "2.3"
@@ -37,9 +40,17 @@ otel = [
 ]
 
 [dev-dependencies]
+# Bench-only: statistics-driven microbenchmarking for the overhead bench. Lean
+# feature set — no rayon/plotters/HTML; `cargo_bench_support` keeps it runnable
+# under `cargo bench`. It never enters a release/library build (dev-dependency).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 keel-conformance = { path = "../keel-conformance" }
 tempfile = "3.23"
 tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
+
+[[bench]]
+name = "overhead"
+harness = false
 
 [lints]
 workspace = true
