@@ -20,12 +20,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ._backend import load_backend
+from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
-from ._errors import KeelError
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_function_targets, load_policy
 from ._runtime import clear_runtime, set_runtime
 from .adapters import Detection, install_adapters, uninstall_adapters
+from .packs import present_provider_defaults, resolve_dev_cache
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -57,7 +58,12 @@ def install_keel(
     _STATE.installed = True
 
     cwd = Path(cwd or Path.cwd())
-    policy, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
+    raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
+    # Layer the embedded pack defaults (and any present provider pack) UNDER the
+    # user config, then resolve the LLM dev cache (`mode = "dev"` → a concrete
+    # ttl off-prod, dropped when KEEL_ENV=prod). Both steps mirror the Node front
+    # end's policy-merge behavior exactly (cross-language parity).
+    policy = resolve_dev_cache(apply_pack_defaults(raw, present_provider_defaults()), env)
     backend = load_backend(env.get("KEEL_BACKEND"))
     backend.configure(policy)  # raises KEEL-E001 on invalid policy (field paths)
 

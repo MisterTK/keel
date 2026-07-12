@@ -29,6 +29,7 @@ written once.
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from types import MappingProxyType
@@ -102,6 +103,53 @@ def args_hash(method: str, url: str, body: bytes | str | None = None) -> str:
         h.update(b"\n")
         h.update(body.encode("utf-8"))
     return h.hexdigest()
+
+
+def _canonical_json(body: bytes | str | None) -> bytes | None:
+    """Canonical bytes for a request body used as a dev-cache key. Returns the
+    key-sorted, whitespace-free JSON encoding when the body parses as JSON, the
+    raw bytes verbatim when it does not, or ``None`` when there is no buffered
+    body (a streaming body — generator/file — is not cache-replayable).
+
+    Canonicalizing means two semantically-identical prompts replay from cache
+    even when the client serialized their JSON with different key order or
+    spacing (and gives httpx/requests an identical cache key for the same call)."""
+    if isinstance(body, (bytes, bytearray)):
+        raw = bytes(body)
+    elif isinstance(body, str):
+        raw = body.encode("utf-8")
+    else:
+        return None  # None / stream / generator / file-like: not replayable
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw  # not JSON: hash the raw bytes verbatim
+    return json.dumps(
+        parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def derive_args_hash(
+    target: str, method: str, url: str, body: bytes | str | None
+) -> str | None:
+    """Cache-key material for one intercepted call, or ``None`` to disable
+    caching for it.
+
+      * idempotent GET      → ``sha256(method + url [+ buffered body])`` (as before).
+      * LLM POST (``llm:*``) → the dev-cache exception: ``sha256`` over
+        ``(method, url, canonicalized JSON body)``. This enables dev-loop REPLAY
+        of an identical prompt; it does NOT make the call retryable — idempotency
+        is a separate judgment, still ``False`` for a bare POST (a cache *lookup*
+        needs no idempotency; a *retry* does). A streaming/unbuffered body yields
+        ``None`` (a live stream is not cache-replayable).
+      * everything else     → ``None``.
+    """
+    if method == "GET":
+        return args_hash(method, url, body)
+    if method == "POST" and target.startswith("llm:"):
+        canon = _canonical_json(body)
+        return args_hash(method, url, canon) if canon is not None else None
+    return None
 
 
 def parse_retry_after(value: str | None, now: datetime | None = None) -> int | None:
@@ -204,6 +252,7 @@ __all__ = [
     "resolve_target",
     "is_idempotent",
     "args_hash",
+    "derive_args_hash",
     "parse_retry_after",
     "is_transient_status",
     "build_request",

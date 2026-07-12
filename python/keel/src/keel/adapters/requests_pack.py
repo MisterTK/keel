@@ -75,7 +75,11 @@ def targets() -> list[TargetDecl]:
             pattern=f"llm:{provider}",
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
-            args_hash_rule="sha256(method + url) for idempotent GET; None otherwise",
+            args_hash_rule=(
+                "sha256(method + url) for idempotent GET; sha256 over "
+                "(method, url, canonicalized JSON body) for LLM POST "
+                "(dev-cache replay); None otherwise"
+            ),
         )
         for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
     ]
@@ -125,9 +129,10 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     op = f"{method} {host}{parts.path}"
     idem_header = _idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
-    # A prepared GET body is bytes/str (buffered) or None; args_hash ignores a
+    # A prepared body is bytes/str (buffered) or None; derive_args_hash ignores a
     # streaming (generator/file) body, so this never consumes an upload stream.
-    hash_ = _http.args_hash(method, url, request.body) if method == "GET" else None
+    # LLM POSTs get a canonicalized-JSON-body cache key (dev-cache exception).
+    hash_ = _http.derive_args_hash(target, method, url, request.body)
     return target, op, idempotent, hash_
 
 
