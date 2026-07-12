@@ -5,12 +5,13 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate, ResolvedPolicy,
-    RetryPolicy,
+    BreakerPolicy, CacheScope, DurationMs, JournalLocation, NondeterminismResponse, Policy, Rate,
+    ResolvedPolicy, RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -26,6 +27,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, warn};
 
 use crate::events::{CacheStore, EventKind, EventSink, TraceRef};
+use crate::journal_backend::{self, JournalBackend};
 
 /// Count-mode circuit breaker (consecutive terminal failures). Observes
 /// post-retry call outcomes — layer order puts it outside the retry loop.
@@ -416,8 +418,11 @@ pub struct Engine {
     started: Instant,
     policy: RwLock<Policy>,
     state: Mutex<State>,
-    /// Persistence for the `scope = persistent` cache (and, later, Tier 2 flows).
-    journal: Option<Arc<dyn Journal>>,
+    /// Persistence for the `scope = persistent` cache and Tier 2 flows. Behind
+    /// a lock because `configure` honors `policy.journal` by (re)attaching the
+    /// selected backend; readers clone the `Arc` out, so the lock is never held
+    /// across journal I/O (let alone an await).
+    journal: RwLock<JournalSlot>,
     /// Traffic ledger fed one observation per `execute`, for `keel init`/`status`.
     discovery: Option<Arc<dyn DiscoveryRecorder>>,
     /// Live NDJSON event feed for `keel tail`/`keel trace` ([`crate::events`]).
@@ -426,13 +431,24 @@ pub struct Engine {
     events: Option<EventSink>,
 }
 
+/// The engine's journal attachment plus, when policy selected it, the resolved
+/// `file:` path it was opened from — so reapplying an unchanged policy is a
+/// no-op instead of a re-open.
+#[derive(Default)]
+struct JournalSlot {
+    journal: Option<Arc<dyn Journal>>,
+    /// `Some` only for a policy-selected (`file:`) attachment; construction-time
+    /// attachments have no location the engine could compare against.
+    policy_path: Option<PathBuf>,
+}
+
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The trait-object attachments aren't `Debug`; report their presence.
         f.debug_struct("Engine")
             .field("policy", &self.policy)
             .field("state", &self.state)
-            .field("journal_attached", &self.journal.is_some())
+            .field("journal_attached", &self.current_journal().is_some())
             .field("discovery_attached", &self.discovery.is_some())
             .field("events_attached", &self.events.is_some())
             .finish_non_exhaustive()
@@ -452,7 +468,7 @@ impl Engine {
             started: Instant::now(),
             policy: RwLock::new(Policy::default()),
             state: Mutex::new(State::default()),
-            journal: None,
+            journal: RwLock::new(JournalSlot::default()),
             discovery: None,
             // Live events activate from the environment (KEEL_EVENTS / an
             // existing ./.keel dir — see `crate::events`), so every embedding
@@ -461,19 +477,38 @@ impl Engine {
         }
     }
 
-    /// Attach a journal, enabling the persistent cache scope. Optional; set once
-    /// at setup, before the engine is shared for concurrent `execute`.
+    /// Attach a journal at construction time, enabling the persistent cache
+    /// scope. Optional; set at setup, before the engine is shared for
+    /// concurrent `execute`. A later [`configure`](Self::configure) whose
+    /// policy carries a `journal` key replaces this attachment — the effective
+    /// policy is authoritative (spec §4.2).
     pub fn attach_journal(&mut self, journal: impl Journal + 'static) -> &mut Self {
-        self.journal = Some(Arc::new(journal));
+        let slot = self.journal.get_mut().expect("journal lock poisoned");
+        slot.journal = Some(Arc::new(journal));
+        slot.policy_path = None;
         self
     }
 
     /// The attached journal, if any — shared (`Arc`) so a [`FlowManager`] can run
     /// its Tier 2 steps over the *same* store the engine caches through. `None`
-    /// for an in-memory engine (Tier 2 requires a durable journal).
+    /// for an in-memory engine (Tier 2 requires a durable journal). Live: a
+    /// `configure` whose policy selects a `journal` location changes what this
+    /// returns, so Tier 2 wiring should read it after the engine is configured.
+    ///
+    /// [`FlowManager`]: crate::FlowManager
     #[must_use]
     pub fn journal(&self) -> Option<Arc<dyn Journal>> {
-        self.journal.clone()
+        self.current_journal()
+    }
+
+    /// Clone the current journal out of its slot (the lock never outlives the
+    /// statement, so it is never held across journal I/O or an await).
+    fn current_journal(&self) -> Option<Arc<dyn Journal>> {
+        self.journal
+            .read()
+            .expect("journal lock poisoned")
+            .journal
+            .clone()
     }
 
     /// Attach a discovery store; each `execute` then records one observation.
@@ -531,28 +566,26 @@ impl Engine {
 
     /// Apply a policy document (keel.toml as JSON, per
     /// contracts/policy.schema.json), replacing the previous one atomically.
-    /// Rejections are `KEEL-E001` with the exact offending field path.
+    /// Rejections are `KEEL-E001` with the exact offending field path;
+    /// a valid policy naming a journal backend this build cannot provide is
+    /// `KEEL-E005` (and the previous policy stays in force).
     pub fn configure(&self, policy_json: &Value) -> Result<(), KeelError> {
         let policy: Policy =
             serde_path_to_error::deserialize(policy_json).map_err(|e| KeelError {
                 code: ErrorCode::PolicyInvalid,
                 message: format!("policy invalid at {}: {}", e.path(), e.inner()),
             })?;
-        // The `journal` and `telemetry` keys are schema-legal and now typed +
-        // validated, but v0.1 selects the journal path at construction
-        // (KEEL_JOURNAL / .keel/journal.db) and drives OTel export from the
-        // environment. Warn loudly rather than silently ignoring a set value, so
-        // a user pointing `journal` at a migration target — or setting an OTLP
-        // endpoint — is not surprised when it has no effect (finding: frozen keys
-        // accepted and silently ignored).
-        if policy.journal.is_some() {
-            // Note the value is intentionally NOT logged: a `postgres://` journal
-            // location can carry credentials, and this is a diagnostic log line.
-            warn!(
-                "policy `journal` is validated but not yet wired: v0.1 selects the journal path at \
-                 startup (KEEL_JOURNAL env or .keel/journal.db). This value has no effect."
-            );
+        // `journal` selects the backing store (spec §4.2 — "that override is
+        // the entire laptop→enterprise migration"), so it must take effect or
+        // fail loudly, never warn-and-ignore. Applied before the policy swap so
+        // a rejected location leaves the previous configuration fully in force.
+        if let Some(location) = &policy.journal {
+            self.apply_journal_location(location)?;
         }
+        // `telemetry` is schema-legal and typed + validated, but v0.1 drives
+        // OTel export from the environment. Warn loudly rather than silently
+        // ignoring a set value, so a user setting an OTLP endpoint is not
+        // surprised when it has no effect.
         if policy.telemetry.is_some() {
             warn!(
                 "policy `telemetry` is validated but inert in v0.1: OTel export is configured from \
@@ -560,6 +593,42 @@ impl Engine {
             );
         }
         *self.policy.write().expect("policy lock poisoned") = policy;
+        Ok(())
+    }
+
+    /// Honor `policy.journal`: open and attach the backend it names, replacing
+    /// any construction-time attachment — the effective policy is
+    /// authoritative. (Front ends that want an environment escape hatch such as
+    /// `KEEL_JOURNAL` compose it into the effective policy *before* calling
+    /// `configure`, per the effective-policy contract.) Reapplying an unchanged
+    /// `file:` location is a no-op, so reconfigure loops never re-open the
+    /// store or drop its connection state.
+    ///
+    /// # Errors
+    /// - `KEEL-E005` for a backend this build cannot provide (`postgres://`).
+    /// - `KEEL-E040` when the selected SQLite file cannot be created/opened.
+    fn apply_journal_location(&self, location: &JournalLocation) -> Result<(), KeelError> {
+        let backend = JournalBackend::select(location);
+        if let JournalBackend::File(path) = &backend {
+            let slot = self.journal.read().expect("journal lock poisoned");
+            if slot.policy_path.as_deref() == Some(path.as_path()) {
+                return Ok(()); // unchanged location: keep the open store
+            }
+        }
+        // Open OFF the lock (filesystem I/O); the brief write below only swaps
+        // pointers. Two racing configures both open, last writer wins — the
+        // loser's store is just dropped.
+        let journal = journal_backend::open(&backend)?;
+        let policy_path = match backend {
+            JournalBackend::File(path) => {
+                debug!(path = %path.display(), "journal selected by policy");
+                Some(path)
+            }
+            JournalBackend::Postgres => None, // unreachable today: open() errors
+        };
+        let mut slot = self.journal.write().expect("journal lock poisoned");
+        slot.journal = Some(journal);
+        slot.policy_path = policy_path;
         Ok(())
     }
 
@@ -742,7 +811,7 @@ impl Engine {
             return CachePlan::None;
         };
         match cache.scope {
-            CacheScope::Persistent if self.journal.is_some() => CachePlan::Persistent {
+            CacheScope::Persistent if self.current_journal().is_some() => CachePlan::Persistent {
                 key: JournalCacheKey::new(format!("{target}#{hash}")),
                 ttl,
             },
@@ -815,7 +884,7 @@ impl Engine {
         key: &JournalCacheKey,
         out: &mut Outcome,
     ) -> bool {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return false;
         };
         let bytes = match journal.get_cache(key) {
@@ -1009,7 +1078,7 @@ impl Engine {
         payload: &Value,
         ttl: DurationMs,
     ) {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return;
         };
         let bytes = match encode_cache_payload(payload) {

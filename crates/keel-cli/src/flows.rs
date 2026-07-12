@@ -50,7 +50,8 @@ struct FlowsReport {
 
 /// `keel flows [--dead]` for `project`, dating ages against `now_ms`.
 pub fn flows(project: &Path, dead_only: bool, now_ms: i64) -> Rendered {
-    let path = evidence::journal_db(project);
+    // Honor the policy's `journal` key (file: locations), like the engine does.
+    let path = evidence::resolved_journal(project).path;
     if !path.exists() {
         return Rendered::ok(
             "keel \u{25b8} no flows yet.\n  Run a flow with `keel run <script>` (a `[flows]` entrypoint) to record one."
@@ -187,7 +188,7 @@ struct TraceReport {
 /// `keel trace <flow>` for `project`. `flow` is an exact `flow_id`, or a
 /// substring of an id/entrypoint that resolves to exactly one flow.
 pub fn trace(project: &Path, flow: &str) -> Rendered {
-    let path = evidence::journal_db(project);
+    let path = evidence::resolved_journal(project).path;
     if !path.exists() {
         return soft_error("no journal yet (.keel/journal.db). Run a flow first with `keel run`.");
     }

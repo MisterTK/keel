@@ -98,6 +98,12 @@
       "topic": "policy"
     }
   ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
   "ok": false,
   "policy": {
     "field": "target.api.example.com.retry.attempts",

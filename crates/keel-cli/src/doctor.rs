@@ -9,9 +9,14 @@
 //!    tested against a version) or best-effort, annotated with what was detected.
 //! 3. **Policy.** `keel.toml` validated against the typed model
 //!    ([`keel_core_api::policy::Policy`]); on error, the exact field path.
+//! 4. **Journal.** Where the journal lives, resolved the way the engine
+//!    resolves it at configure time (`journal` key, else `.keel/journal.db`).
+//!    A location this build has no backend for (`postgres://`) is an error
+//!    finding: the app will fail to configure with KEEL-E005.
 //!
 //! Every finding carries a suggested action, and the whole thing has a `--json`
-//! twin. An invalid policy exits [`EXIT_USAGE`](crate::EXIT_USAGE); otherwise 0.
+//! twin. An invalid policy — or a journal backend this build cannot provide —
+//! exits [`EXIT_USAGE`](crate::EXIT_USAGE); otherwise 0.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -146,12 +151,44 @@ struct Finding {
     topic: &'static str,
 }
 
+/// Where the journal lives, as resolved for this project — the same selection
+/// the engine makes at configure time.
+#[derive(Debug, Serialize)]
+struct JournalReport {
+    /// `"sqlite"` (default and `file:` locations) or `"postgres"`.
+    backend: &'static str,
+    /// The location as users should read it: a `file:` path as written, the
+    /// default relative path, or a credential-redacted `postgres://` form.
+    location: String,
+    /// `"keel.toml"` when the `journal` key set it, else `"default"`.
+    source: &'static str,
+    /// `false` when this build has no backend for the location — the app will
+    /// fail to configure with KEEL-E005.
+    supported: bool,
+}
+
+impl JournalReport {
+    fn from_resolved(resolved: &evidence::ResolvedJournal) -> Self {
+        Self {
+            backend: resolved.backend.as_str(),
+            location: resolved.display.clone(),
+            source: if resolved.from_policy {
+                "keel.toml"
+            } else {
+                "default"
+            },
+            supported: resolved.backend == evidence::JournalBackendKind::Sqlite,
+        }
+    }
+}
+
 /// The whole doctor report.
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     adapters: Vec<AdapterStatus>,
     coverage: Coverage,
     findings: Vec<Finding>,
+    journal: JournalReport,
     ok: bool,
     policy: PolicyCheck,
 }
@@ -181,18 +218,20 @@ pub fn run(project: &Path) -> Rendered {
         }
     };
     let policy = validate_policy(&evidence::keel_toml(project));
-    let report = build_report(&scan, &discovery, policy);
+    let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
+    let report = build_report(&scan, &discovery, policy, journal);
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
     Rendered::ok(human, to_json(&report)).with_exit(exit)
 }
 
-/// Assemble the report from the three evidence inputs. Pure, so the golden test
+/// Assemble the report from the four evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3`.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
     policy: PolicyValidation,
+    journal: JournalReport,
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
     let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
@@ -278,8 +317,20 @@ fn build_report(
             topic: "policy",
         });
     }
+    if !journal.supported {
+        findings.push(Finding {
+            action: "Use a `file:` location (or drop the key for the default .keel/journal.db); Postgres support is future work — see docs.".to_owned(),
+            detail: format!(
+                "keel.toml sets `journal` to a {} location, but this build has no {} backend — the app will fail to configure with KEEL-E005.",
+                journal.backend, journal.backend
+            ),
+            fix: None,
+            level: "error",
+            topic: "journal",
+        });
+    }
 
-    let ok = policy.valid || !policy.present;
+    let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
         adapters,
         coverage: Coverage {
@@ -288,6 +339,7 @@ fn build_report(
             wrapped,
         },
         findings,
+        journal,
         ok,
         policy,
     }
@@ -415,6 +467,20 @@ fn human(r: &DoctorReport) -> String {
         out.push_str(&line);
     }
 
+    out.push_str("\njournal\n");
+    let journal_line = if r.journal.supported {
+        format!(
+            "  {} at {} ({})\n",
+            r.journal.backend, r.journal.location, r.journal.source
+        )
+    } else {
+        format!(
+            "  {} at {} ({}) — NOT supported in this build (KEEL-E005)\n",
+            r.journal.backend, r.journal.location, r.journal.source
+        )
+    };
+    out.push_str(&journal_line);
+
     if !r.findings.is_empty() {
         out.push_str("\nfindings\n");
         for f in &r.findings {
@@ -430,7 +496,14 @@ fn human(r: &DoctorReport) -> String {
             }
         }
     }
-    let tail = format!("\n{}\n", if r.ok { "ok" } else { "policy error (exit 2)" });
+    let tail = format!(
+        "\n{}\n",
+        if r.ok {
+            "ok"
+        } else {
+            "configuration error (exit 2)"
+        }
+    );
     out.push_str(&tail);
     out
 }
@@ -448,6 +521,16 @@ fn line_list(out: &mut String, label: &str, items: &[String]) {
 mod tests {
     use super::*;
     use crate::scan::{Sighting, TargetClass, TargetEvidence};
+
+    /// The default journal report (no `journal` key in keel.toml).
+    fn default_journal() -> JournalReport {
+        JournalReport {
+            backend: "sqlite",
+            location: ".keel/journal.db".to_owned(),
+            source: "default",
+            supported: true,
+        }
+    }
 
     fn scan_with(target: &str, class: TargetClass, libs: &[&str]) -> ScanResult {
         let mut s = ScanResult {
@@ -485,7 +568,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy);
+        let r = build_report(&scan, &wrapped, policy, default_journal());
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
@@ -510,13 +593,90 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy);
+        let r = build_report(&scan, &wrapped, policy, default_journal());
         assert!(!r.ok);
         assert!(
             r.findings
                 .iter()
                 .any(|f| f.topic == "policy" && f.level == "error")
         );
+    }
+
+    /// A `postgres://` journal has no backend in this build: doctor reports it,
+    /// raises an error finding naming KEEL-E005, and exits non-ok — the app
+    /// would fail to configure, so CI must not pass silently.
+    #[test]
+    fn unsupported_journal_backend_is_an_error_finding_and_not_ok() {
+        let scan = ScanResult::default();
+        let wrapped = BTreeSet::new();
+        let policy = PolicyValidation {
+            check: PolicyCheck {
+                field: None,
+                message: None,
+                present: true,
+                valid: true,
+            },
+            fix: None,
+        };
+        let journal = JournalReport {
+            backend: "postgres",
+            location: "postgres://\u{2026}@db.internal/keel".to_owned(),
+            source: "keel.toml",
+            supported: false,
+        };
+        let r = build_report(&scan, &wrapped, policy, journal);
+        assert!(!r.ok, "an unbootable configuration must not be ok");
+        let finding = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "journal")
+            .expect("journal finding present");
+        assert_eq!(finding.level, "error");
+        assert!(finding.detail.contains("KEEL-E005"));
+        assert!(finding.action.contains("file:"));
+        // Human output carries the journal facts.
+        let text = human(&r);
+        assert!(text.contains("postgres"));
+        assert!(text.contains("NOT supported"));
+    }
+
+    /// End-to-end over a real project dir: doctor resolves and reports the
+    /// `file:` journal location from keel.toml.
+    #[test]
+    fn doctor_reports_the_policy_selected_journal_location() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("keel.toml"),
+            "journal = \"file:custom/j.db\"\n",
+        )
+        .unwrap();
+        let r = run(dir.path());
+        assert_eq!(r.exit, EXIT_OK);
+        assert_eq!(r.json["journal"]["backend"], "sqlite");
+        assert_eq!(r.json["journal"]["location"], "custom/j.db");
+        assert_eq!(r.json["journal"]["source"], "keel.toml");
+        assert_eq!(r.json["journal"]["supported"], true);
+        assert!(r.human.contains("custom/j.db"));
+    }
+
+    /// End-to-end: a `postgres://` journal exits `EXIT_USAGE`, with credentials
+    /// redacted from both output forms.
+    #[test]
+    fn doctor_flags_a_postgres_journal_and_redacts_credentials() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("keel.toml"),
+            "journal = \"postgres://keel:sekrit@db.internal/keel\"\n",
+        )
+        .unwrap();
+        let r = run(dir.path());
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert_eq!(r.json["journal"]["backend"], "postgres");
+        assert_eq!(r.json["journal"]["supported"], false);
+        assert_eq!(r.json["ok"], false);
+        let json_text = crate::render::json_string(&r.json);
+        assert!(!json_text.contains("sekrit"), "credentials never printed");
+        assert!(!r.human.contains("sekrit"), "credentials never printed");
     }
 
     #[test]

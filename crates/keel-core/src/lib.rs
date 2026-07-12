@@ -32,6 +32,7 @@
 mod engine;
 pub mod events;
 mod flow;
+mod journal_backend;
 #[cfg(feature = "otel")]
 pub mod otel;
 
