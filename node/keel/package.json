@@ -1,0 +1,39 @@
+{
+  "name": "keel",
+  "version": "0.1.0",
+  "description": "The SQLite of durable execution — production-grade resilience for Node with zero code changes.",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    },
+    "./hook": {
+      "import": "./hook.mjs",
+      "require": "./hook.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "keel-node-run": "./bin/keel-node-run.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "hook.mjs",
+    "hook.cjs",
+    "bin/",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": ["keel", "resilience", "retry", "circuit-breaker", "durable", "fetch"],
+  "license": "Apache-2.0"
+}
