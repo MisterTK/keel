@@ -43,7 +43,7 @@ against the **10 µs** budget (DX invariant 8), emitted as a CI artifact by
 (`npm i -D keel`) are **not published yet** — today you build from source (below).
 The native Python module builds with `maturin`; the CLI with `cargo build`.
 
-**License is undecided** — the choice belongs to TK ([architecture-spec §10](docs/architecture-spec.md)); until it lands, treat the code as all-rights-reserved (see [LICENSE-PENDING.md](LICENSE-PENDING.md)).
+Licensed under [Apache-2.0](LICENSE).
 
 **OTel export is opt-in and off by default.** The OTLP exporter lives behind the
 `otel` cargo feature; the shipped wheel/addon carry no OpenTelemetry dependency.

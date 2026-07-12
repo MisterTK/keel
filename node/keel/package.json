@@ -41,5 +41,5 @@
     "test": "node --test"
   },
   "keywords": ["keel", "resilience", "retry", "circuit-breaker", "durable", "fetch"],
-  "license": "UNLICENSED"
+  "license": "Apache-2.0"
 }
