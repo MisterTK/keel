@@ -1,0 +1,29 @@
+# Build config for the `keel_core` native module (PyO3 over keel-core::Engine).
+# Source only — no wheels are committed. Build/install into a venv with maturin:
+#
+#   uv venv .venv && . .venv/bin/activate
+#   uv pip install maturin
+#   maturin develop --release            # run from crates/keel-py
+#
+# then `python -c "import keel_core"` and `conformance/runner.py --impl native`.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+# Distribution name; the IMPORT name is `keel_core` (the cdylib `[lib].name`).
+name = "keel-core"
+version = "0.1.0"
+description = "Keel native core (keel_core): PyO3 binding over keel-core::Engine."
+requires-python = ">=3.11"
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.maturin]
+# Import name of the compiled module.
+module-name = "keel_core"
+# abi3 wheel: one build imports on CPython 3.11+.
+features = ["extension-module"]
