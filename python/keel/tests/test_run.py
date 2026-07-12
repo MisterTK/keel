@@ -151,7 +151,14 @@ class StartupBudgetTest(unittest.TestCase):
         best = float("inf")
         for _ in range(runs):
             start = time.perf_counter()
-            subprocess.run(cmd, env=env, cwd=cwd, capture_output=True)
+            proc = subprocess.run(cmd, env=env, cwd=cwd, capture_output=True)
+            # A failed child (e.g. KEEL_BACKEND=native with no wheel → KEEL-E040)
+            # aborts fast and would make the budget assert vacuously — fail loudly.
+            if proc.returncode != 0:
+                raise AssertionError(
+                    f"startup-budget child exited {proc.returncode} for {cmd!r}: "
+                    f"{proc.stderr.decode(errors='replace')[:400]}"
+                )
             best = min(best, (time.perf_counter() - start) * 1000)
         return best
 
@@ -172,9 +179,10 @@ class StartupBudgetTest(unittest.TestCase):
             "(target <100 ms, budget <250 ms)",
             file=sys.stderr,
         )
-        # Native is the shipped path; assert it against the budget. (If the wheel
-        # isn't built, KEEL_BACKEND=native aborts loudly rather than skewing this.)
+        # Both paths must exit 0 (enforced in _min_ms) AND stay under budget —
+        # native is the shipped path, stub is the no-wheel CI path.
         self.assertLess(native_added, 250.0, f"native startup budget exceeded: {native_added:.1f} ms")
+        self.assertLess(stub_added, 250.0, f"stub startup budget exceeded: {stub_added:.1f} ms")
 
 
 if __name__ == "__main__":

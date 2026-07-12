@@ -67,16 +67,36 @@ class NativeBackend {
 
 async function tryLoadNative({ journalPath } = {}) {
   for (const spec of NATIVE_CANDIDATES) {
+    let mod;
     try {
-      const mod = await import(spec);
-      const Ctor = mod.KeelCoreNative ?? mod.default;
-      if (typeof Ctor !== "function") continue;
-      const core = journalPath ? new Ctor({ journalPath }) : new Ctor();
-      if (typeof core.executeAsync === "function" && typeof core.configure === "function") {
-        return new NativeBackend(core);
-      }
+      mod = await import(spec);
     } catch {
-      // not present / not loadable / journal open failed — expected until built.
+      continue; // addon not present at this spec — try the next candidate
+    }
+    const Ctor = mod.KeelCoreNative ?? mod.default;
+    if (typeof Ctor !== "function") continue;
+    let core;
+    try {
+      core = journalPath ? new Ctor({ journalPath }) : new Ctor();
+    } catch (err) {
+      if (!journalPath) continue; // no-journal construction failed — genuinely unusable
+      // The addon loaded but the journal could not open (unwritable/invalid path).
+      // Degrade to an IN-MEMORY native core rather than downgrading to the stub —
+      // resilience still comes from the real engine; only cross-run dev-cache
+      // replay is lost. Mirrors the Python front end's graceful fallback.
+      process.emitWarning(
+        `keel: journal at ${journalPath} could not open (${err?.message ?? err}); ` +
+          "native core running in-memory (no cross-run dev cache)",
+        { code: "KEEL_JOURNAL_UNAVAILABLE" }
+      );
+      try {
+        core = new Ctor();
+      } catch {
+        continue;
+      }
+    }
+    if (typeof core.executeAsync === "function" && typeof core.configure === "function") {
+      return new NativeBackend(core);
     }
   }
   return null;
