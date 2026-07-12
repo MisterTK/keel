@@ -343,17 +343,28 @@ impl EventSink {
     /// `<run>.ndjson` file, and a `run_start` header anchored to wall time.
     pub fn open(dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let run_id = new_run_id();
-        let path = dir.join(format!("{run_id}.{EVENTS_EXT}"));
-        // create_new: a run-id collision must surface, never clobber a feed.
-        let file = std::fs::File::create_new(&path)?;
-        Self::start(
-            Box::new(io::BufWriter::new(file)),
-            run_id,
-            Some(path),
-            Some(epoch_ms()),
-            Some(std::process::id()),
-        )
+        // create_new: a run-id collision must never clobber another process's
+        // feed. Retry under a fresh id — the random suffix makes repeated
+        // same-millisecond collisions vanishingly unlikely.
+        let mut collision: io::Error = io::ErrorKind::AlreadyExists.into();
+        for _ in 0..3 {
+            let run_id = new_run_id();
+            let path = dir.join(format!("{run_id}.{EVENTS_EXT}"));
+            match std::fs::File::create_new(&path) {
+                Ok(file) => {
+                    return Self::start(
+                        Box::new(io::BufWriter::new(file)),
+                        run_id,
+                        Some(path),
+                        Some(epoch_ms()),
+                        Some(std::process::id()),
+                    );
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => collision = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(collision)
     }
 
     /// Deterministic test/bench sink: write to any `Write` under a caller-fixed
