@@ -45,6 +45,10 @@ otel = [
 # under `cargo bench`. It never enters a release/library build (dev-dependency).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 keel-conformance = { path = "../keel-conformance" }
+# Flow tests load the checked-in golden journal fixtures (bit-identical SQL over
+# contracts/journal.sql), then resume them through the flow manager. Same version
+# keel-journal already pins, so the lock is unchanged.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 tempfile = "3.23"
 tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
 
