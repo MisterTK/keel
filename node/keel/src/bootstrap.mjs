@@ -122,6 +122,9 @@ function banner(env, source, fnCount, mcp) {
   );
 }
 
+// Cross-language parity with the Python front end's `.strip().lower() in
+// {"1","true","yes"}`, so `KEEL_DISABLE=" TRUE "` / `KEEL_QUIET=Yes` behave
+// identically in both front ends.
 function isTruthy(v) {
-  return v === "1" || v === "true" || v === "yes";
+  return ["1", "true", "yes"].includes(String(v ?? "").trim().toLowerCase());
 }
