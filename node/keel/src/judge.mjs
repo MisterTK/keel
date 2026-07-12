@@ -94,6 +94,61 @@ export function argsHash(method, url, body) {
   return h.digest("hex");
 }
 
+/** Stable JSON with sorted object keys (no whitespace), so two equivalent bodies
+ *  hash identically regardless of key order/spacing. Cache-key material only. */
+function stableStringify(value) {
+  return JSON.stringify(value, (_key, v) => {
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const sorted = {};
+      for (const k of Object.keys(v).sort()) sorted[k] = v[k];
+      return sorted;
+    }
+    return v;
+  });
+}
+
+/** Canonical string for a request body used as a dev-cache key, or null when
+ *  there is no replayable body. Mirrors the Python twin's `_canonical_json`: a
+ *  buffered JSON body is key-sorted + whitespace-free (so two equivalent prompts
+ *  share a cache key even when the client serialized them differently); a
+ *  non-JSON buffered body is hashed verbatim; a stream/Blob/FormData body is not
+ *  replayable → null. */
+function canonicalBody(body) {
+  let raw;
+  if (typeof body === "string") raw = body;
+  else if (body instanceof ArrayBuffer) raw = Buffer.from(new Uint8Array(body)).toString("utf8");
+  else if (ArrayBuffer.isView(body))
+    raw = Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8");
+  else return null; // None / ReadableStream / Blob / FormData: not cache-replayable
+  try {
+    return stableStringify(JSON.parse(raw));
+  } catch {
+    return raw; // not JSON: hash the raw bytes/string verbatim
+  }
+}
+
+/**
+ * Cache-key material for one intercepted call, or null to disable caching for
+ * it. The Node twin of the Python `derive_args_hash` — the two front ends MUST
+ * agree on which calls are cacheable:
+ *
+ *   - idempotent GET   → sha256(method + url [+ buffered body]).
+ *   - LLM POST (llm:*) → the documented dev-cache exception: sha256 over
+ *     (method, url, canonicalized JSON body). This enables dev-loop REPLAY of an
+ *     identical prompt; it does NOT make the POST retryable — idempotency is a
+ *     separate judgment, still false for a bare POST (a cache LOOKUP needs no
+ *     idempotency; a RETRY does). A streaming/unbuffered body yields null.
+ *   - everything else  → null.
+ */
+export function deriveArgsHash(target, method, url, body) {
+  if (method === "GET") return argsHash(method, url, body);
+  if (method === "POST" && target.startsWith("llm:")) {
+    const canon = canonicalBody(body);
+    return canon === null ? null : argsHash(method, url, canon);
+  }
+  return null;
+}
+
 /** Parse a Retry-After header value to milliseconds, or undefined. */
 export function parseRetryAfter(value, nowMs = Date.now()) {
   if (value == null) return undefined;

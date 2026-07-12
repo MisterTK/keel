@@ -19,14 +19,19 @@
  *   - a thrown transport error (conn/timeout) is re-thrown UNCHANGED after the
  *     final attempt, with a non-enumerable `keelOutcome` attached.
  *   - non-idempotent calls (POST without an idempotency key) are observed, not
- *     retried (KEEL-E014).
+ *     retried (KEEL-E014). A call whose body is an unbuffered stream is likewise
+ *     not retried (it cannot be re-sent); in-memory bodies are re-sent unchanged
+ *     on each attempt.
+ *   - an LLM POST (llm:* target) still derives an args_hash from its canonical
+ *     JSON body (the documented dev-cache exception) so identical prompts replay
+ *     from cache — without being made retryable.
  */
 
 import {
   normalizeRequest,
   resolveTarget,
   isIdempotent,
-  argsHash,
+  deriveArgsHash,
   parseRetryAfter,
   classifyThrow,
   isTransientStatus,
@@ -73,10 +78,16 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     const target = resolveTarget(hostname);
     const op = `${method} ${hostname}${parsed.pathname}`;
     const idemHeader = readIdempotencyHeader(backend, target);
-    const idempotent = isIdempotent(method, headers, idemHeader);
-    // args_hash (cache/journal key material) is derived ONLY for idempotent GET
-    // requests, per the brief — cross-language parity with the Python twin.
-    const hash = method === "GET" ? argsHash(method, parsed.href, body) : null;
+    // A call is only retried if it is BOTH idempotent by method/header AND its
+    // body can be re-sent on a retry: an unbuffered stream body is consumed once,
+    // so a call carrying one is downgraded to non-idempotent (Level 0: can't wrap
+    // safely → observed, not retried). In-memory bodies (string/bytes) are
+    // re-sent unchanged on each attempt (the same init.body is passed through).
+    const idempotent = isIdempotent(method, headers, idemHeader) && isBodyRetrySafe(input, body);
+    // args_hash (cache/journal key material): idempotent GET, plus the documented
+    // LLM-POST dev-cache exception — cross-language parity with the Python twin's
+    // derive_args_hash (a cacheable POST is not thereby made retryable).
+    const hash = deriveArgsHash(target, method, parsed.href, body);
     const request = { v: 1, target, op, idempotent, args_hash: hash };
 
     // Per-attempt timeout is enforced only for idempotent calls: a timeout we
@@ -164,6 +175,28 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
 function readIdempotencyHeader(backend, target) {
   const idem = backend.layer(target, "idempotency");
   return idem && typeof idem === "object" ? idem.header : undefined;
+}
+
+/**
+ * Whether a retried attempt can safely re-send this request's body. In-memory
+ * bodies (string, bytes, URLSearchParams, Blob) are re-sent unchanged on each
+ * attempt; an unbuffered ReadableStream body — or a `Request` input carrying a
+ * live body — can be consumed only once, so a call using one is NOT retried
+ * (Level 0: do nothing if it can't be wrapped safely; the caller sees a single
+ * attempt, observed-not-retried). No body → trivially safe.
+ */
+function isBodyRetrySafe(input, body) {
+  // A Request instance streams its own body; re-sending it would fail on retry.
+  if (typeof Request !== "undefined" && input instanceof Request && input.body != null) return false;
+  if (body == null) return true;
+  if (typeof body === "string") return true;
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return true;
+  if (typeof Blob !== "undefined" && body instanceof Blob) return true;
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return true;
+  // ReadableStream, FormData, async iterables and any other opaque body: treat
+  // as unbuffered and conservatively do not retry (a corrupted resend is worse
+  // than a single observed attempt).
+  return false;
 }
 
 function durationMs(v) {
