@@ -94,13 +94,19 @@ llm_pack = _LlmPack()
 def resolve_dev_cache(
     policy: dict[str, Any],
     env: Mapping[str, str] | None = None,
+    *,
+    persistent: bool = False,
 ) -> dict[str, Any]:
     """Resolve dev-mode caches into concrete cache directives the core
     understands, honoring ``KEEL_ENV``. Walks every ``cache`` layer that could
     apply (``defaults.llm``, ``defaults.outbound``, and each ``[target."…"]``):
 
       * ``cache = { mode = "dev" }``  → off-prod: ``cache = { ttl = "<DEV_CACHE_TTL>" }``
-                                        (an explicit user ttl is preserved);
+                                        (an explicit user ttl is preserved), plus
+                                        ``scope = "persistent"`` when ``persistent``
+                                        is set (native + journal) so identical
+                                        prompts replay across RUNS, not just within
+                                        one process;
                                       → prod:    the cache layer is removed (inert).
       * any other cache layer is left exactly as-is.
 
@@ -121,6 +127,8 @@ def resolve_dev_cache(
             return
         nxt = {k: v for k, v in cache.items() if k != "mode"}
         nxt.setdefault("ttl", DEV_CACHE_TTL)
+        if persistent and "scope" not in nxt:
+            nxt["scope"] = "persistent"  # cross-run replay under native + journal
         owner["cache"] = nxt
 
     defaults = out.get("defaults")

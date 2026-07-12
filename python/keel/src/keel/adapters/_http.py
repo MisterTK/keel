@@ -28,6 +28,7 @@ written once.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -38,6 +39,10 @@ from typing import Any, Callable, Iterable
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
+
+#: Marker key identifying a serialized HTTP response envelope (the JSON the core
+#: carries as `payload`; see `response_envelope`).
+RESPONSE_MARK = "__keel_http__"
 
 #: Host → LLM provider. A cross-language parity contract with the Node front
 #: end (``LLM_HOST_PROVIDERS`` in judge.mjs); extend in lockstep across
@@ -191,24 +196,48 @@ def build_request(target: str, op: str, idempotent: bool, hash_: str | None) -> 
     }
 
 
-def transient_error(response: Any, http_status: int, retry_after: str | None) -> dict[str, Any]:
+def response_envelope(
+    status: int, headers: Iterable[tuple[str, str]], body: bytes | None
+) -> dict[str, Any]:
+    """A JSON-serializable envelope of an HTTP response for the core ``payload``.
+
+    The core requires a JSON ``payload`` (contracts/core_api.rs) — the real
+    native core cannot round-trip a live ``Response`` object, only the stub can.
+    So a response never crosses the boundary as the payload: we send this
+    envelope and keep the live ``Response`` side-band, returning the live object
+    on the success path (byte-transparent) and rebuilding one only on a CACHE HIT
+    (in-process or, under the persistent journal, across runs). ``body`` is
+    buffered (base64) only for cacheable calls, so a non-cached call is never
+    forced to read a streaming body it won't replay."""
+    env: dict[str, Any] = {
+        RESPONSE_MARK: ENVELOPE_VERSION,
+        "status": int(status),
+        "headers": [[k, v] for k, v in headers],
+    }
+    if body is not None:
+        env["body_b64"] = base64.b64encode(bytes(body)).decode("ascii")
+    return env
+
+
+def transient_error(http_status: int, retry_after: str | None) -> dict[str, Any]:
     """An ``AttemptResult`` error for a transient HTTP response (5xx/429). The
-    response is round-tripped as ``original`` so the front end can hand the
-    caller the real, unchanged response after retries exhaust."""
+    live response is kept side-band by the pack (not sent through the core, which
+    cannot serialize it); the pack hands back the real response after retries
+    exhaust."""
     return {
         "status": "error",
         "class": "http",
         "http_status": http_status,
         "retry_after_ms": parse_retry_after(retry_after),
         "message": f"HTTP {http_status}",
-        "original": response,
     }
 
 
 def thrown_error(err: BaseException, cls: str) -> dict[str, Any]:
-    """An ``AttemptResult`` error for a thrown transport exception, carrying the
-    original exception object for unchanged re-raise (DX invariant 5)."""
-    return {"status": "error", "class": cls, "message": str(err), "original": err}
+    """An ``AttemptResult`` error for a thrown transport exception. The exception
+    is kept side-band for unchanged re-raise (DX invariant 5) — it is not sent
+    through the core (which cannot serialize it)."""
+    return {"status": "error", "class": cls, "message": str(err)}
 
 
 def attach_outcome(obj: Any, outcome: dict[str, Any]) -> Any:
@@ -223,29 +252,47 @@ def attach_outcome(obj: Any, outcome: dict[str, Any]) -> Any:
     return obj
 
 
-def deliver(outcome: dict[str, Any], is_response: Callable[[Any], bool]) -> tuple[str, Any]:
-    """Turn a core outcome into a delivery decision:
+def deliver(
+    outcome: dict[str, Any],
+    *,
+    ok_response: Any,
+    transient_response: Any,
+    exc: BaseException | None,
+    rebuild: Callable[[Any], Any],
+) -> tuple[str, Any]:
+    """Turn a core outcome + the pack's side-band live objects into a delivery
+    decision. The core payload is JSON, so the pack — not the core — owns the
+    live objects:
 
-      * ``("return", response)`` — a real response to hand back unchanged (an
-        ok payload, or the last real HTTP response after transient retries).
-      * ``("raise", exc)``       — an exception to raise unchanged (the original
-        transport error) or a synthesized ``KeelError`` (e.g. breaker open
-        before any attempt, so no original was captured).
-    """
+      * ok, live call    → the real response, unchanged (byte-transparency).
+      * ok, cache hit    → a response rebuilt from the envelope (in-process, or
+                           across runs under the persistent journal).
+      * error            → the last thrown transport exception (re-raised), or
+                           the last real 5xx/429 response (returned) after
+                           retries exhaust, else a synthesized ``KeelError``.
+
+    The chosen live original is re-attached to ``outcome["error"]["original"]``
+    for DX/consistency — the core never carries it (it isn't serializable)."""
     if outcome.get("result") == "ok":
-        return ("return", attach_outcome(outcome.get("payload"), outcome))
-    err = outcome.get("error") or {}
-    original = err.get("original")
-    if original is not None and is_response(original):
-        return ("return", attach_outcome(original, outcome))
-    if isinstance(original, BaseException):
-        return ("raise", attach_outcome(original, outcome))
-    synthetic = KeelError(err.get("code") or "KEEL-E040", err.get("message") or "keel: request failed")
+        if outcome.get("from_cache"):
+            return ("return", attach_outcome(rebuild(outcome.get("payload")), outcome))
+        return ("return", attach_outcome(ok_response, outcome))
+    err = outcome.get("error")
+    original = exc if isinstance(exc, BaseException) else transient_response
+    if isinstance(err, dict) and original is not None:
+        err["original"] = original
+    if isinstance(exc, BaseException):
+        return ("raise", attach_outcome(exc, outcome))
+    if transient_response is not None:
+        return ("return", attach_outcome(transient_response, outcome))
+    e = err or {}
+    synthetic = KeelError(e.get("code") or "KEEL-E040", e.get("message") or "keel: request failed")
     return ("raise", attach_outcome(synthetic, outcome))
 
 
 __all__ = [
     "ENVELOPE_VERSION",
+    "RESPONSE_MARK",
     "LLM_HOST_PROVIDERS",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
@@ -256,6 +303,7 @@ __all__ = [
     "parse_retry_after",
     "is_transient_status",
     "build_request",
+    "response_envelope",
     "transient_error",
     "thrown_error",
     "attach_outcome",

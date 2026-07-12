@@ -29,6 +29,7 @@ core removes the thread hop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import importlib.metadata
 import importlib.util
@@ -227,6 +228,48 @@ def _classify(err: BaseException) -> str:
     return "other"
 
 
+# --- response (de)serialization for the core payload ------------------------
+
+def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
+    """A JSON envelope of `resp` for the core payload (sync). The body is
+    buffered only for cacheable calls (so a non-cached streaming body is never
+    forced); the live response is returned unchanged on the success path."""
+    body = None
+    if cacheable:
+        try:
+            body = resp.read()  # buffers the transport stream into resp.content
+        except Exception:
+            body = None
+    return _http.response_envelope(resp.status_code, _headers(resp), body)
+
+
+async def _ok_payload_async(resp: Any, cacheable: bool) -> dict[str, Any]:
+    """Async twin of `_ok_payload` — buffers the body via `aread` on the loop."""
+    body = None
+    if cacheable:
+        try:
+            body = await resp.aread()
+        except Exception:
+            body = None
+    return _http.response_envelope(resp.status_code, _headers(resp), body)
+
+
+def _headers(resp: Any) -> list[tuple[str, str]]:
+    try:
+        return list(resp.headers.items())
+    except Exception:
+        return []
+
+
+def _rebuild(payload: Any) -> Any:
+    """Rebuild an httpx.Response from an envelope (a cache-hit replay)."""
+    import httpx
+
+    p = payload if isinstance(payload, dict) else {}
+    body = base64.b64decode(p["body_b64"]) if isinstance(p.get("body_b64"), str) else b""
+    return httpx.Response(status_code=int(p.get("status", 200)), headers=p.get("headers", []), content=body)
+
+
 # --- sync seam ---------------------------------------------------------------
 
 def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
@@ -236,22 +279,28 @@ def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    held: list[Any] = [None]
+    cacheable = hash_ is not None
+    # Live objects kept side-band so the core payload stays JSON: the ok winner,
+    # the last superseded transient (closed on supersede), and a thrown error.
+    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:
         try:
             resp = do_call()
         except Exception as err:  # not BaseException: let exit/interrupt fly
+            live["exc"] = err
             return _http.thrown_error(err, _classify(err))
+        live["exc"] = None
         if _http.is_transient_status(resp.status_code):
-            if held[0] is not None and held[0] is not resp:
-                _close_sync(held[0])
-            held[0] = resp
-            return _http.transient_error(resp, resp.status_code, resp.headers.get("retry-after"))
-        if held[0] is not None:
-            _close_sync(held[0])
-            held[0] = None
-        return {"status": "ok", "payload": resp}
+            if live["transient"] is not None and live["transient"] is not resp:
+                _close_sync(live["transient"])
+            live["transient"] = resp
+            return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
+        if live["transient"] is not None and live["transient"] is not resp:
+            _close_sync(live["transient"])
+        live["transient"] = None
+        live["ok"] = resp
+        return {"status": "ok", "payload": _ok_payload(resp, cacheable)}
 
     started = time.perf_counter()
     outcome = backend.execute(env, effect)
@@ -259,9 +308,15 @@ def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
     if discovery is not None:
         discovery.record(target, outcome, latency_ms)
 
-    action, value = _http.deliver(outcome, _is_response)
-    if action == "raise" and held[0] is not None and held[0] is not value:
-        _close_sync(held[0])  # dangling transient before a thrown transport error
+    action, value = _http.deliver(
+        outcome,
+        ok_response=live["ok"],
+        transient_response=live["transient"],
+        exc=live["exc"],
+        rebuild=_rebuild,
+    )
+    if action == "raise" and live["transient"] is not None and live["transient"] is not value:
+        _close_sync(live["transient"])  # dangling transient before a thrown transport error
     if action == "return":
         return value
     raise value
@@ -298,37 +353,75 @@ async def _run_async(make_coro: Callable[[], Any], request: Any) -> Any:
     if backend is None:
         return await make_coro()  # disabled / uninstalled: transparent
     discovery = _runtime.get_discovery()
-    loop = asyncio.get_running_loop()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    held: list[Any] = [None]
-
-    def effect(_attempt: int) -> dict[str, Any]:
-        # Runs in a worker thread; the actual await happens on `loop`.
-        future = asyncio.run_coroutine_threadsafe(make_coro(), loop)
-        try:
-            resp = future.result()
-        except Exception as err:
-            return _http.thrown_error(err, _classify(err))
-        if _http.is_transient_status(resp.status_code):
-            if held[0] is not None and held[0] is not resp:
-                _aclose_threadsafe(held[0], loop)
-            held[0] = resp
-            return _http.transient_error(resp, resp.status_code, resp.headers.get("retry-after"))
-        if held[0] is not None:
-            _aclose_threadsafe(held[0], loop)
-            held[0] = None
-        return {"status": "ok", "payload": resp}
+    cacheable = hash_ is not None
+    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
+    exec_async = getattr(backend, "execute_async", None)
 
     started = time.perf_counter()
-    outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
+    if callable(exec_async):
+        # NATIVE async path (Task 14 item 3): drive the effect directly on the
+        # caller's loop via keel_core.execute_async — no worker thread, no
+        # run_coroutine_threadsafe. The real async core awaits our coroutine.
+        async def aeffect(_attempt: int) -> dict[str, Any]:
+            try:
+                resp = await make_coro()
+            except Exception as err:
+                live["exc"] = err
+                return _http.thrown_error(err, _classify(err))
+            live["exc"] = None
+            if _http.is_transient_status(resp.status_code):
+                if live["transient"] is not None and live["transient"] is not resp:
+                    await _aclose(live["transient"])
+                live["transient"] = resp
+                return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
+            if live["transient"] is not None and live["transient"] is not resp:
+                await _aclose(live["transient"])
+            live["transient"] = None
+            live["ok"] = resp
+            return {"status": "ok", "payload": await _ok_payload_async(resp, cacheable)}
+
+        outcome = await exec_async(env, aeffect)
+    else:
+        # STUB async path: the synchronous stub cannot await, so each attempt is
+        # driven in a worker thread that marshals the await back onto this loop.
+        loop = asyncio.get_running_loop()
+
+        def effect(_attempt: int) -> dict[str, Any]:
+            future = asyncio.run_coroutine_threadsafe(make_coro(), loop)
+            try:
+                resp = future.result()
+            except Exception as err:
+                live["exc"] = err
+                return _http.thrown_error(err, _classify(err))
+            live["exc"] = None
+            if _http.is_transient_status(resp.status_code):
+                if live["transient"] is not None and live["transient"] is not resp:
+                    _aclose_threadsafe(live["transient"], loop)
+                live["transient"] = resp
+                return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
+            if live["transient"] is not None and live["transient"] is not resp:
+                _aclose_threadsafe(live["transient"], loop)
+            live["transient"] = None
+            live["ok"] = resp
+            payload = asyncio.run_coroutine_threadsafe(_ok_payload_async(resp, cacheable), loop).result()
+            return {"status": "ok", "payload": payload}
+
+        outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
     latency_ms = round((time.perf_counter() - started) * 1000)
     if discovery is not None:
         discovery.record(target, outcome, latency_ms)
 
-    action, value = _http.deliver(outcome, _is_response)
-    if action == "raise" and held[0] is not None and held[0] is not value:
-        await _aclose(held[0])
+    action, value = _http.deliver(
+        outcome,
+        ok_response=live["ok"],
+        transient_response=live["transient"],
+        exc=live["exc"],
+        rebuild=_rebuild,
+    )
+    if action == "raise" and live["transient"] is not None and live["transient"] is not value:
+        await _aclose(live["transient"])
     if action == "return":
         return value
     raise value

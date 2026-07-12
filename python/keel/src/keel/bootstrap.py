@@ -59,12 +59,17 @@ def install_keel(
 
     cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
+    # Backend first: whether it's persistent (native + attached journal) decides
+    # whether the LLM dev cache resolves to `scope=persistent` (cross-run replay).
+    backend = load_backend(env.get("KEEL_BACKEND"), cwd=cwd, env=env)
+    persistent = bool(getattr(backend, "persistent", False))
     # Layer the embedded pack defaults (and any present provider pack) UNDER the
     # user config, then resolve the LLM dev cache (`mode = "dev"` → a concrete
-    # ttl off-prod, dropped when KEEL_ENV=prod). Both steps mirror the Node front
-    # end's policy-merge behavior exactly (cross-language parity).
-    policy = resolve_dev_cache(apply_pack_defaults(raw, present_provider_defaults()), env)
-    backend = load_backend(env.get("KEEL_BACKEND"))
+    # ttl off-prod, dropped when KEEL_ENV=prod; scope=persistent when the backend
+    # can persist). Both steps mirror the Node front end exactly (parity).
+    policy = resolve_dev_cache(
+        apply_pack_defaults(raw, present_provider_defaults()), env, persistent=persistent
+    )
     backend.configure(policy)  # raises KEEL-E001 on invalid policy (field paths)
 
     discovery = Discovery(cwd)

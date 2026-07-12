@@ -17,6 +17,7 @@ untouched ``requests.Response`` (success-path byte-transparency).
 
 from __future__ import annotations
 
+import base64
 import functools
 import importlib.metadata
 import importlib.util
@@ -161,6 +162,39 @@ def _classify(err: BaseException) -> str:
     return "other"
 
 
+# --- response (de)serialization for the core payload ------------------------
+
+def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
+    """A JSON envelope of a requests.Response for the core payload. The body
+    (`resp.content`, buffered when stream=False) is included only for cacheable
+    calls; the live response is returned unchanged on the success path."""
+    body = None
+    if cacheable:
+        try:
+            body = resp.content
+        except Exception:
+            body = None
+    try:
+        headers = list(resp.headers.items())
+    except Exception:
+        headers = []
+    return _http.response_envelope(resp.status_code, headers, body)
+
+
+def _rebuild(payload: Any) -> Any:
+    """Rebuild a requests.Response from an envelope (a cache-hit replay)."""
+    import requests
+    from requests.structures import CaseInsensitiveDict
+
+    p = payload if isinstance(payload, dict) else {}
+    resp = requests.Response()
+    resp.status_code = int(p.get("status", 200))
+    resp._content = base64.b64decode(p["body_b64"]) if isinstance(p.get("body_b64"), str) else b""
+    resp.headers = CaseInsensitiveDict(dict(p.get("headers", [])))
+    resp.encoding = requests.utils.get_encoding_from_headers(resp.headers)
+    return resp
+
+
 # --- seam --------------------------------------------------------------------
 
 def _run_send(do_call: Callable[[], Any], request: Any) -> Any:
@@ -170,22 +204,26 @@ def _run_send(do_call: Callable[[], Any], request: Any) -> Any:
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    held: list[Any] = [None]
+    cacheable = hash_ is not None
+    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:
         try:
             resp = do_call()
         except Exception as err:
+            live["exc"] = err
             return _http.thrown_error(err, _classify(err))
+        live["exc"] = None
         if _http.is_transient_status(resp.status_code):
-            if held[0] is not None and held[0] is not resp:
-                _close(held[0])
-            held[0] = resp
-            return _http.transient_error(resp, resp.status_code, resp.headers.get("Retry-After"))
-        if held[0] is not None:
-            _close(held[0])
-            held[0] = None
-        return {"status": "ok", "payload": resp}
+            if live["transient"] is not None and live["transient"] is not resp:
+                _close(live["transient"])
+            live["transient"] = resp
+            return _http.transient_error(resp.status_code, resp.headers.get("Retry-After"))
+        if live["transient"] is not None and live["transient"] is not resp:
+            _close(live["transient"])
+        live["transient"] = None
+        live["ok"] = resp
+        return {"status": "ok", "payload": _ok_payload(resp, cacheable)}
 
     started = time.perf_counter()
     outcome = backend.execute(env, effect)
@@ -193,9 +231,15 @@ def _run_send(do_call: Callable[[], Any], request: Any) -> Any:
     if discovery is not None:
         discovery.record(target, outcome, latency_ms)
 
-    action, value = _http.deliver(outcome, _is_response)
-    if action == "raise" and held[0] is not None and held[0] is not value:
-        _close(held[0])
+    action, value = _http.deliver(
+        outcome,
+        ok_response=live["ok"],
+        transient_response=live["transient"],
+        exc=live["exc"],
+        rebuild=_rebuild,
+    )
+    if action == "raise" and live["transient"] is not None and live["transient"] is not value:
+        _close(live["transient"])
     if action == "return":
         return value
     raise value
