@@ -57,6 +57,9 @@ resume**. Done:
 published — build from source (README quickstart; `maturin develop -m
 crates/keel-py` for the native Python module). Postgres/fleet journal (Level 3),
 `keel mcp`, `keel record test`, and further adapter packs are future work.
+KEEL-E001 currently covers both policy-validation failures and v0.1
+unsupported-configuration limits (async-in-flow, flows-without-journal); a CCR
+to split these into a dedicated code is deliberately deferred.
 
 ## Commands (run all before any push that touches behavior)
 
@@ -74,8 +77,9 @@ python3 tools/faultproxy/test_faultproxy.py      # faultproxy sequencing
 ```
 
 Native front-end legs (flows, persistent cache, native adapters) need the built
-module: `maturin develop -m crates/keel-py/Cargo.toml` (Python), `napi build` in
-`crates/keel-node` (Node); they skip cleanly otherwise. Overhead artifact:
+module: `maturin develop -m crates/keel-py/Cargo.toml` (Python), `cargo build
+-p keel-node --release` (Node; `node/keel-core-native` loads the built cdylib);
+they skip cleanly otherwise. Overhead artifact:
 `bash scripts/bench-overhead.sh`.
 
 ## Rules that bite

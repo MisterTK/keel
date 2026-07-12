@@ -19,5 +19,7 @@ code changes.
 What made it durable: listing `py:pipeline:main` under `[flows]` in `keel.toml`.
 That's it.
 
-Smoke-tested by `python/keel/tests/test_resume_demo.py` (the real subprocess
-`kill -9` + resume assertion; native-only, skips cleanly otherwise).
+The resume mechanism is exercised by `python/keel/tests/test_resume_demo.py`
+(a real subprocess `kill -9` + resume assertion over an equivalent inlined
+pipeline; native-only, skips cleanly otherwise). The files in this directory
+are the runnable, human-facing version of that same flow.
