@@ -12,6 +12,7 @@ fallback, `timeout` validated but not enforced.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Callable
 
@@ -23,10 +24,27 @@ _DEFAULT_ON = ["conn", "timeout", "429", "5xx"]
 _DEFAULT_BREAKER_FAILURES = 5
 _DEFAULT_BREAKER_COOLDOWN_MS = 15_000
 
-_DURATION_RE = re.compile(r"^(\d+)(ms|s|m|h)$")
+# ASCII digits only (`[0-9]`, not `\d` which also matches unicode digits) and no
+# embedded whitespace — matching Node's regexes and the Rust core, so the same
+# keel.toml validates identically on every backend.
+_DURATION_RE = re.compile(r"^([0-9]+)(ms|s|m|h)$")
+_RATE_RE = re.compile(r"^([0-9]+)/(s|sec|min|h|hour)$")
+_FACTOR_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 _DURATION_MULT = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000}
 _RATE_WINDOW = {"s": 1_000, "sec": 1_000, "min": 60_000, "h": 3_600_000, "hour": 3_600_000}
 _CLASSES = ("conn", "timeout", "http", "cancelled", "other")
+
+#: Allowed keys per policy object (mirrors contracts/policy.schema.json's
+#: additionalProperties:false and the typed core's #[serde(deny_unknown_fields)],
+#: so an unknown/typo'd key fails loudly with KEEL-E001 on the stub too).
+_ALLOWED_TOP = ("defaults", "target", "flows", "journal", "telemetry")
+_ALLOWED_DEFAULTS = ("outbound", "llm")
+_ALLOWED_TARGET = ("timeout", "retry", "breaker", "rate", "cache", "idempotency", "fallback", "budget")
+_ALLOWED_RETRY = ("attempts", "schedule", "on")
+_ALLOWED_BREAKER = ("failures", "cooldown", "window", "failure_rate", "min_calls")
+_ALLOWED_CACHE = ("ttl", "scope", "mode", "key")
+_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism")
+_ALLOWED_TELEMETRY = ("otlp_endpoint", "console")
 
 
 class KeelError(Exception):
@@ -42,12 +60,12 @@ def _parse_duration(s: str) -> int | None:
 
 
 def _parse_rate(s: str) -> tuple[int, int] | None:
-    parts = s.strip().split("/")
-    if len(parts) != 2 or not parts[0].strip().isdigit():
+    m = _RATE_RE.match(s.strip())  # anchored/ASCII: rejects "3 / s", unicode digits
+    if not m:
         return None
-    limit = int(parts[0])
-    window = _RATE_WINDOW.get(parts[1].strip())
-    return (limit, window) if limit >= 1 and window else None
+    limit = int(m.group(1))
+    window = _RATE_WINDOW[m.group(2)]
+    return (limit, window) if limit >= 1 else None
 
 
 def _parse_schedule(s: str) -> tuple[int, float, int] | None:
@@ -61,9 +79,13 @@ def _parse_schedule(s: str) -> tuple[int, float, int] | None:
         base = _parse_duration(parts[0])
         if base is None or not parts[1].startswith("x"):
             return None
-        try:
-            factor = float(parts[1][1:])
-        except ValueError:
+        # Factor must be a plain ASCII decimal — reject "xinf"/"xnan"/"x1_0"/
+        # unicode, matching Node's Number()+isFinite (float() would accept them).
+        factor_str = parts[1][1:]
+        if not _FACTOR_RE.match(factor_str):
+            return None
+        factor = float(factor_str)
+        if not math.isfinite(factor):
             return None
         cap = 2**63
         for p in parts[2:]:
@@ -112,10 +134,12 @@ class KeelCoreStub:
     def configure(self, policy: dict[str, Any]) -> None:
         if not isinstance(policy, dict):
             raise KeelError("KEEL-E001", "policy invalid at $: policy document must be a table")
+        self._reject_unknown("", policy, _ALLOWED_TOP)
         defaults = policy.get("defaults")
         if defaults is not None:
             if not isinstance(defaults, dict):
                 raise KeelError("KEEL-E001", "policy invalid at defaults: expected a table")
+            self._reject_unknown("defaults", defaults, _ALLOWED_DEFAULTS)
             for key in ("outbound", "llm"):
                 if key in defaults:
                     self._validate_target_policy(f"defaults.{key}", defaults[key])
@@ -125,16 +149,65 @@ class KeelCoreStub:
                 raise KeelError("KEEL-E001", "policy invalid at target: expected a table")
             for name, v in targets.items():
                 self._validate_target_policy(f'target."{name}"', v)
+        self._validate_flows(policy.get("flows"))
+        self._validate_journal(policy.get("journal"))
+        self._validate_telemetry(policy.get("telemetry"))
         self._policy = policy
 
     @staticmethod
     def _invalid(path: str, msg: str) -> KeelError:
         return KeelError("KEEL-E001", f"policy invalid at {path}: {msg}")
 
+    @staticmethod
+    def _reject_unknown(path: str, table: dict[str, Any], allowed: tuple[str, ...]) -> None:
+        """Reject any key outside `allowed` (parity with the frozen schema's
+        additionalProperties:false + the core's deny_unknown_fields), so a typo
+        like `retrys`/`atempts` fails loudly at configure instead of silently
+        running the defaults."""
+        for k in table:
+            if k not in allowed:
+                where = f"{path}.{k}" if path else k
+                raise KeelCoreStub._invalid(where, f"unknown key {k!r}")
+
+    def _validate_flows(self, flows: Any) -> None:
+        if flows is None:
+            return
+        if not isinstance(flows, dict):
+            raise self._invalid("flows", "expected a table")
+        self._reject_unknown("flows", flows, _ALLOWED_FLOWS)
+        entrypoints = flows.get("entrypoints")
+        if entrypoints is not None and (
+            not isinstance(entrypoints, list) or not all(isinstance(e, str) for e in entrypoints)
+        ):
+            raise self._invalid("flows.entrypoints", "must be an array of strings")
+        on = flows.get("on_nondeterminism")
+        if on is not None and on not in ("fail", "warn", "branch"):
+            raise self._invalid("flows.on_nondeterminism", "must be fail|warn|branch")
+
+    def _validate_journal(self, journal: Any) -> None:
+        if journal is None:
+            return
+        if not isinstance(journal, str) or not re.match(r"^(file:.+|postgres://.+)$", journal):
+            raise self._invalid("journal", "must be a file:… or postgres://… location")
+
+    def _validate_telemetry(self, telemetry: Any) -> None:
+        if telemetry is None:
+            return
+        if not isinstance(telemetry, dict):
+            raise self._invalid("telemetry", "expected a table")
+        self._reject_unknown("telemetry", telemetry, _ALLOWED_TELEMETRY)
+        endpoint = telemetry.get("otlp_endpoint")
+        if endpoint is not None and not isinstance(endpoint, str):
+            raise self._invalid("telemetry.otlp_endpoint", "must be a string")
+        console = telemetry.get("console")
+        if console is not None and not isinstance(console, bool):
+            raise self._invalid("telemetry.console", "must be a boolean")
+
     @classmethod
     def _validate_target_policy(cls, path: str, v: Any) -> None:
         if not isinstance(v, dict):
             raise cls._invalid(path, "expected a table")
+        cls._reject_unknown(path, v, _ALLOWED_TARGET)
         timeout = v.get("timeout")
         if timeout is not None and (
             not isinstance(timeout, str) or _parse_duration(timeout) is None
@@ -144,6 +217,7 @@ class KeelCoreStub:
         if retry is not None:
             if not isinstance(retry, dict):
                 raise cls._invalid(path, "retry must be a table")
+            cls._reject_unknown(f"{path}.retry", retry, _ALLOWED_RETRY)
             attempts = retry.get("attempts")
             if attempts is not None and (
                 not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1
@@ -169,6 +243,7 @@ class KeelCoreStub:
         if breaker is not None:
             if not isinstance(breaker, dict):
                 raise cls._invalid(path, "breaker must be a table")
+            cls._reject_unknown(f"{path}.breaker", breaker, _ALLOWED_BREAKER)
             failures = breaker.get("failures")
             if failures is not None and (
                 not isinstance(failures, int) or isinstance(failures, bool) or failures < 1
@@ -186,9 +261,37 @@ class KeelCoreStub:
         if cache is not None:
             if not isinstance(cache, dict):
                 raise cls._invalid(path, "cache must be a table")
+            cls._reject_unknown(f"{path}.cache", cache, _ALLOWED_CACHE)
             ttl = cache.get("ttl")
             if ttl is not None and (not isinstance(ttl, str) or _parse_duration(ttl) is None):
                 raise cls._invalid(path, "bad cache.ttl")
+            # Closed enums (parity with the core's serde enums): a typo like
+            # scope="persistant" must fail, not silently fall back to a default.
+            scope = cache.get("scope")
+            if scope is not None and scope not in ("memory", "persistent"):
+                raise cls._invalid(path, "cache.scope must be memory|persistent")
+            mode = cache.get("mode")
+            if mode is not None and mode not in ("always", "dev"):
+                raise cls._invalid(path, "cache.mode must be always|dev")
+            key = cache.get("key")
+            if key is not None and key not in ("args", "url"):
+                raise cls._invalid(path, "cache.key must be args|url")
+        idempotency = v.get("idempotency")
+        if idempotency is not None:
+            if not isinstance(idempotency, dict):
+                raise cls._invalid(path, "idempotency must be a table")
+            cls._reject_unknown(f"{path}.idempotency", idempotency, ("header",))
+            header = idempotency.get("header")
+            if not isinstance(header, str):  # header is required by the schema
+                raise cls._invalid(path, "idempotency.header must be a string")
+        fallback = v.get("fallback")
+        if fallback is not None and (
+            not isinstance(fallback, list) or not all(isinstance(x, str) for x in fallback)
+        ):
+            raise cls._invalid(path, "fallback must be an array of strings")
+        budget = v.get("budget")
+        if budget is not None and not isinstance(budget, str):
+            raise cls._invalid(path, "budget must be a string")
 
     # -- resolution --------------------------------------------------------
 
