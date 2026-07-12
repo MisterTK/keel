@@ -37,9 +37,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-import time
 from pathlib import Path
-from typing import Any
+from time import time as _wall_clock  # captured at import: immune to in-flow
+from typing import Any  # time virtualization (keel's own clock is never journaled)
 
 _DISCOVERY_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS discovery (
@@ -156,7 +156,7 @@ def _row_from_outcome(
     last_error_class = err.get("class") if failure else None
     last_error_status = err.get("http_status") if failure else None
 
-    now = int(time.time() * 1000)
+    now = int(_wall_clock() * 1000)
     return (
         target,
         1,  # calls
