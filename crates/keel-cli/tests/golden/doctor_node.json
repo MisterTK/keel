@@ -88,6 +88,12 @@
       "topic": "invisible"
     }
   ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
   "ok": true,
   "policy": {
     "field": null,

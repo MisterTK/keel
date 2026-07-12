@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use keel_cli::render::json_string;
-use keel_cli::{doctor, explain, init, scan, status};
+use keel_cli::{doctor, explain, flows, init, scan, status};
 use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
@@ -218,6 +218,35 @@ fn doctor_json_matches_golden() {
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("doctor_node.json", &json_string(&r.json));
+}
+
+/// The evidence readers honor `keel.toml`'s `journal` key: a journal at a
+/// custom `file:` location (relative to the project) is found by `flows`,
+/// `trace`, and `status` even though `.keel/journal.db` does not exist.
+#[test]
+fn flows_and_status_honor_the_policy_journal_location() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "journal = \"file:state/custom.db\"\n",
+    )
+    .unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let conn = rusqlite::Connection::open(state.join("custom.db")).unwrap();
+    conn.execute_batch(JOURNAL_SCHEMA).unwrap();
+    conn.execute_batch(COMPLETED_FLOW).unwrap();
+    drop(conn);
+
+    let f = flows::flows(dir.path(), false, T0);
+    assert_eq!(f.json["journal_present"], true, "custom journal found");
+    assert_eq!(f.json["count"], 1, "the completed fixture flow is listed");
+
+    let s = status::run(dir.path());
+    assert_eq!(
+        s.json["flows"]["total"], 1,
+        "status reads the custom journal"
+    );
 }
 
 #[test]

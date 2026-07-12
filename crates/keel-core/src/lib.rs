@@ -28,6 +28,7 @@
 
 mod engine;
 mod flow;
+mod journal_backend;
 #[cfg(feature = "otel")]
 pub mod otel;
 
