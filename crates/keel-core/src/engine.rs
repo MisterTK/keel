@@ -25,6 +25,8 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, warn};
 
+use crate::events::{CacheStore, EventKind, EventSink, TraceRef};
+
 /// Count-mode circuit breaker (consecutive terminal failures). Observes
 /// post-retry call outcomes — layer order puts it outside the retry loop.
 #[derive(Debug, Default)]
@@ -357,6 +359,20 @@ fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
     }
 }
 
+/// Append the dx-invariant-4 trace reference (`… trace: keel trace <ref>`) to
+/// a terminal failure message. `trace` is `Some` only while a live event sink
+/// minted a ref for this call, so without a sink — the conformance condition —
+/// every implementation stays message-identical (parity rule).
+fn with_trace_ref(message: String, trace: Option<&TraceRef>) -> String {
+    match trace {
+        Some(t) => {
+            let sep = if message.ends_with('.') { "" } else { "." };
+            format!("{message}{sep} trace: keel trace {t}")
+        }
+        None => message,
+    }
+}
+
 fn terminal_message(
     code: ErrorCode,
     request: &Request,
@@ -404,6 +420,10 @@ pub struct Engine {
     journal: Option<Arc<dyn Journal>>,
     /// Traffic ledger fed one observation per `execute`, for `keel init`/`status`.
     discovery: Option<Arc<dyn DiscoveryRecorder>>,
+    /// Live NDJSON event feed for `keel tail`/`keel trace` ([`crate::events`]).
+    /// `None` (the zero-cost path) unless the environment activates it or a
+    /// sink is attached; like journal/discovery it can never change an outcome.
+    events: Option<EventSink>,
 }
 
 impl fmt::Debug for Engine {
@@ -414,6 +434,7 @@ impl fmt::Debug for Engine {
             .field("state", &self.state)
             .field("journal_attached", &self.journal.is_some())
             .field("discovery_attached", &self.discovery.is_some())
+            .field("events_attached", &self.events.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -433,6 +454,10 @@ impl Engine {
             state: Mutex::new(State::default()),
             journal: None,
             discovery: None,
+            // Live events activate from the environment (KEEL_EVENTS / an
+            // existing ./.keel dir — see `crate::events`), so every embedding
+            // — FFI, PyO3, napi, CLI — inherits the feed with no plumbing.
+            events: EventSink::from_env(),
         }
     }
 
@@ -456,6 +481,52 @@ impl Engine {
     pub fn attach_discovery(&mut self, discovery: impl DiscoveryRecorder + 'static) -> &mut Self {
         self.discovery = Some(Arc::new(discovery));
         self
+    }
+
+    /// Attach (or replace) a live event sink. [`Engine::new`] already resolves
+    /// one from the environment (see [`crate::events`]); this override exists
+    /// for tests and embedders that place the feed elsewhere.
+    pub fn attach_events(&mut self, sink: EventSink) -> &mut Self {
+        self.events = Some(sink);
+        self
+    }
+
+    /// The active event sink, if any — its run id anchors this engine's trace
+    /// refs, and `flush()` makes the feed current for a same-process reader.
+    #[must_use]
+    pub fn events(&self) -> Option<&EventSink> {
+        self.events.as_ref()
+    }
+
+    /// Emit one live event, stamped with engine-elapsed (virtual-clock-safe)
+    /// milliseconds. The closure defers construction — and its string clones —
+    /// to the active-sink case, so the disabled path costs one branch.
+    fn emit_event(&self, kind: impl FnOnce() -> EventKind) {
+        if let Some(sink) = self.events.as_ref() {
+            sink.emit(self.elapsed_ms(), kind());
+        }
+    }
+
+    /// Feed event for a consulted cache: hit (the call is served) or miss
+    /// (the call proceeds live). Not emitted when no cache plan exists.
+    fn emit_cache(&self, out: &Outcome, target: &str, scope: CacheStore, hit: bool) {
+        self.emit_event(|| {
+            let call = out.trace_id.clone();
+            let target = target.to_owned();
+            if hit {
+                EventKind::CacheHit {
+                    call,
+                    target,
+                    scope,
+                }
+            } else {
+                EventKind::CacheMiss {
+                    call,
+                    target,
+                    scope,
+                }
+            }
+        });
     }
 
     /// Apply a policy document (keel.toml as JSON, per
@@ -545,6 +616,15 @@ impl Engine {
             .await;
         record_call_fields(&span, &out);
         self.observe(request, &out, started);
+        // Every call's last feed event, on all paths (cache hit, breaker
+        // reject, envelope error, live attempt).
+        self.emit_event(|| EventKind::CallEnd {
+            call: out.trace_id.clone(),
+            target: request.target.clone(),
+            result: out.result.clone(),
+            code: out.error.as_ref().map(|e| e.code),
+            attempts: out.attempts,
+        });
         out
     }
 
@@ -558,6 +638,23 @@ impl Engine {
     {
         let target = request.target.as_str();
         let mut out = self.begin_call(target);
+
+        // Every call's first feed event; its seq anchors the trace ref that
+        // failure messages carry (`None` without a sink — the parity path).
+        let trace = self.events.as_ref().map(|sink| {
+            let seq = sink.emit(
+                self.elapsed_ms(),
+                EventKind::CallStart {
+                    call: out.trace_id.clone(),
+                    target: target.to_owned(),
+                    op: request.op.clone(),
+                },
+            );
+            TraceRef {
+                run: sink.run_id().to_owned(),
+                seq,
+            }
+        });
 
         if request.v != ENVELOPE_VERSION {
             out.error = Some(OutcomeError {
@@ -582,13 +679,17 @@ impl Engine {
         match &cache_plan {
             CachePlan::Memory { key } => {
                 if self.serve_from_cache(key, &mut out) {
+                    self.emit_cache(&out, target, CacheStore::Memory, true);
                     return out;
                 }
+                self.emit_cache(&out, target, CacheStore::Memory, false);
             }
             CachePlan::Persistent { key, .. } => {
                 if self.serve_from_persistent(target, key, &mut out) {
+                    self.emit_cache(&out, target, CacheStore::Persistent, true);
                     return out;
                 }
+                self.emit_cache(&out, target, CacheStore::Persistent, false);
             }
             CachePlan::None => {}
         }
@@ -599,7 +700,7 @@ impl Engine {
         }
 
         // breaker admission (observes post-retry call outcomes)
-        let admission = self.admit(target, &resolved, &mut out);
+        let admission = self.admit(target, &resolved, &mut out, trace.as_ref());
         if admission == Admission::Rejected {
             return out;
         }
@@ -610,7 +711,7 @@ impl Engine {
             ..RetryPolicy::default()
         });
         let result = self
-            .run_attempts(request, &resolved, &retry, effect, &mut out)
+            .run_attempts(request, &resolved, &retry, effect, &mut out, trace.as_ref())
             .await;
         // Only the memory scope writes through under the state lock; the
         // persistent scope writes after the lock drops (journal I/O off-lock).
@@ -757,13 +858,25 @@ impl Engine {
             out.throttled = true;
             out.throttle_wait_ms = wait_ms;
             self.state().metrics_for(target).throttled += 1;
+            // Emitted before the wait so a live tail shows the queueing now.
+            self.emit_event(|| EventKind::Throttle {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                wait_ms,
+            });
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
     }
 
     /// Consults the target's breaker; on rejection, fills the fail-fast
     /// KEEL-E012 outcome (the effect is never invoked).
-    fn admit(&self, target: &str, resolved: &ResolvedPolicy, out: &mut Outcome) -> Admission {
+    fn admit(
+        &self,
+        target: &str,
+        resolved: &ResolvedPolicy,
+        out: &mut Outcome,
+        trace: Option<&TraceRef>,
+    ) -> Admission {
         if resolved.breaker.is_none() {
             return Admission::Closed;
         }
@@ -780,7 +893,10 @@ impl Engine {
                     code: ErrorCode::BreakerOpen,
                     class: ErrorClass::Other,
                     http_status: None,
-                    message: format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                    message: with_trace_ref(
+                        format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                        trace,
+                    ),
                     original: None,
                 });
                 out.breaker = BreakerState::Open;
@@ -788,9 +904,20 @@ impl Engine {
             }
             admission
         };
+        // Both feed events run off the state lock, like the debug! below.
+        if admission == Admission::Rejected {
+            self.emit_event(|| EventKind::BreakerReject {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
+        }
         // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
         if admission == Admission::HalfOpen {
             debug!(target = %target, transition = "half_open", "breaker transition");
+            self.emit_event(|| EventKind::BreakerHalfOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
         }
         admission
     }
@@ -857,6 +984,18 @@ impl Engine {
             transition
         };
         emit_breaker_transition(target, transition);
+        match transition {
+            BreakerTransition::Opened => self.emit_event(|| EventKind::BreakerOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                cooldown_ms: resolved.breaker.as_ref().map_or(0, |b| b.cooldown.0),
+            }),
+            BreakerTransition::Closed => self.emit_event(|| EventKind::BreakerClose {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            }),
+            BreakerTransition::None => {}
+        }
     }
 
     /// Writes a live success into the journal's persistent cache (called after
@@ -979,7 +1118,8 @@ impl Engine {
         }
     }
 
-    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error.
+    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error
+    /// (whose message carries the call's trace ref when a sink is live).
     async fn run_attempts<F>(
         &self,
         request: &Request,
@@ -987,6 +1127,7 @@ impl Engine {
         retry: &RetryPolicy,
         effect: &mut F,
         out: &mut Outcome,
+        trace: Option<&TraceRef>,
     ) -> Result<Value, OutcomeError>
     where
         F: AsyncFnMut(u32) -> AttemptResult,
@@ -1003,6 +1144,11 @@ impl Engine {
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
+            self.emit_event(|| EventKind::AttemptStart {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                attempt,
+            });
 
             // Child span per attempt (spec §4.5): `class`/`http_status`/`wait_ms`
             // are filled in below once the attempt resolves. The effect future
@@ -1037,6 +1183,13 @@ impl Engine {
                     if let Some(status) = http_status {
                         attempt_span.record("http_status", status);
                     }
+                    self.emit_event(|| EventKind::AttemptError {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        class,
+                        http_status,
+                    });
                     let retryable = retry.is_retryable(class, http_status);
                     if let Some(code) =
                         terminal_code(retryable, attempt, max_attempts, request.idempotent)
@@ -1055,14 +1208,17 @@ impl Engine {
                             code,
                             class,
                             http_status,
-                            message: terminal_message(
-                                code,
-                                request,
-                                attempt,
-                                max_attempts,
-                                class,
-                                http_status,
-                                &message,
+                            message: with_trace_ref(
+                                terminal_message(
+                                    code,
+                                    request,
+                                    attempt,
+                                    max_attempts,
+                                    class,
+                                    http_status,
+                                    &message,
+                                ),
+                                trace,
                             ),
                             original,
                         });
@@ -1077,6 +1233,13 @@ impl Engine {
                     attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
+                    // Emitted before the wait so a live tail shows it now.
+                    self.emit_event(|| EventKind::Backoff {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        wait_ms: wait,
+                    });
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
             }

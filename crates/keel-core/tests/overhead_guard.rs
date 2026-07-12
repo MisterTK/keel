@@ -21,10 +21,12 @@ fn overhead_stays_under_debug_ceiling() {
     let empty = support::median_ns(|| cases.empty());
     let miss = support::median_ns(|| cases.miss());
     let hit = support::median_ns(|| cases.hit());
+    let events = support::median_ns(|| cases.events());
 
     println!(
         "overhead medians (debug profile, ns/call): \
-         0_baseline={baseline} a_empty={empty} b_cache_miss={miss} c_cache_hit={hit}"
+         0_baseline={baseline} a_empty={empty} b_cache_miss={miss} c_cache_hit={hit} \
+         d_events={events}"
     );
 
     // The baseline is the runtime floor, not Keel overhead — printed, not gated.
@@ -32,6 +34,7 @@ fn overhead_stays_under_debug_ceiling() {
         ("a_empty", empty),
         ("b_cache_miss", miss),
         ("c_cache_hit", hit),
+        ("d_events", events),
     ] {
         assert!(
             ns < CEILING_NS,
