@@ -2,7 +2,7 @@
 //! The same scenarios run against the Python and Node stubs; the real core
 //! must pass them too. Format and semantics: conformance/README.md.
 
-use keel_core_api::{AttemptResult, KeelCore, Request, ENVELOPE_VERSION};
+use keel_core_api::{AttemptResult, ENVELOPE_VERSION, KeelCore, Request};
 use keel_core_stub::KeelCoreStub;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -46,16 +46,16 @@ fn run_scenario(scenario: &Value) -> Vec<String> {
         .and_then(Value::as_str);
     match (core.configure(policy), want_cfg_err) {
         (Ok(()), None) => {}
-        (Ok(()), Some(code)) => {
+        (Ok(()), Some(expected)) => {
             return vec![format!(
-                "configure: expected {code}, but configure succeeded"
-            )]
+                "configure: expected {expected}, but configure succeeded"
+            )];
         }
-        (Err(e), Some(code)) => {
-            if e.code.as_str() == code {
+        (Err(e), Some(expected)) => {
+            if e.code.as_str() == expected {
                 return vec![];
             }
-            return vec![format!("configure: expected {code}, got {}", e.code)];
+            return vec![format!("configure: expected {expected}, got {}", e.code)];
         }
         (Err(e), None) => return vec![format!("configure: unexpected error {e}")],
     }

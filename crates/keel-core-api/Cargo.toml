@@ -3,6 +3,7 @@ name = "keel-core-api"
 description = "Keel core API contract types (contracts-v1). Single source of truth: contracts/core_api.rs."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 # Not publishable as-is: the source is included from ../../contracts so the
 # contract file stays the single source of truth. Publishing gets a copy step.
@@ -11,3 +12,6 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

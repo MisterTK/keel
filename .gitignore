@@ -1,6 +1,6 @@
-# rust
+# rust (Cargo.lock is committed: reproducible builds are current guidance
+# for libraries and binaries alike)
 /target/
-Cargo.lock
 
 # python
 __pycache__/
