@@ -6,9 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-# Not publishable as-is: the source is included from ../../contracts so the
-# contract file stays the single source of truth. Publishing gets a copy step.
-publish = false
+readme.workspace = true
+# Publishable: the compiled source is the vendored crate-local copy in
+# contract/, kept byte-identical to the frozen contracts/core_api.rs by
+# build.rs on every workspace build. Publishing itself is a release-workflow
+# step; registry naming is docs/naming-decision.md.
 
 [dependencies]
 serde = { workspace = true }

@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn default_body_matches_the_frozen_pack() {
         // The hardcoded policy bodies must equal contracts/defaults.toml.
-        let defaults: toml::Value = include_str!("../../../contracts/defaults.toml")
+        let defaults: toml::Value = include_str!("../contract/defaults.toml")
             .parse()
             .expect("defaults.toml parses");
         let outbound = &defaults["defaults"]["outbound"];

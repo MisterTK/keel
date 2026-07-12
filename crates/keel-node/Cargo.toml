@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Ships as the napi addon inside the npm package, not as a crate.
 publish = false
 
 [lib]
