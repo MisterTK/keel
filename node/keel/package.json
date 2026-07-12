@@ -10,6 +10,10 @@
       "types": "./index.d.ts",
       "import": "./index.mjs"
     },
+    "./ai-sdk": {
+      "types": "./ai-sdk.d.ts",
+      "import": "./ai-sdk.mjs"
+    },
     "./hook": {
       "import": "./hook.mjs",
       "require": "./hook.cjs"
@@ -25,6 +29,8 @@
   "files": [
     "index.mjs",
     "index.d.ts",
+    "ai-sdk.mjs",
+    "ai-sdk.d.ts",
     "hook.mjs",
     "hook.cjs",
     "bin/",
