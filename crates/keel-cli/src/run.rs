@@ -327,4 +327,38 @@ mod tests {
         let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
         assert!(matches!(err, RunError::NoEntry { .. }));
     }
+
+    #[test]
+    fn child_exit_code_propagates() {
+        // `keel run` is invisible on the success path — the child's exit code is
+        // the process's exit code (dx-spec §1). Drive the exec path directly with
+        // a shell that exits 7.
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec!["-c".to_owned(), "exit 7".to_owned()],
+            disable: false,
+        };
+        assert_eq!(exec(&plan).expect("sh should spawn"), 7);
+    }
+
+    #[test]
+    fn spawn_failure_is_a_framed_error_with_exit_1() {
+        // A program that cannot be spawned surfaces a what/why/next error on
+        // stderr and exit 1 (an underlying failure, not a usage error).
+        let plan = RunPlan {
+            program: "keel-nonexistent-program-9f3a".to_owned(),
+            argv: vec![],
+            disable: false,
+        };
+        let rendered = exec(&plan).expect_err("nonexistent program cannot spawn");
+
+        assert_eq!(rendered.exit, EXIT_FAILURE);
+        assert!(rendered.to_stderr);
+        assert_eq!(rendered.json["error"], "spawn-failed");
+        // The human message is framed: what (keel ▸ …), why, and next.
+        assert!(rendered.human.starts_with("keel \u{25b8} "));
+        assert!(rendered.human.contains("keel-nonexistent-program-9f3a"));
+        assert!(rendered.human.contains("why:"));
+        assert!(rendered.human.contains("next:"));
+    }
 }

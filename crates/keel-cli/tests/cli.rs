@@ -137,6 +137,50 @@ fn init_python_httpx_openai_matches_golden() {
     check_golden("init_py.toml", &out);
 }
 
+/// An `llm:*` target with observed discovery traffic gets an *active* rate limit
+/// tuned from its evidence (dx-spec §1 flagship). Built from a hand-made scan +
+/// discovery snapshot so it needs no python3 and stays byte-deterministic:
+/// 200 calls over a 2-min window → mean 100/min → ×3 = 300 → clean 500/min.
+#[test]
+fn init_observed_llm_matches_golden() {
+    let mut scanned = scan::ScanResult {
+        files_scanned: 1,
+        python_available: true,
+        ..scan::ScanResult::default()
+    };
+    scanned.targets.insert(
+        "llm:openai".to_owned(),
+        scan::TargetEvidence {
+            class: scan::TargetClass::Llm,
+            sightings: [scan::Sighting {
+                file: "agent.py".to_owned(),
+                line: 12,
+            }]
+            .into_iter()
+            .collect(),
+        },
+    );
+    let discovery = vec![TargetStats {
+        target: "llm:openai".to_owned(),
+        calls: 200,
+        attempts: 212,
+        retries: 12,
+        successes: 200,
+        failures: 0,
+        cache_hits: 0,
+        throttled: 0,
+        breaker_opens: 0,
+        total_latency_ms: 40_000,
+        max_latency_ms: 900,
+        first_seen_ms: T0,
+        last_seen_ms: T0 + 120_000,
+        last_error_class: None,
+        last_error_status: None,
+    }];
+    let out = init::render_keel_toml(&scanned, &discovery, None);
+    check_golden("init_llm_observed.toml", &out);
+}
+
 // ---- status / doctor / explain: --json golden-tested ----
 
 #[test]

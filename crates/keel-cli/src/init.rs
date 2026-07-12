@@ -193,27 +193,129 @@ fn write_block(
         },
         |e| e.class,
     );
-    out.push_str(policy_body(class));
+    match (class, stats) {
+        // dx-spec §1 flagship: an observed `llm:*` target earns an *active* rate
+        // limit tuned from its own evidence, inserted between breaker and cache.
+        (TargetClass::Llm, Some(s)) => {
+            out.push_str(LLM_BODY_HEAD);
+            out.push_str(&observed_rate_line(s));
+            out.push('\n');
+            out.push_str(LLM_CACHE_LINE);
+        }
+        // Host targets stay comments-only even with observed traffic: imposing an
+        // active throttle on general outbound HTTP without an explicit opt-in
+        // would be a Level-0 surprise (dx-spec §1 hard rules). An evidence-tuned
+        // host rate is deliberately out of scope for v0.1.
+        _ => out.push_str(&policy_body(class)),
+    }
 }
 
-/// The policy body for a class. Values mirror the frozen smart-defaults pack
-/// (`contracts/defaults.toml`); a test asserts they stay in sync. Writing them
-/// out (rather than relying on the invisible defaults) makes the file
-/// self-documenting — the DX promise that "the generated file is the docs".
-fn policy_body(class: TargetClass) -> &'static str {
+/// Outbound-host policy body. Mirrors the frozen smart-defaults pack
+/// (`contracts/defaults.toml` outbound); a test asserts they stay in sync.
+const HOST_BODY: &str = concat!(
+    "timeout = \"30s\"\n",
+    "retry   = { attempts = 3, schedule = \"exp(200ms, x2, max 30s, jitter)\", on = [\"conn\", \"timeout\", \"429\", \"5xx\"] }\n",
+    "breaker = { failures = 5, cooldown = \"15s\" }\n",
+);
+
+/// The LLM body up to and including the breaker line — everything that precedes
+/// the *optional* evidence-derived `rate` line. Mirrors `contracts/defaults.toml`
+/// llm pack.
+const LLM_BODY_HEAD: &str = concat!(
+    "timeout = \"120s\"\n",
+    "retry   = { attempts = 6, schedule = \"exp(500ms, x2, max 60s, jitter)\", on = [\"conn\", \"timeout\", \"429\", \"5xx\"] }\n",
+    "breaker = { failures = 5, cooldown = \"30s\" }\n",
+);
+
+/// The LLM dev-cache line — always the last line of an `llm:*` block.
+const LLM_CACHE_LINE: &str =
+    "cache   = { mode = \"dev\" }          # dev-loop cache; disabled when KEEL_ENV=prod\n";
+
+/// Floor for an observed `llm:*` target's active rate, in calls/min. Below this
+/// the derived headroom is noise (LLM traffic is bursty), so we never emit an
+/// active limit under 60/min — also the value used when the observation window
+/// is a single instant (no mean to derive).
+const LLM_RATE_FLOOR_PER_MIN: u64 = 60;
+
+/// Headroom multiplier over the observed MEAN rate. The discovery store keeps
+/// only `calls` + `first_seen_ms`/`last_seen_ms` — it measures a mean, never a
+/// per-minute *peak* — so we scale the mean up generously to leave room for the
+/// peaks we did not measure. NEVER describe the result as a peak.
+const LLM_RATE_HEADROOM: u64 = 3;
+
+/// The policy body for a class *without* any evidence-derived keys. Values
+/// mirror the frozen smart-defaults pack (`contracts/defaults.toml`); a test
+/// asserts they stay in sync. Writing them out (rather than relying on the
+/// invisible defaults) makes the file self-documenting — the DX promise that
+/// "the generated file is the docs".
+fn policy_body(class: TargetClass) -> String {
     match class {
-        TargetClass::Host => concat!(
-            "timeout = \"30s\"\n",
-            "retry   = { attempts = 3, schedule = \"exp(200ms, x2, max 30s, jitter)\", on = [\"conn\", \"timeout\", \"429\", \"5xx\"] }\n",
-            "breaker = { failures = 5, cooldown = \"15s\" }\n",
-        ),
-        TargetClass::Llm => concat!(
-            "timeout = \"120s\"\n",
-            "retry   = { attempts = 6, schedule = \"exp(500ms, x2, max 60s, jitter)\", on = [\"conn\", \"timeout\", \"429\", \"5xx\"] }\n",
-            "breaker = { failures = 5, cooldown = \"30s\" }\n",
-            "cache   = { mode = \"dev\" }          # dev-loop cache; disabled when KEEL_ENV=prod\n",
-        ),
+        TargetClass::Host => HOST_BODY.to_owned(),
+        TargetClass::Llm => format!("{LLM_BODY_HEAD}{LLM_CACHE_LINE}"),
     }
+}
+
+/// The observed MEAN calls/minute as an integer floor, or `0` when the window is
+/// a single instant (`first_seen_ms == last_seen_ms`). Pure integer math keeps
+/// the output byte-deterministic. Basis for both the derived rate and its
+/// comment.
+fn mean_per_min_floor(s: &TargetStats) -> u64 {
+    let span_ms = u64::try_from((s.last_seen_ms - s.first_seen_ms).max(0)).unwrap_or(u64::MAX);
+    if span_ms == 0 {
+        return 0;
+    }
+    let calls = u64::try_from(s.calls.max(0)).unwrap_or(u64::MAX);
+    calls.saturating_mul(60_000) / span_ms
+}
+
+/// Derive an active per-minute rate limit for an observed `llm:*` target:
+/// `mean × LLM_RATE_HEADROOM`, [rounded up to a clean value](round_up_clean),
+/// clamped to a floor of [`LLM_RATE_FLOOR_PER_MIN`]. A single-instant window has
+/// no derivable mean, so it falls back to the floor. Deterministic integer math.
+fn llm_rate_per_min(s: &TargetStats) -> u64 {
+    let mean = mean_per_min_floor(s);
+    if mean == 0 {
+        return LLM_RATE_FLOOR_PER_MIN;
+    }
+    round_up_clean(mean.saturating_mul(LLM_RATE_HEADROOM)).max(LLM_RATE_FLOOR_PER_MIN)
+}
+
+/// Round `n` UP to the next "clean" value in the 1-2-5 decade series
+/// (…10, 20, 50, 100, 200, 500, 1000…) — the standard nice-number ceiling.
+/// `round_up_clean(0) == 0`.
+fn round_up_clean(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut unit = 1_u64;
+    loop {
+        for m in [1_u64, 2, 5] {
+            let candidate = m.saturating_mul(unit);
+            if candidate >= n {
+                return candidate;
+            }
+        }
+        match unit.checked_mul(10) {
+            Some(next) => unit = next,
+            None => return u64::MAX,
+        }
+    }
+}
+
+/// The active `rate` line for an observed `llm:*` target, comment-aligned like
+/// the rest of the block. Honest about what we measured: it cites the mean,
+/// never a peak.
+fn observed_rate_line(s: &TargetStats) -> String {
+    let mean = mean_per_min_floor(s);
+    let comment = if mean == 0 {
+        "# floor: single observation window, no mean to derive".to_owned()
+    } else {
+        format!("# headroom over your observed mean of ~{mean}/min")
+    };
+    pad_comment(
+        &format!("rate    = \"{}/min\"", llm_rate_per_min(s)),
+        &comment,
+    )
 }
 
 /// The observed-traffic comment for a target with discovery evidence.
@@ -429,8 +531,34 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+
     use keel_journal::ErrorClass;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// A `TargetStats` for `llm:openai` with the given call count and observation
+    /// window; every other counter is inert (irrelevant to rate derivation).
+    fn llm_stats(calls: i64, first_seen_ms: i64, last_seen_ms: i64) -> TargetStats {
+        TargetStats {
+            target: "llm:openai".to_owned(),
+            calls,
+            attempts: calls,
+            retries: 0,
+            successes: calls,
+            failures: 0,
+            cache_hits: 0,
+            throttled: 0,
+            breaker_opens: 0,
+            total_latency_ms: 0,
+            max_latency_ms: 0,
+            first_seen_ms,
+            last_seen_ms,
+            last_error_class: None,
+            last_error_status: None,
+        }
+    }
 
     fn host_scan() -> ScanResult {
         let mut s = ScanResult {
@@ -556,5 +684,200 @@ mod tests {
     fn civil_date_epoch_is_1970_01_01() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_997), (2024, 10, 1));
+    }
+
+    // ---- item 3: evidence-tuned llm rate derivation ----
+
+    #[test]
+    fn round_up_clean_walks_the_1_2_5_series() {
+        assert_eq!(round_up_clean(0), 0);
+        assert_eq!(round_up_clean(1), 1);
+        assert_eq!(round_up_clean(3), 5);
+        assert_eq!(round_up_clean(6), 10);
+        assert_eq!(round_up_clean(11), 20);
+        assert_eq!(round_up_clean(50), 50);
+        assert_eq!(round_up_clean(60), 100);
+        assert_eq!(round_up_clean(123), 200);
+        assert_eq!(round_up_clean(300), 500);
+        assert_eq!(round_up_clean(501), 1_000);
+    }
+
+    #[test]
+    fn llm_rate_is_mean_times_three_rounded_up_to_a_clean_value() {
+        // 200 calls over a 2-min window → mean 100/min → ×3 = 300 → clean 500.
+        let s = llm_stats(200, 0, 120_000);
+        assert_eq!(mean_per_min_floor(&s), 100);
+        assert_eq!(llm_rate_per_min(&s), 500);
+    }
+
+    #[test]
+    fn llm_rate_floors_at_60_for_sparse_traffic() {
+        // 5 calls over 1 min → mean 5/min → ×3 = 15 → clean 20 → floored to 60.
+        let s = llm_stats(5, 0, 60_000);
+        assert_eq!(mean_per_min_floor(&s), 5);
+        assert_eq!(llm_rate_per_min(&s), LLM_RATE_FLOOR_PER_MIN);
+    }
+
+    #[test]
+    fn llm_rate_zero_span_window_falls_back_to_floor() {
+        // Single-instant window (first_seen == last_seen): no mean derivable.
+        let s = llm_stats(500, 1_000, 1_000);
+        assert_eq!(mean_per_min_floor(&s), 0);
+        assert_eq!(llm_rate_per_min(&s), LLM_RATE_FLOOR_PER_MIN);
+    }
+
+    #[test]
+    fn observed_llm_target_gets_an_active_rate_line() {
+        let scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        let stats = llm_stats(200, 0, 120_000);
+        let out = render_keel_toml(&scan, std::slice::from_ref(&stats), None);
+
+        assert!(out.contains("[target.\"llm:openai\"]"));
+        assert!(out.contains("rate    = \"500/min\""));
+        assert!(out.contains("# headroom over your observed mean of ~100/min"));
+        // We measure a mean, never a peak — the word must never appear.
+        assert!(!out.contains("peak"));
+        // The rate line sits between breaker and cache.
+        let rate_at = out.find("rate    =").expect("rate line present");
+        let cache_at = out.find("cache   =").expect("cache line present");
+        assert!(rate_at < cache_at, "rate must precede cache");
+    }
+
+    #[test]
+    fn zero_span_llm_target_emits_floor_with_honest_comment() {
+        let scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        let stats = llm_stats(9, 5_000, 5_000);
+        let out = render_keel_toml(&scan, std::slice::from_ref(&stats), None);
+        assert!(out.contains("rate    = \"60/min\""));
+        assert!(out.contains("# floor: single observation window, no mean to derive"));
+        assert!(!out.contains("peak"));
+    }
+
+    #[test]
+    fn observed_host_target_stays_comments_only() {
+        // Host targets never get an active rate, even with observed traffic.
+        let scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        let stats = TargetStats {
+            target: "api.host.example".to_owned(),
+            ..llm_stats(200, 0, 120_000)
+        };
+        let out = render_keel_toml(&scan, std::slice::from_ref(&stats), None);
+        assert!(out.contains("[target.\"api.host.example\"]"));
+        assert!(
+            !out.contains("rate    ="),
+            "host targets must not emit an active rate line"
+        );
+    }
+
+    // ---- item 2: keel init write path ----
+
+    #[test]
+    fn refuses_when_keel_toml_already_exists() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keel.toml"), "# hand-written\n").unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.to_stderr);
+        assert!(r.human.contains("already exists"));
+        // The existing file is left untouched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
+            "# hand-written\n"
+        );
+    }
+
+    #[test]
+    fn diff_reports_added_and_removed_targets_precisely() {
+        let dir = TempDir::new().unwrap();
+        // JS scan (pure Rust, no python3) will find `api.example.com`.
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+        // An existing keel.toml declares a target the scan will NOT find.
+        fs::write(
+            dir.path().join("keel.toml"),
+            "[target.\"api.gone.example\"]\ntimeout = \"30s\"\n",
+        )
+        .unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert_eq!(
+            r.json["added"].as_array().unwrap(),
+            &vec![serde_json::json!("api.example.com")]
+        );
+        assert_eq!(
+            r.json["removed"].as_array().unwrap(),
+            &vec![serde_json::json!("api.gone.example")]
+        );
+        assert!(r.json["unchanged"].as_array().unwrap().is_empty());
+        assert!(r.human.contains("+ [target.\"api.example.com\"]"));
+        assert!(r.human.contains("- [target.\"api.gone.example\"]"));
+        // --diff never writes.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
+            "[target.\"api.gone.example\"]\ntimeout = \"30s\"\n"
+        );
+    }
+
+    #[test]
+    fn gitignore_is_created_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(update_gitignore(dir.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            ".keel/\n"
+        );
+    }
+
+    #[test]
+    fn gitignore_is_appended_when_keel_line_missing() {
+        let dir = TempDir::new().unwrap();
+        // No trailing newline: the appender must add one before `.keel/`.
+        fs::write(dir.path().join(".gitignore"), "node_modules/\n*.log").unwrap();
+
+        assert!(update_gitignore(dir.path()).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "node_modules/\n*.log\n.keel/\n"
+        );
+    }
+
+    #[test]
+    fn gitignore_is_a_noop_when_already_ignored() {
+        let dir = TempDir::new().unwrap();
+        let original = "build/\n.keel/\ncoverage/\n";
+        fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+        assert!(!update_gitignore(dir.path()).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            original
+        );
     }
 }
