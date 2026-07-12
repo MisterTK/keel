@@ -192,8 +192,10 @@ def _buffered_body(request: Any) -> bytes | None:
     # Include the body in the cache key only when it is already buffered, so we
     # never consume a single-use streaming request body (matches Node, which
     # hashes only buffered/string bodies). httpx buffers non-streaming request
-    # content into `_content` at construction; a streaming body has none.
-    return request.content if hasattr(request, "_content") else None
+    # content into `_content` at construction; a streaming body has none. An
+    # empty (no-body) GET collapses to None so it hashes identically to the
+    # requests/Node judges (no trailing separator).
+    return (request.content or None) if hasattr(request, "_content") else None
 
 
 def _idempotency_header(target: str) -> str | None:

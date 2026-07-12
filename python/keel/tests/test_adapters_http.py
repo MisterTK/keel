@@ -10,7 +10,10 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from keel.adapters import _http
+import httpx
+from requests.models import PreparedRequest
+
+from keel.adapters import _http, httpx_pack, requests_pack
 
 
 class ResolveTargetTest(unittest.TestCase):
@@ -83,6 +86,21 @@ class RetryAfterTest(unittest.TestCase):
         # Node's /^\d+$/ matches ASCII digits only; exotic digits must not be
         # taken as delta-seconds (nor raise on int()).
         self.assertIsNone(_http.parse_retry_after("１２３"))  # fullwidth digits
+
+
+class CrossJudgeParityTest(unittest.TestCase):
+    """A no-body GET must produce the SAME args_hash from the httpx and requests
+    judges (and match method+url with no body) — cross-adapter cache-key parity."""
+
+    def test_no_body_get_hashes_identically_across_judges(self) -> None:
+        url = "https://example.com/p"
+        _, _, _, hx_hash = httpx_pack._judge(httpx.Request("GET", url))
+        prepared = PreparedRequest()
+        prepared.prepare(method="GET", url=url)
+        _, _, _, rq_hash = requests_pack._judge(prepared)
+        self.assertIsNotNone(hx_hash)
+        self.assertEqual(hx_hash, rq_hash)
+        self.assertEqual(hx_hash, _http.args_hash("GET", url))  # no trailing body separator
 
 
 class TransientStatusTest(unittest.TestCase):
