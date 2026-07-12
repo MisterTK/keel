@@ -78,6 +78,13 @@ class RetryAfterTest(unittest.TestCase):
         past = (now - timedelta(seconds=30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
         self.assertEqual(_http.parse_retry_after(past, now=now), 0)
 
+    def test_iso8601_date_is_honored(self) -> None:
+        # A server that emits an ISO-8601 Retry-After (a common extension) must be
+        # honored, matching Node's Date.parse (parity — Node already accepts it).
+        now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(_http.parse_retry_after("2026-07-12T12:00:03Z", now=now), 3000)
+        self.assertEqual(_http.parse_retry_after("2026-07-12T12:00:03+00:00", now=now), 3000)
+
     def test_unparseable_and_none(self) -> None:
         self.assertIsNone(_http.parse_retry_after(None))
         self.assertIsNone(_http.parse_retry_after("soon"))

@@ -139,13 +139,16 @@ def _banner(
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
-    n = len(target_keys)
-    noun = "call site" if n == 1 else "call sites"
-    breakdown = f" ({', '.join(sorted(target_keys))})" if n else ""
     desc = "production defaults" if source == "defaults" else "policy keel.toml"
-    sys.stderr.write(
-        f"keel ▸ wrapped {n} {noun}{breakdown} with {desc} — `keel init` to customize\n"
-    )
+    # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
+    # listing function call sites and armed adapters together. At Level 0 there
+    # are no function targets, so we show the adapters rather than "0 call sites".
+    pieces: list[str] = []
+    n = len(target_keys)
+    if n:
+        noun = "call site" if n == 1 else "call sites"
+        pieces.append(f"{n} {noun} ({', '.join(sorted(target_keys))})")
     if adapters:
-        listed = ", ".join(f"{d.name} {d.version}".strip() for d in adapters)
-        sys.stderr.write(f"keel ▸ adapters ready: {listed}\n")
+        pieces.append(", ".join(f"{d.name} {d.version}".strip() for d in adapters))
+    wrapped = " + ".join(pieces) if pieces else "nothing yet"
+    sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")

@@ -42,14 +42,23 @@ _RANDOM_KEY = "py:random.random#-"
 
 
 def match_flow(target: str, entrypoints: Sequence[FlowEntrypoint]) -> FlowEntrypoint | None:
-    """The flow entrypoint whose module is the `target` script, if any. v0.1
-    matches a single-component module against the script's file stem (e.g.
-    `pipeline.py` ⇒ module `pipeline`)."""
+    """The flow entrypoint whose module PATH matches the `target` script, if any.
+
+    Identity is anchored to the file the module imports from: a single-component
+    module (`pipeline`) matches any `…/pipeline.py`, and a dotted module
+    (`jobs.pipeline`) matches ONLY `…/jobs/pipeline.py`. Matching a bare file stem
+    (the old rule) let a different script that merely shares a name — e.g. a
+    scratch `pipeline.py` in another directory — enter and resume the production
+    flow's journal (flow identity never includes which file ran), replaying
+    foreign step outcomes into foreign code. Requiring the module path to match
+    the file's path suffix closes that."""
     if not entrypoints:
         return None
-    stem = Path(target).stem
+    tparts = Path(target).parts
     for entry in entrypoints:
-        if entry.module == stem or entry.module.rsplit(".", 1)[-1] == stem:
+        mod = entry.module.split(".")
+        want = tuple(mod[:-1]) + (mod[-1] + ".py",)
+        if len(want) <= len(tparts) and tparts[-len(want):] == want:
             return entry
     return None
 
@@ -82,7 +91,14 @@ def virtualize_time_random(backend: Any) -> Iterator[None]:
     """Patch `time.time`/`time.time_ns`/`random.random` to journal-backed values
     for the duration of a flow, then restore the originals. On replay the backend
     substitutes the recorded value, so a resumed flow observes the same clock and
-    randomness it did on its first run."""
+    randomness it did on its first run.
+
+    The backend decides what actually becomes a value step: on the native core a
+    read that happens *inside* an intercepted effect passes through to the live
+    value (it is NOT journaled — only the flow's top-level reads between steps are
+    recorded), which also avoids re-locking the active-flow mutex mid-effect. The
+    pure-Python stub has no such reentrancy and still journals in-effect reads —
+    a known stub/native divergence for flows that read the clock inside an effect."""
     import random as _random
     import time as _time
 
@@ -165,8 +181,19 @@ def run_as_flow(
 ) -> None:
     """Run `entry`'s function as a durable flow through `backend`. Opens/resumes
     the flow, runs the body with time/random virtualized, and stamps the terminal
-    status on exit. A raised exception marks the flow `failed` and propagates
-    unchanged (DX invariant 5)."""
+    status on exit.
+
+    Terminal status is chosen carefully so a rerun never bricks a working script:
+      * a clean ``SystemExit`` (code 0/None) — the ordinary ``main()`` success
+        exit ``_run.py`` passes through — completes the flow (not `failed`);
+      * a real exception on a fresh (non-replayed) run marks it `failed` and
+        propagates unchanged (DX invariant 5);
+      * an already-COMPLETED (replayed) flow is NEVER demoted to `failed` — a
+        designed replay-miss (KEEL-E031) after a code change, or any error while
+        re-running finished code, must not re-open a done flow for live
+        re-execution (nor march it toward `dead`);
+      * ``KeyboardInterrupt`` leaves the flow `running` so it can be resumed,
+        rather than burning an attempt."""
     env = env if env is not None else os.environ
     if not backend_supports_flows(backend):
         _unsupported_on_stub(entry)  # exits
@@ -194,12 +221,19 @@ def run_as_flow(
     if env.get("KEEL_QUIET", "").strip().lower() not in {"1", "true", "yes"}:
         sys.stderr.write(f"keel ▸ {verb} flow {entry.raw} [{info.get('flow_id')}]\n")
 
-    status = "completed"
     try:
         with virtualize_time_random(backend):
             func()
-    except BaseException:
-        status = "failed"
-        backend.exit_flow(status)
+    except SystemExit as exc:
+        if exc.code in (None, 0):  # clean exit == success (common main() shape)
+            backend.exit_flow("completed")
+        elif not replayed:
+            backend.exit_flow("failed")
         raise
-    backend.exit_flow(status)
+    except KeyboardInterrupt:
+        raise  # leave the flow 'running' for resume; don't stamp 'failed'
+    except BaseException:
+        if not replayed:  # never demote an already-completed (replayed) flow
+            backend.exit_flow("failed")
+        raise
+    backend.exit_flow("completed")

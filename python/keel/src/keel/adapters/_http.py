@@ -36,6 +36,7 @@ from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
+from .. import _runtime
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
@@ -64,6 +65,39 @@ IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRAC
 #: Header names that mark an otherwise-unsafe request (POST/PATCH) as safe to
 #: retry. Parity with the Node twin's ``DEFAULT_IDEMPOTENCY_HEADERS``.
 DEFAULT_IDEMPOTENCY_HEADERS = ("idempotency-key", "x-idempotency-key")
+
+
+def resolve_layer(target: str, key: str) -> Any:
+    """The resolved value of policy layer ``key`` for ``target`` (or ``None``).
+
+    Reads the active backend's ``layer(target, key)`` (parity with Node, whose
+    packs read ``backend.layer``). Resolution — exact ``[target."…"]`` wins, then
+    ``[defaults.llm]`` for an ``llm:`` target, then ``[defaults.outbound]`` — is
+    owned by the backend (the stub's public ``layer``; the native core wrapped by
+    ``_backend._NativeBackend.layer``), so the two front ends make identical
+    per-target judgments for the same policy."""
+    backend = _runtime.get_backend()
+    layer = getattr(backend, "layer", None)
+    return layer(target, key) if callable(layer) else None
+
+
+def idempotency_header(target: str) -> str | None:
+    """The target's configured ``idempotency.header`` (policy knob), or ``None``
+    to use the default idempotency-key header set. Honored under BOTH backends
+    now that resolution reads the configured policy from the runtime."""
+    idem = resolve_layer(target, "idempotency")
+    return idem.get("header") if isinstance(idem, dict) else None
+
+
+def cache_configured(target: str) -> bool:
+    """True iff a cache ttl is actually resolved for ``target`` — the gate for
+    buffering a response body at the seam. Mirrors Node's fetch gate
+    (``hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined``): a call
+    with no configured cache never has its (possibly streaming) body read, since
+    there is nothing to store. The LLM dev cache resolves ``mode="dev"`` to a
+    concrete ttl at bootstrap, so ``llm:`` POST bodies are still buffered."""
+    cache = resolve_layer(target, "cache")
+    return isinstance(cache, dict) and cache.get("ttl") is not None
 
 
 def resolve_target(host: str) -> str:
@@ -157,19 +191,35 @@ def derive_args_hash(
     return None
 
 
+def _parse_http_date(s: str) -> datetime | None:
+    """A Retry-After HTTP-date. RFC 9110 mandates IMF-fixdate (RFC 5322), but
+    servers commonly emit ISO-8601 timestamps too; Node honors those via
+    Date.parse, so we accept both for cross-front-end parity (Node matches)."""
+    try:
+        when = parsedate_to_datetime(s)  # RFC 5322 / IMF-fixdate
+    except (TypeError, ValueError):
+        when = None
+    if when is not None:
+        return when
+    # ISO-8601 fallback (e.g. "2026-07-12T10:00:00Z"); normalize a trailing Z.
+    iso = f"{s[:-1]}+00:00" if s.endswith(("Z", "z")) else s
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
 def parse_retry_after(value: str | None, now: datetime | None = None) -> int | None:
-    """Parse a ``Retry-After`` header to milliseconds. Supports the two RFC
-    9110 forms — delta-seconds (an integer) and an HTTP-date — and returns
-    ``None`` for anything unparseable. A past date clamps to 0."""
+    """Parse a ``Retry-After`` header to milliseconds. Supports delta-seconds (an
+    integer) and an HTTP-date — RFC 5322/IMF-fixdate AND ISO-8601, to match the
+    Node twin — and returns ``None`` for anything unparseable. A past date clamps
+    to 0."""
     if value is None:
         return None
     s = value.strip()
     if s.isascii() and s.isdigit():  # ASCII digits only, matching Node's /^\d+$/
         return int(s) * 1000
-    try:
-        when = parsedate_to_datetime(s)
-    except (TypeError, ValueError):
-        return None
+    when = _parse_http_date(s)
     if when is None:
         return None
     if when.tzinfo is None:
@@ -296,6 +346,9 @@ __all__ = [
     "LLM_HOST_PROVIDERS",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
+    "resolve_layer",
+    "idempotency_header",
+    "cache_configured",
     "resolve_target",
     "is_idempotent",
     "args_hash",

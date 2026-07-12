@@ -205,5 +205,33 @@ class StartupBudgetTest(unittest.TestCase):
             )
 
 
+class BannerTest(unittest.TestCase):
+    """The happy-path banner is a single line in the dx-spec format, and never
+    reports the awkward 'wrapped 0 call sites' at Level 0 (adapters only)."""
+
+    def _banner(self, source: str, target_keys: list[str], adapters: list) -> str:
+        import contextlib
+        import io
+
+        from keel.bootstrap import _banner
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            _banner({}, source, target_keys, adapters)
+        return buf.getvalue()
+
+    def test_level0_banner_lists_adapters_not_zero_call_sites(self) -> None:
+        from keel.adapters import Detection
+
+        out = self._banner("defaults", [], [Detection(matched=True, name="httpx", version="0.28")])
+        self.assertEqual(out.count("\n"), 1, "banner must be a single line")
+        self.assertIn("keel ▸ wrapped httpx 0.28 with production defaults", out)
+        self.assertNotIn("0 call site", out)
+
+    def test_banner_with_function_targets_counts_call_sites(self) -> None:
+        out = self._banner("keel.toml", ["py:m.enrich"], [])
+        self.assertIn("keel ▸ wrapped 1 call site (py:m.enrich) with policy keel.toml", out)
+
+
 if __name__ == "__main__":
     unittest.main()

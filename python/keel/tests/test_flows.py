@@ -51,6 +51,14 @@ class MatchFlowTest(unittest.TestCase):
     def test_no_entries_no_match(self) -> None:
         self.assertIsNone(_flow.match_flow("/tmp/pipeline.py", []))
 
+    def test_dotted_module_matches_only_its_path_not_a_bare_stem(self) -> None:
+        # A dotted-module entrypoint must NOT be entered by an unrelated script
+        # that merely shares the last name component (would resume a foreign flow).
+        entries = [FlowEntrypoint("py:jobs.pipeline:main", "jobs.pipeline", "main")]
+        self.assertEqual(_flow.match_flow("/app/jobs/pipeline.py", entries), entries[0])
+        self.assertIsNone(_flow.match_flow("/scratch/pipeline.py", entries))
+        self.assertIsNone(_flow.match_flow("/app/other/pipeline.py", entries))
+
 
 class _FakeFlowBackend:
     """A native-shaped double: records enter/exit and routes execute + value
@@ -156,6 +164,42 @@ class RunAsFlowTest(unittest.TestCase):
                 str(self.dir / "flowmod_boom.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
             )
         self.assertEqual(backend.exited, ["failed"])
+
+    def test_clean_sys_exit_completes_not_fails(self) -> None:
+        # sys.exit(0) is the ordinary success exit — it must complete the flow,
+        # not mark it 'failed' (which would march a working script to 'dead').
+        entry = self._module(
+            "flowmod_exit0",
+            """
+            import sys
+            def main():
+                sys.exit(0)
+            """,
+        )
+        backend = _FakeFlowBackend()
+        with self.assertRaises(SystemExit):
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_exit0.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+            )
+        self.assertEqual(backend.exited, ["completed"])
+
+    def test_replayed_flow_is_not_demoted_on_error(self) -> None:
+        # A rerun of an already-COMPLETED flow that raises (e.g. a replay-miss
+        # after a code change) must NOT be stamped 'failed' — that would re-open a
+        # finished flow for live re-execution.
+        entry = self._module(
+            "flowmod_replay_err",
+            """
+            def main():
+                raise RuntimeError("changed code / replay miss")
+            """,
+        )
+        backend = _FakeFlowBackend(replay=True)  # already completed → replay path
+        with self.assertRaises(RuntimeError):
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_replay_err.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+            )
+        self.assertEqual(backend.exited, [], "completed flow must not be demoted to failed")
 
     def test_time_random_restored_after_flow(self) -> None:
         import random

@@ -26,15 +26,19 @@ class WrapTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
+        self._discoveries: list[Discovery] = []
 
     def tearDown(self) -> None:
         _runtime.clear_runtime()
+        for d in self._discoveries:  # close SQLite connections (no ResourceWarning)
+            d.close()
         self._tmp.cleanup()
 
     def install(self, policy: dict[str, Any]) -> tuple[Any, Discovery]:
         backend = load_backend("stub")
         backend.configure(policy)
         discovery = Discovery(self.cwd)
+        self._discoveries.append(discovery)
         _runtime.set_runtime(backend, discovery)
         return backend, discovery
 

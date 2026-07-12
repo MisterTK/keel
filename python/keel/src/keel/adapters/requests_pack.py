@@ -128,22 +128,13 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     host = parts.hostname or ""
     target = _http.resolve_target(host)
     op = f"{method} {host}{parts.path}"
-    idem_header = _idempotency_header(target)
+    idem_header = _http.idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
     # A prepared body is bytes/str (buffered) or None; derive_args_hash ignores a
     # streaming (generator/file) body, so this never consumes an upload stream.
     # LLM POSTs get a canonicalized-JSON-body cache key (dev-cache exception).
     hash_ = _http.derive_args_hash(target, method, url, request.body)
     return target, op, idempotent, hash_
-
-
-def _idempotency_header(target: str) -> str | None:
-    backend = _runtime.get_backend()
-    layer = getattr(backend, "layer", None)
-    if not callable(layer):
-        return None
-    idem = layer(target, "idempotency")
-    return idem.get("header") if isinstance(idem, dict) else None
 
 
 def _is_response(obj: Any) -> bool:
@@ -204,7 +195,10 @@ def _run_send(do_call: Callable[[], Any], request: Any) -> Any:
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(request)
     env = _http.build_request(target, op, idempotent, hash_)
-    cacheable = hash_ is not None
+    # Buffer the body ONLY when a cache ttl is actually configured (mirrors Node's
+    # fetch gate); with no cache there is nothing to store, so a stream=True GET
+    # is never force-read at the seam.
+    cacheable = hash_ is not None and _http.cache_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:
