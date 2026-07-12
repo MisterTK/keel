@@ -23,7 +23,10 @@ rmp-serde = "1.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
-tokio = { version = "1.47", features = ["time"] }
+# `rt` powers the Tier 2 flow lease heartbeat (tokio::spawn + Handle); `time`
+# is the engine's virtual-clock-testable sleeps. The front ends already run the
+# core inside a runtime, so this adds no new operational requirement.
+tokio = { version = "1.47", features = ["rt", "time"] }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }

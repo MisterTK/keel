@@ -41,6 +41,16 @@ use tracing::{debug, warn};
 /// audit (spec §4.4).
 const BRANCH_SEQ_BASE: u64 = 1_000_000;
 
+/// The reserved step slot holding the flow-level resume counter. Real steps are
+/// numbered from 1, so seq 0 never collides with them.
+const ATTEMPT_SEQ: u64 = 0;
+/// The step key of the reserved resume-counter marker.
+const ATTEMPT_KEY: &str = "flow:attempt";
+/// The step key virtualized clock reads journal under (spec §4.4).
+const TIME_KEY: &str = "keel:time#-";
+/// The step key virtualized random draws journal under.
+const RANDOM_KEY: &str = "keel:random#-";
+
 use crate::engine::Engine;
 
 /// How a flow is identified and fenced. Identity is
@@ -201,15 +211,50 @@ impl FlowManager {
             .journal
             .get_flow(flow_id)
             .map_err(|e| internal(format!("get_flow failed: {e}")))?;
+        let status = existing.as_ref().map_or(FlowStatus::Running, |f| f.status);
 
-        if existing
-            .as_ref()
-            .is_some_and(|f| f.status == FlowStatus::Dead)
-        {
+        // A dead flow is never auto-resumed (spec §4.3).
+        if status == FlowStatus::Dead {
             return Err(KeelError {
                 code: ErrorCode::FlowDead,
                 message: format!("flow {flow_id} is dead; refusing to resume (KEEL-E032)"),
             });
+        }
+
+        // Flow-level attempt cap (distinct from Tier 1 step attempts): each
+        // resume of a not-yet-completed flow consumes one attempt from the
+        // reserved seq-0 counter; exceeding the cap marks the flow dead. A
+        // completed flow's re-entry is pure replay and consumes nothing.
+        let attempt = if status == FlowStatus::Completed {
+            None
+        } else {
+            let prior = self
+                .journal
+                .step_at(flow_id, ATTEMPT_SEQ)
+                .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
+                .map_or(0, |(_, o)| o.attempt);
+            let attempt = prior.saturating_add(1);
+            if attempt > self.config.max_attempts {
+                self.journal
+                    .complete_flow(flow_id, FlowStatus::Dead)
+                    .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
+                return Err(KeelError {
+                    code: ErrorCode::FlowDead,
+                    message: format!(
+                        "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
+                        self.config.max_attempts
+                    ),
+                });
+            }
+            Some(attempt)
+        };
+
+        // A cleanly-failed flow is put back to `running` before re-leasing so a
+        // resume can proceed (and so a re-crash lands it in the recovery scan).
+        if status == FlowStatus::Failed {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Running)
+                .map_err(|e| internal(format!("reset-to-running failed: {e}")))?;
         }
 
         let acquired = self
@@ -225,12 +270,38 @@ impl FlowManager {
             });
         }
 
+        if let Some(attempt) = attempt {
+            let now = self.clock.now_ms();
+            let marker = StepOutcome {
+                kind: StepKind::Marker,
+                attempt,
+                status: StepStatus::Ok,
+                payload: None,
+                error_class: None,
+                started_at: now,
+                ended_at: Some(now),
+            };
+            if let Err(e) =
+                self.journal
+                    .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
+            {
+                warn!(flow = %flow_id, error = %e, "attempt-counter record failed");
+            }
+        }
+
         // Replay is fenced when the recorded code differs from what is running
         // now: a divergence under a changed deploy downgrades fail→warn (§4.4).
         let code_hash_fenced = match (existing.and_then(|f| f.code_hash), current_code_hash) {
             (Some(recorded), Some(current)) => recorded != current,
             _ => false,
         };
+
+        let heartbeat = spawn_heartbeat(
+            Arc::clone(&self.journal),
+            flow_id.clone(),
+            self.holder.clone(),
+            self.config.lease_ttl,
+        );
 
         Ok(FlowHandle {
             engine: Arc::clone(&self.engine),
@@ -241,6 +312,7 @@ impl FlowManager {
             code_hash_fenced,
             replay_abandoned: false,
             completed: false,
+            heartbeat,
         })
     }
 }
@@ -259,6 +331,9 @@ pub struct FlowHandle {
     code_hash_fenced: bool,
     replay_abandoned: bool,
     completed: bool,
+    /// The lease-renewal task; aborted when the handle drops so a completed or
+    /// crashed flow stops heart-beating.
+    heartbeat: Option<tokio::task::AbortHandle>,
 }
 
 impl core::fmt::Debug for FlowHandle {
@@ -412,9 +487,7 @@ impl FlowHandle {
     }
 
     /// Journal a branch `marker` and re-execute the divergent step live, then
-    /// stay live for the rest of the flow. With `preserve` (`branch`), the fresh
-    /// attempt writes to a high seq lane so the abandoned run's records survive
-    /// for audit; otherwise (`warn`) it continues in place.
+    /// stay live for the rest of the flow.
     async fn branch_and_continue<F>(
         &mut self,
         div: Divergence<'_>,
@@ -424,6 +497,18 @@ impl FlowHandle {
     where
         F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
     {
+        self.journal_branch_marker(&div);
+        let live_seq = self.seq;
+        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
+            .await
+    }
+
+    /// Journal the branch marker, abandon replay, and advance the cursor to the
+    /// live-continuation seq (left in `self.seq`). With `preserve` (`branch`),
+    /// the marker + continuation go to a high seq lane so the abandoned run's
+    /// records survive for audit; otherwise (`warn`) they continue in place.
+    /// Shared by the effect and value (time/random) re-execution paths.
+    fn journal_branch_marker(&mut self, div: &Divergence<'_>) {
         warn!(
             flow = %self.flow_id, seq = div.seq, mode = div.mode,
             expected = %div.recorded, observed = %div.observed,
@@ -453,12 +538,90 @@ impl FlowHandle {
                 ended_at: Some(now),
             },
         );
-        // The divergent step re-executes live in the slot after its marker;
+        // The divergent step re-executes in the slot after its marker;
         // subsequent steps continue from there (replay is now abandoned).
         self.seq = marker_seq + 1;
-        let live_seq = self.seq;
-        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
-            .await
+    }
+
+    /// Journal (or replay) a virtualized clock read. On replay the recorded
+    /// value is substituted so a resumed flow sees the same time; live, `now_ms`
+    /// is recorded and returned (spec §4.4).
+    ///
+    /// # Errors
+    /// `KEEL-E031` if this step diverges from the journal under `fail`.
+    pub fn journal_time(&mut self, now_ms: i64) -> Result<i64, KeelError> {
+        let bytes = encode_payload(&json!(now_ms)).unwrap_or_default();
+        let recorded = self.resolve_value_step(TIME_KEY, StepKind::Time, bytes)?;
+        Ok(decode_payload(&recorded)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(now_ms))
+    }
+
+    /// Journal (or replay) a virtualized random draw. On replay the recorded
+    /// bytes are substituted; live, `bytes` are recorded and returned.
+    ///
+    /// # Errors
+    /// `KEEL-E031` if this step diverges from the journal under `fail`.
+    pub fn journal_random(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>, KeelError> {
+        self.resolve_value_step(RANDOM_KEY, StepKind::Random, bytes)
+    }
+
+    /// The shared replay/live machinery for a pure value step (time/random):
+    /// no side effect, so its recorded payload bytes are the whole outcome.
+    fn resolve_value_step(
+        &mut self,
+        key_str: &str,
+        kind: StepKind,
+        live_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, KeelError> {
+        self.seq += 1;
+        let seq = self.seq;
+        let key = StepKey::new(key_str);
+        match self.plan_step(seq, &key) {
+            StepPlan::Replay(outcome) => Ok(outcome.payload.unwrap_or_default()),
+            StepPlan::Live => {
+                self.record_value(seq, &key, kind, &live_bytes);
+                Ok(live_bytes)
+            }
+            StepPlan::Diverged { recorded } => {
+                let (mode, preserve) = match self.effective_response() {
+                    NondeterminismResponse::Fail => {
+                        return Err(diverged_error(&self.flow_id, seq, &recorded, &key));
+                    }
+                    NondeterminismResponse::Warn => ("warn", false),
+                    NondeterminismResponse::Branch => ("branch", true),
+                };
+                let div = Divergence {
+                    seq,
+                    recorded: &recorded,
+                    observed: &key,
+                    mode,
+                    preserve,
+                };
+                self.journal_branch_marker(&div);
+                let live_seq = self.seq;
+                self.record_value(live_seq, &key, kind, &live_bytes);
+                Ok(live_bytes)
+            }
+        }
+    }
+
+    /// Record a pure value step (time/random): instantaneous, terminal `ok`.
+    fn record_value(&self, seq: u64, key: &StepKey, kind: StepKind, bytes: &[u8]) {
+        let now = self.now();
+        self.record(
+            seq,
+            key,
+            &StepOutcome {
+                kind,
+                attempt: 0,
+                status: StepStatus::Ok,
+                payload: Some(bytes.to_vec()),
+                error_class: None,
+                started_at: now,
+                ended_at: Some(now),
+            },
+        );
     }
 
     /// Journal a `running` step, run the effect through the engine, and record
@@ -553,12 +716,42 @@ impl FlowHandle {
 
 impl Drop for FlowHandle {
     fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
         if !self.completed {
             // A handle dropped without complete() models a crash: the flow stays
             // `running` with its lease and is resumed after the lease expires.
             debug!(flow = %self.flow_id, "flow handle dropped uncompleted; left running for recovery");
         }
     }
+}
+
+/// Spawn the lease-renewal heartbeat, if a tokio runtime is available (it always
+/// is under the front ends and tests; a bare synchronous caller simply gets no
+/// heartbeat rather than a panic). Renews every `ttl/2` against the journal's
+/// clock, so a paused-clock test drives it deterministically.
+fn spawn_heartbeat(
+    journal: Arc<dyn Journal>,
+    flow: FlowId,
+    holder: ProcessId,
+    ttl: Duration,
+) -> Option<tokio::task::AbortHandle> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return None;
+    }
+    let period = (ttl / 2).max(Duration::from_millis(1));
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.tick().await; // the immediate first tick is the initial acquire
+        loop {
+            interval.tick().await;
+            if let Err(e) = journal.acquire_lease(&flow, &holder, ttl) {
+                warn!(flow = %flow, error = %e, "lease heartbeat renewal failed");
+            }
+        }
+    });
+    Some(task.abort_handle())
 }
 
 /// A configuration/internal `KEEL-E040`.
@@ -607,20 +800,32 @@ fn replay_outcome(flow: &FlowId, seq: u64, step: &StepOutcome) -> Outcome {
     outcome
 }
 
-/// The KEEL-E031 outcome for a `(seq, step_key)` divergence, naming the
-/// recorded vs. observed step so the diagnostic is precise (spec §4.4).
+/// The precise expected-vs-actual diagnostic for a `(seq, step_key)` divergence
+/// (spec §4.4), shared by the outcome and error surfaces.
+fn divergence_message(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> String {
+    format!("flow {flow} diverged at step {seq}: expected {recorded}, got {observed} (KEEL-E031)")
+}
+
+/// The KEEL-E031 outcome for a divergence on an effect step (`execute_step`).
 fn diverged_outcome(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> Outcome {
     let mut outcome = base_outcome(step_trace(flow, seq));
     outcome.error = Some(OutcomeError {
         code: ErrorCode::FlowNondeterminism,
         class: ErrorClass::Other,
         http_status: None,
-        message: format!(
-            "flow {flow} diverged at step {seq}: expected {recorded}, got {observed} (KEEL-E031)"
-        ),
+        message: divergence_message(flow, seq, recorded, observed),
         original: None,
     });
     outcome
+}
+
+/// The KEEL-E031 error for a divergence on a value step (`journal_time` /
+/// `journal_random`), which return `Result` rather than an `Outcome`.
+fn diverged_error(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> KeelError {
+    KeelError {
+        code: ErrorCode::FlowNondeterminism,
+        message: divergence_message(flow, seq, recorded, observed),
+    }
 }
 
 /// A fresh error/replay [`Outcome`] shell with the shared envelope defaults.

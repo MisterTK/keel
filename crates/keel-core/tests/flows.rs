@@ -5,8 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use keel_core::{Engine, FlowDescriptor, FlowManager};
+use keel_core::{Engine, FlowConfig, FlowDescriptor, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
 use keel_journal::{
     Clock, FlowId, FlowStatus, Journal, ManualClock, ProcessId, SqliteJournal, StepKey, StepStatus,
@@ -92,6 +93,31 @@ fn rig_with_response(holder: &str, response: &str) -> Rig {
         Arc::clone(&journal),
         clock_dyn,
         ProcessId::new(holder),
+    );
+    Rig {
+        manager,
+        journal,
+        clock,
+        _dir: dir,
+    }
+}
+
+/// A rig whose flow manager caps flow-level attempts at `max_attempts`.
+fn rig_with_config(holder: &str, max_attempts: u32) -> Rig {
+    let dir = TempDir::new().unwrap();
+    let clock = ManualClock::new(T0);
+    let journal: Arc<dyn Journal> =
+        Arc::new(SqliteJournal::open(dir.path().join("journal.db"), clock.clone()).unwrap());
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
+    let manager = FlowManager::with_config(
+        Arc::new(Engine::new()),
+        Arc::clone(&journal),
+        clock_dyn,
+        ProcessId::new(holder),
+        FlowConfig {
+            lease_ttl: Duration::from_secs(30),
+            max_attempts,
+        },
     );
     Rig {
         manager,
@@ -543,6 +569,120 @@ async fn code_hash_mismatch_downgrades_fail_to_warn() {
         "fenced divergence downgrades to warn (live)"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn attempt_cap_marks_a_poison_flow_dead_with_e032() {
+    let r = rig_with_config("host-a:pid-1", 2);
+    let d = descriptor("ah-1");
+
+    // Two failing attempts are within the cap (complete_failed clears the lease,
+    // so the next attempt can re-enter immediately).
+    for _ in 0..2 {
+        let mut h = r.manager.enter_flow(&d).expect("attempt within cap");
+        h.complete_failed();
+    }
+
+    // The third entry exceeds the cap: the flow is marked dead and refused.
+    let err = r.manager.enter_flow(&d).unwrap_err();
+    assert_eq!(err.code.as_str(), "KEEL-E032");
+    assert_eq!(
+        r.journal.get_flow(&d.flow_id()).unwrap().unwrap().status,
+        FlowStatus::Dead
+    );
+    // A dead flow is never a recovery candidate, and re-entry stays refused.
+    assert!(r.journal.incomplete_flows(true).unwrap().is_empty());
+    assert_eq!(
+        r.manager.enter_flow(&d).unwrap_err().code.as_str(),
+        "KEEL-E032"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dead_flow_from_the_golden_fixture_is_never_resumed() {
+    let dir = TempDir::new().unwrap();
+    let path = build_fixture_db(&dir, "dead-flow.sql");
+    let clock = ManualClock::new(T0 + 60_000);
+    let journal: Arc<dyn Journal> = Arc::new(SqliteJournal::open(&path, clock.clone()).unwrap());
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
+    let manager = FlowManager::new(
+        Arc::new(Engine::new()),
+        Arc::clone(&journal),
+        clock_dyn,
+        ProcessId::new("host-b:pid-9"),
+    );
+
+    let dead_id = FlowId::new("01JZWY0A0000000000000003");
+    let desc = journal
+        .get_flow(&dead_id)
+        .unwrap()
+        .expect("dead flow present");
+    assert_eq!(desc.status, FlowStatus::Dead);
+
+    let err = manager.resume_flow(&desc, Some("ch-1a7f02")).unwrap_err();
+    assert_eq!(err.code.as_str(), "KEEL-E032");
+    assert!(
+        journal.incomplete_flows(true).unwrap().is_empty(),
+        "a dead flow is not a recovery candidate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_heartbeat_renews_the_lease() {
+    let r = rig("host-a:pid-1");
+    let handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let fid = handle.flow_id().clone();
+    let initial = r
+        .journal
+        .get_flow(&fid)
+        .unwrap()
+        .unwrap()
+        .lease_expires
+        .unwrap();
+
+    // Advance the journal clock and tokio time together so the ttl/2 heartbeat
+    // fires and re-stamps the expiry against the moved-forward clock.
+    for _ in 0..3 {
+        r.clock.advance(20_000);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+    }
+
+    let renewed = r
+        .journal
+        .get_flow(&fid)
+        .unwrap()
+        .unwrap()
+        .lease_expires
+        .unwrap();
+    assert!(
+        renewed > initial,
+        "heartbeat pushed the lease expiry forward: {renewed} > {initial}"
+    );
+    drop(handle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn journal_time_and_random_replay_recorded_values() {
+    let r = rig("host-a:pid-1");
+    // Run 1: record a virtualized time read and a random draw, then crash.
+    {
+        let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+        assert_eq!(handle.journal_time(1_000).unwrap(), 1_000);
+        assert_eq!(handle.journal_random(vec![1, 2, 3]).unwrap(), vec![1, 2, 3]);
+    }
+    r.clock.advance(31_000);
+
+    // Run 2: resume — the recorded values are substituted, not the new args, so
+    // the resumed flow observes the same "now" and randomness (spec §4.4).
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    assert_eq!(handle.journal_time(9_999).unwrap(), 1_000, "time replays");
+    assert_eq!(
+        handle.journal_random(vec![9, 9, 9]).unwrap(),
+        vec![1, 2, 3],
+        "random replays"
+    );
+    handle.complete_success();
 }
 
 #[test]
