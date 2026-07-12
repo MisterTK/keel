@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Ships as the `keel-core` wheel via maturin (see pyproject.toml), not as a crate.
 publish = false
 
 [lib]
