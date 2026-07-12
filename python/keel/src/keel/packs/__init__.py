@@ -2,7 +2,8 @@
 
 Unlike the *library* adapters in ``keel.adapters`` (httpx/requests), which own a
 monkey-patched seam, the packs here are SEMANTIC: their targets are produced by
-the transport seams (the ``llm:<provider>`` host map) and they contribute only
+the transport seams (the ``llm:<provider>`` host map) or by a framework pack's
+wrap site (``tool:<name>`` via ``tool.wrap_tool``) and they contribute only
 (a) a policy-defaults fragment merged UNDER user config and (b) — for the
 generic ``llm`` pack — the dev-cache resolution. They carry zero resilience
 logic of their own (adapter-pack rule 3).
@@ -18,6 +19,7 @@ from typing import Any
 
 from . import anthropic_pack, openai_pack
 from .llm import DEV_CACHE_TTL, llm_pack, resolve_dev_cache
+from .tool import is_valid_tool_name, tool_pack, wrap_tool
 
 #: Registration order = report order (stable, deterministic).
 PROVIDER_PACKS = (openai_pack, anthropic_pack)
@@ -38,4 +40,7 @@ __all__ = [
     "openai_pack",
     "anthropic_pack",
     "present_provider_defaults",
+    "is_valid_tool_name",
+    "tool_pack",
+    "wrap_tool",
 ]
