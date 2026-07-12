@@ -1,0 +1,59 @@
+[package]
+name = "keel-node"
+description = "napi-rs native addon (`keel-core-native`) wrapping keel-core::Engine for the Keel Node front end: a synchronous `execute` (blocks on a per-handle current-thread runtime, calling the JS effect on the main thread), an `executeAsync` bridge (tokio↔libuv via a ThreadsafeFunction awaiting the JS effect's Promise), and a harness-only paused virtual clock. Same conformance suite as node/keel-core-stub."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# Rust crate name `keel_node` (avoids colliding with the `keel-core` dependency,
+# whose lib is `keel_core`). The built cdylib is renamed to a `.node` addon and
+# loaded by node/keel-core-native/index.mjs; `rlib` lets this crate's own
+# `cargo test` link and exercise the pure-Rust helpers without a Node host.
+name = "keel_node"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Aliased to `keel_engine` in code (its lib name `keel_core` would otherwise be
+# confusing next to this crate's Node module identity).
+keel_engine = { package = "keel-core", path = "../keel-core" }
+keel-core-api = { path = "../keel-core-api" }
+# napi v3 + derive. `serde-json` lets request/outcome/report cross the boundary
+# as serde_json::Value directly (no hand-rolled Object walking, no JSON-string
+# round-trip). `napi4` enables ThreadsafeFunction; `tokio_rt` enables `async fn`
+# methods and awaiting a JS `Promise<T>` on napi's runtime (the async bridge).
+napi = { version = "3", default-features = false, features = ["napi4", "serde-json", "tokio_rt"] }
+napi-derive = "3"
+serde_json = { workspace = true }
+# Per-handle current-thread runtime + time driver (the engine needs the timer
+# wheel, never IO). `test-util` is always on: the paused clock + `advanceClock`
+# are exposed unconditionally as documented harness-only surface (per the brief).
+tokio = { version = "1.47", features = ["rt", "time", "test-util"] }
+
+[build-dependencies]
+# Emits the platform link args a Node addon needs — notably macOS
+# `-undefined dynamic_lookup`, so the cdylib links without a Node host present.
+napi-build = "2"
+
+# This crate cannot inherit `[workspace.lints]`: the workspace FORBIDS
+# unsafe_code (an absolute level no inner attribute can relax), but the napi
+# `#[napi]` macros expand to `unsafe`. So we restate the workspace lint posture
+# verbatim, changing only unsafe_code — every other standard stays in force and
+# CI still runs clippy pedantic `-D warnings`. This crate itself writes no
+# `unsafe`.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"

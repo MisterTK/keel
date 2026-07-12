@@ -1,0 +1,16 @@
+{
+  "name": "@keel/core-native",
+  "version": "0.1.0",
+  "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source only — binaries are built locally and never committed.",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "private": true,
+  "scripts": {
+    "build": "cargo build -p keel-node --release --manifest-path ../../Cargo.toml",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
