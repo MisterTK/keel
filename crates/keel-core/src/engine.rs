@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerPolicy, CacheScope, DurationMs, Policy, Rate, ResolvedPolicy, RetryPolicy,
+    BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate, ResolvedPolicy,
+    RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -460,6 +461,19 @@ impl Engine {
             })?;
         *self.policy.write().expect("policy lock poisoned") = policy;
         Ok(())
+    }
+
+    /// The configured Tier 2 `flows.on_nondeterminism` response (default
+    /// [`NondeterminismResponse::Fail`]), read live so a reconfigure is honored.
+    /// The flow manager consults this when a replay `(seq, step_key)` diverges.
+    #[must_use]
+    pub fn nondeterminism_response(&self) -> NondeterminismResponse {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .flows
+            .as_ref()
+            .map_or(NondeterminismResponse::default(), |f| f.on_nondeterminism)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

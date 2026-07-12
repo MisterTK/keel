@@ -64,12 +64,56 @@ fn second_manager(rig: &Rig, holder: &str) -> FlowManager {
 }
 
 fn descriptor(args_hash: &str) -> FlowDescriptor {
+    descriptor_ch(args_hash, "ch-1")
+}
+
+fn descriptor_ch(args_hash: &str, code_hash: &str) -> FlowDescriptor {
     FlowDescriptor {
         entrypoint: "py:pipeline.ingest:main".to_owned(),
         args_hash: args_hash.to_owned(),
         explicit_key: None,
-        code_hash: Some("ch-1".to_owned()),
+        code_hash: Some(code_hash.to_owned()),
     }
+}
+
+/// A rig whose engine is configured with a `flows.on_nondeterminism` response.
+fn rig_with_response(holder: &str, response: &str) -> Rig {
+    let dir = TempDir::new().unwrap();
+    let clock = ManualClock::new(T0);
+    let journal: Arc<dyn Journal> =
+        Arc::new(SqliteJournal::open(dir.path().join("journal.db"), clock.clone()).unwrap());
+    let engine = Engine::new();
+    engine
+        .configure(&json!({ "flows": { "on_nondeterminism": response } }))
+        .unwrap();
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
+    let manager = FlowManager::new(
+        Arc::new(engine),
+        Arc::clone(&journal),
+        clock_dyn,
+        ProcessId::new(holder),
+    );
+    Rig {
+        manager,
+        journal,
+        clock,
+        _dir: dir,
+    }
+}
+
+/// Record step 1 under `api.a#q1`, then "crash" and let the lease expire, so a
+/// resume that runs a differently-keyed step at seq 1 diverges.
+async fn seed_divergence(r: &Rig, desc: &FlowDescriptor) {
+    {
+        let mut h = r.manager.enter_flow(desc).unwrap();
+        let sink = Arc::new(AtomicUsize::new(0));
+        h.execute_step(
+            &request("api.a", "q1"),
+            counting_ok(&sink, json!({ "v": 1 })),
+        )
+        .await;
+    }
+    r.clock.advance(31_000);
 }
 
 fn request(target: &str, args_hash: &str) -> Request {
@@ -391,6 +435,114 @@ async fn resumes_the_interrupted_flow_golden_fixture() {
         journal.get_flow(handle.flow_id()).unwrap().unwrap().status,
         FlowStatus::Completed
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn divergence_fails_with_e031_naming_expected_and_actual() {
+    // Default policy is `fail`.
+    let r = rig("host-a:pid-1");
+    seed_divergence(&r, &descriptor("ah-1")).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let out = handle
+        .execute_step(
+            &request("api.b", "q2"),
+            counting_ok(&calls, json!({ "v": 2 })),
+        )
+        .await;
+
+    assert_eq!(out.result, "error");
+    let err = out.error.expect("divergence error");
+    assert_eq!(err.code.as_str(), "KEEL-E031");
+    assert!(err.message.contains("api.a#q1"), "names the expected step");
+    assert!(err.message.contains("api.b#q2"), "names the observed step");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "fail never runs the effect"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn warn_continues_live_and_journals_a_marker() {
+    let r = rig_with_response("host-a:pid-1", "warn");
+    seed_divergence(&r, &descriptor("ah-1")).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let fid = handle.flow_id().clone();
+    let out = handle
+        .execute_step(
+            &request("api.b", "q2"),
+            counting_ok(&calls, json!({ "v": 2 })),
+        )
+        .await;
+
+    assert_eq!(out.result, "ok", "warn continues live");
+    assert_eq!(out.payload, Some(json!({ "v": 2 })));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the divergent step ran live"
+    );
+    // seq 1 now holds the branch marker; the live re-execution lands at seq 2.
+    let (marker_key, marker) = r.journal.step_at(&fid, 1).unwrap().unwrap();
+    assert_eq!(marker_key, StepKey::new("flow:branch:warn"));
+    assert_eq!(marker.kind, keel_journal::StepKind::Marker);
+    let (live_key, _) = r.journal.step_at(&fid, 2).unwrap().unwrap();
+    assert_eq!(live_key, StepKey::new("api.b#q2"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn branch_starts_fresh_and_preserves_the_old_record() {
+    let r = rig_with_response("host-a:pid-1", "branch");
+    seed_divergence(&r, &descriptor("ah-1")).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let fid = handle.flow_id().clone();
+    let out = handle
+        .execute_step(
+            &request("api.b", "q2"),
+            counting_ok(&calls, json!({ "v": 2 })),
+        )
+        .await;
+
+    assert_eq!(out.result, "ok", "branch runs a fresh attempt live");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // The abandoned run's original step at seq 1 is preserved for audit.
+    let (original_key, _) = r.journal.step_at(&fid, 1).unwrap().unwrap();
+    assert_eq!(original_key, StepKey::new("api.a#q1"), "old record kept");
+    // The fresh attempt wrote its live step in the high branch lane.
+    let (live_key, _) = r.journal.step_at(&fid, 1_000_002).unwrap().unwrap();
+    assert_eq!(live_key, StepKey::new("api.b#q2"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn code_hash_mismatch_downgrades_fail_to_warn() {
+    // Engine policy is the default `fail`, but the recorded code_hash differs
+    // from the one now deployed — a changed deploy is expected to diverge.
+    let r = rig("host-a:pid-1");
+    seed_divergence(&r, &descriptor_ch("ah-1", "ch-1")).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut handle = r
+        .manager
+        .enter_flow(&descriptor_ch("ah-1", "ch-2"))
+        .unwrap();
+    let out = handle
+        .execute_step(
+            &request("api.b", "q2"),
+            counting_ok(&calls, json!({ "v": 2 })),
+        )
+        .await;
+
+    assert_eq!(
+        out.result, "ok",
+        "fenced divergence downgrades to warn (live)"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

@@ -25,6 +25,7 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use keel_core_api::policy::NondeterminismResponse;
 use keel_core_api::{
     ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome, OutcomeError, Request,
 };
@@ -32,8 +33,13 @@ use keel_journal::{
     Clock, FlowId, FlowStatus, Journal, NewFlow, ProcessId, StepKey, StepKind, StepOutcome,
     StepStatus,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, warn};
+
+/// Where a `branch`-mode fresh attempt writes its steps, high above any real
+/// step count so the abandoned run's records (seqs `1..`) are preserved for
+/// audit (spec §4.4).
+const BRANCH_SEQ_BASE: u64 = 1_000_000;
 
 use crate::engine::Engine;
 
@@ -250,10 +256,6 @@ pub struct FlowHandle {
     clock: Arc<dyn Clock>,
     flow_id: FlowId,
     seq: u64,
-    #[expect(
-        dead_code,
-        reason = "read by the on_nondeterminism policy (code_hash downgrade), added in the nondeterminism slice"
-    )]
     code_hash_fenced: bool,
     replay_abandoned: bool,
     completed: bool,
@@ -278,6 +280,16 @@ enum StepPlan {
     Replay(StepOutcome),
     /// The recorded key at this seq differs from the current one: nondeterminism.
     Diverged { recorded: StepKey },
+}
+
+/// The context of a `warn`/`branch` divergence recovery, grouped so the
+/// re-execution helper stays within argument bounds.
+struct Divergence<'a> {
+    seq: u64,
+    recorded: &'a StepKey,
+    observed: &'a StepKey,
+    mode: &'static str,
+    preserve: bool,
 }
 
 impl FlowHandle {
@@ -345,15 +357,108 @@ impl FlowHandle {
         match self.plan_step(seq, &key) {
             StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
             StepPlan::Diverged { recorded } => {
-                // Slice 3 will apply the on_nondeterminism policy; the default
-                // (and only) response so far is `fail`.
-                diverged_outcome(&self.flow_id, seq, &recorded, &key)
+                self.on_divergence(seq, &recorded, &key, request, effect)
+                    .await
             }
             StepPlan::Live => {
                 self.run_live(seq, &key, StepKind::Effect, request, effect)
                     .await
             }
         }
+    }
+
+    /// The `flows.on_nondeterminism` response effective for this handle: the
+    /// configured one, except a `code_hash` mismatch downgrades `fail`→`warn`
+    /// (a deploy that changed the code is expected to diverge; §4.4).
+    fn effective_response(&self) -> NondeterminismResponse {
+        let configured = self.engine.nondeterminism_response();
+        if self.code_hash_fenced && configured == NondeterminismResponse::Fail {
+            NondeterminismResponse::Warn
+        } else {
+            configured
+        }
+    }
+
+    /// Apply the nondeterminism policy to a `(seq, step_key)` divergence (§4.4).
+    async fn on_divergence<F>(
+        &mut self,
+        seq: u64,
+        recorded: &StepKey,
+        observed: &StepKey,
+        request: &Request,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        let (mode, preserve) = match self.effective_response() {
+            // Halt with a precise diagnostic; the caller fails the flow.
+            NondeterminismResponse::Fail => {
+                return diverged_outcome(&self.flow_id, seq, recorded, observed);
+            }
+            // Continue live from the divergence point, journaling a marker.
+            NondeterminismResponse::Warn => ("warn", false),
+            // Abandon replay for a fresh attempt, preserving the old records.
+            NondeterminismResponse::Branch => ("branch", true),
+        };
+        let div = Divergence {
+            seq,
+            recorded,
+            observed,
+            mode,
+            preserve,
+        };
+        self.branch_and_continue(div, request, effect).await
+    }
+
+    /// Journal a branch `marker` and re-execute the divergent step live, then
+    /// stay live for the rest of the flow. With `preserve` (`branch`), the fresh
+    /// attempt writes to a high seq lane so the abandoned run's records survive
+    /// for audit; otherwise (`warn`) it continues in place.
+    async fn branch_and_continue<F>(
+        &mut self,
+        div: Divergence<'_>,
+        request: &Request,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        warn!(
+            flow = %self.flow_id, seq = div.seq, mode = div.mode,
+            expected = %div.recorded, observed = %div.observed,
+            "flow nondeterminism; abandoning replay"
+        );
+        self.replay_abandoned = true;
+        let marker_seq = if div.preserve {
+            BRANCH_SEQ_BASE + div.seq
+        } else {
+            div.seq
+        };
+        let now = self.now();
+        self.record(
+            marker_seq,
+            &StepKey::new(format!("flow:branch:{}", div.mode)),
+            &StepOutcome {
+                kind: StepKind::Marker,
+                attempt: 0,
+                status: StepStatus::Ok,
+                payload: encode_payload(&json!({
+                    "mode": div.mode,
+                    "expected": div.recorded.as_str(),
+                    "observed": div.observed.as_str(),
+                })),
+                error_class: None,
+                started_at: now,
+                ended_at: Some(now),
+            },
+        );
+        // The divergent step re-executes live in the slot after its marker;
+        // subsequent steps continue from there (replay is now abandoned).
+        self.seq = marker_seq + 1;
+        let live_seq = self.seq;
+        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
+            .await
     }
 
     /// Journal a `running` step, run the effect through the engine, and record
