@@ -1,0 +1,19 @@
+[package]
+name = "keel-journal"
+description = "Keel persistence layer: the Journal trait and its WAL-mode SQLite backend (architecture spec §4.2–4.3), plus the discovery store that feeds `keel init`/`status`/`doctor`. Adapts to the frozen contracts/journal.sql schema; never restates it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+keel-core-api = { path = "../keel-core-api" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints]
+workspace = true

@@ -5,6 +5,7 @@ members = [
     "crates/keel-core",
     "crates/keel-core-api",
     "crates/keel-core-stub",
+    "crates/keel-journal",
 ]
 
 [workspace.package]
