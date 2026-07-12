@@ -1,0 +1,25 @@
+# Keel smart-defaults pack — contracts-v1.
+# This document ships compiled into the binary and is what Level 0
+# (`keel run` with no keel.toml) applies to every discovered call site.
+# A user keel.toml is layered on top of these defaults; any layer a user
+# sets for a target replaces the corresponding default layer wholesale.
+#
+# Level 0 hard rules (DX spec §1) that are BEHAVIOR, not config, and cannot
+# be expressed or overridden here:
+#   - never change program semantics on the success path
+#   - never retry non-idempotent calls (POST without idempotency key);
+#     they are observed, not retried (KEEL-E014) and reported in `keel status`
+#   - if a call site cannot be wrapped safely, do nothing and note it
+
+[defaults.outbound]                 # any intercepted network call
+timeout = "30s"
+retry   = { attempts = 3, schedule = "exp(200ms, x2, max 30s, jitter)", on = ["conn", "timeout", "429", "5xx"] }
+breaker = { failures = 5, cooldown = "15s" }
+
+[defaults.llm]                      # any llm:* target; overrides outbound field-wise per layer
+timeout = "120s"
+retry   = { attempts = 6, schedule = "exp(500ms, x2, max 60s, jitter)", on = ["conn", "timeout", "429", "5xx"] }
+# Provider-aware backoff: a Retry-After (or provider equivalent) on the error
+# overrides the schedule wait: wait = max(schedule_wait, retry_after).
+breaker = { failures = 5, cooldown = "30s" }
+cache   = { mode = "dev" }          # dev-loop response cache; inert when KEEL_ENV=prod
