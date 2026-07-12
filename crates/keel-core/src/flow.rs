@@ -933,13 +933,47 @@ fn internal(message: String) -> KeelError {
     }
 }
 
-/// Bare (schema-untagged) MessagePack of a step payload — the encoding the
-/// golden journal fixtures use (`conformance/fixtures/journal/`).
-fn encode_payload(value: &Value) -> Option<Vec<u8>> {
-    rmp_serde::to_vec_named(value).ok()
+/// Self-describing schema tag stamped into every step payload blob, honoring
+/// journal.sql's "MessagePack, schema-tagged" contract (`steps.payload`) and
+/// mirroring the persistent cache's `keel.cache/v1` convention so one journal.db
+/// uses one payload-tagging discipline.
+const STEP_PAYLOAD_SCHEMA: &str = "keel.step/v1";
+
+/// The schema-tagged step-payload envelope, written by reference (no clone).
+#[derive(serde::Serialize)]
+struct StepPayloadRef<'a> {
+    schema: &'a str,
+    payload: &'a Value,
 }
 
+/// The owned form read back before its tag is verified.
+#[derive(serde::Deserialize)]
+struct StepPayloadOwned {
+    schema: String,
+    payload: Value,
+}
+
+/// MessagePack-encode a step payload with its schema tag (journal.sql:
+/// `steps.payload` is "MessagePack, schema-tagged").
+fn encode_payload(value: &Value) -> Option<Vec<u8>> {
+    rmp_serde::to_vec_named(&StepPayloadRef {
+        schema: STEP_PAYLOAD_SCHEMA,
+        payload: value,
+    })
+    .ok()
+}
+
+/// Decode a step payload. Prefers the schema-tagged envelope; falls back to a
+/// bare value so journals written before the tag existed — including the golden
+/// fixtures in `conformance/fixtures/journal/` — still replay (the tag is
+/// introduced without a breaking on-disk migration, which is exactly what
+/// "versioned, self-describing" buys).
 fn decode_payload(bytes: &[u8]) -> Option<Value> {
+    if let Ok(envelope) = rmp_serde::from_slice::<StepPayloadOwned>(bytes)
+        && envelope.schema == STEP_PAYLOAD_SCHEMA
+    {
+        return Some(envelope.payload);
+    }
     rmp_serde::from_slice(bytes).ok()
 }
 
@@ -1061,5 +1095,33 @@ fn base_outcome(trace_id: String) -> Outcome {
         throttle_wait_ms: 0,
         breaker: keel_core_api::BreakerState::Closed,
         trace_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_payload, encode_payload};
+    use serde_json::json;
+
+    #[test]
+    fn payload_round_trips_through_the_schema_tag() {
+        let value = json!({ "rows": 120, "nested": [1, 2, 3], "ok": true });
+        let bytes = encode_payload(&value).expect("encodes");
+        assert_eq!(decode_payload(&bytes), Some(value));
+    }
+
+    #[test]
+    fn legacy_bare_messagepack_still_decodes() {
+        // Journals written before the tag (and the golden fixtures) stored the
+        // bare value; the decoder must still read them (no breaking migration).
+        let map = json!({ "rows": 120 });
+        let bare_map = rmp_serde::to_vec_named(&map).expect("bare encodes");
+        assert_eq!(decode_payload(&bare_map), Some(map));
+
+        // The fixtures' bare uint32 virtualized-time value (0xCE6A518600).
+        let num = json!(1_783_727_616u64);
+        let bare_num = rmp_serde::to_vec_named(&num).expect("bare encodes");
+        assert_eq!(bare_num, vec![0xCE, 0x6A, 0x51, 0x86, 0x00]);
+        assert_eq!(decode_payload(&bare_num), Some(num));
     }
 }

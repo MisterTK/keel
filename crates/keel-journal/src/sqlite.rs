@@ -64,12 +64,19 @@ impl<C: Clock> SqliteJournal<C> {
     /// Open (creating if absent) the journal at `path`, initializing the frozen
     /// schema when the file is new and asserting the connection pragmas either
     /// way. `clock` supplies every timestamp the store originates.
+    ///
+    /// Schema init is **race-safe and crash-atomic**: it runs inside a single
+    /// `BEGIN IMMEDIATE` transaction, re-checking `flows` existence *after*
+    /// taking the write lock. Two processes opening a fresh project therefore
+    /// serialize — the loser sees the tables the winner created and skips the
+    /// batch instead of failing with "table already exists"; and a crash
+    /// (`kill -9`, the product's own model) mid-batch rolls the whole transaction
+    /// back on next open rather than leaving a half-created schema that every
+    /// future open mistakes for complete and then silently fails to journal to.
     pub fn open(path: impl AsRef<Path>, clock: C) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(CONNECTION_PRAGMAS)?;
-        if !table_exists(&conn, "flows")? {
-            conn.execute_batch(SCHEMA)?;
-        }
+        init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
@@ -345,6 +352,35 @@ fn step_from_row(raw: StepRowData) -> Result<StepOutcome> {
         started_at: raw.started_at,
         ended_at: raw.ended_at,
     })
+}
+
+/// Apply the frozen schema exactly once, race-safely and crash-atomically.
+///
+/// `BEGIN IMMEDIATE` takes the database write lock up front, so concurrent
+/// first-opens serialize here; the `flows` existence check is re-evaluated
+/// *inside* the lock so the process that waited sees the winner's tables and
+/// skips the batch. The whole `CREATE TABLE` batch commits atomically, so a
+/// crash mid-batch rolls back (leaving no `flows` table) and the next open
+/// re-applies the full schema — never a partially-initialized journal.
+fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !table_exists(conn, "flows")? {
+            conn.execute_batch(SCHEMA)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; surface the original error.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 /// Does a table by this name exist in the connection's schema?
@@ -635,6 +671,34 @@ mod tests {
         j.put_cache(&key, b"v2", Duration::from_secs(10)).unwrap();
         clock.advance(6_000); // past v1's expiry, within v2's
         assert_eq!(j.get_cache(&key).unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    #[test]
+    fn concurrent_first_open_is_race_safe() {
+        // Many processes opening a fresh project at once must all succeed: the
+        // loser sees the winner's tables and skips the batch, never failing with
+        // "table keel_meta already exists" (finding: schema init not race-safe).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("journal.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    SqliteJournal::open(&p, ManualClock::new(T0))
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .unwrap()
+                .expect("concurrent first open must not race on schema creation");
+        }
+        // The schema is fully present and usable.
+        let j = journal(&dir, ManualClock::new(T0));
+        j.begin_flow(&sample_flow("01FLOW")).unwrap();
+        assert!(j.get_flow(&FlowId::new("01FLOW")).unwrap().is_some());
     }
 
     #[test]
