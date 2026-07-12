@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/keel-core-api", "crates/keel-core-stub"]
+members = [
+    "crates/keel-conformance",
+    "crates/keel-core",
+    "crates/keel-core-api",
+    "crates/keel-core-stub",
+]
 
 [workspace.package]
 version = "0.1.0"

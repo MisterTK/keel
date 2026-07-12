@@ -1,6 +1,6 @@
 [package]
-name = "keel-core-stub"
-description = "In-memory fake keel-core: records calls, applies trivial resilience semantics on a virtual clock. Unblocks front-end teams until the real core lands."
+name = "keel-core"
+description = "The Keel kernel, Tier 1 scope: policy-driven cache/rate/breaker/timeout/retry execution on tokio, per architecture spec §4. Same conformance suite as the stub."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+fastrand = "2.3"
 keel-core-api = { path = "../keel-core-api" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
+tokio = { version = "1.47", features = ["time"] }
 
 [dev-dependencies]
 keel-conformance = { path = "../keel-conformance" }
+tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

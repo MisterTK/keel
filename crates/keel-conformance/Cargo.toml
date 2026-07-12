@@ -1,0 +1,16 @@
+[package]
+name = "keel-conformance"
+description = "Shared conformance-harness pieces: typed scenario model, scripted effects, subset matcher. Used by the stub's and the real core's test harnesses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+keel-core-api = { path = "../keel-core-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,18 +1,19 @@
-//! The stub against the shared conformance corpus (conformance/scenarios/),
-//! via the sync `KeelCore` trait. The real core runs the identical corpus in
-//! crates/keel-core/tests/conformance.rs; the Python and Node stubs run it
-//! through their own harnesses.
+//! The real core against the SAME conformance corpus as the stubs
+//! (conformance/scenarios/). Runs under tokio's paused test clock: the
+//! engine's real `sleep`s advance virtual time deterministically, and
+//! `advance_ms` steps map to `tokio::time::advance`.
+
+use std::time::Duration;
 
 use keel_conformance::{
     Scenario, ScriptedEffect, Step, load_dir, scenarios_dir, subset_mismatches,
 };
-use keel_core_api::KeelCore;
-use keel_core_stub::KeelCoreStub;
+use keel_core::Engine;
 
-fn run_scenario(scenario: &Scenario) -> Vec<String> {
-    let mut core = KeelCoreStub::new();
+async fn run_scenario(scenario: &Scenario) -> Vec<String> {
+    let engine = Engine::new();
     match (
-        core.configure(&scenario.policy),
+        engine.configure(&scenario.policy),
         scenario.expect_configure_error.as_deref(),
     ) {
         (Ok(()), None) => {}
@@ -34,10 +35,12 @@ fn run_scenario(scenario: &Scenario) -> Vec<String> {
     for (i, step) in scenario.steps.iter().enumerate() {
         let label = format!("step[{i}]");
         match step {
-            Step::Advance { advance_ms } => core.advance_clock(*advance_ms),
+            Step::Advance { advance_ms } => {
+                tokio::time::advance(Duration::from_millis(*advance_ms)).await;
+            }
             Step::ReportExpect { report_expect } => {
                 let mut mismatches = Vec::new();
-                subset_mismatches(&core.report(), report_expect, "$", &mut mismatches);
+                subset_mismatches(&engine.report(), report_expect, "$", &mut mismatches);
                 failures.extend(
                     mismatches
                         .into_iter()
@@ -47,7 +50,9 @@ fn run_scenario(scenario: &Scenario) -> Vec<String> {
             Step::Call { call } => {
                 let request = call.request();
                 let mut scripted = ScriptedEffect::new(label.clone(), &call.effect);
-                let outcome = core.execute(&request, &mut |attempt| scripted.next(attempt));
+                let outcome = engine
+                    .execute(&request, async |attempt| scripted.next(attempt))
+                    .await;
                 if let Some(leftover) = scripted.leftover() {
                     failures.push(leftover);
                 }
@@ -65,12 +70,12 @@ fn run_scenario(scenario: &Scenario) -> Vec<String> {
     failures
 }
 
-#[test]
-fn conformance() {
+#[tokio::test(start_paused = true)]
+async fn conformance() {
     let scenarios = load_dir(&scenarios_dir(env!("CARGO_MANIFEST_DIR")));
     let mut failed = Vec::new();
     for (_path, scenario) in &scenarios {
-        let mismatches = run_scenario(scenario);
+        let mismatches = run_scenario(scenario).await;
         if mismatches.is_empty() {
             println!("ok    {}", scenario.name);
         } else {

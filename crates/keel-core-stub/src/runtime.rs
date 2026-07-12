@@ -11,7 +11,7 @@ use keel_core_api::{
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::policy::{BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy};
+use keel_core_api::policy::{BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy};
 
 /// The stub never sleeps: waits advance this counter and are recorded in the
 /// outcome. Conformance scenarios drive it via `advance_clock`.

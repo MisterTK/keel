@@ -10,7 +10,7 @@ use core::num::{NonZeroU32, NonZeroU64};
 use core::str::FromStr;
 use std::collections::BTreeMap;
 
-use keel_core_api::ErrorClass;
+use crate::ErrorClass;
 use serde::Deserialize;
 
 /// A literal that failed to parse; surfaces through serde as the
@@ -131,8 +131,16 @@ impl Schedule {
         jitter: true,
     };
 
-    /// Wait after failed attempt `n` (1-based): `min(base * factor^(n-1), cap)`.
-    /// The stub is deterministic, so `jitter` is parsed but not applied.
+    /// True when the schedule requests jitter. The stub ignores it (its
+    /// clock is virtual and deterministic); the real core samples equal
+    /// jitter, uniform in `[w/2, w]`, per contracts/schedule-grammar.ebnf.
+    #[must_use]
+    pub fn has_jitter(self) -> bool {
+        matches!(self, Self::Exp { jitter: true, .. })
+    }
+
+    /// Deterministic wait after failed attempt `n` (1-based):
+    /// `min(base * factor^(n-1), cap)`, before any jitter.
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -424,6 +432,7 @@ pub struct Policy {
 /// `defaults.llm` for `llm:*` targets, else `defaults.outbound`.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedPolicy {
+    pub timeout: Option<DurationMs>,
     pub retry: Option<RetryPolicy>,
     pub breaker: Option<BreakerPolicy>,
     pub rate: Option<Rate>,
@@ -433,6 +442,7 @@ pub struct ResolvedPolicy {
 impl Policy {
     pub fn resolve(&self, target: &str) -> ResolvedPolicy {
         ResolvedPolicy {
+            timeout: self.layer(target, |t| t.timeout.as_ref()).copied(),
             retry: self.layer(target, |t| t.retry.as_ref()).cloned(),
             breaker: self.layer(target, |t| t.breaker.as_ref()).cloned(),
             rate: self.layer(target, |t| t.rate.as_ref()).copied(),
