@@ -21,4 +21,4 @@
 
 mod engine;
 
-pub use engine::Engine;
+pub use engine::{DiscoveryRecorder, Engine};

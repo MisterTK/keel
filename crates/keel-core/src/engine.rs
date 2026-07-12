@@ -3,18 +3,26 @@
 //! Normative semantics: `conformance/README.md`; envelope types:
 //! `contracts/core_api.rs`.
 
+use core::fmt;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
-use keel_core_api::policy::{BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy};
+use keel_core_api::policy::{
+    BreakerPolicy, CacheScope, DurationMs, Policy, Rate, ResolvedPolicy, RetryPolicy,
+};
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
     OutcomeError, Request,
 };
-use serde::Serialize;
+use keel_journal::{
+    CacheKey as JournalCacheKey, CallObservation, CallResult, Clock, DiscoveryStore, Journal,
+    ObservedError,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
+use tracing::warn;
 
 /// Count-mode circuit breaker (consecutive terminal failures). Observes
 /// post-retry call outcomes — layer order puts it outside the retry loop.
@@ -110,6 +118,80 @@ struct CacheKey {
 struct CacheEntry {
     expires_at: Instant,
     payload: Value,
+}
+
+/// Self-describing tag stamped into every persistent cache payload, so a future
+/// reader (`keel trace`, a schema migration, a foreign tool) can tell the
+/// encoding and its version apart from a bare value — journal.sql specifies the
+/// `cache.value` blob as "MessagePack, schema-tagged".
+const CACHE_PAYLOAD_SCHEMA: &str = "keel.cache/v1";
+
+/// The schema-tagged envelope the persistent cache stores. Written by reference
+/// so the payload is never cloned on the hot write path.
+#[derive(Serialize)]
+struct CachePayloadRef<'a> {
+    schema: &'a str,
+    payload: &'a Value,
+}
+
+/// The owned form read back from the journal, before its tag is verified.
+#[derive(Deserialize)]
+struct CachePayloadOwned {
+    schema: String,
+    payload: Value,
+}
+
+/// MessagePack-encode a cache payload with its schema tag.
+fn encode_cache_payload(payload: &Value) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(&CachePayloadRef {
+        schema: CACHE_PAYLOAD_SCHEMA,
+        payload,
+    })
+}
+
+/// Decode a schema-tagged cache payload. A codec failure or an unrecognized tag
+/// returns a reason string, so the read path can degrade to a miss rather than
+/// surfacing a poisoned entry to the caller.
+fn decode_cache_payload(bytes: &[u8]) -> Result<Value, String> {
+    let envelope: CachePayloadOwned =
+        rmp_serde::from_slice(bytes).map_err(|e| format!("messagepack decode failed: {e}"))?;
+    if envelope.schema != CACHE_PAYLOAD_SCHEMA {
+        return Err(format!(
+            "unrecognized cache payload schema {:?}",
+            envelope.schema
+        ));
+    }
+    Ok(envelope.payload)
+}
+
+/// Which cache backend serves a call, decided once per `execute`. `Persistent`
+/// is chosen only when the policy asks for it *and* a journal is attached;
+/// otherwise the in-memory `Memory` path keeps the engine fully functional
+/// un-journaled.
+#[derive(Debug)]
+enum CachePlan {
+    None,
+    Memory {
+        key: CacheKey,
+    },
+    Persistent {
+        key: JournalCacheKey,
+        ttl: DurationMs,
+    },
+}
+
+/// The discovery-recording surface the engine depends on: a single method, so
+/// the engine can hold a [`DiscoveryStore`] type-erased regardless of the
+/// [`Clock`] it was opened with. Implemented for every `DiscoveryStore<C>`.
+pub trait DiscoveryRecorder: Send + Sync {
+    /// Fold one observed call into the store; the error is the journal's own.
+    fn record(&self, observation: &CallObservation) -> keel_journal::Result<()>;
+}
+
+impl<C: Clock> DiscoveryRecorder for DiscoveryStore<C> {
+    fn record(&self, observation: &CallObservation) -> keel_journal::Result<()> {
+        DiscoveryStore::record(self, observation)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -239,11 +321,30 @@ fn terminal_message(
 }
 
 /// The Keel kernel, Tier 1 scope. One per process; `&self`-concurrent.
-#[derive(Debug)]
+///
+/// A journal and/or discovery store are optional attachments: the engine is
+/// fully functional without either, and neither can change a call's outcome —
+/// their I/O failures degrade to a `warn!` (resilience first, honest reporting).
 pub struct Engine {
     started: Instant,
     policy: RwLock<Policy>,
     state: Mutex<State>,
+    /// Persistence for the `scope = persistent` cache (and, later, Tier 2 flows).
+    journal: Option<Arc<dyn Journal>>,
+    /// Traffic ledger fed one observation per `execute`, for `keel init`/`status`.
+    discovery: Option<Arc<dyn DiscoveryRecorder>>,
+}
+
+impl fmt::Debug for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The trait-object attachments aren't `Debug`; report their presence.
+        f.debug_struct("Engine")
+            .field("policy", &self.policy)
+            .field("state", &self.state)
+            .field("journal_attached", &self.journal.is_some())
+            .field("discovery_attached", &self.discovery.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Engine {
@@ -259,7 +360,23 @@ impl Engine {
             started: Instant::now(),
             policy: RwLock::new(Policy::default()),
             state: Mutex::new(State::default()),
+            journal: None,
+            discovery: None,
         }
+    }
+
+    /// Attach a journal, enabling the persistent cache scope. Optional; set once
+    /// at setup, before the engine is shared for concurrent `execute`.
+    pub fn attach_journal(&mut self, journal: impl Journal + 'static) -> &mut Self {
+        self.journal = Some(Arc::new(journal));
+        self
+    }
+
+    /// Attach a discovery store; each `execute` then records one observation.
+    /// Optional and failure-isolated — recording never affects an outcome.
+    pub fn attach_discovery(&mut self, discovery: impl DiscoveryRecorder + 'static) -> &mut Self {
+        self.discovery = Some(Arc::new(discovery));
+        self
     }
 
     /// Apply a policy document (keel.toml as JSON, per
@@ -283,10 +400,25 @@ impl Engine {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Run one intercepted call through the target's layer chain. `effect`
-    /// performs a single attempt (1-based attempt numbers). Always returns an
-    /// `Outcome` — policy failures are outcomes, not panics.
+    /// Run one intercepted call through the target's layer chain, then record it
+    /// for discovery. `effect` performs a single attempt (1-based attempt
+    /// numbers). Always returns an `Outcome` — policy failures are outcomes, not
+    /// panics, and neither journal nor discovery I/O can change what's returned.
     pub async fn execute<F>(&self, request: &Request, mut effect: F) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> AttemptResult,
+    {
+        let started = Instant::now();
+        let out = self.run_chain(request, &mut effect).await;
+        self.observe(request, &out, started);
+        out
+    }
+
+    /// The layer chain proper — cache → rate → breaker → timeout → retry —
+    /// unchanged in semantics from the journal-free engine. The persistent cache
+    /// scope simply swaps the in-memory map for the journal's `cache` table when
+    /// a journal is attached; every other layer is byte-for-byte as before.
+    async fn run_chain<F>(&self, request: &Request, effect: &mut F) -> Outcome
     where
         F: AsyncFnMut(u32) -> AttemptResult,
     {
@@ -312,17 +444,19 @@ impl Engine {
             .resolve(target);
 
         // cache (outermost layer)
-        let cache_key = match (&resolved.cache, &request.args_hash) {
-            (Some(cache), Some(hash)) if cache.ttl.is_some() => Some(CacheKey {
-                target: target.to_owned(),
-                args_hash: hash.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(key) = &cache_key
-            && self.serve_from_cache(key, &mut out)
-        {
-            return out;
+        let cache_plan = self.plan_cache(target, &resolved, request);
+        match &cache_plan {
+            CachePlan::Memory { key } => {
+                if self.serve_from_cache(key, &mut out) {
+                    return out;
+                }
+            }
+            CachePlan::Persistent { key, .. } => {
+                if self.serve_from_persistent(target, key, &mut out) {
+                    return out;
+                }
+            }
+            CachePlan::None => {}
         }
 
         // rate limiter (lock never held across the sleep)
@@ -342,10 +476,48 @@ impl Engine {
             ..RetryPolicy::default()
         });
         let result = self
-            .run_attempts(request, &resolved, &retry, &mut effect, &mut out)
+            .run_attempts(request, &resolved, &retry, effect, &mut out)
             .await;
-        self.settle(target, &resolved, admission, cache_key, result, &mut out);
+        // Only the memory scope writes through under the state lock; the
+        // persistent scope writes after the lock drops (journal I/O off-lock).
+        let memory_key = match &cache_plan {
+            CachePlan::Memory { key } => Some(key.clone()),
+            _ => None,
+        };
+        self.settle(target, &resolved, admission, memory_key, result, &mut out);
+
+        if let CachePlan::Persistent { key, ttl } = &cache_plan
+            && out.result == "ok"
+            && let Some(payload) = &out.payload
+        {
+            self.write_persistent(target, key, payload, *ttl);
+        }
         out
+    }
+
+    /// Decide which cache backend (if any) serves this call. Persistent scope
+    /// without a journal falls back to the in-memory map — the engine stays
+    /// fully functional un-journaled rather than silently dropping caching.
+    fn plan_cache(&self, target: &str, resolved: &ResolvedPolicy, request: &Request) -> CachePlan {
+        let (Some(cache), Some(hash)) = (resolved.cache.as_ref(), request.args_hash.as_ref())
+        else {
+            return CachePlan::None;
+        };
+        let Some(ttl) = cache.ttl else {
+            return CachePlan::None;
+        };
+        match cache.scope {
+            CacheScope::Persistent if self.journal.is_some() => CachePlan::Persistent {
+                key: JournalCacheKey::new(format!("{target}#{hash}")),
+                ttl,
+            },
+            _ => CachePlan::Memory {
+                key: CacheKey {
+                    target: target.to_owned(),
+                    args_hash: hash.clone(),
+                },
+            },
+        }
     }
 
     /// Registers the call and mints its outcome envelope + trace id.
@@ -385,6 +557,48 @@ impl Engine {
         metrics.cache_hits += 1;
         metrics.successes += 1;
         out.breaker = state.breaker_state(&key.target, now);
+        true
+    }
+
+    /// Serves a fresh persistent cache payload from the journal, if any (attempts
+    /// stays 0). The journal owns TTL expiry against its own clock (identical
+    /// semantics to the in-memory scope). Any journal or codec failure degrades
+    /// to a miss + `warn!`, so the call proceeds to a live attempt — a broken
+    /// journal never fails the call. The journal read runs *before* the state
+    /// lock is taken, so no lock is held across journal I/O.
+    fn serve_from_persistent(
+        &self,
+        target: &str,
+        key: &JournalCacheKey,
+        out: &mut Outcome,
+    ) -> bool {
+        let Some(journal) = self.journal.as_ref() else {
+            return false;
+        };
+        let bytes = match journal.get_cache(key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(target = %target, error = %error, "persistent cache read failed; serving live");
+                return false;
+            }
+        };
+        let payload = match decode_cache_payload(&bytes) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                warn!(target = %target, reason = %reason, "persistent cache entry undecodable; serving live");
+                return false;
+            }
+        };
+        let now = Instant::now();
+        let mut state = self.state();
+        out.result = String::from("ok");
+        out.payload = Some(payload);
+        out.from_cache = true;
+        let metrics = state.metrics_for(target);
+        metrics.cache_hits += 1;
+        metrics.successes += 1;
+        out.breaker = state.breaker_state(target, now);
         true
     }
 
@@ -477,6 +691,70 @@ impl Engine {
             }
         }
         out.breaker = state.breaker_state(target, now);
+    }
+
+    /// Writes a live success into the journal's persistent cache (called after
+    /// the state lock is dropped, so journal I/O is never under the engine
+    /// mutex). Encoding or journal failure degrades to a `warn!`; the outcome the
+    /// caller already holds is unaffected.
+    fn write_persistent(
+        &self,
+        target: &str,
+        key: &JournalCacheKey,
+        payload: &Value,
+        ttl: DurationMs,
+    ) {
+        let Some(journal) = self.journal.as_ref() else {
+            return;
+        };
+        let bytes = match encode_cache_payload(payload) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(target = %target, error = %error, "persistent cache encode failed; entry not stored");
+                return;
+            }
+        };
+        if let Err(error) = journal.put_cache(key, &bytes, Duration::from_millis(ttl.0)) {
+            warn!(target = %target, error = %error, "persistent cache write failed; entry not stored");
+        }
+    }
+
+    /// Records one observation of a completed call into the discovery store, if
+    /// attached. Runs off the state lock, from data already in the `Outcome`.
+    /// Failure degrades to a `warn!` — discovery is evidence, never on the
+    /// call's critical path.
+    fn observe(&self, request: &Request, out: &Outcome, started: Instant) {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return;
+        };
+        let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let result = if out.from_cache {
+            CallResult::CacheHit
+        } else if out.result == "ok" {
+            CallResult::Success
+        } else {
+            CallResult::Failure
+        };
+        let error = out.error.as_ref().map(|e| ObservedError {
+            class: e.class,
+            http_status: e.http_status,
+        });
+        let breaker_opened = out
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::BreakerOpen);
+        let observation = CallObservation {
+            target: request.target.clone(),
+            result,
+            attempts: out.attempts,
+            latency_ms,
+            throttled: out.throttled,
+            breaker_opened,
+            error,
+        };
+        if let Err(error) = discovery.record(&observation) {
+            warn!(target = %request.target, error = %error, "discovery record failed; observation dropped");
+        }
     }
 
     /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error.
