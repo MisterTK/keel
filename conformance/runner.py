@@ -4,9 +4,12 @@ implementation (default: the Python keel-core-stub). See conformance/README.md
 for the scenario format and the normative execution semantics.
 
 Usage:
-    python3 conformance/runner.py [--impl python-stub] [--scenarios DIR]
+    python3 conformance/runner.py [--impl {stub,native}] [--scenarios DIR]
 
-Exit code 0 iff every scenario passes.
+`--impl stub` (default) drives the pure-Python keel-core-stub; `--impl native`
+drives the PyO3 `keel_core` module (build it first with `maturin develop` in
+crates/keel-py). Both must pass 15/15 — the same scenarios and runner logic, only
+the injected core object differs. Exit code 0 iff every scenario passes.
 """
 
 from __future__ import annotations
@@ -15,18 +18,34 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_impl(name: str):
-    if name == "python-stub":
+def load_impl(name: str) -> tuple[Callable[[], Any], type[Exception]]:
+    """Resolve `(make_core, error_cls)` for the chosen implementation.
+
+    `make_core()` builds a fresh core on a virtual clock at 0 (stub natively;
+    native via the harness-only `paused=True` flag), so the runner's
+    configure/execute/report/advance_clock loop is identical for both.
+    """
+    if name in ("stub", "python-stub"):
         sys.path.insert(0, str(ROOT / "python" / "keel-core-stub"))
         from keel_core_stub import KeelCoreStub, KeelError
 
         return KeelCoreStub, KeelError
-    raise SystemExit(f"unknown --impl {name!r} (available: python-stub)")
+    if name == "native":
+        try:
+            import keel_core
+        except ImportError as e:
+            raise SystemExit(
+                f"--impl native: cannot import keel_core ({e}); "
+                "build it with `maturin develop` in crates/keel-py first"
+            ) from e
+
+        return (lambda: keel_core.KeelCore(paused=True)), keel_core.KeelCoreError
+    raise SystemExit(f"unknown --impl {name!r} (available: stub, native)")
 
 
 def subset_mismatches(actual: Any, expected: Any, path: str = "$") -> list[str]:
@@ -57,8 +76,11 @@ def subset_mismatches(actual: Any, expected: Any, path: str = "$") -> list[str]:
     return [] if actual == expected else [f"{path}: expected {expected!r}, got {actual!r}"]
 
 
-def run_scenario(scenario: dict[str, Any], stub_cls, error_cls) -> list[str]:
-    core = stub_cls()
+def run_scenario(scenario: dict[str, Any], make_core, error_cls) -> list[str]:
+    if scenario.get("tier", 1) != 1:
+        # Tier 2 (durable flows) is real-core only; the stub skips it cleanly.
+        return []
+    core = make_core()
     want_cfg_err = scenario.get("expect_configure_error")
     try:
         core.configure(scenario["policy"])
@@ -120,20 +142,26 @@ def run_scenario(scenario: dict[str, Any], stub_cls, error_cls) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--impl", default="python-stub")
+    ap.add_argument("--impl", default="stub", choices=["stub", "native", "python-stub"])
     ap.add_argument("--scenarios", default=str(ROOT / "conformance" / "scenarios"))
     args = ap.parse_args()
 
-    stub_cls, error_cls = load_impl(args.impl)
+    make_core, error_cls = load_impl(args.impl)
     files = sorted(Path(args.scenarios).glob("*.json"))
     if not files:
         print(f"no scenarios found in {args.scenarios}", file=sys.stderr)
         return 2
 
     failed = 0
+    skipped = 0
     for f in files:
         scenario = json.loads(f.read_text())
-        mismatches = run_scenario(scenario, stub_cls, error_cls)
+        if scenario.get("tier", 1) != 1:
+            # Tier 2 (durable flows) is real-core only; the stub skips it.
+            skipped += 1
+            print(f"skip  {scenario['name']}  (tier {scenario['tier']})")
+            continue
+        mismatches = run_scenario(scenario, make_core, error_cls)
         if mismatches:
             failed += 1
             print(f"FAIL  {scenario['name']}  ({f.name})")
@@ -141,8 +169,9 @@ def main() -> int:
                 print(f"      {m}")
         else:
             print(f"ok    {scenario['name']}")
-    total = len(files)
-    print(f"\n{total - failed}/{total} scenarios passed  [impl: {args.impl}]")
+    total = len(files) - skipped
+    suffix = f" ({skipped} tier-2 skipped)" if skipped else ""
+    print(f"\n{total - failed}/{total} scenarios passed  [impl: {args.impl}]{suffix}")
     return 1 if failed else 0
 
 

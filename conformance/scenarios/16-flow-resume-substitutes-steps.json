@@ -1,0 +1,56 @@
+{
+  "name": "flow-resume-substitutes-steps",
+  "tier": 2,
+  "description": "Tier 2: a 3-step durable flow crashes after step 2; on resume steps 1-2 are substituted from the journal (their effects never re-run, and the live effect payloads are ignored in favor of the recorded ones) while step 3 executes live. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-16",
+    "code_hash": "ch-16"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 2,
+      "steps": [
+        {
+          "target": "api.source.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "rows": 120 } },
+          "expect": { "result": "ok", "payload": { "rows": 120 }, "attempts": 1 }
+        },
+        {
+          "target": "api.enrich.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "ok": true } },
+          "expect": { "result": "ok", "payload": { "ok": true } }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.source.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "rows": 999 } },
+          "expect": { "result": "ok", "payload": { "rows": 120 } }
+        },
+        {
+          "target": "api.enrich.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "ok": false } },
+          "expect": { "result": "ok", "payload": { "ok": true } }
+        },
+        {
+          "target": "api.store.internal",
+          "args_hash": "w1",
+          "effect": { "status": "ok", "payload": { "stored": true } },
+          "expect": { "result": "ok", "payload": { "stored": true } }
+        }
+      ]
+    }
+  ]
+}

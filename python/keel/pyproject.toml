@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keel"
+version = "0.1.0"
+description = "Keel — resilience as a zero-config Python front end (Tier 1 bootstrap, import hook, discovery)."
+requires-python = ">=3.11"
+# Runtime is stdlib-only: adapters activate only when their library is already
+# present in the environment, and never import an absent one.
+dependencies = []
+
+# Test-only dependencies (the adapter contract-test farm). Install with
+# `pip install -e '.[dev]'` or `uv pip install httpx requests`. The library
+# versions the packs certify are pinned in each pack's `_PINNED`; these ranges
+# track them. Development for Task 10 used httpx 0.28.1 + requests 2.32.5 on
+# CPython 3.14 (system interpreter).
+[project.optional-dependencies]
+dev = ["httpx>=0.27,<0.29", "requests>=2.31,<2.33"]
+
+# Internal run entry. The public `keel run` CLI (Task 8) dispatches here for
+# Python entrypoints; `keel-py-run app.py [args...]` runs a script directly.
+[project.scripts]
+keel-py-run = "keel._run:main_run_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["keel*"]

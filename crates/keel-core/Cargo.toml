@@ -6,18 +6,58 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish = false
+# Only the explicitly declared `overhead` bench is a target; `benches/support.rs`
+# is a module of it (and of tests/overhead_guard.rs), not a bench of its own.
+autobenches = false
 
 [dependencies]
 fastrand = "2.3"
 keel-core-api = { path = "../keel-core-api" }
+keel-journal = { path = "../keel-journal" }
+# OTLP export, gated behind the `otel` feature so the default core stays lean
+# and dependency-free (see src/otel.rs). Versions form a compatible 0.32 set.
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32", optional = true }
+rmp-serde = "1.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
-tokio = { version = "1.47", features = ["time"] }
+# `rt` powers the Tier 2 flow lease heartbeat (tokio::spawn + Handle); `time`
+# is the engine's virtual-clock-testable sleeps. The front ends already run the
+# core inside a runtime, so this adds no new operational requirement.
+tokio = { version = "1.47", features = ["rt", "time"] }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[features]
+# Wire `tracing` spans to an OpenTelemetry collector over OTLP. Off by default:
+# the FFI/bench paths stay deterministic and dependency-free without it.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
 
 [dev-dependencies]
+# Bench-only: statistics-driven microbenchmarking for the overhead bench. Lean
+# feature set — no rayon/plotters/HTML; `cargo_bench_support` keeps it runnable
+# under `cargo bench`. It never enters a release/library build (dev-dependency).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 keel-conformance = { path = "../keel-conformance" }
+# Flow tests load the checked-in golden journal fixtures (bit-identical SQL over
+# contracts/journal.sql), then resume them through the flow manager. Same version
+# keel-journal already pins, so the lock is unchanged.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tempfile = "3.23"
 tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
+
+[[bench]]
+name = "overhead"
+harness = false
 
 [lints]
 workspace = true

@@ -1,0 +1,186 @@
+# Keel — full documentation for retrieval
+
+> The SQLite of durable execution: production-grade resilience and opt-in durable
+> execution as an in-process library, zero code changes, policy in one
+> `keel.toml`. This file is the self-contained corpus — every feature with one
+> canonical example, plus the CLI and error-code reference. Stable headings; an
+> agent can retrieve any section without following a link.
+
+## What Keel is
+
+Keel wraps a program's outbound effects at the call boundary and applies a
+policy: retries, exponential backoff with jitter, per-attempt timeouts, circuit
+breakers, rate limits, response caching, and — opt-in — crash-resumable durable
+flows. It runs inside your process (no daemon, no port, no login); state is files
+under `.keel/`. Add it with `keel run`; remove the package and your code runs
+identically (minus resilience). Two tiers:
+
+- **Tier 1 (resilience):** always on, per intercepted call. cache → rate →
+  breaker → timeout → retry.
+- **Tier 2 (durability):** opt-in per flow. Journals each effect; a crashed run
+  re-executes from the top and substitutes already-completed effects from the
+  journal instead of re-firing them.
+
+## The "just works" ladder
+
+### Level 0 — zero config
+
+```
+keel run app.py            # python
+keel run app.mjs           # node
+```
+
+Every discovered outbound call gets conservative production defaults (30s
+timeout, 3 retries on transient errors — conn/timeout/429/5xx — with jittered
+exponential backoff, per-host breaker). LLM provider calls get the LLM pack. One
+line of output, then silence. Hard rules: never change success-path semantics;
+never retry a non-idempotent call (POST without an idempotency key) by default —
+it is marked observed-not-retried (KEEL-E014); if Keel can't wrap something
+safely it does nothing and says so in `keel doctor`.
+
+### Level 1 — `keel init`
+
+```
+keel init                  # writes keel.toml from static scan + observed runs
+keel init --diff           # preview adds/removes against an existing keel.toml
+```
+
+Generated entries cite `file:line` evidence and observed traffic; deleting any
+entry falls back to the same built-in defaults. The generated file is the
+documentation.
+
+### Level 2 — durable flows (config-only)
+
+```toml
+# keel.toml
+[flows]
+entrypoints = ["py:pipeline:main"]     # module `pipeline`, function `main`
+```
+
+```
+keel run pipeline.py       # runs it as a durable flow
+# kill -9 it mid-run, then re-run: resumes, replaying completed steps
+```
+
+Completed steps are substituted from `.keel/journal.db` (their effects never
+re-fire); the rest run live. `keel flows` lists resumable/completed flows;
+`keel trace <flow>` shows the step ledger. Time (`time.time`/`time_ns`) and
+`random.random` reads inside a flow are virtualized so a resumed run sees the
+same values.
+
+v0.1 limits (precise, never silent): a flow needs a journal (native core), and
+flow bodies are synchronous-only — an async intercepted call inside a flow is
+refused (KEEL-E001) rather than silently downgraded to Tier 1.
+
+### Level 3 — fleet
+
+One line (`journal = "postgres://…"`) moves the journal to Postgres for
+multi-process recovery; nothing else changes. (Not in v0.1.)
+
+## Targets
+
+A policy entry is `[target."<key>"]`. Kinds:
+
+- **host** — e.g. `[target."api.stripe.com"]`, matched by request host.
+- **`py:` / `ts:` functions** — e.g. `[target."py:pipeline.do_step"]`; listing a
+  function asserts it is safe to retry (idempotent).
+- **semantic** — `llm:<provider>` (openai/anthropic/google-genai/…),
+  `tool:<name>`, `mcp:<server>`. Auto-detected from provider hosts / framework
+  adapters.
+
+Canonical policy example:
+
+```toml
+[target."api.stripe.com"]              # seen in: billing.py:41
+retry       = { attempts = 5, schedule = "exp(200ms, x2, max 30s, jitter)" }
+idempotency = { header = "Idempotency-Key" }
+
+[target."llm:openai"]                   # seen in: agent.py:12
+retry = { attempts = 6, on = ["429","5xx","timeout"] }
+rate  = "60/min"
+cache = { mode = "dev" }                # dev-loop cache; inert when KEEL_ENV=prod
+```
+
+## Resilience features (one example each)
+
+- **Retry + backoff:** `retry = { attempts = 5, schedule = "exp(200ms, x2, max 30s, jitter)", on = ["conn","timeout","429","5xx"] }`. 429 backoff honors `Retry-After` when larger than the scheduled wait.
+- **Timeout:** `timeout = "30s"` — enforced per attempt (KEEL-E011 on breach).
+- **Circuit breaker:** `breaker = { failures = 5, cooldown = "15s" }` — opens after N failures, half-opens after cooldown (KEEL-E012 while open).
+- **Rate limit:** `rate = "60/min"` — token bucket; KEEL-E013 if the wait budget is exceeded.
+- **Idempotency:** `idempotency = { header = "Idempotency-Key" }` — makes a non-idempotent call retryable (otherwise KEEL-E014, observed-not-retried).
+- **Cache / LLM dev-cache:** `cache = { mode = "dev" }` — identical request+args replay off `KEEL_ENV=prod`; with the native core + journal it persists across separate runs (a repeated prompt costs ~0).
+
+## LLM / agent frameworks
+
+`llm:<provider>` calls get a default pack (retry on 429/5xx/timeout with
+provider-aware backoff, rate limiting, dev cache). Framework adapter packs are
+auto-detected from dependencies (AI SDK middleware, `mcp:` transports, etc.) and
+wrap tool/LLM calls with zero agent-code changes. See dx-spec §4.
+
+## CLI reference
+
+Global: `--json` on any command emits deterministic JSON (sorted keys, no
+timestamps) instead of prose. Same command, two audiences.
+
+- `keel run <target> [args...]` — run a script/package/dir under Keel. `--disable` runs it byte-identically with Keel off.
+- `keel init [--diff] [--stamp] [--agents]` — generate `keel.toml` from evidence; `--diff` previews; `--stamp` dates the header; `--agents` writes the Keel section into `AGENTS.md` instead.
+- `keel doctor` — the honesty report: what's wrapped, what's visible-but-unwrapped and why, adapter version pins, detected framework.
+- `keel status` — coverage %, retries saved, breaker events, cache hit rate, resumable flows.
+- `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
+- `keel flows [--dead]` — list durable flows (id, entrypoint, status, steps, age).
+- `keel trace <flow>` — one flow's steps (outcomes, attempts, timings).
+
+## Error codes (frozen taxonomy)
+
+Every user-facing error carries a `KEEL-E0NN` code, a first line (what/why/next),
+a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
+
+- KEEL-E001 policy-invalid — keel.toml failed validation (wrong type / unknown key / bad literal), or a `[flows]` designation cannot be honored (no journal, or an async effect inside a flow). Next: `keel doctor`; validate against policy.schema.json.
+- KEEL-E002 policy-target-unknown — strict mode only; unknown target with no entry.
+- KEEL-E003 envelope-decode — a request/attempt-result envelope could not be decoded at the FFI boundary (version mismatch / corruption).
+- KEEL-E004 envelope-version-unsupported — language package and core binary are incompatible releases.
+- KEEL-E010 attempts-exhausted — failed on the final permitted attempt; original error re-raised unchanged.
+- KEEL-E011 timeout — exceeded the policy timeout.
+- KEEL-E012 breaker-open — the breaker is open; the call failed fast, unattempted.
+- KEEL-E013 rate-budget-exceeded — could not queue under the rate limit within the wait budget.
+- KEEL-E014 non-idempotent-not-retried — a retryable failure on a non-idempotent call; observed, not retried (Level 0 hard rule). Add `idempotency = { header = "…" }` to make it retryable.
+- KEEL-E015 non-retryable-error — error class not in `retry.on`; original re-raised.
+- KEEL-E020 cache-codec — a response could not be (de)serialized for the cache.
+- KEEL-E030 flow-lease-held — the flow is being executed by another process (live lease).
+- KEEL-E031 flow-nondeterminism — on replay the code diverged from the journal (or code changed). Set `flows.on_nondeterminism = "warn"|"branch"` to continue.
+- KEEL-E032 flow-dead — the flow exhausted its resume-attempt cap (poison flow).
+- KEEL-E040 internal — a Keel bug (invariant violation inside the core). File an issue with the trace id.
+
+## DX invariants (tested in CI as behaviors)
+
+1. Zero code changes in Python/TS (one optional attribute in Rust).
+2. Uninstall = remove the package; code runs identically.
+3. No daemon, no port, no login — state is files in `.keel/`.
+4. Silence on success, precision on failure (what/why/next/trace).
+5. Never swallow errors — the original propagates unchanged, with a `keel` attachment.
+6. Everything has `--json` and stable exit codes.
+7. Works offline — no telemetry, no phone-home.
+8. Fast — `keel run` adds <100 ms startup; wrapping overhead ≤10 µs/call (measured ~0.56 µs), published in the README.
+
+## Determinism (for agents)
+
+Identical inputs produce byte-identical `--json` (sorted keys, no wall-clock
+timestamps unless asked). Suggestions are emitted as applyable diffs. Run
+`keel doctor --json` before changing resilience behavior; `keel init --agents`
+seeds `AGENTS.md` so future sessions inherit this context.
+
+## Build from source (packaging not yet published)
+
+```
+maturin develop -m crates/keel-py/Cargo.toml   # native keel_core into the venv (Python)
+pip install -e 'python/keel[dev]'
+node node/keel/bin/keel-node-run.mjs app.mjs   # Node from-source `keel run`
+cargo build -p keel-cli                         # the `keel` binary
+```
+
+## Conformance
+
+17 scenarios in `conformance/scenarios/` (01–15 Tier 1, 16–17 Tier 2), run by the
+real Rust core (17/17), the Rust/Python/Node stubs (15/15 Tier 1; Tier 2 skipped
+— no journal), and the native front ends. `conformance/README.md` is the
+normative semantics.

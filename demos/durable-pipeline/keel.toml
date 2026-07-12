@@ -1,0 +1,7 @@
+# Designate the pipeline entrypoint as a durable flow. do_step is a plain
+# function target — listing it here is the user's assertion it is safe to
+# journal/replay. No code changes; the whole run becomes crash-resumable.
+[flows]
+entrypoints = ["py:pipeline:main"]
+
+[target."py:pipeline.do_step"]

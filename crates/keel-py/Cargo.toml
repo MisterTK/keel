@@ -1,0 +1,75 @@
+[package]
+name = "keel-py"
+description = "PyO3 native module (`keel_core`) wrapping keel-core::Engine for the Keel Python front end: a synchronous `execute` (GIL released while blocked in the engine, re-acquired to invoke the effect callback), an asyncio `execute_async` bridge (pyo3-async-runtimes), and a harness-only paused virtual clock. Same conformance suite as the stub."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# Rust crate name is `keel_py` to avoid colliding with the `keel-core`
+# dependency (whose lib is `keel_core`); the PYTHON import name is `keel_core`,
+# set by the `#[pymodule] fn keel_core` symbol and `[tool.maturin] module-name`.
+# `cdylib` is the importable extension module; `rlib` lets this crate's own
+# `cargo test` link and exercise the pure-Rust helpers without a Python.
+name = "keel_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Aliased to `keel_engine` in code: the crate's own Python module symbol is
+# `keel_core`, which would otherwise collide with keel-core's lib name.
+keel_engine = { package = "keel-core", path = "../keel-core" }
+keel-core-api = { path = "../keel-core-api" }
+# The persistent journal (SQLite) attached on demand for the dev-cache
+# `scope = persistent` (Task 14 item 1) — enables cross-RUN LLM dev replay.
+keel-journal = { path = "../keel-journal" }
+# abi3-py311: one wheel imports on CPython 3.11+ (built here with 3.14). The
+# `extension-module` feature (no libpython link) is enabled only for the wheel
+# build, via the `extension-module` crate feature below — NOT by default, so
+# `cargo test` links libpython and can run.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+# The maintained successor to pyo3-asyncio, version-locked to pyo3 0.29. Bridges
+# the engine future to a Python awaitable and awaits the async effect coroutine
+# on the caller's asyncio loop.
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+# One dict<->serde mechanism (no JSON-string round-trip): preserves value types
+# and surfaces serde error paths for diagnostic fidelity.
+pythonize = "0.29"
+serde_json = { workspace = true }
+# Current-thread runtime + time driver (the engine needs the timer wheel, never
+# IO). `test-util` is always on: the paused clock + `advance_clock` are exposed
+# unconditionally as documented harness-only surface (per the task brief).
+tokio = { version = "1.47", features = ["rt", "time", "test-util"] }
+
+[features]
+# Enabled by maturin for the wheel build (see pyproject.toml): tells pyo3 not to
+# link libpython, as required for a loadable extension module. Off under
+# `cargo test`, so the test binary links libpython and runs.
+extension-module = ["pyo3/extension-module"]
+# Forward keel-core's optional OTLP span export. OFF by default (the shipped
+# wheel has no OpenTelemetry dependency). Build the wheel `--features otel` and
+# set `KEEL_OTEL=1` at runtime to export the engine's spans over OTLP; the
+# standard `OTEL_*` env vars configure the exporter (see crates/keel-core/otel.rs).
+otel = ["keel_engine/otel"]
+
+# This crate cannot inherit `[workspace.lints]`: the workspace FORBIDS
+# unsafe_code (an absolute level no inner attribute can relax), but the pyo3
+# `#[pyclass]`/`#[pymodule]` macros expand to `unsafe` in this crate. So we
+# restate the workspace lint posture verbatim, changing only unsafe_code — every
+# other standard stays in force and CI still runs clippy pedantic `-D warnings`.
+# This crate itself writes no `unsafe`.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"

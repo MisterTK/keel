@@ -1,0 +1,39 @@
+[package]
+name = "keel-cli"
+description = "The `keel` binary: run | init | doctor | status | explain. The product's face — every command has a byte-deterministic `--json` twin and stable exit codes (dx-spec §1–2, §5–6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "keel_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keel"
+path = "src/main.rs"
+
+[dependencies]
+keel-core-api = { path = "../keel-core-api" }
+keel-journal = { path = "../keel-journal" }
+clap = { version = "4", features = ["derive"] }
+# Read `.keel/journal.db` for `keel status` directly. The schema is frozen
+# (contracts/journal.sql); keel-journal owns writes, the CLI only reads.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+# Parse the user's keel.toml for `doctor` validation and `init --diff`.
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.23"
+# Integration tests build fixture DBs the way the front ends do: the journal via
+# the frozen schema (rusqlite), the discovery store via keel-journal's own API.
+keel-journal = { path = "../keel-journal" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[lints]
+workspace = true

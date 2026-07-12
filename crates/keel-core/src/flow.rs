@@ -1,0 +1,1129 @@
+//! Tier 2: the durable flow manager (architecture spec §4.3–4.4).
+//!
+//! A *flow* is a function whose intercepted effects are journaled as it runs, so
+//! that a crashed run can be re-executed from the top and each already-completed
+//! effect is *substituted* from the journal instead of re-invoked. This is the
+//! DBOS-style coordinator-free recovery model: no scheduler service exists, a
+//! process just scans for incomplete flows with expired leases and resumes them.
+//!
+//! Two durability boundaries meet here and must not contaminate each other
+//! (spec §4.3): retries *within* a step are the Tier 1 engine's business
+//! (attempts of one step, journaled as that step's `attempt` count);
+//! re-execution *of the flow* is this manager's business. So a
+//! [`FlowHandle::execute_step`] wraps [`Engine::execute`] — the step gets full
+//! Tier 1 resilience — and journals the single post-retry outcome.
+//!
+//! At-least-once honesty: a live step is journaled `running` *before* the effect
+//! runs and its terminal outcome recorded *before* the result is released, so a
+//! crash between those points leaves a `running` step that resume re-executes.
+//!
+//! # Synchronous-only in v0.1 (front-end binding constraint)
+//!
+//! [`FlowHandle::execute_step`] is `async` here, but the front-end *bindings*
+//! only route the **synchronous** intercepted-call path through it. The Python
+//! binding's `execute_async` runs on the bare [`Engine`], not the open handle —
+//! so an async effect inside a flow would be silently downgraded to Tier 1
+//! (never journaled, never replayed). Rather than let that happen quietly (a
+//! Level 0 surprise), the binding *refuses* an async intercepted call while a
+//! flow is open with a precise KEEL-E001 (`keel-py`'s `execute_async` guard).
+//! v0.1 durable flows are therefore synchronous-only; lifting this is future
+//! work (an async `execute_step` bridge in each binding).
+//!
+//! Replay correctness is checked, not assumed (spec §4.4): the `(seq, step_key)`
+//! encountered on replay must match the journal. A `seq` recorded under a
+//! *different* key is nondeterminism ([`ErrorCode::FlowNondeterminism`],
+//! KEEL-E031), handled per the `flows.on_nondeterminism` policy.
+//!
+//! # Re-entering a completed flow is pure replay
+//!
+//! A rerun of a flow that already reached `completed` is a *pure replay*: no
+//! lease is taken, no flow-level attempt is consumed, no heartbeat runs, and no
+//! effect ever fires — every step is substituted from the journal and the
+//! function reconstructs its result from the recorded values. This is what makes
+//! `keel run` on a finished pipeline instant and side-effect-free, and it is why
+//! re-entry must never surface a lease error (a completed flow is not `running`,
+//! so a naive `acquire_lease WHERE status='running'` would wrongly report
+//! KEEL-E030). A replay-only handle reaching a step with no recorded outcome is
+//! itself a divergence (the code grew a step since completion) and is refused
+//! with KEEL-E031 rather than run live.
+//!
+//! # Step-key convention (who names steps)
+//!
+//! Step keys are *front-end supplied*, never minted by this manager, so the key
+//! a live run records and the key a replay observes are produced by the same
+//! code path. Effect steps key on the request as `"(target)#(args_hash)"`
+//! ([`FlowHandle::step_key`]). Virtualized value steps (time/random) take an
+//! explicit caller key following the same `"<callable>#<args_hash>"` shape with
+//! the front end's language prefix and `-` for a niladic read — e.g. the Python
+//! front end and the golden fixtures both use `py:time.time#-`,
+//! `py:time.time_ns#-`, `py:random.random#-`. Keeping the convention in the
+//! caller means the fixtures, the live front end, and replay all agree on one
+//! key per read.
+
+use core::time::Duration;
+use std::sync::Arc;
+
+use keel_core_api::policy::NondeterminismResponse;
+use keel_core_api::{
+    ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome, OutcomeError, Request,
+};
+use keel_journal::{
+    Clock, FlowId, FlowStatus, Journal, NewFlow, ProcessId, StepKey, StepKind, StepOutcome,
+    StepStatus,
+};
+use serde_json::{Value, json};
+use tracing::{debug, warn};
+
+/// Where a `branch`-mode fresh attempt writes its steps, high above any real
+/// step count so the abandoned run's records (seqs `1..`) are preserved for
+/// audit (spec §4.4).
+const BRANCH_SEQ_BASE: u64 = 1_000_000;
+
+/// The reserved step slot holding the flow-level resume counter. Real steps are
+/// numbered from 1, so seq 0 never collides with them.
+const ATTEMPT_SEQ: u64 = 0;
+/// The step key of the reserved resume-counter marker.
+const ATTEMPT_KEY: &str = "flow:attempt";
+
+use crate::engine::Engine;
+
+/// How a flow is identified and fenced. Identity is
+/// `(entrypoint, args_hash, explicit_key?)` (spec §4.3); `code_hash` fences
+/// replay across deploys (spec §4.4).
+#[derive(Debug, Clone)]
+pub struct FlowDescriptor {
+    /// The flow's entrypoint, e.g. `"py:pipeline.ingest:main"`.
+    pub entrypoint: String,
+    /// Hash of the flow's arguments; part of its identity.
+    pub args_hash: String,
+    /// An optional explicit identity key, disambiguating two runs that share an
+    /// entrypoint and args (spec §4.3).
+    pub explicit_key: Option<String>,
+    /// Hash of the flow's code, used to fence replay across deploys.
+    pub code_hash: Option<String>,
+}
+
+impl FlowDescriptor {
+    /// The deterministic storage key for this identity. Deterministic (no ULID
+    /// clock/random draw) so a rerun with the same identity keys the same flow
+    /// row — which is what makes resume-on-rerun work through the idempotent
+    /// [`Journal::begin_flow`].
+    #[must_use]
+    pub fn flow_id(&self) -> FlowId {
+        FlowId::new(format!(
+            "{}#{}#{}",
+            self.entrypoint,
+            self.args_hash,
+            self.explicit_key.as_deref().unwrap_or("")
+        ))
+    }
+}
+
+/// Tuning for a [`FlowManager`]: lease lifetime and the flow-level attempt cap
+/// (spec §4.3 leases; the cap turns a poison flow `dead`).
+#[derive(Debug, Clone, Copy)]
+pub struct FlowConfig {
+    /// How long an acquired lease is valid before another process may steal it.
+    pub lease_ttl: Duration,
+    /// Maximum flow-level (re-)execution attempts before the flow is marked
+    /// `dead` and refused (KEEL-E032). Distinct from Tier 1 step attempts.
+    pub max_attempts: u32,
+}
+
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self {
+            lease_ttl: Duration::from_secs(30),
+            max_attempts: 3,
+        }
+    }
+}
+
+/// The Tier 2 flow manager: opens and resumes durable flows over a [`Journal`],
+/// running each step's effect through the Tier 1 [`Engine`]. One per process,
+/// `&self`-concurrent; hands out a `&mut` [`FlowHandle`] per running flow.
+pub struct FlowManager {
+    engine: Arc<Engine>,
+    journal: Arc<dyn Journal>,
+    clock: Arc<dyn Clock>,
+    holder: ProcessId,
+    config: FlowConfig,
+}
+
+impl core::fmt::Debug for FlowManager {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FlowManager")
+            .field("holder", &self.holder)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FlowManager {
+    /// A manager with the default [`FlowConfig`].
+    #[must_use]
+    pub fn new(
+        engine: Arc<Engine>,
+        journal: Arc<dyn Journal>,
+        clock: Arc<dyn Clock>,
+        holder: ProcessId,
+    ) -> Self {
+        Self::with_config(engine, journal, clock, holder, FlowConfig::default())
+    }
+
+    /// A manager with explicit tuning.
+    #[must_use]
+    pub fn with_config(
+        engine: Arc<Engine>,
+        journal: Arc<dyn Journal>,
+        clock: Arc<dyn Clock>,
+        holder: ProcessId,
+        config: FlowConfig,
+    ) -> Self {
+        Self {
+            engine,
+            journal,
+            clock,
+            holder,
+            config,
+        }
+    }
+
+    /// Enter (begin or resume) the flow with this identity: open the row
+    /// (idempotent), take the lease, and hand back a handle in replay-or-live
+    /// mode. `Err` when the lease is held by a live holder (KEEL-E030) or the
+    /// flow is already `dead` (KEEL-E032).
+    ///
+    /// # Errors
+    /// - `KEEL-E030` if another holder's lease is still valid.
+    /// - `KEEL-E032` if the flow is `dead` (never auto-resumed).
+    /// - `KEEL-E040` if the journal cannot open the flow row.
+    pub fn enter_flow(&self, desc: &FlowDescriptor) -> Result<FlowHandle, KeelError> {
+        self.enter(
+            &desc.flow_id(),
+            &desc.entrypoint,
+            &desc.args_hash,
+            desc.code_hash.as_deref(),
+        )
+    }
+
+    /// Resume a flow the recovery scan surfaced ([`Journal::incomplete_flows`]),
+    /// fencing against the currently-deployed `code_hash`.
+    ///
+    /// # Errors
+    /// As [`enter_flow`](Self::enter_flow).
+    pub fn resume_flow(
+        &self,
+        flow: &keel_journal::FlowDescriptor,
+        current_code_hash: Option<&str>,
+    ) -> Result<FlowHandle, KeelError> {
+        self.enter(
+            &flow.flow_id,
+            &flow.entrypoint,
+            &flow.args_hash,
+            current_code_hash,
+        )
+    }
+
+    fn enter(
+        &self,
+        flow_id: &FlowId,
+        entrypoint: &str,
+        args_hash: &str,
+        current_code_hash: Option<&str>,
+    ) -> Result<FlowHandle, KeelError> {
+        self.journal
+            .begin_flow(&NewFlow {
+                flow_id: flow_id.clone(),
+                entrypoint: entrypoint.to_owned(),
+                args_hash: args_hash.to_owned(),
+                code_hash: current_code_hash.map(str::to_owned),
+            })
+            .map_err(|e| internal(format!("begin_flow failed: {e}")))?;
+
+        let existing = self
+            .journal
+            .get_flow(flow_id)
+            .map_err(|e| internal(format!("get_flow failed: {e}")))?;
+        let status = existing.as_ref().map_or(FlowStatus::Running, |f| f.status);
+
+        // A dead flow is never auto-resumed (spec §4.3).
+        if status == FlowStatus::Dead {
+            return Err(KeelError {
+                code: ErrorCode::FlowDead,
+                message: format!("flow {flow_id} is dead; refusing to resume (KEEL-E032)"),
+            });
+        }
+
+        // Re-entering a completed flow is PURE REPLAY (see module docs): hand
+        // back a replay-only handle that substitutes every step, takes no lease,
+        // spawns no heartbeat, and consumes no attempt. A naive lease acquire
+        // here would fail (a completed flow is not `running`) and wrongly report
+        // KEEL-E030; instead the rerun reconstructs its result from the journal.
+        if status == FlowStatus::Completed {
+            return Ok(self.new_handle(flow_id.clone(), status, false, None, true));
+        }
+
+        // Flow-level attempt cap (distinct from Tier 1 step attempts): each
+        // resume of a not-yet-completed flow consumes one attempt from the
+        // reserved seq-0 counter; exceeding the cap marks the flow dead.
+        let prior = self
+            .journal
+            .step_at(flow_id, ATTEMPT_SEQ)
+            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
+            .map_or(0, |(_, o)| o.attempt);
+        let attempt = prior.saturating_add(1);
+        if attempt > self.config.max_attempts {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Dead)
+                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
+            return Err(KeelError {
+                code: ErrorCode::FlowDead,
+                message: format!(
+                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
+                    self.config.max_attempts
+                ),
+            });
+        }
+
+        // A cleanly-failed flow is put back to `running` before re-leasing so a
+        // resume can proceed (and so a re-crash lands it in the recovery scan).
+        if status == FlowStatus::Failed {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Running)
+                .map_err(|e| internal(format!("reset-to-running failed: {e}")))?;
+        }
+
+        let acquired = self
+            .journal
+            .acquire_lease(flow_id, &self.holder, self.config.lease_ttl)
+            .map_err(|e| internal(format!("acquire_lease failed: {e}")))?;
+        if !acquired {
+            return Err(KeelError {
+                code: ErrorCode::FlowLeaseHeld,
+                message: format!(
+                    "flow {flow_id} is leased by another holder; not resuming (KEEL-E030)"
+                ),
+            });
+        }
+
+        let now = self.clock.now_ms();
+        let marker = StepOutcome {
+            kind: StepKind::Marker,
+            attempt,
+            status: StepStatus::Ok,
+            payload: None,
+            error_class: None,
+            started_at: now,
+            ended_at: Some(now),
+        };
+        if let Err(e) =
+            self.journal
+                .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
+        {
+            warn!(flow = %flow_id, error = %e, "attempt-counter record failed");
+        }
+
+        // Replay is fenced when the recorded code differs from what is running
+        // now: a divergence under a changed deploy downgrades fail→warn (§4.4).
+        let code_hash_fenced = match (existing.and_then(|f| f.code_hash), current_code_hash) {
+            (Some(recorded), Some(current)) => recorded != current,
+            _ => false,
+        };
+
+        let heartbeat = spawn_heartbeat(
+            Arc::clone(&self.journal),
+            flow_id.clone(),
+            self.holder.clone(),
+            self.config.lease_ttl,
+        );
+
+        Ok(self.new_handle(flow_id.clone(), status, code_hash_fenced, heartbeat, false))
+    }
+
+    /// Assemble a [`FlowHandle`] over this manager's shared engine/journal/clock.
+    /// `replay_only` marks a completed-flow re-entry (pure replay: every step is
+    /// substituted, no effect fires) — the handle is born already `completed` so
+    /// dropping it is quiet and a front-end `exit_flow` is a harmless re-stamp.
+    fn new_handle(
+        &self,
+        flow_id: FlowId,
+        entry_status: FlowStatus,
+        code_hash_fenced: bool,
+        heartbeat: Option<HeartbeatHandle>,
+        replay_only: bool,
+    ) -> FlowHandle {
+        FlowHandle {
+            engine: Arc::clone(&self.engine),
+            journal: Arc::clone(&self.journal),
+            clock: Arc::clone(&self.clock),
+            holder: self.holder.clone(),
+            flow_id,
+            seq: 0,
+            code_hash_fenced,
+            replay_abandoned: false,
+            replay_only,
+            completed: replay_only,
+            entry_status,
+            heartbeat,
+        }
+    }
+}
+
+/// A single running flow. Owns the step cursor (`seq`), so it is used by one
+/// task via `&mut`; the manager stays `&self`-concurrent for many flows.
+///
+/// Dropping a handle without [`complete`](Self::complete) leaves the flow
+/// `running` with its lease — exactly the crash shape recovery resumes.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent per-handle replay/lease predicate, not a \
+              packed state enum: code_hash_fenced, replay_abandoned, replay_only, completed"
+)]
+pub struct FlowHandle {
+    engine: Arc<Engine>,
+    journal: Arc<dyn Journal>,
+    clock: Arc<dyn Clock>,
+    /// This handle's lease holder id — checked before every live step so a
+    /// handle that has lost its lease fences (KEEL-E030) instead of running the
+    /// effect a second executor may already be running (double-fire defense).
+    holder: ProcessId,
+    flow_id: FlowId,
+    seq: u64,
+    code_hash_fenced: bool,
+    replay_abandoned: bool,
+    /// A completed-flow re-entry (pure replay): every step is substituted from
+    /// the journal and no effect fires; a step with no record is a divergence.
+    replay_only: bool,
+    /// The flow's status when this handle was opened (`completed` for a pure
+    /// replay handle, `running`/`failed` for a live entry) — the front end reads
+    /// it to distinguish "resumed" from "already finished".
+    entry_status: FlowStatus,
+    completed: bool,
+    /// The lease-renewal thread; stopped and joined when the handle drops so a
+    /// completed or crashed flow stops heart-beating.
+    heartbeat: Option<HeartbeatHandle>,
+}
+
+impl core::fmt::Debug for FlowHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FlowHandle")
+            .field("flow_id", &self.flow_id)
+            .field("seq", &self.seq)
+            .field("entry_status", &self.entry_status)
+            .field("replay_only", &self.replay_only)
+            .field("completed", &self.completed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What resolving a step against the journal decided.
+enum StepPlan {
+    /// Run the effect live and journal it (fresh progress or a re-executed
+    /// crashed step).
+    Live,
+    /// Substitute this recorded outcome without invoking the effect.
+    Replay(StepOutcome),
+    /// The recorded key at this seq differs from the current one: nondeterminism.
+    Diverged { recorded: StepKey },
+}
+
+/// The context of a `warn`/`branch` divergence recovery, grouped so the
+/// re-execution helper stays within argument bounds.
+struct Divergence<'a> {
+    seq: u64,
+    recorded: &'a StepKey,
+    observed: &'a StepKey,
+    mode: &'static str,
+    preserve: bool,
+}
+
+impl FlowHandle {
+    /// This flow's storage id.
+    #[must_use]
+    pub fn flow_id(&self) -> &FlowId {
+        &self.flow_id
+    }
+
+    /// The flow's status when this handle was opened. `completed` means this is a
+    /// pure-replay handle (a rerun of an already-finished flow); `running` or
+    /// `failed` means a live entry/resume. The front end reads this to tell the
+    /// user "resumed" vs. "already completed".
+    #[must_use]
+    pub fn entry_status(&self) -> FlowStatus {
+        self.entry_status
+    }
+
+    /// Whether this handle is a completed-flow pure replay — every step is
+    /// substituted from the journal and no effect will fire.
+    #[must_use]
+    pub fn is_replay_only(&self) -> bool {
+        self.replay_only
+    }
+
+    fn now(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
+    /// Whether this handle has definitively lost its lease: the flow's recorded
+    /// holder is no longer us, or the lease has expired against our clock (so
+    /// another process may steal and resume it). A missing flow row or a journal
+    /// read error is *not* treated as loss (resilience-first: at-least-once still
+    /// holds via the `running` marker), so a transient hiccup does not stall a
+    /// legitimately-held flow.
+    fn lease_lost(&self) -> bool {
+        match self.journal.get_flow(&self.flow_id) {
+            Ok(Some(flow)) => {
+                let held = flow.lease_holder.as_ref() == Some(&self.holder)
+                    && flow
+                        .lease_expires
+                        .is_some_and(|expires| expires >= self.now());
+                !held
+            }
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    /// Decide how the step at `seq` (with `key`) resolves against the journal.
+    fn plan_step(&self, seq: u64, key: &StepKey) -> StepPlan {
+        if self.replay_abandoned {
+            return StepPlan::Live;
+        }
+        match self.journal.step_at(&self.flow_id, seq) {
+            Ok(None) => StepPlan::Live,
+            Ok(Some((recorded_key, outcome))) => {
+                if recorded_key == *key {
+                    // A crashed-mid-step record (`running`) is re-executed live;
+                    // any terminal record is substituted.
+                    match outcome.status {
+                        StepStatus::Running => StepPlan::Live,
+                        StepStatus::Ok | StepStatus::Error => StepPlan::Replay(outcome),
+                    }
+                } else {
+                    StepPlan::Diverged {
+                        recorded: recorded_key,
+                    }
+                }
+            }
+            Err(e) => {
+                // Resilience first: a read failure degrades to a live attempt
+                // rather than stalling the flow (at-least-once still holds — a
+                // re-record on resume corrects the journal).
+                warn!(flow = %self.flow_id, seq, error = %e, "step_at failed; executing live");
+                StepPlan::Live
+            }
+        }
+    }
+
+    /// The `(target)#(args_hash)` key identifying a step, matching
+    /// `steps.step_key` and the golden fixtures.
+    fn step_key(request: &Request) -> StepKey {
+        StepKey::new(format!(
+            "{}#{}",
+            request.target,
+            request.args_hash.as_deref().unwrap_or("-")
+        ))
+    }
+
+    /// Execute one journaled step: an intercepted effect wrapped in the Tier 1
+    /// engine (retries/timeout/breaker are attempts of this one step). On
+    /// replay the recorded outcome is substituted and `effect` is never called.
+    pub async fn execute_step<F>(&mut self, request: &Request, effect: F) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        self.seq += 1;
+        let seq = self.seq;
+        let key = Self::step_key(request);
+        let plan = self.plan_step(seq, &key);
+        // A completed-flow replay never runs an effect: substitute a recorded
+        // step, and treat a missing/diverging record as nondeterminism (the code
+        // grew or changed a step since the flow completed) rather than firing it.
+        if self.replay_only {
+            return match plan {
+                StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
+                _ => replay_miss_outcome(&self.flow_id, seq, &key),
+            };
+        }
+        match plan {
+            StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
+            StepPlan::Diverged { recorded } => {
+                self.on_divergence(seq, &recorded, &key, request, effect)
+                    .await
+            }
+            StepPlan::Live => {
+                self.run_live(seq, &key, StepKind::Effect, request, effect)
+                    .await
+            }
+        }
+    }
+
+    /// The `flows.on_nondeterminism` response effective for this handle: the
+    /// configured one, except a `code_hash` mismatch downgrades `fail`→`warn`
+    /// (a deploy that changed the code is expected to diverge; §4.4).
+    fn effective_response(&self) -> NondeterminismResponse {
+        let configured = self.engine.nondeterminism_response();
+        if self.code_hash_fenced && configured == NondeterminismResponse::Fail {
+            NondeterminismResponse::Warn
+        } else {
+            configured
+        }
+    }
+
+    /// Apply the nondeterminism policy to a `(seq, step_key)` divergence (§4.4).
+    async fn on_divergence<F>(
+        &mut self,
+        seq: u64,
+        recorded: &StepKey,
+        observed: &StepKey,
+        request: &Request,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        let (mode, preserve) = match self.effective_response() {
+            // Halt with a precise diagnostic; the caller fails the flow.
+            NondeterminismResponse::Fail => {
+                return diverged_outcome(&self.flow_id, seq, recorded, observed);
+            }
+            // Continue live from the divergence point, journaling a marker.
+            NondeterminismResponse::Warn => ("warn", false),
+            // Abandon replay for a fresh attempt, preserving the old records.
+            NondeterminismResponse::Branch => ("branch", true),
+        };
+        let div = Divergence {
+            seq,
+            recorded,
+            observed,
+            mode,
+            preserve,
+        };
+        self.branch_and_continue(div, request, effect).await
+    }
+
+    /// Journal a branch `marker` and re-execute the divergent step live, then
+    /// stay live for the rest of the flow.
+    async fn branch_and_continue<F>(
+        &mut self,
+        div: Divergence<'_>,
+        request: &Request,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        self.journal_branch_marker(&div);
+        let live_seq = self.seq;
+        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
+            .await
+    }
+
+    /// Journal the branch marker, abandon replay, and advance the cursor to the
+    /// live-continuation seq (left in `self.seq`). With `preserve` (`branch`),
+    /// the marker + continuation go to a high seq lane so the abandoned run's
+    /// records survive for audit; otherwise (`warn`) they continue in place.
+    /// Shared by the effect and value (time/random) re-execution paths.
+    fn journal_branch_marker(&mut self, div: &Divergence<'_>) {
+        warn!(
+            flow = %self.flow_id, seq = div.seq, mode = div.mode,
+            expected = %div.recorded, observed = %div.observed,
+            "flow nondeterminism; abandoning replay"
+        );
+        self.replay_abandoned = true;
+        let marker_seq = if div.preserve {
+            BRANCH_SEQ_BASE + div.seq
+        } else {
+            div.seq
+        };
+        let now = self.now();
+        self.record(
+            marker_seq,
+            &StepKey::new(format!("flow:branch:{}", div.mode)),
+            &StepOutcome {
+                kind: StepKind::Marker,
+                attempt: 0,
+                status: StepStatus::Ok,
+                payload: encode_payload(&json!({
+                    "mode": div.mode,
+                    "expected": div.recorded.as_str(),
+                    "observed": div.observed.as_str(),
+                })),
+                error_class: None,
+                started_at: now,
+                ended_at: Some(now),
+            },
+        );
+        // The divergent step re-executes in the slot after its marker;
+        // subsequent steps continue from there (replay is now abandoned).
+        self.seq = marker_seq + 1;
+    }
+
+    /// Journal (or replay) a virtualized clock read under the front-end-supplied
+    /// `key` (the module-docs convention, e.g. `py:time.time#-`). On replay the
+    /// recorded value is substituted so a resumed flow sees the same time; live,
+    /// `now_ms` is recorded and returned (spec §4.4).
+    ///
+    /// # Errors
+    /// `KEEL-E031` if this step diverges from the journal under `fail`.
+    pub fn journal_time(&mut self, key: &str, now_ms: i64) -> Result<i64, KeelError> {
+        let bytes = encode_payload(&json!(now_ms)).unwrap_or_default();
+        let recorded = self.resolve_value_step(key, StepKind::Time, bytes)?;
+        Ok(decode_payload(&recorded)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(now_ms))
+    }
+
+    /// Journal (or replay) a virtualized random draw under the front-end-supplied
+    /// `key` (e.g. `py:random.random#-`). On replay the recorded bytes are
+    /// substituted; live, `bytes` are recorded and returned.
+    ///
+    /// # Errors
+    /// `KEEL-E031` if this step diverges from the journal under `fail`.
+    pub fn journal_random(&mut self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>, KeelError> {
+        self.resolve_value_step(key, StepKind::Random, bytes)
+    }
+
+    /// The shared replay/live machinery for a pure value step (time/random):
+    /// no side effect, so its recorded payload bytes are the whole outcome.
+    fn resolve_value_step(
+        &mut self,
+        key_str: &str,
+        kind: StepKind,
+        live_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, KeelError> {
+        self.seq += 1;
+        let seq = self.seq;
+        let key = StepKey::new(key_str);
+        let plan = self.plan_step(seq, &key);
+        // Pure replay: substitute the recorded value; never re-draw/re-read.
+        if self.replay_only {
+            return match plan {
+                StepPlan::Replay(outcome) => Ok(outcome.payload.unwrap_or_default()),
+                _ => Err(replay_miss_error(&self.flow_id, seq, &key)),
+            };
+        }
+        match plan {
+            StepPlan::Replay(outcome) => Ok(outcome.payload.unwrap_or_default()),
+            StepPlan::Live => {
+                self.record_value(seq, &key, kind, &live_bytes);
+                Ok(live_bytes)
+            }
+            StepPlan::Diverged { recorded } => {
+                let (mode, preserve) = match self.effective_response() {
+                    NondeterminismResponse::Fail => {
+                        return Err(diverged_error(&self.flow_id, seq, &recorded, &key));
+                    }
+                    NondeterminismResponse::Warn => ("warn", false),
+                    NondeterminismResponse::Branch => ("branch", true),
+                };
+                let div = Divergence {
+                    seq,
+                    recorded: &recorded,
+                    observed: &key,
+                    mode,
+                    preserve,
+                };
+                self.journal_branch_marker(&div);
+                let live_seq = self.seq;
+                self.record_value(live_seq, &key, kind, &live_bytes);
+                Ok(live_bytes)
+            }
+        }
+    }
+
+    /// Record a pure value step (time/random): instantaneous, terminal `ok`.
+    fn record_value(&self, seq: u64, key: &StepKey, kind: StepKind, bytes: &[u8]) {
+        let now = self.now();
+        self.record(
+            seq,
+            key,
+            &StepOutcome {
+                kind,
+                attempt: 0,
+                status: StepStatus::Ok,
+                payload: Some(bytes.to_vec()),
+                error_class: None,
+                started_at: now,
+                ended_at: Some(now),
+            },
+        );
+    }
+
+    /// Journal a `running` step, run the effect through the engine, and record
+    /// the terminal outcome *before* returning it (at-least-once honesty).
+    async fn run_live<F>(
+        &mut self,
+        seq: u64,
+        key: &StepKey,
+        kind: StepKind,
+        request: &Request,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
+        // Lease fence: before firing a live effect, confirm we still hold the
+        // lease. If it lapsed (heartbeat starved, clock jump) another process
+        // may have stolen it and be resuming this flow concurrently — running
+        // the effect now would double-fire it (charges, emails, LLM spend) and
+        // interleave step records. Fail the step loudly (KEEL-E030) instead of
+        // silently double-executing. A journal read error is resilience-first
+        // (proceed): only a definitive loss fences.
+        if self.lease_lost() {
+            warn!(flow = %self.flow_id, seq, "lease lost before live step; refusing to double-execute (KEEL-E030)");
+            return lease_lost_outcome(&self.flow_id, seq);
+        }
+        let started_at = self.now();
+        self.record(
+            seq,
+            key,
+            &StepOutcome {
+                kind,
+                attempt: 0,
+                status: StepStatus::Running,
+                payload: None,
+                error_class: None,
+                started_at,
+                ended_at: None,
+            },
+        );
+
+        let outcome = self.engine.execute(request, effect).await;
+
+        let ended_at = self.now();
+        let (status, payload, error_class) = if outcome.result == "ok" {
+            (
+                StepStatus::Ok,
+                outcome.payload.as_ref().and_then(encode_payload),
+                None,
+            )
+        } else {
+            (
+                StepStatus::Error,
+                None,
+                outcome.error.as_ref().map(|e| e.class),
+            )
+        };
+        self.record(
+            seq,
+            key,
+            &StepOutcome {
+                kind,
+                attempt: outcome.attempts,
+                status,
+                payload,
+                error_class,
+                started_at,
+                ended_at: Some(ended_at),
+            },
+        );
+        outcome
+    }
+
+    /// Record a step, degrading a journal failure to a `warn!`. A lost record
+    /// costs replay dedup, never correctness: the `running` marker (or its
+    /// absence) makes resume re-execute the step, so the effect runs
+    /// at-least-once regardless.
+    fn record(&self, seq: u64, key: &StepKey, outcome: &StepOutcome) {
+        if let Err(e) = self.journal.record_step(&self.flow_id, seq, key, outcome) {
+            warn!(flow = %self.flow_id, seq, error = %e, "record_step failed; step not journaled");
+        }
+    }
+
+    /// Move the flow to a terminal status on scope exit. Idempotent-ish: a
+    /// second call re-stamps the status — except a `completed` flow is immutable
+    /// at the journal (`complete_flow` refuses to demote it), so re-running a
+    /// finished flow can never flip it to `failed`/`dead`.
+    pub fn complete(&mut self, status: FlowStatus) {
+        if let Err(e) = self.journal.complete_flow(&self.flow_id, status) {
+            warn!(flow = %self.flow_id, error = %e, "complete_flow failed");
+        }
+        self.completed = true;
+    }
+
+    /// Mark the flow `completed` (the success scope exit).
+    pub fn complete_success(&mut self) {
+        self.complete(FlowStatus::Completed);
+    }
+
+    /// Mark the flow `failed` (a non-retryable failure exit).
+    pub fn complete_failed(&mut self) {
+        self.complete(FlowStatus::Failed);
+    }
+}
+
+impl Drop for FlowHandle {
+    fn drop(&mut self) {
+        // Stop and join the lease-renewal thread (HeartbeatHandle::drop).
+        self.heartbeat = None;
+        if !self.completed {
+            // A handle dropped without complete() models a crash: the flow stays
+            // `running` with its lease and is resumed after the lease expires.
+            debug!(flow = %self.flow_id, "flow handle dropped uncompleted; left running for recovery");
+        }
+    }
+}
+
+/// A running lease-renewal thread. Dropping this signals the thread to stop (by
+/// disconnecting the channel) and joins it.
+struct HeartbeatHandle {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for HeartbeatHandle {
+    fn drop(&mut self) {
+        // Dropping the sender disconnects the channel, waking the thread's
+        // `recv_timeout` immediately so it exits without waiting out the period.
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Spawn the lease-renewal heartbeat on a dedicated **OS thread** (not a tokio
+/// task). Under the synchronous front-end bindings the ambient runtime is a
+/// current-thread runtime that only makes progress while a `block_on` is in
+/// flight, so a tokio-task heartbeat starves exactly when it is needed — during
+/// a long blocking step or pure-caller compute between steps — letting the lease
+/// lapse while the flow is still alive. A std thread renews on real wall-clock
+/// time regardless of whether any runtime is being polled. Renews every `ttl/2`
+/// against the journal's clock; a lost lease (`Ok(false)`) is logged loudly
+/// (the step-level fence is what actually prevents double execution).
+fn spawn_heartbeat(
+    journal: Arc<dyn Journal>,
+    flow: FlowId,
+    holder: ProcessId,
+    ttl: Duration,
+) -> Option<HeartbeatHandle> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
+    let period = (ttl / 2).max(Duration::from_millis(1));
+    let (stop, rx) = channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name(String::from("keel-lease-heartbeat"))
+        .spawn(move || {
+            // Loop until the sender is dropped/sent (handle closing) —
+            // `recv_timeout` then yields `Ok`/`Disconnected` and the `while let`
+            // ends; a `Timeout` is a renewal tick.
+            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(period) {
+                match journal.acquire_lease(&flow, &holder, ttl) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(flow = %flow, "lease heartbeat: lease lost to another holder");
+                    }
+                    Err(e) => {
+                        warn!(flow = %flow, error = %e, "lease heartbeat renewal failed");
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(HeartbeatHandle {
+        stop: Some(stop),
+        thread: Some(thread),
+    })
+}
+
+/// A configuration/internal `KEEL-E040`.
+fn internal(message: String) -> KeelError {
+    KeelError {
+        code: ErrorCode::Internal,
+        message,
+    }
+}
+
+/// Self-describing schema tag stamped into every step payload blob, honoring
+/// journal.sql's "MessagePack, schema-tagged" contract (`steps.payload`) and
+/// mirroring the persistent cache's `keel.cache/v1` convention so one journal.db
+/// uses one payload-tagging discipline.
+const STEP_PAYLOAD_SCHEMA: &str = "keel.step/v1";
+
+/// The schema-tagged step-payload envelope, written by reference (no clone).
+#[derive(serde::Serialize)]
+struct StepPayloadRef<'a> {
+    schema: &'a str,
+    payload: &'a Value,
+}
+
+/// The owned form read back before its tag is verified.
+#[derive(serde::Deserialize)]
+struct StepPayloadOwned {
+    schema: String,
+    payload: Value,
+}
+
+/// MessagePack-encode a step payload with its schema tag (journal.sql:
+/// `steps.payload` is "MessagePack, schema-tagged").
+fn encode_payload(value: &Value) -> Option<Vec<u8>> {
+    rmp_serde::to_vec_named(&StepPayloadRef {
+        schema: STEP_PAYLOAD_SCHEMA,
+        payload: value,
+    })
+    .ok()
+}
+
+/// Decode a step payload. Prefers the schema-tagged envelope; falls back to a
+/// bare value so journals written before the tag existed — including the golden
+/// fixtures in `conformance/fixtures/journal/` — still replay (the tag is
+/// introduced without a breaking on-disk migration, which is exactly what
+/// "versioned, self-describing" buys).
+fn decode_payload(bytes: &[u8]) -> Option<Value> {
+    if let Ok(envelope) = rmp_serde::from_slice::<StepPayloadOwned>(bytes)
+        && envelope.schema == STEP_PAYLOAD_SCHEMA
+    {
+        return Some(envelope.payload);
+    }
+    rmp_serde::from_slice(bytes).ok()
+}
+
+/// A synthetic trace id for a step outcome the manager mints (replay /
+/// divergence), distinct from the engine's `t-NNNNNN` live ids.
+fn step_trace(flow: &FlowId, seq: u64) -> String {
+    format!("flow-{flow}-s{seq}")
+}
+
+/// Reconstruct an [`Outcome`] from a recorded step — the replay substitution.
+fn replay_outcome(flow: &FlowId, seq: u64, step: &StepOutcome) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.attempts = step.attempt;
+    match step.status {
+        StepStatus::Ok | StepStatus::Running => {
+            outcome.result = String::from("ok");
+            outcome.payload = step.payload.as_deref().and_then(decode_payload);
+        }
+        StepStatus::Error => {
+            outcome.error = Some(OutcomeError {
+                code: ErrorCode::NonRetryableError,
+                class: step.error_class.unwrap_or(ErrorClass::Other),
+                http_status: None,
+                message: String::from("replayed failed step"),
+                original: None,
+            });
+        }
+    }
+    outcome
+}
+
+/// The precise expected-vs-actual diagnostic for a `(seq, step_key)` divergence
+/// (spec §4.4), shared by the outcome and error surfaces.
+fn divergence_message(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> String {
+    format!("flow {flow} diverged at step {seq}: expected {recorded}, got {observed} (KEEL-E031)")
+}
+
+/// The KEEL-E031 outcome for a divergence on an effect step (`execute_step`).
+fn diverged_outcome(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.error = Some(OutcomeError {
+        code: ErrorCode::FlowNondeterminism,
+        class: ErrorClass::Other,
+        http_status: None,
+        message: divergence_message(flow, seq, recorded, observed),
+        original: None,
+    });
+    outcome
+}
+
+/// The KEEL-E030 outcome for a live step whose lease was lost to another holder
+/// — the step is refused rather than double-executed.
+fn lease_lost_outcome(flow: &FlowId, seq: u64) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.error = Some(OutcomeError {
+        code: ErrorCode::FlowLeaseHeld,
+        class: ErrorClass::Other,
+        http_status: None,
+        message: format!(
+            "flow {flow} lost its lease before step {seq}; another holder may be resuming it \
+             (KEEL-E030). Refusing to run the effect to avoid double execution."
+        ),
+        original: None,
+    });
+    outcome
+}
+
+/// The KEEL-E031 error for a divergence on a value step (`journal_time` /
+/// `journal_random`), which return `Result` rather than an `Outcome`.
+fn diverged_error(flow: &FlowId, seq: u64, recorded: &StepKey, observed: &StepKey) -> KeelError {
+    KeelError {
+        code: ErrorCode::FlowNondeterminism,
+        message: divergence_message(flow, seq, recorded, observed),
+    }
+}
+
+/// A completed-flow replay reached step `seq` (`observed`) with no matching
+/// recorded outcome — the code grew or reordered a step since the flow finished.
+/// Refused as nondeterminism (KEEL-E031) so no effect fires on a replay handle.
+fn replay_miss_message(flow: &FlowId, seq: u64, observed: &StepKey) -> String {
+    format!(
+        "flow {flow} replay reached unrecorded step {seq} ({observed}); \
+         the completed flow's code changed (KEEL-E031)"
+    )
+}
+
+/// The KEEL-E031 outcome for a replay-only miss on an effect step.
+fn replay_miss_outcome(flow: &FlowId, seq: u64, observed: &StepKey) -> Outcome {
+    let mut outcome = base_outcome(step_trace(flow, seq));
+    outcome.error = Some(OutcomeError {
+        code: ErrorCode::FlowNondeterminism,
+        class: ErrorClass::Other,
+        http_status: None,
+        message: replay_miss_message(flow, seq, observed),
+        original: None,
+    });
+    outcome
+}
+
+/// The KEEL-E031 error for a replay-only miss on a value step.
+fn replay_miss_error(flow: &FlowId, seq: u64, observed: &StepKey) -> KeelError {
+    KeelError {
+        code: ErrorCode::FlowNondeterminism,
+        message: replay_miss_message(flow, seq, observed),
+    }
+}
+
+/// A fresh error/replay [`Outcome`] shell with the shared envelope defaults.
+fn base_outcome(trace_id: String) -> Outcome {
+    Outcome {
+        v: ENVELOPE_VERSION,
+        result: String::from("error"),
+        payload: None,
+        error: None,
+        attempts: 0,
+        from_cache: false,
+        waits_ms: Vec::new(),
+        throttled: false,
+        throttle_wait_ms: 0,
+        breaker: keel_core_api::BreakerState::Closed,
+        trace_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_payload, encode_payload};
+    use serde_json::json;
+
+    #[test]
+    fn payload_round_trips_through_the_schema_tag() {
+        let value = json!({ "rows": 120, "nested": [1, 2, 3], "ok": true });
+        let bytes = encode_payload(&value).expect("encodes");
+        assert_eq!(decode_payload(&bytes), Some(value));
+    }
+
+    #[test]
+    fn legacy_bare_messagepack_still_decodes() {
+        // Journals written before the tag (and the golden fixtures) stored the
+        // bare value; the decoder must still read them (no breaking migration).
+        let map = json!({ "rows": 120 });
+        let bare_map = rmp_serde::to_vec_named(&map).expect("bare encodes");
+        assert_eq!(decode_payload(&bare_map), Some(map));
+
+        // The fixtures' bare uint32 virtualized-time value (0xCE6A518600).
+        let num = json!(1_783_727_616u64);
+        let bare_num = rmp_serde::to_vec_named(&num).expect("bare encodes");
+        assert_eq!(bare_num, vec![0xCE, 0x6A, 0x51, 0x86, 0x00]);
+        assert_eq!(decode_payload(&bare_num), Some(num));
+    }
+}

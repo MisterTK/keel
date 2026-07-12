@@ -1,0 +1,8 @@
+{
+  "paths": {
+    "/flaky": [
+      { "status": 503 },
+      { "status": 200, "body": "late" }
+    ]
+  }
+}
