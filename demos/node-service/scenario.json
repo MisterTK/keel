@@ -1,0 +1,8 @@
+{
+  "paths": {
+    "/svc": [
+      { "status": 500 },
+      { "status": 200, "body": "late" }
+    ]
+  }
+}

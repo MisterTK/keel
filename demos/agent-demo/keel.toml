@@ -1,0 +1,5 @@
+# The fake LLM endpoint runs on loopback; wrap that host with LLM-shaped policy:
+# ride out the 429 storm, and dev-cache identical prompts (inert under KEEL_ENV=prod).
+[target."127.0.0.1"]
+retry = { attempts = 6 }
+cache = { mode = "dev" }
