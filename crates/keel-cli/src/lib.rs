@@ -2,7 +2,8 @@
 //!
 //! Subcommands: [`run`] (dispatch a script into a language front end),
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
-//! report), [`status`] (the "what is Keel doing for me" screen),
+//! report; `--effective-policy` prints the composed `defaults < packs < user`
+//! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
 //! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
 //! [`flows`] (list durable flows) and [`flows::trace`] (`keel trace`).
 //!
@@ -12,6 +13,7 @@
 //! testable core; [`main`](../keel/index.html) is a thin clap front.
 
 pub mod doctor;
+pub mod effective;
 pub mod explain;
 pub mod flows;
 pub mod init;

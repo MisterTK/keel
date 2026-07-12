@@ -6,10 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-publish = false
+readme.workspace = true
+# Publishable (self-contained: the frozen journal.sql is vendored into
+# contract/, drift-checked by build.rs). Publishing is a release-workflow step.
 
 [dependencies]
-keel-core-api = { path = "../keel-core-api" }
+keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
 

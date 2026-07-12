@@ -9,11 +9,12 @@
 //! frozen `contracts/journal.sql` + the golden fixture inserts, the discovery
 //! store through `keel-journal`'s own API.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use keel_cli::render::json_string;
-use keel_cli::{doctor, explain, init, scan, status};
+use keel_cli::{doctor, effective, explain, init, scan, status};
 use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
@@ -58,6 +59,35 @@ fn python3_present() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+fn node_present() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Run `cmd`, feed `stdin_data`, and return stdout. Panics on failure — the
+/// caller has already checked the interpreter is present.
+fn run_with_stdin(mut cmd: Command, stdin_data: &str) -> String {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn subprocess");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(stdin_data.as_bytes())
+        .expect("write child stdin");
+    let out = child.wait_with_output().expect("wait for subprocess");
+    assert!(
+        out.status.success(),
+        "subprocess failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("subprocess stdout is UTF-8")
 }
 
 /// Build a `.keel/journal.db` at `project` with the three golden flows.
@@ -234,6 +264,153 @@ fn explain_e005_json_matches_golden() {
     let r = explain::run("KEEL-E005");
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("explain_e005.json", &json_string(&r.json));
+}
+
+// ---- doctor --effective-policy: golden + cross-language merge parity ----
+
+/// The shared user policy the merge parity legs all consume: a wholesale llm
+/// retry override, an outbound timeout override, and a pass-through target.
+/// Matches `EFFECTIVE_KEEL_TOML` parsed to JSON.
+const MERGE_FIXTURE: &str = r#"{
+  "defaults": {
+    "llm": { "retry": { "attempts": 2 } },
+    "outbound": { "timeout": "10s" }
+  },
+  "target": {
+    "api.example.com": { "retry": { "attempts": 5 } }
+  }
+}"#;
+
+/// The same policy as the keel.toml the CLI-level golden test reads.
+const EFFECTIVE_KEEL_TOML: &str = concat!(
+    "[defaults.outbound]\n",
+    "timeout = \"10s\"\n",
+    "\n",
+    "[defaults.llm]\n",
+    "retry = { attempts = 2 }\n",
+    "\n",
+    "[target.\"api.example.com\"]\n",
+    "retry = { attempts = 5 }\n",
+);
+
+/// The Rust merge of the shared fixture, as the canonical sorted-pretty JSON
+/// bytes every implementation must reproduce.
+fn rust_merge_json() -> String {
+    let user: serde_json::Value = serde_json::from_str(MERGE_FIXTURE).unwrap();
+    let merged = effective::effective_policy(&user, &[effective::llm_pack_fragment()]);
+    json_string(&merged)
+}
+
+/// A fixture project whose JS scan detects the `openai` pack (pure Rust, no
+/// python3) plus the shared keel.toml.
+fn effective_fixture_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("node_openai").join("app.mjs"),
+        dir.path().join("app.mjs"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("keel.toml"), EFFECTIVE_KEEL_TOML).unwrap();
+    dir
+}
+
+#[test]
+fn doctor_effective_json_matches_golden() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("doctor_effective.json", &json_string(&r.json));
+}
+
+#[test]
+fn doctor_effective_human_matches_golden() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    check_golden("doctor_effective.txt", &r.human);
+}
+
+#[test]
+fn doctor_effective_level0_json_matches_golden() {
+    // No keel.toml, no packs: the pure Level 0 composition.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("node_fetch").join("app.mjs"),
+        dir.path().join("app.mjs"),
+    )
+    .unwrap();
+    let r = effective::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert_eq!(r.json["user_policy_present"], serde_json::json!(false));
+    check_golden("doctor_effective_level0.json", &json_string(&r.json));
+}
+
+/// The report's `policy` object IS the merge — byte-identical to the shared
+/// merge golden the other two languages also reproduce.
+#[test]
+fn doctor_effective_policy_field_is_the_shared_merge() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    assert_eq!(json_string(&r.json["policy"]), rust_merge_json());
+}
+
+#[test]
+fn effective_merge_rust_matches_golden() {
+    check_golden("effective_policy_merge.json", &rust_merge_json());
+}
+
+/// Python's `apply_pack_defaults` over the same fixture (with the provider
+/// fragment its bootstrap would fold) must produce the same bytes.
+#[test]
+fn effective_merge_parity_python() {
+    const SCRIPT: &str = r#"
+import importlib.util, json, sys
+
+spec = importlib.util.spec_from_file_location("keel_defaults", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+user = json.loads(sys.stdin.read())
+merged = mod.apply_pack_defaults(user, [{"defaults": {"llm": mod.llm_defaults()}}])
+print(json.dumps(merged, sort_keys=True, indent=2))
+"#;
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let defaults_py = manifest_dir().join("../../python/keel/src/keel/_defaults.py");
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(SCRIPT).arg(defaults_py);
+    let out = run_with_stdin(cmd, MERGE_FIXTURE);
+    assert_eq!(out, rust_merge_json(), "Python merge diverges from Rust");
+}
+
+/// Node's `applyPackDefaults` over the same fixture must produce the same
+/// bytes (it takes no fragments; the pack fold is identity by contract).
+#[test]
+fn effective_merge_parity_node() {
+    const SCRIPT: &str = r#"
+const { pathToFileURL } = require("node:url");
+const sort = (v) =>
+  Array.isArray(v)
+    ? v.map(sort)
+    : v && typeof v === "object"
+      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])]))
+      : v;
+let s = "";
+process.stdin.on("data", (d) => (s += d));
+process.stdin.on("end", async () => {
+  const { applyPackDefaults } = await import(pathToFileURL(process.argv[1]).href);
+  console.log(JSON.stringify(sort(applyPackDefaults(JSON.parse(s))), null, 2));
+});
+"#;
+    if !node_present() {
+        eprintln!("skip: node not available");
+        return;
+    }
+    let defaults_mjs = manifest_dir().join("../../node/keel/src/defaults.mjs");
+    let mut cmd = Command::new("node");
+    cmd.arg("-e").arg(SCRIPT).arg(defaults_mjs);
+    let out = run_with_stdin(cmd, MERGE_FIXTURE);
+    assert_eq!(out, rust_merge_json(), "Node merge diverges from Rust");
 }
 
 // ---- --json parity: every human-visible fact has a JSON counterpart ----

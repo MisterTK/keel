@@ -32,7 +32,7 @@ use crate::types::{
 
 /// The frozen schema, embedded so the compiled backend and the contract can
 /// never drift.
-const SCHEMA: &str = include_str!("../../../contracts/journal.sql");
+const SCHEMA: &str = include_str!("../contract/journal.sql");
 
 /// Per-connection pragmas set on every open. WAL is also persisted in the file
 /// by the schema, but re-asserting it makes opening a foreign-created DB safe.
