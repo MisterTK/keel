@@ -42,10 +42,14 @@
 //! A malformed effect result degrades to `Error { class: other }` exactly as the
 //! FFI facade does — the callback can never crash the core.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use keel_core_api::{AttemptResult, ErrorClass, KeelError, Outcome, Request};
+use keel_core_api::{
+    AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
+    OutcomeError, Request,
+};
 use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
 use keel_journal::{FlowStatus, Journal, ProcessId, SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
@@ -88,6 +92,97 @@ fn synth_other(message: String) -> AttemptResult {
         message,
         original: None,
     }
+}
+
+thread_local! {
+    /// `true` while a synchronous effect is executing on this OS thread.
+    ///
+    /// The sync `execute` path holds this handle's `runtime` (and, in a flow, its
+    /// `active_flow`) mutex across a `block_on`, and the effect runs Python on the
+    /// *same* thread. Anything the effect body does that re-enters this core —
+    /// a nested intercepted call (a wrapped `py:` function whose body calls
+    /// `requests.get`), or a patched `time.time`/`random.random` read that routes
+    /// to `journal_time`/`journal_random` (e.g. `http.cookiejar` inside every
+    /// `requests` response) — would otherwise re-lock a held mutex (deadlock) or
+    /// start a second `block_on` on the current-thread runtime (panic). While
+    /// this flag is set, those re-entrant paths *pass through* (run directly)
+    /// instead of routing back through the engine/journal.
+    static IN_EFFECT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the current thread as "inside an effect" for the guard's lifetime,
+/// restoring the previous value on drop (so nested effects nest correctly and a
+/// panic in the effect cannot leave the flag stuck on).
+struct InEffectGuard(bool);
+
+impl InEffectGuard {
+    fn enter() -> Self {
+        Self(IN_EFFECT.replace(true))
+    }
+}
+
+impl Drop for InEffectGuard {
+    fn drop(&mut self) {
+        IN_EFFECT.set(self.0);
+    }
+}
+
+/// Whether an effect is currently running on this thread (a re-entrant call).
+fn in_effect() -> bool {
+    IN_EFFECT.with(Cell::get)
+}
+
+/// Lock a per-handle mutex, recovering the guard even if a previous holder
+/// panicked while holding it. The guarded state (the tokio runtime, or the
+/// active flow handle) remains valid after an unrelated panic, so one panic must
+/// not permanently brick the handle with an opaque `PanicException` on every
+/// later call (poisoned-mutex lock-out).
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Build a terminal [`Outcome`] from a single effect attempt, applying no layer
+/// chain. This is the *passthrough* a re-entrant (nested) intercepted call
+/// returns: the outer call keeps full Tier 1 resilience, the inner one degrades
+/// to a direct invocation rather than deadlocking. Pure — unit tested.
+fn outcome_from_single_attempt(result: AttemptResult) -> Outcome {
+    let mut outcome = Outcome {
+        v: ENVELOPE_VERSION,
+        result: String::from("error"),
+        payload: None,
+        error: None,
+        attempts: 1,
+        from_cache: false,
+        waits_ms: Vec::new(),
+        throttled: false,
+        throttle_wait_ms: 0,
+        breaker: BreakerState::Closed,
+        trace_id: String::from("t-nested"),
+    };
+    match result {
+        AttemptResult::Ok { payload } => {
+            outcome.result = String::from("ok");
+            outcome.payload = Some(payload);
+        }
+        AttemptResult::Error {
+            class,
+            http_status,
+            message,
+            original,
+            ..
+        } => {
+            outcome.error = Some(OutcomeError {
+                code: ErrorCode::NonRetryableError,
+                class,
+                http_status,
+                message,
+                original,
+            });
+        }
+    }
+    outcome
 }
 
 /// Type a request `Value` as a [`Request`], defaulting a missing `idempotent`
@@ -204,6 +299,10 @@ fn status_str(status: FlowStatus) -> &'static str {
 struct KeelCore {
     engine: Arc<Engine>,
     runtime: Mutex<Runtime>,
+    /// True when the runtime runs on tokio's paused virtual clock (harness only).
+    /// `advance_clock` is valid only on such a handle — advancing a real-time
+    /// runtime panics tokio, so we refuse it precisely instead.
+    paused: bool,
     /// True when a journal is attached (the persistent dev-cache scope is live).
     persistent: bool,
     /// The shared journal for Tier 2 flows, if one is attached (`None` for an
@@ -250,6 +349,7 @@ impl KeelCore {
         Ok(Self {
             engine: Arc::new(engine),
             runtime: Mutex::new(runtime),
+            paused,
             persistent,
             journal,
             active_flow: Mutex::new(None),
@@ -284,6 +384,18 @@ impl KeelCore {
         effect: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let request = decode_request(py, request)?;
+        // Re-entrant call: this `execute` is running inside another call's effect
+        // on the same thread (a wrapped `py:` function whose body makes an
+        // intercepted call). A nested `block_on` on the current-thread runtime
+        // panics and the `runtime` mutex is already held by the outer call, so we
+        // pass through — run the effect once with no layer chain. The OUTER call
+        // keeps full resilience; the inner one degrades to a direct invocation
+        // rather than deadlocking (a v0.1 native-core limitation; the pure-Python
+        // stub composes nesting fully).
+        if in_effect() {
+            let attempt = invoke_sync_effect(py, &effect, 1);
+            return outcome_to_py(py, &outcome_from_single_attempt(attempt));
+        }
         let engine = Arc::clone(&self.engine);
         let runtime = &self.runtime;
         let active = &self.active_flow;
@@ -291,12 +403,18 @@ impl KeelCore {
         // per attempt inside the effect. Holding the runtime mutex across the
         // synchronous `block_on` serializes calls on this handle. While a flow is
         // open, route the call through its `execute_step` so it is journaled and
-        // replayable; otherwise run the bare engine (identical to before).
+        // replayable; otherwise run the bare engine (identical to before). The
+        // effect runs under an `InEffectGuard` so any re-entrant intercepted call
+        // or time/random read it triggers passes through instead of deadlocking.
         let outcome = py.detach(move || {
-            let guard = runtime.lock().expect("keel-py runtime mutex poisoned");
-            let mut flow = active.lock().expect("keel-py active-flow mutex poisoned");
-            let effect_fn =
-                async |attempt: u32| Python::attach(|py| invoke_sync_effect(py, &effect, attempt));
+            let guard = lock_recover(runtime);
+            let mut flow = lock_recover(active);
+            let effect_fn = async |attempt: u32| {
+                Python::attach(|py| {
+                    let _in_effect = InEffectGuard::enter();
+                    invoke_sync_effect(py, &effect, attempt)
+                })
+            };
             match flow.as_mut() {
                 Some(handle) => guard.block_on(handle.execute_step(&request, effect_fn)),
                 None => guard.block_on(engine.execute(&request, effect_fn)),
@@ -325,12 +443,7 @@ impl KeelCore {
         // synchronous-only; the async-in-flow seam is deliberately unsupported
         // (see `keel_engine::flow` module docs). Checked (and dropped) before the
         // awaitable is built, so the error is raised synchronously at call time.
-        if self
-            .active_flow
-            .lock()
-            .expect("keel-py active-flow mutex poisoned")
-            .is_some()
-        {
+        if lock_recover(&self.active_flow).is_some() {
             return Err(keel_error(
                 py,
                 "KEEL-E001",
@@ -362,7 +475,7 @@ impl KeelCore {
     /// the runtime so `clock_ms` reflects this handle's (possibly paused) clock.
     fn report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = {
-            let guard = self.runtime.lock().expect("keel-py runtime mutex poisoned");
+            let guard = lock_recover(&self.runtime);
             guard.block_on(async { self.engine.report() })
         };
         pythonize(py, &value)
@@ -371,12 +484,24 @@ impl KeelCore {
     }
 
     /// Harness-only: advance the paused virtual clock by `ms` milliseconds.
-    /// Requires a `paused=True` handle (tokio panics otherwise).
-    fn advance_clock(&self, ms: u64) {
-        let guard = self.runtime.lock().expect("keel-py runtime mutex poisoned");
+    /// Requires a `paused=True` handle. On a real-time handle we refuse with a
+    /// precise `KEEL-E040` instead of letting `tokio::time::advance` panic —
+    /// a panic inside `block_on` here would otherwise poison the runtime mutex
+    /// and brick every subsequent call on this handle.
+    fn advance_clock(&self, py: Python<'_>, ms: u64) -> PyResult<()> {
+        if !self.paused {
+            return Err(keel_error(
+                py,
+                "KEEL-E040",
+                "advance_clock requires a paused=True handle (harness only); this handle runs on \
+                 the real clock",
+            ));
+        }
+        let guard = lock_recover(&self.runtime);
         guard.block_on(async move {
             tokio::time::advance(Duration::from_millis(ms)).await;
         });
+        Ok(())
     }
 
     /// Open (begin or resume) a Tier 2 durable flow with this identity and make
@@ -428,7 +553,7 @@ impl KeelCore {
         // Enter inside the runtime so the lease heartbeat can spawn (it no-ops
         // outside a runtime); the enter itself is synchronous journal work.
         let handle = {
-            let guard = self.runtime.lock().expect("keel-py runtime mutex poisoned");
+            let guard = lock_recover(&self.runtime);
             guard.block_on(async { manager.enter_flow(&desc) })
         }
         .map_err(|e| keel_error_from(py, &e))?;
@@ -438,10 +563,7 @@ impl KeelCore {
             "status": status_str(handle.entry_status()),
             "replay": handle.is_replay_only(),
         });
-        *self
-            .active_flow
-            .lock()
-            .expect("keel-py active-flow mutex poisoned") = Some(handle);
+        *lock_recover(&self.active_flow) = Some(handle);
         pythonize(py, &info)
             .map(Bound::unbind)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("flow info not encodable: {e}")))
@@ -462,11 +584,7 @@ impl KeelCore {
                 ));
             }
         };
-        let handle = self
-            .active_flow
-            .lock()
-            .expect("keel-py active-flow mutex poisoned")
-            .take();
+        let handle = lock_recover(&self.active_flow).take();
         if let Some(mut handle) = handle {
             handle.complete(final_status);
             // `handle` drops here, aborting the heartbeat task.
@@ -476,11 +594,19 @@ impl KeelCore {
 
     /// Journal (or, on replay, substitute) a virtualized clock read under `key`
     /// (the front-end convention, e.g. `py:time.time#-`). Must be inside a flow.
+    ///
+    /// A read that happens *inside* an effect (a `time.time()` call from within
+    /// intercepted library code such as `http.cookiejar`, or from a wrapped
+    /// function body) is NOT journaled: it passes through to the live value.
+    /// Journaling it would both deadlock (the flow mutex is already held for the
+    /// running step) and be wrong for replay — on replay the effect is
+    /// substituted, not re-run, so its incidental time reads never happen.
+    /// Only the flow's own top-level reads (between steps) become value steps.
     fn journal_time(&self, py: Python<'_>, key: &str, now_ms: i64) -> PyResult<i64> {
-        let mut guard = self
-            .active_flow
-            .lock()
-            .expect("keel-py active-flow mutex poisoned");
+        if in_effect() {
+            return Ok(now_ms);
+        }
+        let mut guard = lock_recover(&self.active_flow);
         let handle = guard
             .as_mut()
             .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_time called outside a flow"))?;
@@ -490,17 +616,18 @@ impl KeelCore {
     }
 
     /// Journal (or substitute) a virtualized random draw under `key` (e.g.
-    /// `py:random.random#-`). Must be inside a flow.
+    /// `py:random.random#-`). Must be inside a flow. As with [`journal_time`], a
+    /// draw made inside a running effect passes through unjournaled.
     fn journal_random<'py>(
         &self,
         py: Python<'py>,
         key: &str,
         data: Vec<u8>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut guard = self
-            .active_flow
-            .lock()
-            .expect("keel-py active-flow mutex poisoned");
+        if in_effect() {
+            return Ok(PyBytes::new(py, &data));
+        }
+        let mut guard = lock_recover(&self.active_flow);
         let handle = guard
             .as_mut()
             .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_random called outside a flow"))?;
@@ -521,8 +648,54 @@ fn keel_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::request_from_value;
+    use super::{
+        AttemptResult, ErrorClass, ErrorCode, InEffectGuard, in_effect,
+        outcome_from_single_attempt, request_from_value,
+    };
     use serde_json::json;
+
+    #[test]
+    fn passthrough_maps_ok_attempt() {
+        let out = outcome_from_single_attempt(AttemptResult::Ok {
+            payload: json!({ "n": 1 }),
+        });
+        assert_eq!(out.result, "ok");
+        assert_eq!(out.payload, Some(json!({ "n": 1 })));
+        assert_eq!(out.attempts, 1);
+        assert!(out.error.is_none());
+    }
+
+    #[test]
+    fn passthrough_maps_error_attempt_as_terminal() {
+        let out = outcome_from_single_attempt(AttemptResult::Error {
+            class: ErrorClass::Http,
+            http_status: Some(500),
+            retry_after_ms: None,
+            message: "boom".to_owned(),
+            original: None,
+        });
+        assert_eq!(out.result, "error");
+        let err = out.error.expect("error present");
+        assert_eq!(err.code, ErrorCode::NonRetryableError);
+        assert_eq!(err.class, ErrorClass::Http);
+        assert_eq!(err.http_status, Some(500));
+        assert_eq!(out.attempts, 1);
+    }
+
+    #[test]
+    fn in_effect_guard_sets_and_restores_and_nests() {
+        assert!(!in_effect(), "clean thread starts outside an effect");
+        {
+            let _outer = InEffectGuard::enter();
+            assert!(in_effect());
+            {
+                let _inner = InEffectGuard::enter();
+                assert!(in_effect(), "nested effect stays flagged");
+            }
+            assert!(in_effect(), "inner drop restores to still-in-effect");
+        }
+        assert!(!in_effect(), "outer drop clears the flag");
+    }
 
     #[test]
     fn request_defaults_idempotent_false() {

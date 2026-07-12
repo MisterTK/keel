@@ -149,6 +149,16 @@ mod bindings {
         throw_keel(env, err.code.as_str(), &err.message)
     }
 
+    /// Lock a per-handle mutex, recovering the guard even if a previous holder
+    /// panicked while holding it (the guarded runtime stays valid). One panic
+    /// must not permanently brick the handle with a poisoned-mutex lock-out on
+    /// every later call.
+    fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Decode a JS request object into a [`Request`] (KEEL-E003 on failure).
     fn decode_request(env: Env, request: Value) -> Result<Request> {
         request_from_value(request)
@@ -188,6 +198,9 @@ mod bindings {
     pub struct KeelCore {
         engine: Arc<Engine>,
         runtime: Mutex<Runtime>,
+        /// True when the runtime runs on tokio's paused virtual clock (harness
+        /// only). `advanceClock` is valid only on such a handle.
+        paused: bool,
         /// True when a journal is attached (the persistent dev-cache scope is live).
         persistent: bool,
     }
@@ -216,6 +229,7 @@ mod bindings {
             Ok(Self {
                 engine: Arc::new(engine),
                 runtime: Mutex::new(runtime),
+                paused,
                 persistent,
             })
         }
@@ -257,10 +271,7 @@ mod bindings {
             effect: Function<'_, u32, Value>,
         ) -> Result<Value> {
             let request = decode_request(env, request)?;
-            let guard = self
-                .runtime
-                .lock()
-                .expect("keel-node runtime mutex poisoned");
+            let guard = lock_recover(&self.runtime);
             // Holding the runtime mutex across the synchronous `block_on`
             // serializes calls on this handle; no `.await` is held across it.
             let outcome = guard.block_on(self.engine.execute(&request, async |attempt: u32| {
@@ -314,10 +325,7 @@ mod bindings {
         /// handle runtime so `clock_ms` reflects its (possibly paused) clock.
         #[napi]
         pub fn report(&self) -> Value {
-            let guard = self
-                .runtime
-                .lock()
-                .expect("keel-node runtime mutex poisoned");
+            let guard = lock_recover(&self.runtime);
             guard.block_on(async { self.engine.report() })
         }
 
@@ -326,14 +334,19 @@ mod bindings {
         /// (a plain JS `number`) covers every virtual-clock advance the suite
         /// needs — ~49 days of milliseconds.
         #[napi]
-        pub fn advance_clock(&self, ms: u32) {
-            let guard = self
-                .runtime
-                .lock()
-                .expect("keel-node runtime mutex poisoned");
+        pub fn advance_clock(&self, ms: u32) -> Result<()> {
+            if !self.paused {
+                // Advancing a real-time runtime panics tokio, which would poison
+                // the runtime mutex and brick the handle. Refuse precisely.
+                return Err(Error::from_reason(
+                    "KEEL-E040: advanceClock requires a { paused: true } handle (harness only)",
+                ));
+            }
+            let guard = lock_recover(&self.runtime);
             guard.block_on(async move {
                 tokio::time::advance(Duration::from_millis(u64::from(ms))).await;
             });
+            Ok(())
         }
     }
 }
