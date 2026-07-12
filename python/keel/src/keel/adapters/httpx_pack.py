@@ -184,8 +184,16 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     op = f"{method} {host}{url.path}"
     idem_header = _idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
-    hash_ = _http.args_hash(method, str(url)) if method == "GET" else None
+    hash_ = _http.args_hash(method, str(url), _buffered_body(request)) if method == "GET" else None
     return target, op, idempotent, hash_
+
+
+def _buffered_body(request: Any) -> bytes | None:
+    # Include the body in the cache key only when it is already buffered, so we
+    # never consume a single-use streaming request body (matches Node, which
+    # hashes only buffered/string bodies). httpx buffers non-streaming request
+    # content into `_content` at construction; a streaming body has none.
+    return request.content if hasattr(request, "_content") else None
 
 
 def _idempotency_header(target: str) -> str | None:

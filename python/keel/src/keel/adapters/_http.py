@@ -111,7 +111,7 @@ def parse_retry_after(value: str | None, now: datetime | None = None) -> int | N
     if value is None:
         return None
     s = value.strip()
-    if s.isdigit():
+    if s.isascii() and s.isdigit():  # ASCII digits only, matching Node's /^\d+$/
         return int(s) * 1000
     try:
         when = parsedate_to_datetime(s)

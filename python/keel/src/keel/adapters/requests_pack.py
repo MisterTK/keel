@@ -125,7 +125,9 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     op = f"{method} {host}{parts.path}"
     idem_header = _idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
-    hash_ = _http.args_hash(method, url) if method == "GET" else None
+    # A prepared GET body is bytes/str (buffered) or None; args_hash ignores a
+    # streaming (generator/file) body, so this never consumes an upload stream.
+    hash_ = _http.args_hash(method, url, request.body) if method == "GET" else None
     return target, op, idempotent, hash_
 
 

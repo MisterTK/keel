@@ -156,16 +156,22 @@ class SyncHardRulesTest(HttpxBase):
 
 
 class AsyncTest(HttpxBase):
-    def test_async_success_is_byte_transparent(self) -> None:
-        with FaultServer([ok(b"async-body")]) as srv:
-            async def go() -> httpx.Response:
+    def test_async_success_is_byte_identical_to_unwrapped(self) -> None:
+        body = b"async-\x00\xff-body"
+        headers = {"X-Custom": "v1", "Content-Type": "application/octet-stream"}
+        with FaultServer([ok(body, headers), ok(body, headers)]) as srv:
+            async def fetch() -> httpx.Response:
                 async with httpx.AsyncClient() as c:
-                    return await c.get(srv.url())
+                    return await c.get(srv.url("/p"))
 
-            r = asyncio.run(go())
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.content, b"async-body")
-        self.assertEqual(r.keel_outcome["result"], "ok")
+            httpx_pack.uninstall()  # control: real, unwrapped async httpx
+            control = asyncio.run(fetch())
+            httpx_pack.install()
+            got = asyncio.run(fetch())
+        self.assertEqual(got.status_code, control.status_code)
+        self.assertEqual(bytes(got.content), bytes(control.content))
+        self.assertEqual(_stable_headers(got), _stable_headers(control))
+        self.assertEqual(got.keel_outcome["result"], "ok")  # the real object, tagged
 
     def test_async_5xx_then_ok_is_retried(self) -> None:
         with FaultServer([fail(503), ok(b"async-ok")]) as srv:

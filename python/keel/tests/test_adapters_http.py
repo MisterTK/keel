@@ -79,6 +79,11 @@ class RetryAfterTest(unittest.TestCase):
         self.assertIsNone(_http.parse_retry_after(None))
         self.assertIsNone(_http.parse_retry_after("soon"))
 
+    def test_non_ascii_digits_are_not_seconds(self) -> None:
+        # Node's /^\d+$/ matches ASCII digits only; exotic digits must not be
+        # taken as delta-seconds (nor raise on int()).
+        self.assertIsNone(_http.parse_retry_after("１２３"))  # fullwidth digits
+
 
 class TransientStatusTest(unittest.TestCase):
     def test_429_and_5xx_are_transient(self) -> None:
