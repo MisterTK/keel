@@ -58,8 +58,10 @@ python3 conformance/fixtures/journal/build_fixtures.py
 - `contracts/` is frozen — CCR process in `contracts/README.md`.
 - Stub/core/Python/Node semantics must stay identical; change them only by
   changing `conformance/README.md` + all implementations + scenarios together.
-- Work happens on branch `claude/new-session-3p7yyq` (PR #1 → `main`);
-  never push other branches without explicit permission.
+- Work happens on the session's designated branch with a draft PR into
+  `main`; never push other branches without explicit permission. (History
+  through 2026-07-11 landed via PR #1 from `claude/new-session-3p7yyq` —
+  make sure it's merged before branching new work off `main`.)
 - Follow `docs/engineering-manifesto.md` for anything not covered here —
   typed-struct validation, `#[expect(reason)]` over `allow`, no locks across
   `await`, no real sleeps in tests, deterministic output.
