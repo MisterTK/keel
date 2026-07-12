@@ -20,3 +20,7 @@ conformance/fixtures/journal/.gen/
 
 # superpowers SDD scratch
 .superpowers/
+.semantex/
+
+# semantex local index
+.semantex/
