@@ -8,9 +8,16 @@ call inside is journaled and — on a rerun after a crash — already-completed
 steps are substituted from the journal instead of re-fired. Time and random
 reads are virtualized inside the flow scope only, and restored on exit.
 
-Tier 2 requires the native core: the pure-Python stub cannot journal/replay, so
-a flow designation against the stub is a precise, actionable error (never a
-silent Tier-1 downgrade — a Level 0 surprise is a P0).
+Tier 2 requires the native core AND an attached journal: the pure-Python stub
+cannot journal/replay, and a native core with no journal has nothing to resume
+from — either case is a precise, actionable error (never a silent Tier-1
+downgrade — a Level 0 surprise is a P0). Both gates are checked *here*, before
+`enter_flow`, so the backend's last-resort KEEL-E040 ("pass a journal_path") is
+unreachable from `keel run`; the front-end error is config-level (KEEL-E001).
+
+Durable flows are synchronous-only in v0.1: an async intercepted call inside a
+flow would bypass the journal, so the native backend refuses it (KEEL-E001).
+Keep flow bodies synchronous, or drop the entrypoint from `[flows]`.
 """
 
 from __future__ import annotations
@@ -127,6 +134,27 @@ def _unsupported_on_stub(entry: FlowEntrypoint) -> None:
     raise SystemExit(1)
 
 
+def backend_has_journal(backend: Any) -> bool:
+    """Whether `backend` has a journal attached (the native `persistent` flag).
+    Tier 2 replay lives in that journal; a native core with none cannot resume."""
+    return bool(getattr(backend, "persistent", False))
+
+
+def _unsupported_without_journal(entry: FlowEntrypoint) -> None:
+    """Emit the precise config-level error (KEEL-E001) for a native backend with
+    no journal, and exit 1. Checked *before* `enter_flow`, so the backend's
+    last-resort KEEL-E040 ("pass a journal_path") is never reached from `keel
+    run` — the front end owns this diagnosis at the correct (policy) altitude."""
+    sys.stderr.write(
+        f"keel ▸ KEEL-E001: durable flow {entry.raw!r} needs a journal, but none is attached.\n"
+        "  why:  Tier 2 journals and replays each step; with no journal there is nothing "
+        "to record to or resume from.\n"
+        "  next: let the native core open .keel/journal.db (check KEEL_JOURNAL and directory "
+        "permissions), or remove this entrypoint from [flows].\n"
+    )
+    raise SystemExit(1)
+
+
 def run_as_flow(
     target: str,
     entry: FlowEntrypoint,
@@ -142,6 +170,8 @@ def run_as_flow(
     env = env if env is not None else os.environ
     if not backend_supports_flows(backend):
         _unsupported_on_stub(entry)  # exits
+    if not backend_has_journal(backend):
+        _unsupported_without_journal(entry)  # exits
 
     func = _import_flow_function(target, entry)
     kwargs: dict[str, Any] = {"code_hash": _code_hash(target)}

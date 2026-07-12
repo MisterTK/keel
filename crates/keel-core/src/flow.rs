@@ -17,6 +17,18 @@
 //! runs and its terminal outcome recorded *before* the result is released, so a
 //! crash between those points leaves a `running` step that resume re-executes.
 //!
+//! # Synchronous-only in v0.1 (front-end binding constraint)
+//!
+//! [`FlowHandle::execute_step`] is `async` here, but the front-end *bindings*
+//! only route the **synchronous** intercepted-call path through it. The Python
+//! binding's `execute_async` runs on the bare [`Engine`], not the open handle —
+//! so an async effect inside a flow would be silently downgraded to Tier 1
+//! (never journaled, never replayed). Rather than let that happen quietly (a
+//! Level 0 surprise), the binding *refuses* an async intercepted call while a
+//! flow is open with a precise KEEL-E001 (`keel-py`'s `execute_async` guard).
+//! v0.1 durable flows are therefore synchronous-only; lifting this is future
+//! work (an async `execute_step` bridge in each binding).
+//!
 //! Replay correctness is checked, not assumed (spec §4.4): the `(seq, step_key)`
 //! encountered on replay must match the journal. A `seq` recorded under a
 //! *different* key is nondeterminism ([`ErrorCode::FlowNondeterminism`],

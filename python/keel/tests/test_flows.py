@@ -56,12 +56,15 @@ class _FakeFlowBackend:
     """A native-shaped double: records enter/exit and routes execute + value
     steps, so `run_as_flow` is testable without the compiled core."""
 
-    def __init__(self, replay: bool = False) -> None:
+    def __init__(self, replay: bool = False, persistent: bool = True) -> None:
         self.entered: list[tuple] = []
         self.exited: list[str] = []
         self.executed = 0
         self.times: list[int] = []
         self._replay = replay
+        # Models a native core with a journal attached (Tier 2 available). Set
+        # False to model a native core with no journal (the fix-#2 gate).
+        self.persistent = persistent
 
     def enter_flow(self, entrypoint, args_hash, code_hash=None, explicit_key=None, lease_ms=None):
         self.entered.append((entrypoint, args_hash, code_hash, lease_ms))
@@ -184,6 +187,18 @@ class RunAsFlowTest(unittest.TestCase):
             _flow.run_as_flow("/tmp/pipeline.py", entry, _StubLike(), [], env={"KEEL_QUIET": "1"})
         self.assertEqual(ctx.exception.code, 1)
 
+    def test_native_backend_without_journal_is_precise_error_before_enter(self) -> None:
+        """Carried fix #2: a native-shaped backend with no journal must be
+        refused by the FRONT END (config-level KEEL-E001), before `enter_flow`
+        is ever called — so the backend's last-resort KEEL-E040 is unreachable
+        from `keel run`."""
+        entry = FlowEntrypoint("py:pipeline:main", "pipeline", "main")
+        backend = _FakeFlowBackend(persistent=False)
+        with self.assertRaises(SystemExit) as ctx:
+            _flow.run_as_flow("/tmp/pipeline.py", entry, backend, [], env={"KEEL_QUIET": "1"})
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(backend.entered, [], "enter_flow must NOT be reached without a journal")
+
 
 @unittest.skipUnless(_NATIVE, "keel_core native module not built (maturin develop in crates/keel-py)")
 class NativeFlowReplayTest(unittest.TestCase):
@@ -241,6 +256,26 @@ class NativeFlowReplayTest(unittest.TestCase):
         with self.assertRaises(keel_core.KeelCoreError) as ctx:
             core.enter_flow("py:pipeline:main", "ah-1")
         self.assertEqual(ctx.exception.code, "KEEL-E040")
+
+    def test_async_effect_in_flow_is_refused(self) -> None:
+        """Carried fix #1: an async intercepted call while a flow is open must be
+        refused (KEEL-E001), synchronously, rather than silently downgraded to
+        Tier 1 by running on the bare engine outside the FlowHandle."""
+        core = self._core()
+
+        async def eff(_attempt):  # pragma: no cover - never awaited (guard fires first)
+            return {"status": "ok"}
+
+        core.enter_flow("py:pipeline:main", "ah-async", code_hash="ch-1")
+        try:
+            with self.assertRaises(keel_core.KeelCoreError) as ctx:
+                core.execute_async(
+                    {"v": 1, "target": "api.x", "op": "api.x", "idempotent": True}, eff
+                )
+            self.assertEqual(ctx.exception.code, "KEEL-E001")
+            self.assertIn("durable flow", str(ctx.exception).lower())
+        finally:
+            core.exit_flow("completed")
 
 
 if __name__ == "__main__":

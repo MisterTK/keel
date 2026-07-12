@@ -308,12 +308,38 @@ impl KeelCore {
     /// Run one intercepted call asynchronously, returning an awaitable that
     /// resolves to the outcome dict. `effect(attempt)` is awaited on the caller's
     /// asyncio loop, so it may be an `async def` performing real async IO.
+    ///
+    /// Refuses (KEEL-E001) if a durable flow is open: async effects inside a flow
+    /// are unsupported in v0.1 and would bypass the journal (Tier 1 downgrade).
     fn execute_async<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'py, PyAny>,
         effect: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Carried review (Task 16 → 17): an async intercepted call while a flow
+        // is open would run on the bare engine below — it does NOT route through
+        // the active `FlowHandle`, so it would be silently downgraded to Tier 1
+        // (never journaled, never replayed) inside a "durable" flow. That is a
+        // Level 0 surprise. Refuse precisely instead. v0.1 durable flows are
+        // synchronous-only; the async-in-flow seam is deliberately unsupported
+        // (see `keel_engine::flow` module docs). Checked (and dropped) before the
+        // awaitable is built, so the error is raised synchronously at call time.
+        if self
+            .active_flow
+            .lock()
+            .expect("keel-py active-flow mutex poisoned")
+            .is_some()
+        {
+            return Err(keel_error(
+                py,
+                "KEEL-E001",
+                "async effects inside durable flows are not supported in v0.1; this call would \
+                 bypass the flow journal and silently run as Tier 1. Run the flow synchronously \
+                 (no async def / await for intercepted calls inside the flow), or remove this \
+                 entrypoint from [flows]. trace: keel trace <flow-id>",
+            ));
+        }
         let request = decode_request(py, request)?;
         let engine = Arc::clone(&self.engine);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
