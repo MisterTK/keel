@@ -67,17 +67,48 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   return { enabled: true, backend, discovery, functionTargets, uninstallFetch, mcp };
 }
 
-function installExitFlush(discovery) {
+/**
+ * Persist buffered discovery on EVERY exit path — normal exit, an empty event
+ * loop, and the signals a dev server is actually stopped with. `process.once`
+ * only covers the 'exit' event, which does NOT fire under default SIGINT/SIGTERM
+ * disposition, so a Ctrl-C'd Node server used to write nothing to discovery.db
+ * for the whole session (the Python front end persists per call). Exported for
+ * a child-process test.
+ *
+ * Signal handling preserves exit semantics: we flush, then either re-raise the
+ * signal (when we are the only handler, so the default disposition still
+ * terminates with code 128+signum) or step aside (when the app has its own
+ * handler that owns termination). We never swallow the signal.
+ */
+export function installExitFlush(discovery, { proc = process } = {}) {
   let flushed = false;
-  process.once("exit", () => {
+  const flush = () => {
     if (flushed) return;
     flushed = true;
     try {
       discovery.flushSync();
     } catch {
-      /* best-effort */
+      /* best-effort — discovery never throws into the user's program */
     }
-  });
+  };
+  proc.once("exit", flush); // normal exit / process.exit()
+  proc.once("beforeExit", flush); // event loop drained without an explicit exit
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    proc.once(sig, () => {
+      flush();
+      // `once` has already removed THIS listener, so a zero count means no other
+      // handler remains → re-raise for default termination (correct exit code).
+      // A remaining handler (the app's own) owns exit; we only flushed.
+      if (proc.listenerCount(sig) === 0) {
+        try {
+          proc.kill(proc.pid, sig);
+        } catch {
+          /* best-effort re-raise */
+        }
+      }
+    });
+  }
+  return flush;
 }
 
 function banner(env, source, fnCount, mcp) {
