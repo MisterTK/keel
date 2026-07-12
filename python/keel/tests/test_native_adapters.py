@@ -11,6 +11,7 @@ module is not built.
 from __future__ import annotations
 
 import asyncio
+import gc
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -58,6 +59,10 @@ class NativeHttpxTest(unittest.TestCase):
         httpx_pack.uninstall()
         _runtime.clear_runtime()
         self.discovery.close()
+        # Drop the native core so its journal's SQLite connection closes now
+        # (via Drop) rather than at GC — keeps test output free of ResourceWarnings.
+        self.backend = None
+        gc.collect()
         self._tmp.cleanup()
 
     def test_native_is_actually_selected(self) -> None:

@@ -156,18 +156,25 @@ class StartupBudgetTest(unittest.TestCase):
         return best
 
     def test_keel_run_startup_overhead_under_budget(self) -> None:
+        cmd = [sys.executable, "-m", "keel", "run", NOOP]
         with TemporaryDirectory() as d:
             baseline = self._min_ms([sys.executable, NOOP], child_env(), d)
-            keeled = self._min_ms(
-                [sys.executable, "-m", "keel", "run", NOOP], child_env(KEEL_QUIET="1"), d
-            )
-        added_ms = keeled - baseline
+            # Measure both backends explicitly (Task 14 item 5): native is the
+            # real core + journal attach; stub is the pure-Python path. `keel run`
+            # via child_env auto-selects native when the wheel is installed.
+            stub_ms = self._min_ms(cmd, child_env(KEEL_QUIET="1", KEEL_BACKEND="stub"), d)
+            native_ms = self._min_ms(cmd, child_env(KEEL_QUIET="1", KEEL_BACKEND="native"), d)
+        stub_added = stub_ms - baseline
+        native_added = native_ms - baseline
         print(
-            f"[startup budget] keel run added {added_ms:.1f} ms "
-            f"(baseline {baseline:.1f} ms, keeled {keeled:.1f} ms)",
+            f"[startup budget] baseline {baseline:.1f} ms | "
+            f"stub +{stub_added:.1f} ms | native +{native_added:.1f} ms "
+            "(target <100 ms, budget <250 ms)",
             file=sys.stderr,
         )
-        self.assertLess(added_ms, 250.0, f"startup budget exceeded: {added_ms:.1f} ms")
+        # Native is the shipped path; assert it against the budget. (If the wheel
+        # isn't built, KEEL_BACKEND=native aborts loudly rather than skewing this.)
+        self.assertLess(native_added, 250.0, f"native startup budget exceeded: {native_added:.1f} ms")
 
 
 if __name__ == "__main__":

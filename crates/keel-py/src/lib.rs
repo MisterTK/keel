@@ -176,7 +176,8 @@ fn attach_journal(engine: &mut Engine, path: &str) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|e| format!("journal dir {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("journal dir {}: {e}", parent.display()))?;
     }
     let journal =
         SqliteJournal::open(path, SystemClock).map_err(|e| format!("journal open {path}: {e}"))?;
