@@ -36,12 +36,18 @@ use crate::types::{
 /// never drift.
 const SCHEMA: &str = include_str!("../contract/journal.sql");
 
-/// Per-connection pragmas set on every open. WAL is also persisted in the file
-/// by the schema, but re-asserting it makes opening a foreign-created DB safe.
+/// Per-connection pragmas set on every open. `busy_timeout` MUST come first:
+/// switching a brand-new file into WAL mode briefly needs an exclusive lock,
+/// and when several processes race to open the same fresh path (the exact
+/// scenario `concurrent_first_open_is_race_safe` exercises), that first WAL
+/// switch is the statement that contends — with `busy_timeout` unset at that
+/// point, a loser gets an immediate `SQLITE_BUSY` ("database is locked")
+/// instead of waiting out the timeout. WAL is also persisted in the file by
+/// the schema, but re-asserting it makes opening a foreign-created DB safe.
 const CONNECTION_PRAGMAS: &str = "\
+PRAGMA busy_timeout = 5000;
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = NORMAL;";
 
 const FLOW_COLUMNS: &str = "flow_id, entrypoint, args_hash, code_hash, status, lease_holder, lease_expires, \
@@ -76,9 +82,7 @@ impl<C: Clock> SqliteJournal<C> {
     /// back on next open rather than leaving a half-created schema that every
     /// future open mistakes for complete and then silently fails to journal to.
     pub fn open(path: impl AsRef<Path>, clock: C) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(CONNECTION_PRAGMAS)?;
-        init_schema(&conn)?;
+        let conn = open_and_init_with_retry(path.as_ref())?;
         // Opportunistic reap: expired cache rows are invisible to reads but
         // still grow the file; sweeping the backlog once per open bounds a
         // dev-cache-heavy project's journal without touching the hot path.
@@ -381,6 +385,49 @@ fn step_from_row(raw: StepRowData) -> Result<StepOutcome> {
 /// skips the batch. The whole `CREATE TABLE` batch commits atomically, so a
 /// crash mid-batch rolls back (leaving no `flows` table) and the next open
 /// re-applies the full schema — never a partially-initialized journal.
+/// Open a fresh connection, apply pragmas, and initialize the schema — the
+/// whole critical section retried as one unit on a transient `SQLITE_BUSY`.
+/// `busy_timeout` (the first pragma applied) covers most lock contention, but
+/// empirically `PRAGMA journal_mode = WAL` itself can surface `SQLITE_BUSY`
+/// immediately rather than through the C-level busy handler when several
+/// threads race to WAL-ize the SAME brand-new file (the exact scenario
+/// `concurrent_first_open_is_race_safe` exercises) — a SQLite behavior this
+/// crate does not control, so a handful of short, jittered retries on a FRESH
+/// connection (never reusing one that hit a mid-setup error) closes the gap
+/// without slowing the uncontended, overwhelming-majority case, which never
+/// retries at all.
+fn open_and_init_with_retry(path: &Path) -> Result<Connection> {
+    const ATTEMPTS: u32 = 8;
+    for attempt in 1..=ATTEMPTS {
+        let attempted = (|| {
+            let conn = Connection::open(path)?;
+            conn.execute_batch(CONNECTION_PRAGMAS)?;
+            init_schema(&conn)?;
+            Ok(conn)
+        })();
+        match attempted {
+            Ok(conn) => return Ok(conn),
+            Err(e) if attempt < ATTEMPTS && is_sqlite_busy(&e) => {
+                std::thread::sleep(Duration::from_millis(5 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt's Ok or Err")
+}
+
+/// Is this a transient `SQLITE_BUSY`/`SQLITE_LOCKED`, safe to retry?
+fn is_sqlite_busy(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
