@@ -216,19 +216,20 @@ pub fn trace(project: &Path, flow: &str) -> Rendered {
     Rendered::ok(human, to_json(&report))
 }
 
-/// A resolved flow header (before its steps are read).
-struct ResolvedFlow {
-    flow_id: String,
-    entrypoint: String,
-    status: String,
-    created_at: i64,
-    updated_at: i64,
+/// A resolved flow header (before its steps are read). Shared with
+/// [`replay`](crate::replay), which resolves flows the same way.
+pub(crate) struct ResolvedFlow {
+    pub(crate) flow_id: String,
+    pub(crate) entrypoint: String,
+    pub(crate) status: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 /// Resolve `flow` to exactly one flow: an exact `flow_id`, else a unique
 /// substring match on id or entrypoint. Ambiguity and absence are precise
 /// errors, never a silent pick.
-fn resolve_flow(conn: &Connection, flow: &str) -> Result<ResolvedFlow, String> {
+pub(crate) fn resolve_flow(conn: &Connection, flow: &str) -> Result<ResolvedFlow, String> {
     let like = format!("%{flow}%");
     let mut stmt = conn
         .prepare(
@@ -258,7 +259,9 @@ fn resolve_flow(conn: &Connection, flow: &str) -> Result<ResolvedFlow, String> {
         return Ok(matches.into_iter().next().expect("first exists"));
     }
     match matches.len() {
-        0 => Err(format!("no flow matches {flow:?} in the journal.")),
+        0 => Err(format!(
+            "no flow matches {flow:?} in the journal. Run `keel flows` to list recorded flows."
+        )),
         1 => Ok(matches.into_iter().next().expect("one match")),
         n => {
             let ids: Vec<&str> = matches.iter().take(5).map(|m| m.flow_id.as_str()).collect();
@@ -345,17 +348,17 @@ fn fmt_age(now_ms: i64, then_ms: i64) -> String {
     }
 }
 
-fn open_ro(path: &Path) -> Result<Connection, String> {
+pub(crate) fn open_ro(path: &Path) -> Result<Connection, String> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("could not open {}: {e}", path.display()))
 }
 
-fn q(e: &rusqlite::Error) -> String {
+pub(crate) fn q(e: &rusqlite::Error) -> String {
     format!("journal query failed: {e}")
 }
 
 /// A read failure (exit 1, on stderr) — mirrors `keel status`.
-fn soft_error(message: &str) -> Rendered {
+pub(crate) fn soft_error(message: &str) -> Rendered {
     #[derive(Serialize)]
     struct ErrReport<'a> {
         error: &'a str,
