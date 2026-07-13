@@ -180,6 +180,55 @@ one seam covers both. Each request routes through the backend as target
   a dependency; the wrapped shape is pinned in `fixtures/mcp-client.d.ts`
   (mirroring `@modelcontextprotocol/sdk@1.29.0`).
 
+### Database drivers — `pg`, `ioredis`, `mysql2`
+
+Resilience for the three database libraries `architecture-spec.md` §5.2 names,
+with the same conservative posture throughout: a target is `<db host>` (the
+connection's `host`/`path`, `kind: "host"` — the frozen `TargetDecl` enum has
+no `db` kind, so these inherit `[defaults.outbound]` exactly like a bare HTTP
+host), idempotency is judged explicitly (never guessed at a query's actual
+side effects), and calls are never cached (`args_hash` is always `null` — a
+result set is not safely replayable). None of the three libraries is a Keel
+dependency; each pack's wrapped shape is pinned in a `fixtures/*.d.ts` file
+(`pg-client.d.ts`, `ioredis-client.d.ts`, `mysql2-connection.d.ts`).
+
+- **`pg`** patches `Client.prototype.query` (`Pool.query` checks a real
+  `Client` out and calls this same method, so one seam covers both).
+  Idempotency is keyed off the SQL verb: a bare `SELECT` is retryable;
+  `INSERT`/`UPDATE`/`DELETE`, a `WITH` CTE (which may wrap a data-modifying
+  statement), DDL, and any unrecognized statement are observed, not retried
+  (KEEL-E014). A CALLBACK invocation (`client.query(text, cb)`) and a
+  SUBMITTABLE argument (`pg-cursor`, `pg-query-stream`, a raw `Query`) are
+  forwarded **untouched** — pg's own contract makes retrying either unsafe to
+  do transparently (documented gap, mirrors the fetch seam's treatment of
+  unbuffered stream bodies).
+- **`ioredis`** patches `Redis.prototype.sendCommand` — Commander's single
+  dispatch chokepoint. Idempotency comes from an **explicit** read-only
+  command table (`GET`/`MGET`/`EXISTS`/`TTL`/...); every mutating command,
+  pub/sub, transaction (`MULTI`/`EXEC`/`WATCH`), and any command absent from
+  the table is observed, not retried. A retried attempt dispatches a fresh
+  `Command` clone (a `Command`'s promise settles once); a callback attached to
+  the original call fires with the FIRST attempt's outcome, while the
+  returned/awaited promise — the dominant modern usage — always reflects the
+  final, retried result (documented limitation).
+- **`mysql2`** patches the BASE (callback) `Connection.prototype.query`/
+  `.execute` — `mysql2/promise`'s `PromiseConnection` calls these same methods
+  internally, so one seam covers the callback API and the promise API at
+  once. Idempotency uses the same SQL-verb rule as `pg`. A callback-less call
+  (mysql2's row-streaming mode) is forwarded untouched; a wrapped call
+  returns `undefined` rather than reconstructing the real `Query`/`Execute`
+  emitter (a documented, narrow deviation — the callback itself, which
+  `mysql2/promise` depends on exclusively, always fires with the correct
+  final outcome).
+- **Timeout is a SOFT race for all three.** Unlike fetch/mcp (which pass an
+  `AbortSignal` into the call), none of these libraries exposes a
+  cancellation hook through the wrapped seam, so a per-attempt deadline stops
+  Keel from *waiting* on an idempotent call without cancelling the underlying
+  I/O — an abandoned attempt keeps running until its own result/error
+  arrives, silently discarded (never an unhandled rejection). The database's
+  own server-side timeout (`statement_timeout`, `commandTimeout`, ...) is the
+  right tool for true cancellation.
+
 ## Errors and the `keelOutcome` attachment
 
 On final failure the original error/response propagates unchanged, with a

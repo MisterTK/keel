@@ -20,10 +20,27 @@ import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
 import { resolveDevCache } from "./packs/llm.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
+import { installPgPack } from "./packs/pg.mjs";
+import { installIoredisPack } from "./packs/ioredis.mjs";
+import { installMysql2Pack } from "./packs/mysql2.mjs";
 
 export function isDisabled(env = process.env) {
   return isTruthy(env.KEEL_DISABLE);
 }
+
+/**
+ * Framework/library packs the bootstrap auto-detects and patches, in install
+ * order. Each `install(opts)` is best-effort (never throws) and resolves to
+ * `{ active: boolean, name?, uninstall? }` (`packs/mcp.mjs` etc.). Extend this
+ * array — never special-case a new pack elsewhere in `installKeel` — when
+ * adding another one; alphabetical by label to minimize merge conflicts.
+ */
+const FRAMEWORK_PACKS = [
+  { label: "ioredis", install: installIoredisPack },
+  { label: "mcp: transports", install: installMcpPack },
+  { label: "mysql2", install: installMysql2Pack },
+  { label: "pg", install: installPgPack },
+];
 
 let installed = false;
 
@@ -46,9 +63,12 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   setRuntime({ enabled: true, backend, discovery });
 
   const uninstallFetch = installFetch(backend, discovery);
-  // Framework packs: auto-detect and wrap MCP client transports if present.
-  // Best-effort — an absent SDK is a silent no-op; never fatal.
-  const mcp = await installMcpPack({ cwd });
+  // Framework/library packs: auto-detect and wrap each one if present.
+  // Best-effort — an absent library is a silent no-op; never fatal.
+  const packs = [];
+  for (const { label, install } of FRAMEWORK_PACKS) {
+    packs.push({ label, ...(await install({ cwd })) });
+  }
 
   const functionTargets = extractFunctionTargets(policy);
   const wrappable = functionTargets.filter((t) => t.fn);
@@ -63,8 +83,8 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   }
 
   installExitFlush(discovery);
-  banner(env, source, wrappable.length, mcp);
-  return { enabled: true, backend, discovery, functionTargets, uninstallFetch, mcp };
+  banner(env, source, wrappable.length, packs);
+  return { enabled: true, backend, discovery, functionTargets, uninstallFetch, packs };
 }
 
 /**
@@ -111,11 +131,11 @@ export function installExitFlush(discovery, { proc = process } = {}) {
   return flush;
 }
 
-function banner(env, source, fnCount, mcp) {
+function banner(env, source, fnCount, packs) {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
-  if (mcp?.active) seams.push("mcp: transports");
+  for (const p of packs) if (p.active) seams.push(p.label);
   const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
   process.stderr.write(
     `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`

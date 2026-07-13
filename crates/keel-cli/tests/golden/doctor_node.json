@@ -65,6 +65,24 @@
       "lib": "mcp",
       "status": "best-effort",
       "target": "mcp:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
     }
   ],
   "coverage": {

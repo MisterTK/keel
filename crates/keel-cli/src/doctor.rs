@@ -103,6 +103,24 @@ const REGISTRY: &[Adapter] = &[
         target: "mcp:*",
         best_effort: true,
     },
+    Adapter {
+        lib: "ioredis",
+        lang: "node",
+        target: "host",
+        best_effort: true,
+    },
+    Adapter {
+        lib: "mysql2",
+        lang: "node",
+        target: "host",
+        best_effort: true,
+    },
+    Adapter {
+        lib: "pg",
+        lang: "node",
+        target: "host",
+        best_effort: true,
+    },
 ];
 
 /// One line in the adapter section: a registry entry plus whether this project

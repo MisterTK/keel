@@ -40,6 +40,7 @@ import {
 } from "./judge.mjs";
 import { attachOutcome } from "./runtime.mjs";
 import { KeelError } from "./engine.mjs";
+import { durationMs } from "./packs/_shared.mjs";
 
 function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -197,13 +198,6 @@ function isBodyRetrySafe(input, body) {
   // as unbuffered and conservatively do not retry (a corrupted resend is worse
   // than a single observed attempt).
   return false;
-}
-
-function durationMs(v) {
-  const m = /^(\d+)(ms|s|m|h)$/.exec(String(v ?? "").trim());
-  if (!m) return null;
-  const mult = { ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]];
-  return Number(m[1]) * mult;
 }
 
 /** Compose the caller's AbortSignal with a Keel timeout; returns a cleanup. */
