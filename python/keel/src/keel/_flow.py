@@ -17,13 +17,20 @@ unreachable from `keel run`. The policy itself is valid — what is missing is a
 capability of this build/configuration — so the front-end error is KEEL-E005
 (unsupported-configuration), not the validation code E001.
 
-Durable flows are synchronous-only in v0.1: an async intercepted call inside a
-flow would bypass the journal, so the native backend refuses it (KEEL-E005).
-Keep flow bodies synchronous, or drop the entrypoint from `[flows]`.
+An `async def` flow body runs on its own event loop (`asyncio.run`); its
+intercepted async effects route through the SAME open `FlowHandle` as a
+synchronous flow's calls (`keel_core`'s `execute_async` async flow bridge), so
+they are journaled and replayed identically. Concurrent awaited effects inside
+one flow (`asyncio.gather`) are admitted — and therefore journaled — in the
+order their calls *reach* the handle, never in completion order (normative:
+conformance/README.md "Async steps inside a flow"). Keep fan-out order
+deterministic (await sequentially, or fan out in a fixed, data-independent
+order) so a resume's dispatch order matches the first run's.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import os
@@ -296,7 +303,13 @@ def run_as_flow(
             # read this to refuse rather than silently run un-journaled.
             _runtime.set_flow_active(True)
             try:
-                func()
+                if asyncio.iscoroutinefunction(func):
+                    # An async flow body drives its own event loop; its
+                    # intercepted calls await `execute_async`, which routes
+                    # through this SAME open flow handle (see module docs).
+                    asyncio.run(func())
+                else:
+                    func()
             finally:
                 _runtime.set_flow_active(False)
     except SystemExit as exc:

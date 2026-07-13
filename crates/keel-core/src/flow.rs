@@ -17,18 +17,34 @@
 //! runs and its terminal outcome recorded *before* the result is released, so a
 //! crash between those points leaves a `running` step that resume re-executes.
 //!
-//! # Synchronous-only in v0.1 (front-end binding constraint)
+//! # The async `execute_step` bridge (front-end binding concern)
 //!
-//! [`FlowHandle::execute_step`] is `async` here, but the front-end *bindings*
-//! only route the **synchronous** intercepted-call path through it. The Python
-//! binding's `execute_async` runs on the bare [`Engine`], not the open handle —
-//! so an async effect inside a flow would be silently downgraded to Tier 1
-//! (never journaled, never replayed). Rather than let that happen quietly (a
-//! Level 0 surprise), the binding *refuses* an async intercepted call while a
-//! flow is open with a precise KEEL-E005 — unsupported-configuration, the policy
-//! is valid but this build cannot honor it (`keel-py`'s `execute_async` guard).
-//! v0.1 durable flows are therefore synchronous-only; lifting this is future
-//! work (an async `execute_step` bridge in each binding).
+//! [`FlowHandle::execute_step`] is `async`, and both the synchronous AND
+//! asynchronous intercepted-call paths in the front-end bindings route through
+//! it while a flow is open (an earlier v0.1 restriction refused an async
+//! intercepted call with KEEL-E005 rather than let it silently downgrade to
+//! Tier 1 on the bare [`Engine`]; that refusal is retired now that the bridge is
+//! real — see `contracts/error-codes.json`'s retired async-in-flow case and
+//! `docs/ccr/0002-async-steps-and-idempotency-injection.md`).
+//!
+//! `&mut self` is what makes a single call to `execute_step` exclusive, but a
+//! flow handle is reachable from *multiple* concurrent async tasks in a
+//! language runtime (Python's `asyncio.gather`, Node's `Promise.all`) — so each
+//! binding wraps its open handle in an **async** mutex (never a blocking one)
+//! that a call acquires with the moral equivalent of `.lock().await` before
+//! touching the handle, and holds for the *entire* step: `seq` is claimed the
+//! instant `execute_step_with_idempotency_key` is entered (its very first
+//! statement, before any `.await`), and the guard is not released until the
+//! terminal outcome is recorded. This is what makes concurrent awaited effects
+//! **serialize in await order** — normative for every binding, spelled out in
+//! conformance/README.md's "Async steps inside a flow" section: a step's
+//! position in the journal is fixed by the order its call *reaches* the handle,
+//! never by completion order, so replay reproduces the exact same `(seq,
+//! step_key)` sequence deterministically. See `crates/keel-py/src/lib.rs`'s
+//! `execute_async` (the reference implementation) for the binding-side half of
+//! this contract; `FlowHandle` itself contributes only the `&mut self` exclusion
+//! and the at-entry `seq` claim above — it holds no lock and knows nothing about
+//! any particular language runtime.
 //!
 //! Replay correctness is checked, not assumed (spec §4.4): the `(seq, step_key)`
 //! encountered on replay must match the journal. A `seq` recorded under a

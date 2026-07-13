@@ -44,8 +44,8 @@ shows the step ledger.
 
 ### v0.1 limitations (precise, never silent)
 
-Durability is a promise; a silent downgrade would be a Level 0 surprise. So both
-of these are hard, actionable errors rather than a quiet fallback:
+Durability is a promise; a silent downgrade would be a Level 0 surprise. So this
+is a hard, actionable error rather than a quiet fallback:
 
 - **A journal is required.** Tier 2 replay lives in `.keel/journal.db`. If the
   native core can't attach one (e.g. `KEEL_JOURNAL=""` or an unwritable dir), a
@@ -54,13 +54,22 @@ of these are hard, actionable errors rather than a quiet fallback:
   un-journaled. (The stub backend, which has no
   journal at all, reports the same class of error, pointing you at the native
   core.)
-- **Flows are synchronous-only.** An `async` intercepted call inside a flow
-  would bypass the journal, so the native backend refuses it with **KEEL-E005**
-  ("async effects inside durable flows are not supported in v0.1"). Keep flow
-  bodies synchronous, or drop the entrypoint from `[flows]`.
 
-Both limits are enforced before any effect fires. Lifting the async limit (an
-async step bridge) is future work.
+This is enforced before any effect fires.
+
+### Async flow bodies
+
+An `async def` flow entrypoint is supported: `keel run` drives it with
+`asyncio.run`, and its `await`ed intercepted calls route through the **same**
+open flow handle a synchronous flow's calls use — journaled and replayed
+identically, with full Tier 1 resilience per step. Concurrent awaited effects
+inside one flow (`asyncio.gather`) are admitted — and therefore journaled — in
+the order their calls *reach* the flow handle, never in completion order, so
+replay always reproduces the same step sequence. Keep fan-out order
+deterministic (await sequentially, or fan out in a fixed, data-independent
+order): if the runtime reaches the handle in a different order on resume
+(racing tasks whose scheduling differs run-to-run), that is nondeterminism,
+handled per `flows.on_nondeterminism` like any other divergence.
 
 ## Errors
 
