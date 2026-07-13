@@ -1,0 +1,37 @@
+{
+  "name": "schedule-composition-handoff",
+  "description": "exp(1s, x2) upTo 4s andThen fixed(500ms): the first two natural waits (1s, 2s; cumulative 3s) fit inside the 4s bound, but the third natural wait (4s) would push the cumulative total to 7s and overshoot it, so the schedule hands off to the fixed(500ms) tail from the third wait on. See conformance/README.md 'Schedule algebra'.",
+  "policy": {
+    "target": {
+      "api.example.com": {
+        "retry": {
+          "attempts": 6,
+          "schedule": "exp(1s, x2) upTo 4s andThen fixed(500ms)",
+          "on": ["timeout"]
+        }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/slow", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 6,
+          "waits_ms": [1000, 2000, 500, 500, 500],
+          "error": { "code": "KEEL-E010", "class": "timeout" }
+        }
+      }
+    }
+  ]
+}

@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 ENVELOPE_VERSION = 1
 
-_DEFAULT_SCHEDULE = (200, 2.0, 30_000)  # base_ms, factor, cap_ms
+_DEFAULT_SCHEDULE = [((200, 2.0, 30_000), None)]  # single unbounded exp segment
 _DEFAULT_ATTEMPTS = 3
 _DEFAULT_ON = ["conn", "timeout", "429", "5xx"]
 _DEFAULT_BREAKER_FAILURES = 5
@@ -79,9 +79,8 @@ def _parse_rate(s: str) -> tuple[int, int] | None:
     return (limit, window) if limit >= 1 else None
 
 
-def _parse_schedule(s: str) -> tuple[int, float, int] | None:
-    """Supports the v0.1 primaries exp(base, xF[, max D][, jitter]) and
-    fixed(D). Composition (upTo/andThen) is frozen grammar, unimplemented."""
+def _parse_primary(s: str) -> tuple[int, float, int] | None:
+    """A schedule primary: exp(base, xF[, max D][, jitter]) or fixed(D)."""
     s = s.strip()
     if s.startswith("exp(") and s.endswith(")"):
         parts = [p.strip() for p in s[4:-1].split(",")]
@@ -113,9 +112,80 @@ def _parse_schedule(s: str) -> tuple[int, float, int] | None:
     return None
 
 
-def _schedule_wait(sched: tuple[int, float, int], attempt: int) -> int:
-    base, factor, cap = sched
-    return round(min(base * factor ** (attempt - 1), cap))
+def _primary_wait(primary: tuple[int, float, int], local_attempt: int) -> int:
+    base, factor, cap = primary
+    return round(min(base * factor ** (local_attempt - 1), cap))
+
+
+# A schedule segment: (primary, up_to_ms). `up_to_ms` is the `upTo` bound on
+# the segment's cumulative *natural* wait, or None on an unbounded segment.
+_ScheduleSegment = tuple[tuple[int, float, int], int | None]
+
+
+def _parse_schedule(s: str) -> list[_ScheduleSegment] | None:
+    """Full grammar (contracts/schedule-grammar.ebnf): one or more `andThen`-
+    separated segments, each a primary with an optional cumulative-wait
+    `upTo` bound. Semantics pinned in conformance/README.md ("Schedule
+    algebra"): every segment but the last must be bounded, and the last never
+    is — both degenerate shapes are rejected here so a schedule is always a
+    total mapping attempt -> wait."""
+    tokens = s.split()
+    if not tokens:
+        return None
+    groups: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "andThen":
+            groups.append([])
+        else:
+            groups[-1].append(token)
+    segments: list[_ScheduleSegment] = []
+    for group in groups:
+        if not group:
+            return None
+        up_to_ms: int | None = None
+        primary_tokens = group
+        if "upTo" in group:
+            pos = group.index("upTo")
+            rest = group[pos + 1 :]
+            if len(rest) != 1:
+                return None
+            up_to_ms = _parse_duration(rest[0])
+            if up_to_ms is None:
+                return None
+            primary_tokens = group[:pos]
+        if not primary_tokens:
+            return None
+        primary = _parse_primary(" ".join(primary_tokens))
+        if primary is None:
+            return None
+        segments.append((primary, up_to_ms))
+    last = len(segments) - 1
+    if any((i < last) != (up_to is not None) for i, (_, up_to) in enumerate(segments)):
+        return None
+    return segments
+
+
+def _schedule_wait(segments: list[_ScheduleSegment], attempt: int) -> int:
+    """Deterministic wait after failed attempt `n` (1-based): walk the
+    segments left to right, handing off to the next segment when the active
+    one's cumulative natural wait would exceed its `upTo` bound. Mirrors
+    crates/keel-core-api's `Schedule::wait_and_jitter` exactly; see
+    conformance/README.md ("Schedule algebra") for the normative spec."""
+    attempt = max(attempt, 1)
+    last = len(segments) - 1
+    i, a, e = 0, 1, 0
+    emitted = 0
+    while True:
+        primary, up_to_ms = segments[i]
+        wait = _primary_wait(primary, a)
+        if i < last and up_to_ms is not None and e + wait > up_to_ms:
+            i, a, e = i + 1, 1, 0
+            continue
+        emitted += 1
+        if emitted == attempt:
+            return wait
+        a += 1
+        e += wait
 
 
 def _condition_matches(cond: str, cls: str, http_status: int | None) -> bool:

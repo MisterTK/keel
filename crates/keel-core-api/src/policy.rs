@@ -316,18 +316,18 @@ impl FromStr for Schedule {
         }
         let mut segments = Vec::new();
         for segment_tokens in tokens.split(|t| *t == "andThen") {
-            let (primary_tokens, up_to_ms) =
-                match segment_tokens.iter().position(|t| *t == "upTo") {
-                    None => (segment_tokens, None),
-                    Some(pos) => {
-                        // exactly `upTo <duration>`, at the segment's tail
-                        let [duration] = &segment_tokens[pos + 1..] else {
-                            return Err(err());
-                        };
-                        let bound = duration.parse::<DurationMs>().map_err(|_| err())?.0;
-                        (&segment_tokens[..pos], Some(bound))
-                    }
-                };
+            let (primary_tokens, up_to_ms) = match segment_tokens.iter().position(|t| *t == "upTo")
+            {
+                None => (segment_tokens, None),
+                Some(pos) => {
+                    // exactly `upTo <duration>`, at the segment's tail
+                    let [duration] = &segment_tokens[pos + 1..] else {
+                        return Err(err());
+                    };
+                    let bound = duration.parse::<DurationMs>().map_err(|_| err())?.0;
+                    (&segment_tokens[..pos], Some(bound))
+                }
+            };
             if primary_tokens.is_empty() {
                 return Err(err());
             }
@@ -802,9 +802,10 @@ mod tests {
 
     #[test]
     fn schedule_composition_exact_fit_stays_and_cascade_skips() {
-        let schedule: Schedule = "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms)"
-            .parse()
-            .unwrap();
+        let schedule: Schedule =
+            "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms)"
+                .parse()
+                .unwrap();
         let waits: Vec<u64> = (1..=6).map(|n| schedule.wait_ms(n)).collect();
         // Three 1s waits fill upTo 3s exactly (e + w == bound stays); the 10s
         // segment's first wait exceeds its own 5s bound, so it contributes
