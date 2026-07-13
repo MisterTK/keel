@@ -1,0 +1,59 @@
+{
+  "notes": [
+    "cache mode \"dev\" is resolved by the front end at run time (a concrete ttl off-prod; dropped when KEEL_ENV=prod) — the policy shown is the pre-resolution merge."
+  ],
+  "packs": [
+    "openai"
+  ],
+  "policy": {
+    "defaults": {
+      "llm": {
+        "breaker": {
+          "cooldown": "30s",
+          "failures": 5
+        },
+        "cache": {
+          "mode": "dev"
+        },
+        "retry": {
+          "attempts": 2
+        },
+        "timeout": "120s"
+      },
+      "outbound": {
+        "breaker": {
+          "cooldown": "15s",
+          "failures": 5
+        },
+        "retry": {
+          "attempts": 3,
+          "on": [
+            "conn",
+            "timeout",
+            "429",
+            "5xx"
+          ],
+          "schedule": "exp(200ms, x2, max 30s, jitter)"
+        },
+        "timeout": "10s"
+      }
+    },
+    "target": {
+      "api.example.com": {
+        "retry": {
+          "attempts": 5
+        }
+      }
+    }
+  },
+  "sources": {
+    "defaults.llm.breaker": "pack",
+    "defaults.llm.cache": "pack",
+    "defaults.llm.retry": "user",
+    "defaults.llm.timeout": "pack",
+    "defaults.outbound.breaker": "defaults",
+    "defaults.outbound.retry": "defaults",
+    "defaults.outbound.timeout": "user"
+  },
+  "user_policy_present": true
+}

@@ -1,0 +1,57 @@
+{
+  "notes": [
+    "cache mode \"dev\" is resolved by the front end at run time (a concrete ttl off-prod; dropped when KEEL_ENV=prod) — the policy shown is the pre-resolution merge."
+  ],
+  "packs": [],
+  "policy": {
+    "defaults": {
+      "llm": {
+        "breaker": {
+          "cooldown": "30s",
+          "failures": 5
+        },
+        "cache": {
+          "mode": "dev"
+        },
+        "retry": {
+          "attempts": 6,
+          "on": [
+            "conn",
+            "timeout",
+            "429",
+            "5xx"
+          ],
+          "schedule": "exp(500ms, x2, max 60s, jitter)"
+        },
+        "timeout": "120s"
+      },
+      "outbound": {
+        "breaker": {
+          "cooldown": "15s",
+          "failures": 5
+        },
+        "retry": {
+          "attempts": 3,
+          "on": [
+            "conn",
+            "timeout",
+            "429",
+            "5xx"
+          ],
+          "schedule": "exp(200ms, x2, max 30s, jitter)"
+        },
+        "timeout": "30s"
+      }
+    }
+  },
+  "sources": {
+    "defaults.llm.breaker": "defaults",
+    "defaults.llm.cache": "defaults",
+    "defaults.llm.retry": "defaults",
+    "defaults.llm.timeout": "defaults",
+    "defaults.outbound.breaker": "defaults",
+    "defaults.outbound.retry": "defaults",
+    "defaults.outbound.timeout": "defaults"
+  },
+  "user_policy_present": false
+}

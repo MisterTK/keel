@@ -850,12 +850,14 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

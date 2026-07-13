@@ -74,7 +74,10 @@ class _NativeBackend:
 
 def _journal_path(cwd: str | Path | None, env: Mapping[str, str]) -> str | None:
     """Where the native core attaches its journal (persistent dev cache + Tier 2).
-    `KEEL_JOURNAL` overrides the path; an explicit empty value disables it."""
+    `KEEL_JOURNAL` overrides the path; an explicit empty value disables it. This
+    is the *construction-time* default: keel.toml's `journal` key replaces it at
+    configure time unless KEEL_JOURNAL is set, in which case the env wins
+    (see ``bootstrap.apply_journal_env_override``)."""
     override = env.get("KEEL_JOURNAL")
     if override is not None:
         return override or None  # empty string ⇒ no journal

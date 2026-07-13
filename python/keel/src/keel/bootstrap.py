@@ -70,7 +70,8 @@ def install_keel(
     policy = resolve_dev_cache(
         apply_pack_defaults(raw, present_provider_defaults()), env, persistent=persistent
     )
-    backend.configure(policy)  # raises KEEL-E001 on invalid policy (field paths)
+    policy = apply_journal_env_override(policy, env)
+    backend.configure(policy)  # raises KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
     discovery = Discovery(cwd)
     _STATE.discovery = discovery
@@ -101,6 +102,22 @@ def install_keel(
         "flow_entrypoints": flow_entrypoints,
         "adapters": adapters,
     }
+
+
+def apply_journal_env_override(
+    policy: dict[str, Any], env: Mapping[str, str]
+) -> dict[str, Any]:
+    """`KEEL_JOURNAL` is the journal escape hatch: when it is set in the
+    environment (even to the empty string, which *disables* the journal), the
+    construction-time selection made from it wins over keel.toml's `journal`
+    key. The core honors the effective policy's `journal` at configure time, so
+    the override is composed here — the key is dropped before `configure`,
+    leaving the env-selected (or disabled) construction attachment in force.
+    Precedence: KEEL_JOURNAL (when set) > policy `journal` > `.keel/journal.db`.
+    Mirrors the Node front end exactly (parity)."""
+    if "KEEL_JOURNAL" not in env or "journal" not in policy:
+        return policy
+    return {k: v for k, v in policy.items() if k != "journal"}
 
 
 def uninstall_keel() -> None:

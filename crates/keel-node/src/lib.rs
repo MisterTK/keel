@@ -236,8 +236,6 @@ mod bindings {
         /// True when the runtime runs on tokio's paused virtual clock (harness
         /// only). `advanceClock` is valid only on such a handle.
         paused: bool,
-        /// True when a journal is attached (the persistent dev-cache scope is live).
-        persistent: bool,
     }
 
     #[napi]
@@ -257,28 +255,25 @@ mod bindings {
             // `Engine::new` reads `tokio::time::Instant::now()`; build it inside
             // the runtime so a paused clock's epoch is anchored (see `keel-ffi`).
             let mut engine = runtime.block_on(async { Engine::new() });
-            let persistent = match journal_path {
-                Some(path) if !path.is_empty() => {
-                    attach_journal(&mut engine, &path)
-                        .map_err(|e| Error::from_reason(format!("KEEL-E040: {e}")))?;
-                    true
-                }
-                _ => false,
-            };
+            if let Some(path) = journal_path.filter(|p| !p.is_empty()) {
+                attach_journal(&mut engine, &path)
+                    .map_err(|e| Error::from_reason(format!("KEEL-E040: {e}")))?;
+            }
             Ok(Self {
                 engine: Arc::new(engine),
                 runtime: Mutex::new(runtime),
                 paused,
-                persistent,
             })
         }
 
         /// Whether a persistent journal is attached (the `scope = persistent`
         /// dev cache is live). The front end reads this to decide whether to emit
         /// `scope = "persistent"` for the LLM dev cache (cross-run replay).
+        /// Live: a `configure` whose policy carries a `journal` location
+        /// attaches one after the fact.
         #[napi(getter)]
         pub fn persistent(&self) -> bool {
-            self.persistent
+            self.engine.journal().is_some()
         }
 
         /// Apply a policy document (object, per `policy.schema.json`). Throws a JS

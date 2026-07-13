@@ -5,12 +5,13 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate, ResolvedPolicy,
-    RetryPolicy,
+    BreakerPolicy, CacheScope, DurationMs, JournalLocation, NondeterminismResponse, Policy, Rate,
+    ResolvedPolicy, RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -24,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, warn};
+
+use crate::events::{CacheStore, EventKind, EventSink, TraceRef};
+use crate::journal_backend::{self, JournalBackend};
 
 /// Count-mode circuit breaker (consecutive terminal failures). Observes
 /// post-retry call outcomes — layer order puts it outside the retry loop.
@@ -357,6 +361,20 @@ fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
     }
 }
 
+/// Append the dx-invariant-4 trace reference (`… trace: keel trace <ref>`) to
+/// a terminal failure message. `trace` is `Some` only while a live event sink
+/// minted a ref for this call, so without a sink — the conformance condition —
+/// every implementation stays message-identical (parity rule).
+fn with_trace_ref(message: String, trace: Option<&TraceRef>) -> String {
+    match trace {
+        Some(t) => {
+            let sep = if message.ends_with('.') { "" } else { "." };
+            format!("{message}{sep} trace: keel trace {t}")
+        }
+        None => message,
+    }
+}
+
 fn terminal_message(
     code: ErrorCode,
     request: &Request,
@@ -400,10 +418,28 @@ pub struct Engine {
     started: Instant,
     policy: RwLock<Policy>,
     state: Mutex<State>,
-    /// Persistence for the `scope = persistent` cache (and, later, Tier 2 flows).
-    journal: Option<Arc<dyn Journal>>,
+    /// Persistence for the `scope = persistent` cache and Tier 2 flows. Behind
+    /// a lock because `configure` honors `policy.journal` by (re)attaching the
+    /// selected backend; readers clone the `Arc` out, so the lock is never held
+    /// across journal I/O (let alone an await).
+    journal: RwLock<JournalSlot>,
     /// Traffic ledger fed one observation per `execute`, for `keel init`/`status`.
     discovery: Option<Arc<dyn DiscoveryRecorder>>,
+    /// Live NDJSON event feed for `keel tail`/`keel trace` ([`crate::events`]).
+    /// `None` (the zero-cost path) unless the environment activates it or a
+    /// sink is attached; like journal/discovery it can never change an outcome.
+    events: Option<EventSink>,
+}
+
+/// The engine's journal attachment plus, when policy selected it, the resolved
+/// `file:` path it was opened from — so reapplying an unchanged policy is a
+/// no-op instead of a re-open.
+#[derive(Default)]
+struct JournalSlot {
+    journal: Option<Arc<dyn Journal>>,
+    /// `Some` only for a policy-selected (`file:`) attachment; construction-time
+    /// attachments have no location the engine could compare against.
+    policy_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for Engine {
@@ -412,8 +448,9 @@ impl fmt::Debug for Engine {
         f.debug_struct("Engine")
             .field("policy", &self.policy)
             .field("state", &self.state)
-            .field("journal_attached", &self.journal.is_some())
+            .field("journal_attached", &self.current_journal().is_some())
             .field("discovery_attached", &self.discovery.is_some())
+            .field("events_attached", &self.events.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -431,24 +468,47 @@ impl Engine {
             started: Instant::now(),
             policy: RwLock::new(Policy::default()),
             state: Mutex::new(State::default()),
-            journal: None,
+            journal: RwLock::new(JournalSlot::default()),
             discovery: None,
+            // Live events activate from the environment (KEEL_EVENTS / an
+            // existing ./.keel dir — see `crate::events`), so every embedding
+            // — FFI, PyO3, napi, CLI — inherits the feed with no plumbing.
+            events: EventSink::from_env(),
         }
     }
 
-    /// Attach a journal, enabling the persistent cache scope. Optional; set once
-    /// at setup, before the engine is shared for concurrent `execute`.
+    /// Attach a journal at construction time, enabling the persistent cache
+    /// scope. Optional; set at setup, before the engine is shared for
+    /// concurrent `execute`. A later [`configure`](Self::configure) whose
+    /// policy carries a `journal` key replaces this attachment — the effective
+    /// policy is authoritative (spec §4.2).
     pub fn attach_journal(&mut self, journal: impl Journal + 'static) -> &mut Self {
-        self.journal = Some(Arc::new(journal));
+        let slot = self.journal.get_mut().expect("journal lock poisoned");
+        slot.journal = Some(Arc::new(journal));
+        slot.policy_path = None;
         self
     }
 
     /// The attached journal, if any — shared (`Arc`) so a [`FlowManager`] can run
     /// its Tier 2 steps over the *same* store the engine caches through. `None`
-    /// for an in-memory engine (Tier 2 requires a durable journal).
+    /// for an in-memory engine (Tier 2 requires a durable journal). Live: a
+    /// `configure` whose policy selects a `journal` location changes what this
+    /// returns, so Tier 2 wiring should read it after the engine is configured.
+    ///
+    /// [`FlowManager`]: crate::FlowManager
     #[must_use]
     pub fn journal(&self) -> Option<Arc<dyn Journal>> {
-        self.journal.clone()
+        self.current_journal()
+    }
+
+    /// Clone the current journal out of its slot (the lock never outlives the
+    /// statement, so it is never held across journal I/O or an await).
+    fn current_journal(&self) -> Option<Arc<dyn Journal>> {
+        self.journal
+            .read()
+            .expect("journal lock poisoned")
+            .journal
+            .clone()
     }
 
     /// Attach a discovery store; each `execute` then records one observation.
@@ -458,30 +518,74 @@ impl Engine {
         self
     }
 
+    /// Attach (or replace) a live event sink. [`Engine::new`] already resolves
+    /// one from the environment (see [`crate::events`]); this override exists
+    /// for tests and embedders that place the feed elsewhere.
+    pub fn attach_events(&mut self, sink: EventSink) -> &mut Self {
+        self.events = Some(sink);
+        self
+    }
+
+    /// The active event sink, if any — its run id anchors this engine's trace
+    /// refs, and `flush()` makes the feed current for a same-process reader.
+    #[must_use]
+    pub fn events(&self) -> Option<&EventSink> {
+        self.events.as_ref()
+    }
+
+    /// Emit one live event, stamped with engine-elapsed (virtual-clock-safe)
+    /// milliseconds. The closure defers construction — and its string clones —
+    /// to the active-sink case, so the disabled path costs one branch.
+    fn emit_event(&self, kind: impl FnOnce() -> EventKind) {
+        if let Some(sink) = self.events.as_ref() {
+            sink.emit(self.elapsed_ms(), kind());
+        }
+    }
+
+    /// Feed event for a consulted cache: hit (the call is served) or miss
+    /// (the call proceeds live). Not emitted when no cache plan exists.
+    fn emit_cache(&self, out: &Outcome, target: &str, scope: CacheStore, hit: bool) {
+        self.emit_event(|| {
+            let call = out.trace_id.clone();
+            let target = target.to_owned();
+            if hit {
+                EventKind::CacheHit {
+                    call,
+                    target,
+                    scope,
+                }
+            } else {
+                EventKind::CacheMiss {
+                    call,
+                    target,
+                    scope,
+                }
+            }
+        });
+    }
+
     /// Apply a policy document (keel.toml as JSON, per
     /// contracts/policy.schema.json), replacing the previous one atomically.
-    /// Rejections are `KEEL-E001` with the exact offending field path.
+    /// Rejections are `KEEL-E001` with the exact offending field path;
+    /// a valid policy naming a journal backend this build cannot provide is
+    /// `KEEL-E005` (and the previous policy stays in force).
     pub fn configure(&self, policy_json: &Value) -> Result<(), KeelError> {
         let policy: Policy =
             serde_path_to_error::deserialize(policy_json).map_err(|e| KeelError {
                 code: ErrorCode::PolicyInvalid,
                 message: format!("policy invalid at {}: {}", e.path(), e.inner()),
             })?;
-        // The `journal` and `telemetry` keys are schema-legal and now typed +
-        // validated, but v0.1 selects the journal path at construction
-        // (KEEL_JOURNAL / .keel/journal.db) and drives OTel export from the
-        // environment. Warn loudly rather than silently ignoring a set value, so
-        // a user pointing `journal` at a migration target — or setting an OTLP
-        // endpoint — is not surprised when it has no effect (finding: frozen keys
-        // accepted and silently ignored).
-        if policy.journal.is_some() {
-            // Note the value is intentionally NOT logged: a `postgres://` journal
-            // location can carry credentials, and this is a diagnostic log line.
-            warn!(
-                "policy `journal` is validated but not yet wired: v0.1 selects the journal path at \
-                 startup (KEEL_JOURNAL env or .keel/journal.db). This value has no effect."
-            );
+        // `journal` selects the backing store (spec §4.2 — "that override is
+        // the entire laptop→enterprise migration"), so it must take effect or
+        // fail loudly, never warn-and-ignore. Applied before the policy swap so
+        // a rejected location leaves the previous configuration fully in force.
+        if let Some(location) = &policy.journal {
+            self.apply_journal_location(location)?;
         }
+        // `telemetry` is schema-legal and typed + validated, but v0.1 drives
+        // OTel export from the environment. Warn loudly rather than silently
+        // ignoring a set value, so a user setting an OTLP endpoint is not
+        // surprised when it has no effect.
         if policy.telemetry.is_some() {
             warn!(
                 "policy `telemetry` is validated but inert in v0.1: OTel export is configured from \
@@ -489,6 +593,42 @@ impl Engine {
             );
         }
         *self.policy.write().expect("policy lock poisoned") = policy;
+        Ok(())
+    }
+
+    /// Honor `policy.journal`: open and attach the backend it names, replacing
+    /// any construction-time attachment — the effective policy is
+    /// authoritative. (Front ends that want an environment escape hatch such as
+    /// `KEEL_JOURNAL` compose it into the effective policy *before* calling
+    /// `configure`, per the effective-policy contract.) Reapplying an unchanged
+    /// `file:` location is a no-op, so reconfigure loops never re-open the
+    /// store or drop its connection state.
+    ///
+    /// # Errors
+    /// - `KEEL-E005` for a backend this build cannot provide (`postgres://`).
+    /// - `KEEL-E040` when the selected SQLite file cannot be created/opened.
+    fn apply_journal_location(&self, location: &JournalLocation) -> Result<(), KeelError> {
+        let backend = JournalBackend::select(location);
+        if let JournalBackend::File(path) = &backend {
+            let slot = self.journal.read().expect("journal lock poisoned");
+            if slot.policy_path.as_deref() == Some(path.as_path()) {
+                return Ok(()); // unchanged location: keep the open store
+            }
+        }
+        // Open OFF the lock (filesystem I/O); the brief write below only swaps
+        // pointers. Two racing configures both open, last writer wins — the
+        // loser's store is just dropped.
+        let journal = journal_backend::open(&backend)?;
+        let policy_path = match backend {
+            JournalBackend::File(path) => {
+                debug!(path = %path.display(), "journal selected by policy");
+                Some(path)
+            }
+            JournalBackend::Postgres => None, // unreachable today: open() errors
+        };
+        let mut slot = self.journal.write().expect("journal lock poisoned");
+        slot.journal = Some(journal);
+        slot.policy_path = policy_path;
         Ok(())
     }
 
@@ -545,6 +685,15 @@ impl Engine {
             .await;
         record_call_fields(&span, &out);
         self.observe(request, &out, started);
+        // Every call's last feed event, on all paths (cache hit, breaker
+        // reject, envelope error, live attempt).
+        self.emit_event(|| EventKind::CallEnd {
+            call: out.trace_id.clone(),
+            target: request.target.clone(),
+            result: out.result.clone(),
+            code: out.error.as_ref().map(|e| e.code),
+            attempts: out.attempts,
+        });
         out
     }
 
@@ -558,6 +707,23 @@ impl Engine {
     {
         let target = request.target.as_str();
         let mut out = self.begin_call(target);
+
+        // Every call's first feed event; its seq anchors the trace ref that
+        // failure messages carry (`None` without a sink — the parity path).
+        let trace = self.events.as_ref().map(|sink| {
+            let seq = sink.emit(
+                self.elapsed_ms(),
+                EventKind::CallStart {
+                    call: out.trace_id.clone(),
+                    target: target.to_owned(),
+                    op: request.op.clone(),
+                },
+            );
+            TraceRef {
+                run: sink.run_id().to_owned(),
+                seq,
+            }
+        });
 
         if request.v != ENVELOPE_VERSION {
             out.error = Some(OutcomeError {
@@ -582,13 +748,17 @@ impl Engine {
         match &cache_plan {
             CachePlan::Memory { key } => {
                 if self.serve_from_cache(key, &mut out) {
+                    self.emit_cache(&out, target, CacheStore::Memory, true);
                     return out;
                 }
+                self.emit_cache(&out, target, CacheStore::Memory, false);
             }
             CachePlan::Persistent { key, .. } => {
                 if self.serve_from_persistent(target, key, &mut out) {
+                    self.emit_cache(&out, target, CacheStore::Persistent, true);
                     return out;
                 }
+                self.emit_cache(&out, target, CacheStore::Persistent, false);
             }
             CachePlan::None => {}
         }
@@ -599,7 +769,7 @@ impl Engine {
         }
 
         // breaker admission (observes post-retry call outcomes)
-        let admission = self.admit(target, &resolved, &mut out);
+        let admission = self.admit(target, &resolved, &mut out, trace.as_ref());
         if admission == Admission::Rejected {
             return out;
         }
@@ -610,7 +780,7 @@ impl Engine {
             ..RetryPolicy::default()
         });
         let result = self
-            .run_attempts(request, &resolved, &retry, effect, &mut out)
+            .run_attempts(request, &resolved, &retry, effect, &mut out, trace.as_ref())
             .await;
         // Only the memory scope writes through under the state lock; the
         // persistent scope writes after the lock drops (journal I/O off-lock).
@@ -641,7 +811,7 @@ impl Engine {
             return CachePlan::None;
         };
         match cache.scope {
-            CacheScope::Persistent if self.journal.is_some() => CachePlan::Persistent {
+            CacheScope::Persistent if self.current_journal().is_some() => CachePlan::Persistent {
                 key: JournalCacheKey::new(format!("{target}#{hash}")),
                 ttl,
             },
@@ -714,7 +884,7 @@ impl Engine {
         key: &JournalCacheKey,
         out: &mut Outcome,
     ) -> bool {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return false;
         };
         let bytes = match journal.get_cache(key) {
@@ -757,13 +927,25 @@ impl Engine {
             out.throttled = true;
             out.throttle_wait_ms = wait_ms;
             self.state().metrics_for(target).throttled += 1;
+            // Emitted before the wait so a live tail shows the queueing now.
+            self.emit_event(|| EventKind::Throttle {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                wait_ms,
+            });
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
     }
 
     /// Consults the target's breaker; on rejection, fills the fail-fast
     /// KEEL-E012 outcome (the effect is never invoked).
-    fn admit(&self, target: &str, resolved: &ResolvedPolicy, out: &mut Outcome) -> Admission {
+    fn admit(
+        &self,
+        target: &str,
+        resolved: &ResolvedPolicy,
+        out: &mut Outcome,
+        trace: Option<&TraceRef>,
+    ) -> Admission {
         if resolved.breaker.is_none() {
             return Admission::Closed;
         }
@@ -780,7 +962,10 @@ impl Engine {
                     code: ErrorCode::BreakerOpen,
                     class: ErrorClass::Other,
                     http_status: None,
-                    message: format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                    message: with_trace_ref(
+                        format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                        trace,
+                    ),
                     original: None,
                 });
                 out.breaker = BreakerState::Open;
@@ -788,9 +973,20 @@ impl Engine {
             }
             admission
         };
+        // Both feed events run off the state lock, like the debug! below.
+        if admission == Admission::Rejected {
+            self.emit_event(|| EventKind::BreakerReject {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
+        }
         // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
         if admission == Admission::HalfOpen {
             debug!(target = %target, transition = "half_open", "breaker transition");
+            self.emit_event(|| EventKind::BreakerHalfOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
         }
         admission
     }
@@ -857,6 +1053,18 @@ impl Engine {
             transition
         };
         emit_breaker_transition(target, transition);
+        match transition {
+            BreakerTransition::Opened => self.emit_event(|| EventKind::BreakerOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                cooldown_ms: resolved.breaker.as_ref().map_or(0, |b| b.cooldown.0),
+            }),
+            BreakerTransition::Closed => self.emit_event(|| EventKind::BreakerClose {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            }),
+            BreakerTransition::None => {}
+        }
     }
 
     /// Writes a live success into the journal's persistent cache (called after
@@ -870,7 +1078,7 @@ impl Engine {
         payload: &Value,
         ttl: DurationMs,
     ) {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return;
         };
         let bytes = match encode_cache_payload(payload) {
@@ -979,7 +1187,8 @@ impl Engine {
         }
     }
 
-    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error.
+    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error
+    /// (whose message carries the call's trace ref when a sink is live).
     async fn run_attempts<F>(
         &self,
         request: &Request,
@@ -987,6 +1196,7 @@ impl Engine {
         retry: &RetryPolicy,
         effect: &mut F,
         out: &mut Outcome,
+        trace: Option<&TraceRef>,
     ) -> Result<Value, OutcomeError>
     where
         F: AsyncFnMut(u32) -> AttemptResult,
@@ -1003,6 +1213,11 @@ impl Engine {
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
+            self.emit_event(|| EventKind::AttemptStart {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                attempt,
+            });
 
             // Child span per attempt (spec §4.5): `class`/`http_status`/`wait_ms`
             // are filled in below once the attempt resolves. The effect future
@@ -1037,6 +1252,13 @@ impl Engine {
                     if let Some(status) = http_status {
                         attempt_span.record("http_status", status);
                     }
+                    self.emit_event(|| EventKind::AttemptError {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        class,
+                        http_status,
+                    });
                     let retryable = retry.is_retryable(class, http_status);
                     if let Some(code) =
                         terminal_code(retryable, attempt, max_attempts, request.idempotent)
@@ -1055,14 +1277,17 @@ impl Engine {
                             code,
                             class,
                             http_status,
-                            message: terminal_message(
-                                code,
-                                request,
-                                attempt,
-                                max_attempts,
-                                class,
-                                http_status,
-                                &message,
+                            message: with_trace_ref(
+                                terminal_message(
+                                    code,
+                                    request,
+                                    attempt,
+                                    max_attempts,
+                                    class,
+                                    http_status,
+                                    &message,
+                                ),
+                                trace,
                             ),
                             original,
                         });
@@ -1077,6 +1302,13 @@ impl Engine {
                     attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
+                    // Emitted before the wait so a live tail shows it now.
+                    self.emit_event(|| EventKind::Backoff {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        wait_ms: wait,
+                    });
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
             }

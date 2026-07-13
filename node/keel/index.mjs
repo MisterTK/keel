@@ -15,5 +15,6 @@ export { KeelError } from "./src/engine.mjs";
 export { keelMiddleware } from "./src/packs/ai-sdk.mjs";
 export { llmPack, resolveDevCache, DEV_CACHE_TTL } from "./src/packs/llm.mjs";
 export { mcpPack, installMcpPack, patchClientRequest } from "./src/packs/mcp.mjs";
+export { toolPack, wrapTool, classifyToolError, isValidToolName, toolTarget } from "./src/packs/tool.mjs";
 
 export const VERSION = "0.1.0";

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Ships inside the language packages (wheel/addon) as a cdylib, not as a crate.
 publish = false
 
 [lib]

@@ -1,0 +1,78 @@
+{
+  "code_hash": "ch-9b2e44",
+  "created_at": 1783728000000,
+  "divergences": [],
+  "entrypoint": "py:pipeline.ingest:main",
+  "flow_id": "01JZWY0A0000000000000001",
+  "lease_expires": null,
+  "lease_holder": null,
+  "live_from_seq": null,
+  "mode": "pure-replay",
+  "resumes_recorded": 0,
+  "status": "completed",
+  "steps": [
+    {
+      "action": "substitute",
+      "attempt": 1,
+      "duration_ms": 240,
+      "ended_at": 1783728000250,
+      "error_class": null,
+      "kind": "effect",
+      "outcome": "ok",
+      "seq": 1,
+      "started_at": 1783728000010,
+      "step_key": "api.source.internal#q1"
+    },
+    {
+      "action": "substitute",
+      "attempt": 1,
+      "duration_ms": 0,
+      "ended_at": 1783728000251,
+      "error_class": null,
+      "kind": "time",
+      "outcome": "ok",
+      "seq": 2,
+      "started_at": 1783728000251,
+      "step_key": "py:time.time#-"
+    },
+    {
+      "action": "substitute",
+      "attempt": 2,
+      "duration_ms": 2448,
+      "ended_at": 1783728002700,
+      "error_class": null,
+      "kind": "effect",
+      "outcome": "ok",
+      "seq": 3,
+      "started_at": 1783728000252,
+      "step_key": "api.enrich.internal#q2"
+    },
+    {
+      "action": "substitute",
+      "attempt": 1,
+      "duration_ms": 1399,
+      "ended_at": 1783728004100,
+      "error_class": null,
+      "kind": "effect",
+      "outcome": "ok",
+      "seq": 4,
+      "started_at": 1783728002701,
+      "step_key": "api.store.internal#w1"
+    },
+    {
+      "action": "substitute",
+      "attempt": 1,
+      "duration_ms": 1289,
+      "ended_at": 1783728005390,
+      "error_class": null,
+      "kind": "effect",
+      "outcome": "ok",
+      "seq": 5,
+      "started_at": 1783728004101,
+      "step_key": "api.notify.internal#n1"
+    }
+  ],
+  "steps_reexecute": 0,
+  "steps_substitute": 5,
+  "updated_at": 1783728005400
+}

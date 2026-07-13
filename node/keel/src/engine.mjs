@@ -23,7 +23,11 @@
  *     its KEEL-E001 field-path messages are shared, never re-derived.
  */
 
-import { KeelCoreStub, KeelError, ENVELOPE_VERSION } from "../../keel-core-stub/index.mjs";
+// Vendored copy of node/keel-core-stub/index.mjs so the published package is
+// self-contained (npm pack cannot ship files above the package root). It is
+// byte-identical to the source — enforced by test/vendored-stub-parity.test.mjs
+// and scripts/check-release-metadata.sh; refresh with scripts/sync-vendored.sh.
+import { KeelCoreStub, KeelError, ENVELOPE_VERSION } from "./vendor/keel-core-stub/index.mjs";
 
 export { KeelError, ENVELOPE_VERSION };
 

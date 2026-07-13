@@ -39,8 +39,11 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   // Layer the embedded pack defaults UNDER user config, then resolve the LLM
   // dev cache (mode:"dev" → concrete ttl off-prod, inert when KEEL_ENV=prod;
   // scope=persistent when the backend can persist). Mirrors the Python front end.
-  const policy = resolveDevCache(applyPackDefaults(raw), env, { persistent: backend.persistent });
-  backend.configure(policy); // throws KEEL-E001 on invalid policy
+  const policy = applyJournalEnvOverride(
+    resolveDevCache(applyPackDefaults(raw), env, { persistent: backend.persistent }),
+    env
+  );
+  backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
   const discovery = createDiscovery(cwd);
   setRuntime({ enabled: true, backend, discovery });
@@ -65,6 +68,22 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   installExitFlush(discovery);
   banner(env, source, wrappable.length, mcp);
   return { enabled: true, backend, discovery, functionTargets, uninstallFetch, mcp };
+}
+
+/**
+ * `KEEL_JOURNAL` is the journal escape hatch: when it is set in the environment
+ * (even to the empty string, which *disables* the journal), the construction-
+ * time selection made from it wins over keel.toml's `journal` key. The core
+ * honors the effective policy's `journal` at configure time, so the override is
+ * composed here — the key is dropped before `configure`, leaving the
+ * env-selected (or disabled) construction attachment in force. Precedence:
+ * KEEL_JOURNAL (when set) > policy `journal` > `.keel/journal.db`. Mirrors the
+ * Python front end exactly (parity). Exported for its unit test.
+ */
+export function applyJournalEnvOverride(policy, env) {
+  if (!("KEEL_JOURNAL" in env) || !("journal" in policy)) return policy;
+  const { journal: _dropped, ...rest } = policy;
+  return rest;
 }
 
 /**
