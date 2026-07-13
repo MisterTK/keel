@@ -7,9 +7,12 @@ Two seams, each with its own leg:
   effective policy). No native module needed.
 * The native core honoring `journal` at configure time: a `file:` location
   attaches SQLite there (dirs created, `persistent` flips live), and a
-  `postgres://` location fails loudly with KEEL-E005 through the SAME
-  `configure` error path the front end already surfaces (skips without the
-  built `keel_core`).
+  `postgres://` location attaches the real Postgres/fleet backend (Level 3) —
+  both through the SAME `configure` error path the front end already
+  surfaces (skips without the built `keel_core`). The postgres leg here
+  exercises only the failure path (a malformed URL, so it stays fast and
+  network-free); the backend's own conformance/integration coverage lives in
+  `crates/keel-journal`.
 """
 
 from __future__ import annotations
@@ -26,8 +29,6 @@ try:  # native-only legs: policy journal selection lives in the real core
     _NATIVE = True
 except ImportError:
     _NATIVE = False
-
-_POSTGRES_E005 = "Postgres journal not yet available in this build; use file: — see docs"
 
 
 class JournalEnvOverrideTest(unittest.TestCase):
@@ -67,14 +68,15 @@ class NativeJournalPolicyTest(unittest.TestCase):
             self.assertTrue(core.persistent, "policy journal attached live")
             self.assertTrue(path.exists(), "store created at the policy path")
 
-    def test_postgres_location_raises_e005_through_configure(self) -> None:
-        """The KEEL-E005 contract surfaces through the front end's existing
-        configure error path — exact frozen message, credentials never echoed."""
+    def test_malformed_postgres_location_fails_configure_without_leaking_credentials(self) -> None:
+        """A `postgres://` location is a real backend now (Level 3/fleet); a
+        malformed one still fails configure — through the same error path a
+        bad `file:` path does (KEEL-E040) — and never echoes credentials back,
+        whether or not the URL could ever be parsed."""
         core = keel_core.KeelCore()
         with self.assertRaises(keel_core.KeelCoreError) as ctx:
-            core.configure({"journal": "postgres://keel:sekrit@db.internal/keel"})
-        self.assertEqual(ctx.exception.code, "KEEL-E005")
-        self.assertEqual(ctx.exception.message, _POSTGRES_E005)
+            core.configure({"journal": "postgres://keel:sekrit@[not-a-valid-host/keel"})
+        self.assertEqual(ctx.exception.code, "KEEL-E040")
         self.assertNotIn("sekrit", str(ctx.exception), "credentials never printed")
         self.assertFalse(core.persistent, "the rejected location attaches nothing")
 

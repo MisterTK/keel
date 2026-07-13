@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
+postgres = "0.19.14"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
 

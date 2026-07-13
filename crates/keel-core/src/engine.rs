@@ -5,7 +5,6 @@
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
@@ -608,14 +607,15 @@ pub struct Engine {
 }
 
 /// The engine's journal attachment plus, when policy selected it, the resolved
-/// `file:` path it was opened from — so reapplying an unchanged policy is a
-/// no-op instead of a re-open.
+/// backend it was opened from — so reapplying an unchanged policy (whether a
+/// `file:` path or the same `postgres://` location) is a no-op instead of a
+/// re-open/re-connect.
 #[derive(Default)]
 struct JournalSlot {
     journal: Option<Arc<dyn Journal>>,
-    /// `Some` only for a policy-selected (`file:`) attachment; construction-time
+    /// `Some` only for a policy-selected attachment; construction-time
     /// attachments have no location the engine could compare against.
-    policy_path: Option<PathBuf>,
+    backend: Option<JournalBackend>,
 }
 
 impl fmt::Debug for Engine {
@@ -661,7 +661,7 @@ impl Engine {
     pub fn attach_journal(&mut self, journal: impl Journal + 'static) -> &mut Self {
         let slot = self.journal.get_mut().expect("journal lock poisoned");
         slot.journal = Some(Arc::new(journal));
-        slot.policy_path = None;
+        slot.backend = None;
         self
     }
 
@@ -799,34 +799,32 @@ impl Engine {
     /// authoritative. (Front ends that want an environment escape hatch such as
     /// `KEEL_JOURNAL` compose it into the effective policy *before* calling
     /// `configure`, per the effective-policy contract.) Reapplying an unchanged
-    /// `file:` location is a no-op, so reconfigure loops never re-open the
-    /// store or drop its connection state.
+    /// location — the same `file:` path, or the same `postgres://` URL — is a
+    /// no-op, so reconfigure loops never re-open the store, re-open a fresh
+    /// Postgres connection pool, or drop either's connection state.
     ///
     /// # Errors
-    /// - `KEEL-E005` for a backend this build cannot provide (`postgres://`).
-    /// - `KEEL-E040` when the selected SQLite file cannot be created/opened.
+    /// - `KEEL-E040` when the selected SQLite file, or the selected Postgres
+    ///   database, cannot be opened/connected to.
     fn apply_journal_location(&self, location: &JournalLocation) -> Result<(), KeelError> {
         let backend = JournalBackend::select(location);
-        if let JournalBackend::File(path) = &backend {
+        {
             let slot = self.journal.read().expect("journal lock poisoned");
-            if slot.policy_path.as_deref() == Some(path.as_path()) {
+            if slot.backend.as_ref() == Some(&backend) {
                 return Ok(()); // unchanged location: keep the open store
             }
         }
-        // Open OFF the lock (filesystem I/O); the brief write below only swaps
-        // pointers. Two racing configures both open, last writer wins — the
-        // loser's store is just dropped.
+        // Open OFF the lock (filesystem/network I/O); the brief write below
+        // only swaps pointers. Two racing configures both open, last writer
+        // wins — the loser's store (and, for Postgres, its connection pool)
+        // is just dropped.
         let journal = journal_backend::open(&backend)?;
-        let policy_path = match backend {
-            JournalBackend::File(path) => {
-                debug!(path = %path.display(), "journal selected by policy");
-                Some(path)
-            }
-            JournalBackend::Postgres => None, // unreachable today: open() errors
-        };
+        if let JournalBackend::File(path) = &backend {
+            debug!(path = %path.display(), "journal selected by policy");
+        }
         let mut slot = self.journal.write().expect("journal lock poisoned");
         slot.journal = Some(journal);
-        slot.policy_path = policy_path;
+        slot.backend = Some(backend);
         Ok(())
     }
 
