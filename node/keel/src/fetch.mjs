@@ -29,7 +29,7 @@
 
 import {
   normalizeRequest,
-  resolveTarget,
+  resolvePolicyTarget,
   isIdempotent,
   deriveArgsHash,
   parseRetryAfter,
@@ -60,7 +60,7 @@ function cancelBody(resp) {
  * Install the wrapping fetch. Returns an uninstall function that restores the
  * exact original. Idempotent: a second install is a no-op.
  */
-export function installFetch(backend, discovery, { globalObj = globalThis } = {}) {
+export function installFetch(backend, discovery, { globalObj = globalThis, outboundTargets = null } = {}) {
   const original = globalObj.fetch;
   if (typeof original !== "function") return () => {};
   if (original.__keelWrapped) return () => {}; // already installed
@@ -75,7 +75,17 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
       return original.call(this, input, init);
     }
     const hostname = parsed.hostname;
-    const target = resolveTarget(hostname);
+    // Pattern-aware target selection (docs/targeting.md): exact host key, else
+    // the most specific matching host/URL pattern key, else the bare host.
+    // `outboundTargets` is `compileOutboundMatchers(policy)`, compiled once at
+    // install time; with none installed this is exactly the old `resolveTarget`.
+    const target = resolvePolicyTarget(outboundTargets, {
+      method,
+      hostname,
+      scheme: parsed.protocol.replace(/:$/, ""),
+      port: parsed.port ? Number(parsed.port) : null,
+      path: parsed.pathname,
+    });
     const op = `${method} ${hostname}${parsed.pathname}`;
     const idemHeader = readIdempotencyHeader(backend, target);
     // A call is only retried if it is BOTH idempotent by method/header AND its

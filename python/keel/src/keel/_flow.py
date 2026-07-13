@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
+import re
 import struct
 import sys
 from contextlib import contextmanager
@@ -53,16 +54,71 @@ def match_flow(target: str, entrypoints: Sequence[FlowEntrypoint]) -> FlowEntryp
     scratch `pipeline.py` in another directory — enter and resume the production
     flow's journal (flow identity never includes which file ran), replaying
     foreign step outcomes into foreign code. Requiring the module path to match
-    the file's path suffix closes that."""
+    the file's path suffix closes that.
+
+    Glob designation (docs/targeting.md): an entry whose module contains `*`
+    (`py:pipeline.*:main`) matches when any dotted-module reading of the target
+    path — built from the file's stem outward while path components are valid
+    identifiers, shortest first — matches the glob (`*` crosses dots). CONCRETE
+    entries always win over globs, then declaration order; the returned entry is
+    resolved to the matched concrete module (raw = `py:<module>:<function>`) so
+    two different scripts under one glob NEVER share a flow identity, with `via`
+    recording the designating pattern for messages."""
     if not entrypoints:
         return None
     tparts = Path(target).parts
     for entry in entrypoints:
+        if "*" in entry.module:
+            continue  # concrete designations take precedence over globs
         mod = entry.module.split(".")
         want = tuple(mod[:-1]) + (mod[-1] + ".py",)
         if len(want) <= len(tparts) and tparts[-len(want):] == want:
             return entry
+    candidates = _module_candidates(tparts)
+    if not candidates:
+        return None
+    for entry in entrypoints:
+        if "*" not in entry.module:
+            continue
+        rx = _glob_regex(entry.module)
+        for module in candidates:  # shortest (least-assuming import path) first
+            if rx.match(module):
+                return FlowEntrypoint(
+                    raw=f"py:{module}:{entry.function}",
+                    module=module,
+                    function=entry.function,
+                    via=entry.raw,
+                )
     return None
+
+
+def _glob_regex(glob: str) -> re.Pattern[str]:
+    """`*`-only glob → anchored regex (`*` matches any run of characters, dots
+    included; everything else literal). The same rule as outbound target
+    patterns (`_targets._glob_regex`) — one glob dialect everywhere."""
+    return re.compile("^" + ".*".join(re.escape(p) for p in glob.split("*")) + "$")
+
+
+def _module_candidates(tparts: Sequence[str]) -> list[str]:
+    """Dotted-module readings of a script path, shortest first: for
+    `demo/pipeline/ingest.py` → `ingest`, `pipeline.ingest`,
+    `demo.pipeline.ingest`. Built from the stem outward, stopping at the first
+    path component that is not a valid identifier (it could never be an
+    importable package, so a glob match on it would designate an unrunnable
+    module)."""
+    if not tparts or not tparts[-1].endswith(".py"):
+        return []
+    stem = tparts[-1][: -len(".py")]
+    if not stem.isidentifier():
+        return []
+    dotted = stem
+    out = [dotted]
+    for comp in reversed(tparts[:-1]):
+        if not comp.isidentifier():
+            break
+        dotted = f"{comp}.{dotted}"
+        out.append(dotted)
+    return out
 
 
 def backend_supports_flows(backend: Any) -> bool:
@@ -131,10 +187,16 @@ def _import_flow_function(target: str, entry: FlowEntrypoint) -> Any:
     module = importlib.import_module(entry.module)
     func = getattr(module, entry.function, None)
     if not callable(func):
+        designated = f" (designated by [flows] glob {entry.via!r})" if entry.via else ""
+        next_step = (
+            f"; add a {entry.function}() to the module or narrow the glob"
+            if entry.via
+            else ""
+        )
         raise KeelError(
             "KEEL-E040",
-            f"flow entrypoint {entry.raw!r} names {entry.function!r}, which is not a "
-            f"callable in module {entry.module!r}",
+            f"flow entrypoint {entry.raw!r}{designated} names {entry.function!r}, "
+            f"which is not a callable in module {entry.module!r}{next_step}",
         )
     return func
 

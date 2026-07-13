@@ -185,7 +185,11 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     method = request.method
     url = request.url
     host = url.host
-    target = _http.resolve_target(host)
+    # Pattern-aware target selection (docs/targeting.md): exact host key, else
+    # the most specific matching host/URL pattern key, else the bare host.
+    target = _http.resolve_policy_target(
+        method, host, scheme=url.scheme, port=url.port, path=url.path
+    )
     op = f"{method} {host}{url.path}"
     idem_header = _http.idempotency_header(target)
     idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)

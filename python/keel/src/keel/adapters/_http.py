@@ -36,7 +36,7 @@ from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
-from .. import _runtime
+from .. import _runtime, _targets
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
@@ -105,6 +105,38 @@ def resolve_target(host: str) -> str:
     host, else the bare host string."""
     provider = LLM_HOST_PROVIDERS.get(host)
     return f"llm:{provider}" if provider else host
+
+
+def resolve_policy_target(
+    method: str,
+    host: str,
+    *,
+    scheme: str | None = None,
+    port: int | None = None,
+    path: str | None = None,
+) -> str:
+    """The policy target for one outbound request, honoring URL-pattern keys.
+
+    Precedence (``docs/targeting.md``; parity contract with the Node twin's
+    ``resolvePolicyTarget``): the LLM host map first (a provider host is the
+    semantic target ``llm:<provider>``, exactly as before), then an exact
+    bare-host ``[target]`` key, then the most specific matching host/URL
+    *pattern* key (``*.internal.corp``, ``GET api.catalog.internal/*``, …) —
+    returned verbatim so the core's exact lookup lands on it — and finally the
+    bare host, whose layers fall through to ``[defaults.outbound]``. With no
+    matchers installed (bootstrap not run) this is exactly ``resolve_target``.
+    """
+    provider = LLM_HOST_PROVIDERS.get(host)
+    if provider:
+        return f"llm:{provider}"
+    return _targets.resolve_outbound(
+        _targets.current_outbound_targets(),
+        method,
+        host,
+        scheme=scheme,
+        port=port,
+        path=path,
+    )
 
 
 def is_idempotent(
@@ -349,6 +381,7 @@ __all__ = [
     "resolve_layer",
     "idempotency_header",
     "cache_configured",
+    "resolve_policy_target",
     "resolve_target",
     "is_idempotent",
     "args_hash",

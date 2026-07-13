@@ -60,7 +60,8 @@ journal layers sit inside this order in the real core; scenarios inject
    the target starts with `llm:`, else `defaults.outbound`. A layer set at a
    more specific level replaces the whole layer table (no deep merge).
    Scenarios use exact target ids (glob/pattern resolution is a front-end
-   concern and tested separately).
+   concern and tested separately — see `docs/targeting.md` for the
+   host/URL-pattern grammar and precedence rules).
 2. **Cache.** When the resolved policy has `cache` with a `ttl` and the
    request carries `args_hash`: a fresh entry returns `from_cache: true`
    with `attempts: 0` and no effect invocation; a successful live call
