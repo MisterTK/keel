@@ -64,6 +64,12 @@ class NativeBackend {
       return defaults.llm[key];
     return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
   }
+  /** Flush the native engine's live NDJSON event feed (`.keel/events/`) —
+   * see `KeelCoreNative::flush_events`'s doc comment. A no-op on an addon
+   * build too old to expose it. */
+  flushEvents() {
+    this.#core.flushEvents?.();
+  }
 }
 
 async function tryLoadNative({ journalPath } = {}) {

@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use keel_cli::render::emit;
 use keel_cli::{
     doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record, replay,
-    resume, run, status, tail,
+    resume, run, sim, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -107,6 +107,15 @@ enum Command {
         /// Show one recorded step in full detail (payload, timings, action).
         #[arg(long, value_name = "SEQ")]
         step: Option<i64>,
+    },
+    /// Fault/latency/crash-restart simulation over a declarative plan
+    /// (`docs/sim-format.md`): dispatches the plan's target like `keel run`,
+    /// re-invokes it across a `"crash"` directive's kill-restart, then grades
+    /// the run against the plan's `assert` block — a doctor-style pass/fail
+    /// report.
+    Sim {
+        /// The fault-plan JSON file.
+        plan: String,
     },
     /// Live view of attempts, backoffs, and breaker transitions while your
     /// program runs (reads `.keel/events/`; no daemon). `--json` streams the
@@ -235,21 +244,7 @@ fn main() {
             emit(&r, json)
         }
         Command::Status => emit(&status::run(&project, SystemClock.now_ms()), json),
-        Command::Flows { dead, action } => match action {
-            Some(FlowsCommand::Add { entrypoint, diff }) => {
-                emit(&flows_add::run(&project, &entrypoint, diff), json)
-            }
-            Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(&project), json),
-            Some(FlowsCommand::Resume { flow, all, args }) => {
-                let options = resume::ResumeOptions { flow, all, args };
-                let (rendered, code) = resume::run(&project, &options, SystemClock.now_ms());
-                if let Some(r) = rendered {
-                    emit(&r, json);
-                }
-                code
-            }
-            None => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
-        },
+        Command::Flows { dead, action } => dispatch_flows(&project, dead, action, json),
         Command::Fsck { fix, prune } => {
             let options = fsck::FsckOptions { fix, prune };
             emit(&fsck::run(&project, &options, SystemClock.now_ms()), json)
@@ -260,21 +255,9 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
-        Command::Record { action } => match action {
-            RecordCommand::List => emit(&record::list(&project), json),
-            RecordCommand::Run { target, args } => {
-                let (rendered, code) = record::run(&project, &target, &args);
-                if let Some(r) = rendered {
-                    emit(&r, json);
-                }
-                code
-            }
-            RecordCommand::Test { recording, out } => emit(
-                &record::test_gen(&project, &recording, out.as_deref()),
-                json,
-            ),
-        },
+        Command::Record { action } => dispatch_record(&project, action, json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
+        Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
         Command::Tail { no_follow, run } => {
             let opts = tail::TailOptions {
                 color: tail::color_enabled(),
@@ -297,4 +280,46 @@ fn main() {
         Command::Explain { code } => emit(&explain::run(&code), json),
     };
     exit(code);
+}
+
+/// `keel flows [--dead] [<action>]` (extracted from `main` — clippy's
+/// `too_many_lines`).
+fn dispatch_flows(
+    project: &std::path::Path,
+    dead: bool,
+    action: Option<FlowsCommand>,
+    json: bool,
+) -> i32 {
+    match action {
+        Some(FlowsCommand::Add { entrypoint, diff }) => {
+            emit(&flows_add::run(project, &entrypoint, diff), json)
+        }
+        Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(project), json),
+        Some(FlowsCommand::Resume { flow, all, args }) => {
+            let options = resume::ResumeOptions { flow, all, args };
+            let (rendered, code) = resume::run(project, &options, SystemClock.now_ms());
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        None => emit(&flows::flows(project, dead, SystemClock.now_ms()), json),
+    }
+}
+
+/// `keel record <action>` (extracted from `main` — clippy's `too_many_lines`).
+fn dispatch_record(project: &std::path::Path, action: RecordCommand, json: bool) -> i32 {
+    match action {
+        RecordCommand::List => emit(&record::list(project), json),
+        RecordCommand::Run { target, args } => {
+            let (rendered, code) = record::run(project, &target, &args);
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        RecordCommand::Test { recording, out } => {
+            emit(&record::test_gen(project, &recording, out.as_deref()), json)
+        }
+    }
 }

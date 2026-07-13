@@ -65,6 +65,18 @@ def run_target(
     # sees the same argv[0] and byte-identical behavior.
     sys.argv = [target, *args]
 
+    # `keel sim <plan>`: adapter-level fault injection driven by a declarative
+    # plan (docs/sim-format.md). Wired BEFORE the recording tee below so that,
+    # if a run is somehow both simulated and recorded, the recording captures
+    # what actually happened (including any injected faults) rather than the
+    # pristine outcome underneath.
+    if state is not None and state.get("enabled") and env.get("KEEL_SIM_PLAN"):
+        from . import _runtime
+        from ._sim import install_sim
+
+        state["backend"] = install_sim(state["backend"], plan_path=env["KEEL_SIM_PLAN"], env=env)
+        _runtime.set_runtime(state["backend"], state.get("discovery"))
+
     # `keel record run`: tee every intercepted effect into a recording file
     # (docs/recording-format.md). A pure observer — never changes what a
     # wrapped call sees — so installing it this late (right before the target

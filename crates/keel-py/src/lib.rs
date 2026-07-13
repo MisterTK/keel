@@ -527,6 +527,22 @@ impl KeelCore {
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("report not encodable: {e}")))
     }
 
+    /// Block until every event emitted so far on this handle's live NDJSON
+    /// feed (`.keel/events/`, `KEEL_EVENTS`) is written and flushed to disk.
+    /// A no-op when no sink is attached (Tier 1 events off). The writer
+    /// thread already flushes whenever its queue drains, so a long-lived
+    /// process (a `keel tail`'d server) needs this for nothing — but a
+    /// short-lived script (`keel run`, `keel sim`) can exit before its last
+    /// few events drain on their own; the front end calls this once at
+    /// process exit (mirroring the existing discovery-flush registration)
+    /// so a one-shot run's feed is always complete for `keel tail`/`keel
+    /// sim` to read afterward.
+    fn flush_events(&self) {
+        if let Some(sink) = self.engine.events() {
+            sink.flush();
+        }
+    }
+
     /// Harness-only: advance the paused virtual clock by `ms` milliseconds.
     /// Requires a `paused=True` handle. On a real-time handle we refuse with a
     /// precise `KEEL-E040` instead of letting `tokio::time::advance` panic —
