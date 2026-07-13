@@ -1,0 +1,14 @@
+# Fixture for crates/keel/tests/wrap_integration.rs. `fixed(1ms)` keeps the
+# real (non-virtual — the real Engine sleeps wall-clock time outside the
+# conformance harness's `start_paused` mode) backoff tiny but nonzero, the
+# same trick node/keel-core-native's own tests use.
+[target."orders-api"]
+retry = { attempts = 3, schedule = "fixed(1ms)", on = ["other"] }
+
+[target."flaky-cache-api"]
+retry = { attempts = 3, schedule = "fixed(1ms)", on = ["other"] }
+cache = { ttl = "60s" }
+
+[target."breaker-api"]
+retry = { attempts = 1, schedule = "fixed(1ms)", on = ["other"] }
+breaker = { failures = 1, cooldown = "60s" }

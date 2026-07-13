@@ -1,0 +1,5 @@
+error: #[keel::wrap] only supports `async fn` (v1 scope: the engine chain is driven on the caller's async runtime; wrap a sync body in `tokio::task::spawn_blocking` yourself first if needed)
+ --> tests/ui/fail_sync_fn.rs:5:1
+  |
+5 | fn fetch_order(id: u32) -> Result<u32, std::io::Error> {
+  | ^^
