@@ -26,6 +26,7 @@ import { installIoredisPack } from "./packs/ioredis.mjs";
 import { installMysql2Pack } from "./packs/mysql2.mjs";
 import { evePack } from "./packs/eve.mjs";
 import { aiSdkPack } from "./packs/ai-sdk.mjs";
+import { installRecording } from "./record.mjs";
 
 export function isDisabled(env = process.env) {
   return isTruthy(env.KEEL_DISABLE);
@@ -65,12 +66,25 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   );
   backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
+  // `keel record run`: tee every intercepted effect into a recording file
+  // (docs/recording-format.md). A pure observer — never changes what a
+  // wrapped call sees — so `effectiveBackend` (not `backend`) is what every
+  // seam below actually wires up.
+  const effectiveBackend = env.KEEL_RECORD
+    ? installRecording(backend, {
+        path: env.KEEL_RECORD,
+        target: process.argv[1] ?? "",
+        args: process.argv.slice(2),
+        env,
+      })
+    : backend;
+
   // The explicit `[target."…"]` keys of the SAME effective policy the core
   // just configured — discovery's "wrapped" classification (dx-spec §2's
   // coverage gap) must agree with what actually applied.
   const knownTargets = new Set(Object.keys(policy.target ?? {}));
   const discovery = createDiscovery(cwd, { knownTargets });
-  setRuntime({ enabled: true, backend, discovery });
+  setRuntime({ enabled: true, backend: effectiveBackend, discovery });
 
   // Outbound host/URL-pattern matchers (docs/targeting.md), compiled from the
   // same effective policy the backend was configured with: `fetch`'s target
@@ -78,7 +92,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   // select requests. The core still sees one exact key per call (parity with
   // the Python front end's `install_outbound_targets`).
   const outboundTargets = compileOutboundMatchers(policy);
-  const uninstallFetch = installFetch(backend, discovery, { outboundTargets });
+  const uninstallFetch = installFetch(effectiveBackend, discovery, { outboundTargets });
   // Framework/library packs: auto-detect and wrap each one if present.
   // Best-effort — an absent library is a silent no-op; never fatal.
   const packs = [];
@@ -121,7 +135,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection);
   return {
     enabled: true,
-    backend,
+    backend: effectiveBackend,
     discovery,
     functionTargets,
     uninstallFetch,
