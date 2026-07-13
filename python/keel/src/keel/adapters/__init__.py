@@ -12,6 +12,11 @@ library was already imported. A program that never imports httpx/requests pays
 nothing — the runtime stays stdlib-only and ``keel run`` startup stays cheap,
 honoring the contract rule that a pack never imports its library unless it is
 present *and in use*.
+
+Framework packs (pydantic-ai / openai-agents / crewai / adk / …, ``keel.packs``
+— real seams, not transport libraries; see ``keel.packs``' module docstring)
+are armed through the identical lazy mechanism, keyed by their own ``MODULE``,
+via :func:`_framework_packs`.
 """
 
 from __future__ import annotations
@@ -48,9 +53,9 @@ def _framework_packs() -> tuple[Any, ...]:
     import time) to avoid a cycle: `keel.packs` submodules already import
     `keel.adapters._pack`, so importing `keel.packs` at the top of THIS module
     would make the two packages import each other mid-initialization."""
-    from ..packs import crewai_pack, openai_agents_pack, pydantic_ai_pack
+    from ..packs import adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack
 
-    return (pydantic_ai_pack, openai_agents_pack, crewai_pack)
+    return (adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack)
 
 
 def _all_packs() -> tuple[Any, ...]:

@@ -9,9 +9,11 @@ policy-defaults fragment merged UNDER user config and (b) — for the generic
 their own (adapter-pack rule 3).
 
 The *framework* packs (``pydantic_ai_pack``, ``openai_agents_pack``,
-``crewai_pack``) DO own a seam — each patches its framework's tool-execution
-boundary reversibly, physically wiring it to :func:`tool.wrap_tool` — so they
-are registered for lazy on-import activation alongside the library adapters
+``crewai_pack``, ``adk_pack``) DO own a seam — each patches its framework's
+tool-execution (and, for ``adk_pack``, model-call) boundary reversibly,
+physically wiring it to :func:`tool.wrap_tool` (``adk_pack`` additionally
+registers a plugin on every constructed ADK ``Runner``) — so they are
+registered for lazy on-import activation alongside the library adapters
 (``keel.adapters._framework_packs``, a lazily-imported cross-package
 reference: importing them from THIS module's top level is safe, but the
 reverse is not — see that function's docstring) rather than folded into
@@ -29,7 +31,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import anthropic_pack, crewai_pack, openai_agents_pack, openai_pack, pydantic_ai_pack
+from . import (
+    adk_pack,
+    anthropic_pack,
+    crewai_pack,
+    openai_agents_pack,
+    openai_pack,
+    pydantic_ai_pack,
+)
 from .llm import DEV_CACHE_TTL, llm_pack, resolve_dev_cache
 from .tool import is_valid_tool_name, tool_pack, wrap_tool
 
@@ -39,7 +48,7 @@ PROVIDER_PACKS = (openai_pack, anthropic_pack)
 #: Registration order = report order (stable, deterministic). Physical
 #: activation is `keel.adapters.install_adapters` (via `_framework_packs`);
 #: this tuple is the discoverability/reporting twin of `PROVIDER_PACKS`.
-FRAMEWORK_PACKS = (pydantic_ai_pack, openai_agents_pack, crewai_pack)
+FRAMEWORK_PACKS = (adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack)
 
 
 def present_provider_defaults() -> list[dict[str, Any]]:
@@ -53,6 +62,7 @@ __all__ = [
     "PROVIDER_PACKS",
     "FRAMEWORK_PACKS",
     "DEV_CACHE_TTL",
+    "adk_pack",
     "llm_pack",
     "resolve_dev_cache",
     "openai_pack",

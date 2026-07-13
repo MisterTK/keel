@@ -95,9 +95,11 @@ def install_keel(
     # flow. Parsing only; running one requires the native backend.
     flow_entrypoints = extract_flow_entrypoints(policy)
 
-    # Library adapters (httpx/requests/…): armed lazily — each patches its
-    # library only when the program imports it. Present-but-unused libraries
-    # cost nothing, so `keel run` startup stays cheap.
+    # Library adapters (httpx/requests/…) plus framework packs with a real
+    # seam of their own (adk_pack, pydantic-ai, …): all armed lazily — each
+    # patches its library/framework only when the program imports it.
+    # Present-but-unused libraries cost nothing, so `keel run` startup stays
+    # cheap.
     adapters = install_adapters()
 
     _register_exit_flush()
