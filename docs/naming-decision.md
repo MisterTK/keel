@@ -98,4 +98,8 @@ Nothing in this memo is executed yet: per the 2026-07-12 decision, all
 manifests keep their current names (`keel`, `keel-core`, `keel-core-stub`,
 `@keel/core-native`, crate names as-is) until TK picks an option. The only
 publish-blocking safety currently in-tree is crates/keel-py's
-`Private :: Do Not Upload` classifier and the release workflow's absence.
+`Private :: Do Not Upload` classifier and the fact that
+`.github/workflows/release.yml`'s `publish` job has every real publish
+command (`cargo publish`, `twine upload`, `npm publish`) left commented out
+behind a `workflow_dispatch` input that, even when set, only runs a no-op
+"Publishing is not enabled" step.

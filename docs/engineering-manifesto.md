@@ -50,12 +50,19 @@ it; this says how we build it. Conflicts resolve in that order.*
    "forbid"`, `clippy::all` + `clippy::pedantic`, enforced as errors in CI
    (`-D warnings`). Deviations use `#[expect(lint, reason = "...")]` at the
    narrowest scope — a blanket `allow` without a reason is a review defect.
-   The short curated allow-list lives in the root `Cargo.toml` with a
-   comment justifying each entry.
+   The short curated allow-list lives in the root `Cargo.toml` under a
+   comment justifying the opt-outs as a group.
 10. **Async discipline.** tokio; effects are `AsyncFnMut` closures; locks
     are scoped and *never* held across an `await`; waits are real
     `tokio::time` sleeps so production sleeps wall-clock while tests run
-    under `start_paused` virtual time. No test ever sleeps real time.
+    under `start_paused` virtual time. No test ever sleeps real time,
+    except the handful of lease-heartbeat/DB-clock tests that are
+    inherently real-clock (dedicated-OS-thread heartbeat measuring wall
+    time; Postgres-server-clock arbitration) — each documented in place
+    (see `crates/keel-core/tests/flows.rs`'s
+    `the_heartbeat_renews_the_lease_on_a_real_clock`,
+    `crates/keel-core/src/flow.rs`'s heartbeat-monitor test, and
+    `crates/keel-journal/tests/postgres_journal.rs`).
 11. **Functions stay small because they're decomposed, not suppressed.**
     When `too_many_lines` fires, extract phase methods (`begin_call`,
     `throttle`, `admit`, `settle`) — don't `allow` it away.

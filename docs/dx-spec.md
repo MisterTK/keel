@@ -14,7 +14,8 @@ Each level is complete and valuable on its own. Nobody is ever forced up a level
 ```
 $ uvx keel run app.py            # python
 $ npx keel run app.ts            # node
-$ cargo keel run                 # rust
+// rust: add #[keel::wrap(target = "...")] to a function — see crates/keel;
+// a zero-code `cargo keel run` wrapper is not built (documented debt, CLAUDE.md)
 ```
 
 No `keel.toml` required. **Smart defaults ship in the binary:** every discovered outbound call gets conservative production defaults — 30s timeout, 3 retries on transient errors (connection, timeout, 429, 5xx) with jittered exponential backoff, per-host circuit breaker. LLM provider calls get the LLM default pack (§4.1). One line of output, then silence:
@@ -70,7 +71,7 @@ One line (`journal = "postgres://…"`), nothing else changes. Covered in the ar
 
 Three evidence sources, merged, each labeled in output so trust is inspectable:
 
-1. **Static scan** (`keel init` cold): Python via `ast`, TS via `oxc`/SWC parse, Rust via `syn` in a cargo subcommand. Finds imports of known effect libraries, call sites, URL/host literals, function defs matching effectful naming patterns. Fast, no execution, catches ~80%.
+1. **Static scan** (`keel init` cold): Python via `ast`, TS via `oxc` parse. (A `syn`-based Rust static scanner is not built — see CLAUDE.md's documented debt list.) Finds imports of known effect libraries, call sites, URL/host literals, function defs matching effectful naming patterns. Fast, no execution, catches ~80%.
 2. **Import-time discovery** (every `keel run`): what actually got loaded and wrapped — ground truth on coverage, catches dynamic imports the scan missed.
 3. **Observed runs** (`.keel/discovery.db`, always on, cheap): real call frequencies, latencies, error rates, hosts hit. This is what makes `keel init` output *evidence-based* ("matches your observed peak of 41/min") instead of template boilerplate — the single biggest differentiator between Keel's onboarding and every YAML-template competitor.
 
@@ -97,7 +98,7 @@ Agent code is the densest concentration of flaky effects in modern software — 
 
 Beyond `host:` and function targets, Keel defines pseudo-targets that map to what agent developers actually think about:
 
-- **`llm:<provider>`** — provider SDK calls (openai, anthropic, google-genai/Vertex, Bedrock, AI Gateway). Default pack: retry on 429/5xx/timeout with provider-aware backoff (respects `Retry-After`), token-bucket rate limiting, per-run cost/token budget caps (`budget = "$5/run"` → breaker trips), **model fallback chains** (`fallback = ["gemini-2.5-pro", "claude-sonnet-4.5"]`), and **dev-mode response caching** — identical prompt+params replays from cache during development. The dev cache alone (10× faster iteration, near-zero API spend while hacking on agent logic) is a killer feature that makes agent developers adopt Keel for selfish reasons before they ever need resilience.
+- **`llm:<provider>`** — provider SDK calls (openai, anthropic, google-genai/Vertex — Bedrock and AI Gateway support not yet built). Default pack: retry on 429/5xx/timeout with provider-aware backoff (respects `Retry-After`), token-bucket rate limiting, per-run cost/token budget caps (`budget = "$5/run"` → breaker trips), **model fallback chains** (`fallback = ["gpt-4o", "gpt-4o-mini"]`; cross-provider fallback to a different vendor requires the ai-sdk middleware pack with caller-supplied model instances, not the generic host/fetch seam), and **dev-mode response caching** — identical prompt+params replays from cache during development. The dev cache alone (10× faster iteration, near-zero API spend while hacking on agent logic) is a killer feature that makes agent developers adopt Keel for selfish reasons before they ever need resilience.
 - **`tool:<name>`** — agent tool invocations, wrapped at the framework's own boundary so retries happen *below* the LLM loop (a failed tool call is retried without burning tokens on a new LLM turn).
 - **`mcp:<server>`** — MCP client transports (stdio + HTTP). Per-server timeout, retry, breaker; a hung MCP server degrades gracefully instead of freezing the agent.
 
@@ -105,7 +106,7 @@ Beyond `host:` and function targets, Keel defines pseudo-targets that map to wha
 
 `keel doctor` detects the framework from dependencies and enables the pack; each pack is maintained like a library adapter (version-pinned contract tests):
 
-- **Google ADK (Python + TS):** a `keel-adk` plugin registered automatically at import time via ADK's plugin/callback API — tool and LLM calls become Keel targets; `on_tool_error` wiring becomes policy-driven instead of hand-written. This fills exactly the gap your vendor comparison flagged, with zero agent-code changes. For **google/agents-cli** users: `keel init` recognizes the scaffold layout and emits a policy file matching its structure, so ADK agents built the "official" way are covered by default.
+- **Google ADK (Python):** a `keel-adk` plugin registered automatically at import time via ADK's plugin/callback API — tool and LLM calls become Keel targets; `on_tool_error` wiring becomes policy-driven instead of hand-written. This fills exactly the gap your vendor comparison flagged, with zero agent-code changes. (Planned: `keel init` does not yet special-case the google/agents-cli scaffold layout; it falls back to the generic static scan.)
 - **LangGraph:** node execution wrapped as `tool:`/function targets (call-level resilience under the graph), plus — the strategic move — **a Keel-journal-backed checkpointer**, so graph state persistence and effect-level durability live in one file with one trace view instead of two disjoint systems.
 - **Vercel eve:** eve is TypeScript, filesystem-first (agents are directories of tools/skills/subagents), runs conversations as durable workflows, and reaches the world through MCP servers and OpenAPI tools — which means Keel's Node loader + `mcp:` targets cover it naturally: wrap the tool modules eve discovers and the MCP transports it calls. Keel doesn't compete with eve's conversation-level durability; it hardens the *effects inside* each step, which eve doesn't do at call level. ([vercel/eve](https://github.com/vercel/eve), [InfoQ](https://www.infoq.com/news/2026/06/vercel-eve-agents/))
 - **Vercel AI SDK:** first-class middleware (`wrapLanguageModel`) — the cleanest seam of any framework; the adapter is thin and safe.
@@ -121,7 +122,7 @@ A growing share of Keel's users will be coding agents acting on a human's behalf
 
 - **`keel mcp`** — the CLI doubles as an MCP server exposing: `get_status`, `get_doctor_report`, `propose_policy` (returns a keel.toml *diff*), `get_trace`, `list_flows`, `explain_error`. A coding agent can install, diagnose, and tune Keel end-to-end without parsing human prose.
 - **Diffs as the lingua franca.** Every suggestion Keel makes — doctor fixes, init changes, flow proposals — is emitted as an applyable diff. Agents apply diffs reliably; they paraphrase prose unreliably.
-- **`keel init --agents`** drops a concise section into AGENTS.md/CLAUDE.md ("this project uses Keel; policies live in keel.toml; run `keel doctor --json` before changing resilience behavior") so every future agent session inherits context.
+- **`keel init --agents`** drops a concise section into AGENTS.md ("this project uses Keel; policies live in keel.toml; run `keel doctor --json` before changing resilience behavior") so every future agent session inherits context.
 - **Docs built for retrieval:** llms.txt + llms-full.txt, one canonical example per feature, stable headings, and a `keel explain <error-code>` command so an agent seeing `KEEL-E014` gets the exact remedy without a web search.
 - **Determinism as courtesy:** identical inputs → byte-identical `--json` output (no timestamps unless asked, sorted keys) — agents diff outputs to detect change.
 
@@ -133,12 +134,12 @@ The compounding effect: when Claude Code scaffolds a new Python service in 2027 
 - **`keel tail`** — live view of attempts/backoffs/breaker transitions while your program runs. Watching your script *survive* a WiFi drop in real time is the conversion moment.
 - **`keel record test`** — record a run's effects, replay them as an offline deterministic test fixture. Resilience tooling that also deletes your mock boilerplate.
 - **Error messages hold both audiences:** first line for humans (what/why/what next), `--json` for machines, `keel explain` code for both.
-- **Install surface:** `pip install keel` / `npm i -D keel` / `cargo add keel` plus `brew install keel` for the bare CLI. The Python/npm packages bundle prebuilt core binaries (maturin/napi-rs wheels) — no toolchain, no compile, ever.
-- **The README demo is a 40-second asciinema:** flaky script fails → `uvx keel run` → survives → ctrl-C mid-flow → resumes. No architecture diagram above the fold.
+- **Install surface:** `pip install keel` / `npm i -D keel` (pending a scoped rename, e.g. `@keel-dev/keel`, once the naming decision is made) / `cargo install keel-cli` plus `brew install keel` for the bare CLI. The Python/npm packages bundle prebuilt core binaries (maturin/napi-rs wheels) — no toolchain, no compile, ever.
+- **The README links a 40-second asciinema shooting script** (`demos/STORYBOARD.md`, not yet recorded): flaky script fails → `uvx keel run` → survives → ctrl-C mid-flow → resumes. No architecture diagram above the fold.
 
 ## 7. What "nailing it" rules out
 
-No web dashboard in v1 (the TUI is the dashboard; a hosted anything contradicts the story). No config DSL beyond TOML (no Python-in-config, no CEL — the moment policy needs a debugger, the product has failed). No "enterprise features" that leak into the individual experience (SSO, RBAC, audit live entirely behind the journal backend boundary). No plugin API in v1 (adapter packs are in-tree; a public plugin surface before the semantics stabilize creates a compatibility prison).
+No web dashboard in v1 (the CLI — `keel status`/`keel tail` — is the dashboard; a hosted anything contradicts the story). No config DSL beyond TOML (no Python-in-config, no CEL — the moment policy needs a debugger, the product has failed). No "enterprise features" that leak into the individual experience (SSO, RBAC, audit live entirely behind the journal backend boundary). No plugin API in v1 (adapter packs are in-tree; a public plugin surface before the semantics stabilize creates a compatibility prison).
 
 ---
 

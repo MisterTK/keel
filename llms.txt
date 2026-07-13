@@ -42,6 +42,6 @@ collisions blocking that.
 ## For coding agents
 
 - Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
-- `keel init --agents` drops a Keel section into `AGENTS.md`/`CLAUDE.md`.
+- `keel init --agents` drops a Keel section into `AGENTS.md`.
 - `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
 - Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.

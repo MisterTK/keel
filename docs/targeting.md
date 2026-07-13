@@ -16,8 +16,10 @@ verbatim. `keel-core`'s `Policy::resolve` (`crates/keel-core-api/src/
 policy.rs`), the three stubs, and the conformance scenarios are unchanged —
 they only ever see exact keys. This is why the change needed no CCR and no
 cross-implementation parity ripple beyond the two front ends that do URL/path
-matching (Python, Node) and the one that does flow-glob matching (Python
-today; Node has no flow designation yet — see "Node flow designation" below).*
+matching (Python, Node) and the two that do flow-glob matching (Python and
+Node both implement flow designation, with slightly different concrete-
+designator syntax — `:function` for Python vs `#exportName` for Node — see
+"Node flow designation" below).*
 
 ## 1. Outbound host/URL-pattern targets
 
@@ -173,8 +175,9 @@ whether the script passed to `keel run <target>` is a designated flow:
    the file stem outward (`ingest`, then `pipeline.ingest`, then
    `demo.pipeline.ingest`, …), stopping at the first path component that
    is not a valid Python identifier (such a component could never be an
-   importable package). Each candidate, shortest first, is tested against
-   each glob entry's regex; the first hit wins.
+   importable package). Glob entries are tried in declaration order; for
+   each, its candidates (shortest first) are tested against its regex; the
+   first entry with any matching candidate wins.
 3. **No match at either tier** — the script runs as a plain script, not a
    flow (unchanged Tier-1-only behavior).
 
@@ -195,13 +198,24 @@ target verbatim — a pattern is a *selector*, never itself an identity.
 
 ### 2.3 Node flow designation
 
-Node has no `[flows]` entrypoint matching or durable-flow runner yet (no
-`_flow.py`/`_run.py` equivalent exists under `node/keel/src/` as of this
-writing) — Tier 2 durable flows are a Python-front-end-only surface today.
-When Node grows flow designation, it should implement the same grammar and
-matching rules as §2.1–2.2 (one dialect, one set of rules, two languages) —
-tracked as follow-up work for whoever lands Node Tier 2, not part of this
-change.
+Node implements `[flows]` entrypoint matching and a durable-flow runner too:
+`node/keel/src/flow.mjs`'s `matchFlow` (concrete entries before glob entries,
+mirroring §2.2) and `runAsFlow` (enters/exits the flow, journals time/random
+via the native backend, and always calls `process.exit`); entries are parsed
+by `node/keel/src/policy.mjs`'s `extractFlowEntrypoints`; `node/keel/hook.mjs`
+(preloaded by `node/keel/bin/keel-node-run.mjs`) dispatches to them. Tested in
+`node/keel/test/flow.test.mjs`.
+
+Node's grammar mirrors Python's but uses `#` rather than `:` before the
+function name, matching the existing `[target."ts:..."]` convention:
+
+```
+ts:<pathGlob>#<exportName>
+```
+
+One real difference from Python: the export name must always be concrete —
+there is no shorthand defaulting to `main` the way Python's bare
+`py:<module-glob>` does.
 
 ## 3. Cross-language parity contract
 

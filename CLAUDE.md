@@ -35,9 +35,10 @@ surface, and a scoped Rust front end. Done:
   bit-identical documented semantics on a virtual clock — Tier 1 only; Tier 2
   is real-core-only (stubs skip `"tier": 2` scenarios, per
   `conformance/README.md`).
-- **Conformance suite**: 27 scenarios in `conformance/scenarios/` (01–15 Tier 1
-  plus later Tier 1 additions for breaker rate-mode/token-bucket/schedule
-  composition/idempotency injection at 18–19/20/21–22/23, 16–27 Tier 2). Real
+- **Conformance suite**: 34 scenarios in `conformance/scenarios/` (21 Tier 1 —
+  01–15 plus later additions for breaker rate-mode/token-bucket/schedule
+  composition/idempotency injection reusing numbers 18–19/20/21–22/23 — and
+  13 Tier 2 spanning 16–27, with two Tier-2 scenarios sharing number 24). Real
   Rust core passes all of them (Tier 2 additionally exercised against a real
   Postgres backend, `crates/keel-core/tests/flows_conformance_postgres.rs`);
   stubs pass every Tier 1 scenario, skip Tier 2. Normative semantics —
@@ -61,8 +62,12 @@ surface, and a scoped Rust front end. Done:
   `postgres` crate panicking inside keel-core's own Tokio runtime, schema at
   `crates/keel-journal/src/postgres_schema.sql`, not in `contracts/`).
   Selection is via the policy `journal` key or `KEEL_JOURNAL`
-  (`crates/keel-core/src/journal_backend.rs`); `keel doctor`/`keel fsck`
-  report on it.
+  (`crates/keel-core/src/journal_backend.rs`); the standalone `keel-cli`
+  binary's own `doctor`/`fsck` do not link the Postgres backend —
+  `doctor` reports a `postgres://` journal as an unsupported-backend error
+  (KEEL-E005, recommending `file:`), and `fsck` has no Postgres path at all
+  (silently falls back to the local SQLite default) — only the real engine
+  (via the Python/Node front ends) opens Postgres journals for execution.
 - **FFI + bindings**: `crates/keel-ffi` (C ABI, MessagePack) with PyO3
   (`crates/keel-py` → `keel_core`) and napi (`crates/keel-node`) async
   bridges, both including the Tier-2 async flow surface

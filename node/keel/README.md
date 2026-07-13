@@ -48,13 +48,19 @@ Judgments (kept in parity with the Python adapters):
   semantic target `llm:<provider>`. The host→provider map (`LLM_HOST_PROVIDERS`)
   is a frozen cross-language parity contract: `api.openai.com → llm:openai`,
   `api.anthropic.com → llm:anthropic`,
-  `generativelanguage.googleapis.com → llm:google-genai`.
+  `generativelanguage.googleapis.com → llm:google-genai`,
+  `aiplatform.googleapis.com → llm:google-genai` (Vertex AI's global endpoint),
+  and any `<location>-aiplatform.googleapis.com` regional Vertex endpoint
+  (matched by suffix) → `llm:google-genai`.
 - **Idempotency** — `GET/HEAD/OPTIONS/PUT/DELETE/TRACE` are retryable (TRACE is
   in the judgment table for parity even though WHATWG fetch forbids sending it).
   `POST/PATCH` are **not** retried (Level 0 hard rule) unless an idempotency
   header is present (the target's configured `idempotency.header`, or a common
-  default). A non-idempotent transient failure is *observed, not retried* →
-  **KEEL-E014**.
+  default) — Keel can also mint and inject that header itself before the first
+  attempt (`contracts/adapter-pack.md`'s idempotency-key injection, reusing a
+  crashed predecessor's key when inside an open Tier 2 flow), making the call
+  retryable without the caller supplying one. A non-idempotent transient
+  failure is *observed, not retried* → **KEEL-E014**.
 - **args_hash** (cache/journal key material) is derived **only for idempotent
   GET requests** (sha256 over method+URL); it is `null` for everything else.
 - **Transient vs. success** — only `429` and `≥500` are treated as retryable
@@ -123,6 +129,11 @@ Retry-After-aware backoff, a per-provider breaker, and a **dev response cache**.
   cache during development (10× faster iteration, ~0 API spend). It resolves to a
   concrete cache directive off-prod and is **inert when `KEEL_ENV=prod`**
   (`resolveDevCache`). This behavior is identical to the Python front end.
+- **Budget + fallback.** A target's `budget` (e.g. `"$5/run"`) is a per-run
+  spend cap enforced at the `llm:` seam — once exhausted the call is blocked
+  before dispatch like an open circuit breaker (**KEEL-E012**). `fallback`
+  (an ordered list of model names) re-dispatches a qualifying failure to the
+  next entry in the chain instead of failing terminally.
 
 ### Vercel AI SDK — `keel/ai-sdk`
 
@@ -311,9 +322,15 @@ CREATE TABLE discovery (
   first_seen_ms     INTEGER NOT NULL,
   last_seen_ms      INTEGER NOT NULL,
   last_error_class  TEXT,                         -- most recent error's class
-  last_error_status INTEGER                       -- …and its HTTP status
+  last_error_status INTEGER,                      -- …and its HTTP status
+  not_retried       INTEGER NOT NULL DEFAULT 0,   -- KEEL-E014: observed, not retried
+  unwrapped_calls   INTEGER NOT NULL DEFAULT 0     -- calls with no [target] policy entry
 ) WITHOUT ROWID;
 ```
+
+A second table, `discovery_daily`, keys the same counters (minus the latency
+columns) by `(target, day)` for rolling-window queries, pruned to the trailing
+30 days — mirroring `crates/keel-journal/src/discovery.rs` exactly.
 
 Accounting matches the canonical store: a cache hit is a `call` and a `cache_hit`
 only (no upstream attempt), so `calls == successes + failures + cache_hits`;
@@ -331,6 +348,33 @@ Isolated in `src/backend.mjs`. Priority: the native addon `keel-core-native`
 when loadable (probed by dynamic import; may not exist yet), else the in-repo
 `AsyncEngine`. Override with `KEEL_BACKEND=stub` (force engine) or
 `KEEL_BACKEND=native` (require the addon; **KEEL-E040** if missing).
+
+## Tier 2 — durable flows (Level 2)
+
+Designate an entrypoint in `keel.toml` and `keel run` executes it as a durable
+flow: every intercepted call inside is journaled to `.keel/journal.db`, and a
+rerun after a crash substitutes already-completed steps from the journal
+instead of re-firing them.
+
+```toml
+[flows]
+entrypoints = ["ts:jobs/*.mjs#main"]   # ts:<pathGlob>#<exportName>
+```
+
+Tier 2 requires the native addon **and** an attached journal — the pure-JS
+`AsyncEngine` stub cannot journal/replay, and a native core with no journal has
+nothing to resume from. Either case is a precise, actionable **KEEL-E005** at
+startup (unsupported-configuration), never a silent Tier-1 downgrade.
+
+### Async flow bodies
+
+An `async` flow entrypoint is supported end to end: its intercepted calls route
+through the same open flow handle a synchronous flow's calls use, journaled
+and replayed identically. Concurrent effects fanned out with `Promise.all`
+(or similar) are admitted — and therefore journaled — in the order their
+calls *reach* the flow handle (await/admission order), never completion
+order, so replay always reproduces the same step sequence (the async-flow-step
+ordering rule, normatively documented in `conformance/README.md`).
 
 ## Config errors are fatal
 
