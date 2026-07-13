@@ -33,11 +33,12 @@ from source.
 
 - [Policy schema](contracts/policy.schema.json) and [smart defaults](contracts/defaults.toml).
 - [Error codes](contracts/error-codes.json): the frozen `KEEL-E0NN` taxonomy. `keel explain <code>` prints what/why/next.
-- [CLI](crates/keel-cli): `run · init · doctor · status · explain · flows · trace`; every command has a deterministic `--json` twin.
+- [CLI](crates/keel-cli): `run · init · doctor · status · explain · flows · trace · mcp`; every command has a deterministic `--json` twin.
 - [llms-full.txt](llms-full.txt): the full corpus (all of the above expanded, with the CLI + error-code reference inline).
 
 ## For coding agents
 
 - Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
 - `keel init --agents` drops a Keel section into `AGENTS.md`/`CLAUDE.md`.
+- `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
 - Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.

@@ -4,10 +4,12 @@
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
 //! report; `--effective-policy` prints the composed `defaults < packs < user`
 //! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
-//! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
+//! [`explain`] (the frozen error taxonomy), the Tier 2 flow inspectors
 //! [`flows`] (list durable flows), [`flows::trace`] (`keel trace`), and
 //! [`replay`] (`keel replay` — a journal-driven dry run of what a re-entry
-//! would substitute vs. re-execute).
+//! would substitute vs. re-execute), and [`mcp`] (`keel mcp`: the CLI doubles
+//! as an MCP server over stdio whose six tools return the same bytes as the
+//! corresponding `--json` twins).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -20,6 +22,7 @@ pub mod effective;
 pub mod explain;
 pub mod flows;
 pub mod init;
+pub mod mcp;
 pub mod render;
 pub mod replay;
 pub mod run;
