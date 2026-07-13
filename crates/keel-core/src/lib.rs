@@ -28,6 +28,7 @@
 
 mod engine;
 mod flow;
+mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 

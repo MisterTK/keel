@@ -343,15 +343,18 @@ fn record_call_fields(span: &tracing::Span, out: &Outcome) {
     span.record("breaker", breaker_str(out.breaker));
 }
 
-/// Emits a breaker state change at debug level (architecture spec §4.5).
-/// Called off the state lock; a no-op when nothing changed.
+/// Emits a breaker state change at debug level and as a
+/// `keel.breaker.transitions` metric (architecture spec §4.5). Called off the
+/// state lock; a no-op when nothing changed.
 fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
     match transition {
         BreakerTransition::Opened => {
             debug!(target = %target, transition = "opened", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "opened");
         }
         BreakerTransition::Closed => {
             debug!(target = %target, transition = "closed", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "closed");
         }
         BreakerTransition::None => {}
     }
@@ -577,18 +580,23 @@ impl Engine {
             .expect("policy lock poisoned")
             .resolve(target);
 
-        // cache (outermost layer)
+        // cache (outermost layer); every planned lookup is one
+        // `keel.cache.requests` datapoint (hit ratio, spec §4.5)
         let cache_plan = self.plan_cache(target, &resolved, request);
         match &cache_plan {
             CachePlan::Memory { key } => {
                 if self.serve_from_cache(key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
             }
             CachePlan::Persistent { key, .. } => {
                 if self.serve_from_persistent(target, key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
             }
             CachePlan::None => {}
         }
@@ -757,6 +765,7 @@ impl Engine {
             out.throttled = true;
             out.throttle_wait_ms = wait_ms;
             self.state().metrics_for(target).throttled += 1;
+            crate::metrics::record_throttled(target, wait_ms);
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
     }
@@ -791,6 +800,7 @@ impl Engine {
         // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
         if admission == Admission::HalfOpen {
             debug!(target = %target, transition = "half_open", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "half_open");
         }
         admission
     }
@@ -1003,6 +1013,7 @@ impl Engine {
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
+            crate::metrics::record_attempt(target);
 
             // Child span per attempt (spec §4.5): `class`/`http_status`/`wait_ms`
             // are filled in below once the attempt resolves. The effect future
@@ -1077,6 +1088,7 @@ impl Engine {
                     attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
+                    crate::metrics::record_retry(target, wait);
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
             }
