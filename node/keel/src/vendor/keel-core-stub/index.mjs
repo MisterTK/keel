@@ -17,7 +17,8 @@
 
 export const ENVELOPE_VERSION = 1;
 
-const DEFAULT_SCHEDULE = { base: 200, factor: 2, cap: 30_000 };
+// A single unbounded exp segment; see parseSchedule() for the segment shape.
+const DEFAULT_SCHEDULE = [{ primary: { base: 200, factor: 2, cap: 30_000 }, upToMs: null }];
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_ON = ["conn", "timeout", "429", "5xx"];
 const DEFAULT_BREAKER_FAILURES = 5;
@@ -45,9 +46,9 @@ function parseRate(s) {
   return limit >= 1 ? { limit, windowMs: RATE_WINDOW[m[2]] } : null;
 }
 
-/** v0.1 primaries: exp(base, xF[, max D][, jitter]) and fixed(D). */
-function parseSchedule(s) {
-  s = String(s).trim();
+/** A schedule primary: exp(base, xF[, max D][, jitter]) or fixed(D). */
+function parsePrimary(s) {
+  s = s.trim();
   if (s.startsWith("exp(") && s.endsWith(")")) {
     const parts = s.slice(4, -1).split(",").map((p) => p.trim());
     if (parts.length < 2) return null;
@@ -73,8 +74,77 @@ function parseSchedule(s) {
   return null;
 }
 
-function scheduleWait(sched, attempt) {
-  return Math.round(Math.min(sched.base * sched.factor ** (attempt - 1), sched.cap));
+function primaryWait(primary, localAttempt) {
+  return Math.round(Math.min(primary.base * primary.factor ** (localAttempt - 1), primary.cap));
+}
+
+/**
+ * Full grammar (contracts/schedule-grammar.ebnf): one or more `andThen`-
+ * separated segments, each a primary with an optional cumulative-wait `upTo`
+ * bound. Returns `[{ primary, upToMs }, ...]` or null. Semantics pinned in
+ * conformance/README.md ("Schedule algebra"): every segment but the last
+ * must be bounded, and the last never is — both degenerate shapes are
+ * rejected here so a schedule is always a total mapping attempt -> wait.
+ */
+function parseSchedule(s) {
+  const tokens = String(s).trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) return null;
+  const groups = [[]];
+  for (const token of tokens) {
+    if (token === "andThen") groups.push([]);
+    else groups[groups.length - 1].push(token);
+  }
+  const segments = [];
+  for (const group of groups) {
+    if (group.length === 0) return null;
+    let upToMs = null;
+    let primaryTokens = group;
+    const pos = group.indexOf("upTo");
+    if (pos !== -1) {
+      const rest = group.slice(pos + 1);
+      if (rest.length !== 1) return null;
+      upToMs = parseDuration(rest[0]);
+      if (upToMs === null) return null;
+      primaryTokens = group.slice(0, pos);
+    }
+    if (primaryTokens.length === 0) return null;
+    const primary = parsePrimary(primaryTokens.join(" "));
+    if (primary === null) return null;
+    segments.push({ primary, upToMs });
+  }
+  const last = segments.length - 1;
+  if (segments.some((segment, i) => (i < last) !== (segment.upToMs !== null))) return null;
+  return segments;
+}
+
+/**
+ * Deterministic wait after failed attempt `n` (1-based): walk the segments
+ * left to right, handing off to the next segment when the active one's
+ * cumulative natural wait would exceed its `upTo` bound. Mirrors
+ * crates/keel-core-api's `Schedule::wait_and_jitter` exactly; see
+ * conformance/README.md ("Schedule algebra") for the normative spec.
+ */
+function scheduleWait(segments, attempt) {
+  attempt = Math.max(attempt, 1);
+  const last = segments.length - 1;
+  let i = 0;
+  let a = 1;
+  let e = 0;
+  let emitted = 0;
+  for (;;) {
+    const { primary, upToMs } = segments[i];
+    const wait = primaryWait(primary, a);
+    if (i < last && upToMs !== null && e + wait > upToMs) {
+      i += 1;
+      a = 1;
+      e = 0;
+      continue;
+    }
+    emitted += 1;
+    if (emitted === attempt) return wait;
+    a += 1;
+    e += wait;
+  }
 }
 
 function conditionMatches(cond, cls, httpStatus) {

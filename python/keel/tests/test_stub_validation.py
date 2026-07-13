@@ -150,5 +150,75 @@ class ValidTopLevelSectionsTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
 
+class ScheduleCompositionTest(unittest.TestCase):
+    """upTo/andThen composition (contracts/schedule-grammar.ebnf), semantics
+    normatively pinned in conformance/README.md ("Schedule algebra")."""
+
+    def _rejects(self, schedule: str) -> None:
+        with self.assertRaises(KeelError) as ctx:
+            KeelCoreStub().configure({"target": {"x": {"retry": {"schedule": schedule}}}})
+        self.assertEqual(ctx.exception.code, "KEEL-E001")
+
+    def _waits(self, schedule: str, attempts: int) -> list[int]:
+        core = KeelCoreStub()
+        core.configure(
+            {
+                "target": {
+                    "x": {"retry": {"attempts": attempts, "schedule": schedule, "on": ["timeout"]}}
+                }
+            }
+        )
+        out = core.execute(
+            {"v": 1, "target": "x", "op": "x", "idempotent": True},
+            lambda attempt: {"status": "error", "class": "timeout"},
+        )
+        self.assertEqual(out["attempts"], attempts)
+        return out["waits_ms"]
+
+    def test_spec_example_parses(self) -> None:
+        KeelCoreStub().configure(
+            {"target": {"x": {"retry": {"schedule": "exp(1s, x2, max 5m) upTo 10m andThen fixed(1m)"}}}}
+        )
+
+    def test_handoff_when_the_bound_would_be_overshot(self) -> None:
+        # 1s + 2s = 3s fits; the natural 4s would overshoot the 4s bound.
+        waits = self._waits("exp(1s, x2) upTo 4s andThen fixed(500ms)", 6)
+        self.assertEqual(waits, [1000, 2000, 500, 500, 500])
+
+    def test_exact_fit_stays_and_cascade_skips_a_segment(self) -> None:
+        # Three 1s waits fill `upTo 3s` exactly; `fixed(10s) upTo 5s`'s own
+        # first wait already exceeds its bound, so it contributes nothing and
+        # the handoff cascades straight to the fixed(250ms) tail.
+        waits = self._waits(
+            "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms)", 7
+        )
+        self.assertEqual(waits, [1000, 1000, 1000, 250, 250, 250])
+
+    def test_exp_restarts_at_local_attempt_1_after_a_handoff(self) -> None:
+        # attempts=6 so all 5 waits (through the 6th, terminal attempt) show up.
+        waits = self._waits("fixed(1s) upTo 2s andThen exp(100ms, x3)", 6)
+        self.assertEqual(waits, [1000, 1000, 100, 300, 900])
+
+    def test_shape_rule_rejects_degenerate_composition(self) -> None:
+        for degenerate in (
+            "fixed(1s) andThen fixed(2s)",  # non-final segment unbounded: never hands off
+            "exp(1s, x2, max 5m) upTo 10m",  # final segment bounded: attempts past it have no wait
+            "fixed(1s) upTo 3s andThen fixed(2s) andThen fixed(4s)",
+            "fixed(1s) upTo 3s andThen fixed(2s) upTo 5s",
+        ):
+            self._rejects(degenerate)
+
+    def test_broken_composition_syntax_rejected(self) -> None:
+        for broken in (
+            "fixed(1s) upTo",
+            "upTo 3s andThen fixed(1s)",
+            "fixed(1s) upTo 1s upTo 2s andThen fixed(1s)",
+            "fixed(1s) andThen",
+            "andThen fixed(1s)",
+            "fixed(1s) upTo 3s fixed(2s)",
+        ):
+            self._rejects(broken)
+
+
 if __name__ == "__main__":
     unittest.main()
