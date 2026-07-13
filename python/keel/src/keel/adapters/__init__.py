@@ -12,6 +12,14 @@ library was already imported. A program that never imports httpx/requests pays
 nothing — the runtime stays stdlib-only and ``keel run`` startup stays cheap,
 honoring the contract rule that a pack never imports its library unless it is
 present *and in use*.
+
+``install_adapters`` also accepts ``extra`` packs (framework packs with a real
+seam, e.g. ``keel.packs.adk_pack``, which lives outside this package since it
+is a FRAMEWORK pack rather than a transport library — see ``keel.packs``'
+module docstring) — armed through the exact same lazy mechanism as ``PACKS``,
+keyed by their own ``MODULE``. ``bootstrap.install_keel`` is the only caller
+that passes ``extra``; ``PACKS``/``available_packs()`` stay httpx/requests-only
+so existing detection reporting is unaffected by what a caller passes in.
 """
 
 from __future__ import annotations
@@ -31,24 +39,30 @@ PACKS = (httpx_pack, requests_pack)
 
 class _State:
     finder: "_AdapterFinder | None" = None
+    armed: tuple[Any, ...] = ()
 
 
 _STATE = _State()
 
 
 def available_packs() -> list[Detection]:
-    """Detections for every registered pack, present or not (never imports an
-    absent library). Feeds `keel doctor` and the startup banner."""
+    """Detections for every registered library pack, present or not (never
+    imports an absent library). Feeds `keel doctor` and the startup banner."""
     return [pack.detect() for pack in PACKS]
 
 
-def install_adapters() -> list[Detection]:
-    """Arm every present pack: patch already-imported libraries now, and
-    register a finder so libraries imported later are patched on import.
-    Returns the detections of the present packs (for the banner)."""
+def install_adapters(extra: Sequence[Any] = ()) -> list[Detection]:
+    """Arm every present pack — the built-in library ``PACKS`` plus any
+    ``extra`` framework packs the caller supplies (e.g. ``keel.packs.
+    adk_pack``) — through the identical lazy mechanism: patch already-imported
+    libraries now, and register a finder so libraries imported later are
+    patched on import. Returns the detections of the present packs (for the
+    banner); ``extra`` never affects ``available_packs()``."""
+    armed = (*PACKS, *extra)
+    _STATE.armed = armed
     index: dict[str, Any] = {}
     present: list[Detection] = []
-    for pack in PACKS:
+    for pack in armed:
         detection = pack.detect()
         if not detection.matched:
             continue
@@ -64,16 +78,18 @@ def install_adapters() -> list[Detection]:
 
 
 def uninstall_adapters() -> None:
-    """Remove the finder and restore every patched library (test teardown /
-    uninstall-clean)."""
+    """Remove the finder and restore every patched library — including any
+    ``extra`` packs a prior ``install_adapters(extra=...)`` armed (test
+    teardown / uninstall-clean)."""
     if _STATE.finder is not None:
         try:
             sys.meta_path.remove(_STATE.finder)
         except ValueError:
             pass
         _STATE.finder = None
-    for pack in PACKS:
+    for pack in _STATE.armed or PACKS:
         pack.uninstall()
+    _STATE.armed = ()
 
 
 class _AdapterFinder(importlib.abc.MetaPathFinder):

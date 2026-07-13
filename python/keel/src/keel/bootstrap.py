@@ -26,7 +26,7 @@ from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_flow_entrypoints, extract_function_targets, load_policy
 from ._runtime import clear_runtime, set_runtime
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import present_provider_defaults, resolve_dev_cache
+from .packs import adk_pack, present_provider_defaults, resolve_dev_cache
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -85,10 +85,11 @@ def install_keel(
     # flow. Parsing only; running one requires the native backend.
     flow_entrypoints = extract_flow_entrypoints(policy)
 
-    # Library adapters (httpx/requests/…): armed lazily — each patches its
-    # library only when the program imports it. Present-but-unused libraries
-    # cost nothing, so `keel run` startup stays cheap.
-    adapters = install_adapters()
+    # Library adapters (httpx/requests/…) plus framework packs with a real
+    # seam of their own (adk_pack): all armed lazily — each patches its
+    # library/framework only when the program imports it. Present-but-unused
+    # libraries cost nothing, so `keel run` startup stays cheap.
+    adapters = install_adapters(extra=(adk_pack,))
 
     _register_exit_flush()
     _banner(env, source, [t.key for t in targets], adapters)
