@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from . import _runtime
 from ._errors import KeelError, is_keel_error
 from ._policy import FlowEntrypoint
 
@@ -289,7 +290,15 @@ def run_as_flow(
 
     try:
         with virtualize_time_random(backend):
-            func()
+            # Flip the "a flow body is running" flag (module docs, `_runtime`)
+            # for exactly the scope where `execute()` is journaled: packs that
+            # persist through the flow journal (the LangGraph checkpointer)
+            # read this to refuse rather than silently run un-journaled.
+            _runtime.set_flow_active(True)
+            try:
+                func()
+            finally:
+                _runtime.set_flow_active(False)
     except SystemExit as exc:
         if exc.code in (None, 0):  # clean exit == success (common main() shape)
             backend.exit_flow("completed")

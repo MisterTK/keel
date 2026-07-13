@@ -27,18 +27,32 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
+from ..packs import langgraph_pack
 from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
 #: Alphabetical by module name. Library adapters only (physically-patched,
-#: seam-owning packs that live in this package). Framework packs (pydantic-ai
-#: / openai-agents / crewai / …, `keel.packs`) own a seam the same way but are
-#: registered via :func:`_framework_packs` — a lazily-imported cross-package
-#: reference, so `keel.packs` (which already imports `keel.adapters._pack`)
-#: never has to be imported at `keel.adapters` MODULE-import time (no
-#: init-order cycle).
-PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack)
+#: seam-owning packs that live in this package, or — for `langgraph_pack` —
+#: registered here because it too owns a real seam, `StateGraph.add_node`,
+#: not a semantic pack like `llm`/`tool`). Framework packs (pydantic-ai /
+#: openai-agents / crewai / adk / …, `keel.packs`) own a seam the same way
+#: but are registered via :func:`_framework_packs` — a lazily-imported
+#: cross-package reference, so `keel.packs` (which already imports
+#: `keel.adapters._pack`) never has to be imported at `keel.adapters`
+#: MODULE-import time (no init-order cycle). `langgraph_pack` avoids that
+#: cycle differently: it lives in `keel.packs` but is imported directly here
+#: at module level because (unlike the framework packs) `keel.packs.__init__`
+#: does not import `keel.adapters` back, so there is no cycle to break.
+PACKS = (
+    aiohttp_pack,
+    boto3_pack,
+    httpx_pack,
+    langgraph_pack,
+    psycopg_pack,
+    requests_pack,
+    urllib3_pack,
+)
 
 
 class _State:

@@ -111,21 +111,23 @@ class DetectTest(unittest.TestCase):
         self.assertTrue(detection.matched)
         self.assertEqual(detection.name, "urllib3")
 
-    def test_available_packs_reports_ten_registered(self) -> None:
-        # 6 library adapters (aiohttp, boto3, httpx, psycopg, requests,
-        # urllib3) + 4 framework packs (adk, crewai, openai-agents,
+    def test_available_packs_reports_eleven_registered(self) -> None:
+        # 7 library adapters (aiohttp, boto3, httpx, langgraph, psycopg,
+        # requests, urllib3) + 4 framework packs (adk, crewai, openai-agents,
         # pydantic-ai — adapters._all_packs). Only the always-installed
-        # libraries are actually present here; aiohttp/boto3/psycopg are
-        # exercised (with structural fakes) in their own test files, and the
-        # framework packs are never installed in this repo's test
-        # environment (CLAUDE.md: framework deps never get added to a
-        # manifest), so all seven report unmatched.
+        # libraries are actually present here; aiohttp/boto3/langgraph/
+        # psycopg are exercised (with structural fakes) in their own test
+        # files, and the framework packs are never installed in this repo's
+        # test environment (CLAUDE.md: framework deps never get added to a
+        # manifest), so all eight report unmatched — `available_packs` must
+        # still report each of them (never silently omit an absent
+        # library's pack), just unmatched.
         packs = available_packs()
-        self.assertEqual(len(packs), 10, "6 library adapters + 4 framework packs")
+        self.assertEqual(len(packs), 11, "7 library adapters + 4 framework packs")
         present = {d.name for d in packs if d.matched}
         self.assertEqual(present, _ALWAYS_PRESENT)
         absent = [d for d in packs if not d.matched]
-        self.assertEqual(len(absent), 7)
+        self.assertEqual(len(absent), 8)
         self.assertTrue(all(d.name == "" for d in absent), "an unmatched pack reports no name")
 
 
