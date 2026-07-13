@@ -68,6 +68,18 @@ const REGISTRY: &[Adapter] = &[
         best_effort: true,
     },
     Adapter {
+        lib: "boto3",
+        lang: "python",
+        target: "tool:aws.*",
+        best_effort: true,
+    },
+    Adapter {
+        lib: "psycopg",
+        lang: "python",
+        target: "host",
+        best_effort: true,
+    },
+    Adapter {
         lib: "openai",
         lang: "python+node",
         target: "llm:openai",
@@ -560,7 +572,9 @@ mod tests {
 
     #[test]
     fn wrapped_visible_and_invisible_are_classified() {
-        let scan = scan_with("llm:openai", TargetClass::Llm, &["openai", "boto3"]);
+        // "django" stands in for any effect library with no adapter in the
+        // registry (boto3/psycopg both gained one — see REGISTRY above).
+        let scan = scan_with("llm:openai", TargetClass::Llm, &["openai", "django"]);
         // discovery observed a DIFFERENT target than the visible one.
         let wrapped: BTreeSet<String> = ["api.observed.com".to_owned()].into_iter().collect();
         let policy = PolicyValidation {
@@ -576,7 +590,11 @@ mod tests {
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
-        assert_eq!(r.coverage.invisible, vec!["boto3"], "boto3 has no adapter");
+        assert_eq!(
+            r.coverage.invisible,
+            vec!["django"],
+            "django has no adapter"
+        );
         assert!(r.ok, "no policy present → ok");
         // openai adapter detected + pinned.
         let openai = r.adapters.iter().find(|a| a.lib == "openai").unwrap();

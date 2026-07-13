@@ -29,6 +29,7 @@ written once.
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
 import uuid
@@ -66,6 +67,36 @@ IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRAC
 #: Header names that mark an otherwise-unsafe request (POST/PATCH) as safe to
 #: retry. Parity with the Node twin's ``DEFAULT_IDEMPOTENCY_HEADERS``.
 DEFAULT_IDEMPOTENCY_HEADERS = ("idempotency-key", "x-idempotency-key")
+
+
+#: True while a higher-level Keel seam (requests' ``HTTPAdapter.send``,
+#: botocore's ``BaseClient._make_api_call``) is driving the underlying
+#: transport for one attempt. Lower-level adapters (urllib3) check this and
+#: pass through untouched, so one intercepted call is exactly one core
+#: ``execute`` — never a Keel retry loop nested inside another.
+_SEAM_OWNED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "keel_http_seam_owned", default=False
+)
+
+
+def run_owned(fn: Callable[[], Any]) -> Any:
+    """Run one attempt's underlying library call with the seam-ownership flag
+    set. A ``ContextVar`` set and reset around the call is correct in every
+    execution shape the packs use: the flag is scoped to whichever thread (or
+    async task) actually runs the effect, so a stub worker-thread attempt and a
+    native in-loop attempt both mark exactly their own downstream calls."""
+    token = _SEAM_OWNED.set(True)
+    try:
+        return fn()
+    finally:
+        _SEAM_OWNED.reset(token)
+
+
+def seam_owned() -> bool:
+    """True when a higher-level Keel seam already owns the in-flight call (the
+    double-wrap guard for adapters whose library is also used *by* a wrapped
+    library — urllib3 under requests/botocore)."""
+    return _SEAM_OWNED.get()
 
 
 def resolve_layer(target: str, key: str) -> Any:

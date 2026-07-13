@@ -26,6 +26,18 @@
     },
     {
       "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
       "lib": "openai",
       "status": "pinned",
       "target": "llm:openai"
