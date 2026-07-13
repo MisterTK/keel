@@ -803,6 +803,7 @@ dependencies = [
  "keel-core",
  "keel-core-api",
  "keel-journal",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",

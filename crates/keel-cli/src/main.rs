@@ -9,7 +9,7 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, effective, explain, flows, init, run, status, tail};
+use keel_cli::{doctor, effective, explain, flows, init, replay, run, status, tail};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -67,6 +67,15 @@ enum Command {
         /// Show only `dead` flows (those that exhausted their resume cap).
         #[arg(long)]
         dead: bool,
+    },
+    /// Inspect what re-entering a flow would do — a journal-driven dry run:
+    /// which steps substitute, which re-execute, where replay resumes.
+    Replay {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        flow: String,
+        /// Show one recorded step in full detail (payload, timings, action).
+        #[arg(long, value_name = "SEQ")]
+        step: Option<i64>,
     },
     /// Live view of attempts, backoffs, and breaker transitions while your
     /// program runs (reads `.keel/events/`; no daemon). `--json` streams the
@@ -133,6 +142,7 @@ fn main() {
         }
         Command::Status => emit(&status::run(&project), json),
         Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Tail { no_follow, run } => {
             let opts = tail::TailOptions {
                 color: tail::color_enabled(),
