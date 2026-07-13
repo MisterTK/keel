@@ -431,15 +431,18 @@ fn record_call_fields(span: &tracing::Span, out: &Outcome) {
     span.record("breaker", breaker_str(out.breaker));
 }
 
-/// Emits a breaker state change at debug level (architecture spec §4.5).
-/// Called off the state lock; a no-op when nothing changed.
+/// Emits a breaker state change at debug level and as a
+/// `keel.breaker.transitions` metric (architecture spec §4.5). Called off the
+/// state lock; a no-op when nothing changed.
 fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
     match transition {
         BreakerTransition::Opened => {
             debug!(target = %target, transition = "opened", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "opened");
         }
         BreakerTransition::Closed => {
             debug!(target = %target, transition = "closed", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "closed");
         }
         BreakerTransition::None => {}
     }
@@ -528,6 +531,58 @@ fn terminal_message(
         ),
     };
     text.trim_end().to_owned()
+}
+
+/// Per-attempt context [`terminal_attempt_error`] needs but that never
+/// changes across the retry loop's calls to it — bundled so the helper stays
+/// under clippy's argument-count ceiling.
+struct TerminalAttemptCtx<'a> {
+    request: &'a Request,
+    attempt: u32,
+    max_attempts: u32,
+    trace: Option<&'a TraceRef>,
+    /// Whether THIS attempt was cut off by the policy timeout layer (distinct
+    /// from the retryable-class check): a policy-layer timeout is the more
+    /// precise diagnosis than "exhausted"/"non-retryable" — except the Level 0
+    /// non-idempotent rule, which callers must always see verbatim.
+    timed_out_by_layer: bool,
+}
+
+/// Builds the terminal `OutcomeError` once `run_attempts` has decided this
+/// failed attempt is not retried — folds the timeout-diagnosis override and
+/// the dx-invariant-4 trace ref into one place so the retry loop itself stays
+/// under clippy's line-count ceiling.
+fn terminal_attempt_error(
+    ctx: &TerminalAttemptCtx<'_>,
+    code: ErrorCode,
+    class: ErrorClass,
+    http_status: Option<u16>,
+    message: &str,
+    original: Option<Value>,
+) -> OutcomeError {
+    let code = if ctx.timed_out_by_layer && code != ErrorCode::NonIdempotentNotRetried {
+        ErrorCode::Timeout
+    } else {
+        code
+    };
+    OutcomeError {
+        code,
+        class,
+        http_status,
+        message: with_trace_ref(
+            terminal_message(
+                code,
+                ctx.request,
+                ctx.attempt,
+                ctx.max_attempts,
+                class,
+                http_status,
+                message,
+            ),
+            ctx.trace,
+        ),
+        original,
+    }
 }
 
 /// The Keel kernel, Tier 1 scope. One per process; `&self`-concurrent.
@@ -703,19 +758,40 @@ impl Engine {
         if let Some(location) = &policy.journal {
             self.apply_journal_location(location)?;
         }
-        // `telemetry` is schema-legal and typed + validated, but v0.1 drives
-        // OTel export from the environment. Warn loudly rather than silently
-        // ignoring a set value, so a user setting an OTLP endpoint is not
-        // surprised when it has no effect.
-        if policy.telemetry.is_some() {
+        // `telemetry.otlp_endpoint` IS honored: native front ends built with the
+        // `otel` feature read it back via `telemetry_otlp_endpoint` (below) and
+        // pass it to `otel::init_otlp` (env still wins — see `otel::export_enabled`
+        // / `otel::resolve_endpoint`). `telemetry.console` (the local
+        // pretty-console-summary switch, architecture spec §4.5) is validated and
+        // carried but has no consumer yet; warn on an explicit non-default value
+        // rather than silently ignoring the user's intent.
+        if let Some(telemetry) = &policy.telemetry
+            && !telemetry.console
+        {
             warn!(
-                "policy `telemetry` is validated but inert in v0.1: OTel export is configured from \
-                 the environment (KEEL_OTEL_*). This table has no effect."
+                "policy `telemetry.console = false` is validated but not yet wired: v0.1 always \
+                 uses the default local summary. `telemetry.otlp_endpoint` IS honored by front \
+                 ends built with the `otel` feature."
             );
         }
         warn_inert_breaker_knobs(&policy);
         *self.policy.write().expect("policy lock poisoned") = policy;
         Ok(())
+    }
+
+    /// The effective `telemetry.otlp_endpoint` (`None` if `[telemetry]` is
+    /// absent or the key unset), read live so a reconfigure is honored. Native
+    /// front ends built with the `otel` feature read this after `configure` and
+    /// pass it to [`crate::otel::export_enabled`] / [`crate::otel::resolve_endpoint`]
+    /// to decide whether/where to export (env vars still take precedence).
+    #[must_use]
+    pub fn telemetry_otlp_endpoint(&self) -> Option<String> {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .telemetry
+            .as_ref()
+            .and_then(|t| t.otlp_endpoint.clone())
     }
 
     /// Honor `policy.journal`: open and attach the backend it names, replacing
@@ -881,21 +957,26 @@ impl Engine {
             .expect("policy lock poisoned")
             .resolve(target);
 
-        // cache (outermost layer)
+        // cache (outermost layer); every planned lookup is one
+        // `keel.cache.requests` datapoint (hit ratio, spec §4.5)
         let cache_plan = self.plan_cache(target, &resolved, request);
         match &cache_plan {
             CachePlan::Memory { key } => {
                 if self.serve_from_cache(key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
                     self.emit_cache(&out, target, CacheStore::Memory, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
                 self.emit_cache(&out, target, CacheStore::Memory, false);
             }
             CachePlan::Persistent { key, .. } => {
                 if self.serve_from_persistent(target, key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
                     self.emit_cache(&out, target, CacheStore::Persistent, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
                 self.emit_cache(&out, target, CacheStore::Persistent, false);
             }
             CachePlan::None => {}
@@ -1065,6 +1146,7 @@ impl Engine {
             out.throttled = true;
             out.throttle_wait_ms = wait_ms;
             self.state().metrics_for(target).throttled += 1;
+            crate::metrics::record_throttled(target, wait_ms);
             // Emitted before the wait so a live tail shows the queueing now.
             self.emit_event(|| EventKind::Throttle {
                 call: out.trace_id.clone(),
@@ -1121,6 +1203,7 @@ impl Engine {
         // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
         if admission == Admission::HalfOpen {
             debug!(target = %target, transition = "half_open", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "half_open");
             self.emit_event(|| EventKind::BreakerHalfOpen {
                 call: out.trace_id.clone(),
                 target: target.to_owned(),
@@ -1351,6 +1434,7 @@ impl Engine {
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
+            crate::metrics::record_attempt(target);
             self.emit_event(|| EventKind::AttemptStart {
                 call: out.trace_id.clone(),
                 target: target.to_owned(),
@@ -1401,34 +1485,21 @@ impl Engine {
                     if let Some(code) =
                         terminal_code(retryable, attempt, max_attempts, request.idempotent)
                     {
-                        // A policy-layer timeout is the more precise diagnosis
-                        // than "exhausted"/"non-retryable" — except for the
-                        // Level 0 non-idempotent rule, which callers must see.
-                        let code = if attempt_outcome.timed_out_by_layer
-                            && code != ErrorCode::NonIdempotentNotRetried
-                        {
-                            ErrorCode::Timeout
-                        } else {
-                            code
+                        let ctx = TerminalAttemptCtx {
+                            request,
+                            attempt,
+                            max_attempts,
+                            trace,
+                            timed_out_by_layer: attempt_outcome.timed_out_by_layer,
                         };
-                        return Err(OutcomeError {
+                        return Err(terminal_attempt_error(
+                            &ctx,
                             code,
                             class,
                             http_status,
-                            message: with_trace_ref(
-                                terminal_message(
-                                    code,
-                                    request,
-                                    attempt,
-                                    max_attempts,
-                                    class,
-                                    http_status,
-                                    &message,
-                                ),
-                                trace,
-                            ),
+                            &message,
                             original,
-                        });
+                        ));
                     }
                     // Jitter is the emitting segment's flag (schedules can
                     // compose via `upTo`/`andThen`; the walk is pure in the
@@ -1443,6 +1514,7 @@ impl Engine {
                     attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
+                    crate::metrics::record_retry(target, wait);
                     // Emitted before the wait so a live tail shows it now.
                     self.emit_event(|| EventKind::Backoff {
                         call: out.trace_id.clone(),

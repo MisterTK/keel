@@ -287,6 +287,13 @@ impl FlowManager {
             .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
             .map_or(0, |(_, o)| o.attempt);
         let attempt = prior.saturating_add(1);
+        // A second-or-later attempt is a *recovery*: the flow did not run to
+        // completion in one process lifetime (crash, lease loss, deliberate
+        // resume). First entries (attempt == 1) are ordinary starts, not
+        // recoveries — only re-entries count toward the §4.5 metric.
+        if attempt >= 2 {
+            crate::metrics::record_flow_resume(entrypoint);
+        }
         if attempt > self.config.max_attempts {
             self.journal
                 .complete_flow(flow_id, FlowStatus::Dead)

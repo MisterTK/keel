@@ -130,29 +130,37 @@ mod bindings {
         Ok(())
     }
 
-    /// Best-effort OTLP span export, gated by the `otel` build feature AND the
-    /// `KEEL_OTEL` env var. OFF by default: an addon built without `--features
-    /// otel` links no OpenTelemetry dependency and this is a no-op. When both are
-    /// on, the FIRST core constructed installs the global OTLP exporter (endpoint +
-    /// settings from the standard `OTEL_*` env vars) so the engine's
-    /// `keel.call`/`keel.attempt` spans reach a collector. Init failures never
-    /// break the process — they warn and export stays off. Best-effort: buffered
-    /// spans flush as the core's runtime runs (architecture spec §4.5, otel.rs).
+    /// Best-effort OTLP span + metrics export, gated by the `otel` build feature
+    /// AND [`keel_engine::otel::export_enabled`] (env `KEEL_OTEL` first, else the
+    /// effective policy's `telemetry.otlp_endpoint`). OFF by default: an addon
+    /// built without `--features otel` links no OpenTelemetry dependency and
+    /// this is a no-op. When enabled, the FIRST call that decides to export
+    /// installs the global OTLP exporter — [`keel_engine::otel::resolve_endpoint`]
+    /// picks the endpoint (env wins over policy) — so the engine's
+    /// spans/metrics reach a collector. Called twice per core: once at
+    /// construction with no policy known yet (`policy_endpoint = None`, so only
+    /// `KEEL_OTEL` + `OTEL_*` env can trigger it), and again from `configure`
+    /// once the effective policy's `[telemetry]` is known; the `OnceLock` makes
+    /// the second call a no-op if the first already exported. Init failures
+    /// never break the process — they warn and export stays off. Best-effort:
+    /// buffered spans/metrics flush as the core's runtime runs (architecture
+    /// spec §4.5, otel.rs).
     #[cfg(feature = "otel")]
     static OTEL_GUARD: std::sync::OnceLock<Option<keel_engine::otel::OtelGuard>> =
         std::sync::OnceLock::new();
 
     #[cfg(feature = "otel")]
-    fn maybe_init_otel(runtime: &Runtime) {
-        if std::env::var_os("KEEL_OTEL").is_none() {
+    fn maybe_init_otel(runtime: &Runtime, policy_endpoint: Option<&str>) {
+        if !keel_engine::otel::export_enabled(policy_endpoint) {
             return;
         }
         OTEL_GUARD.get_or_init(|| {
-            match runtime.block_on(async { keel_engine::otel::init_otlp(None) }) {
+            let endpoint = keel_engine::otel::resolve_endpoint(policy_endpoint);
+            match runtime.block_on(async { keel_engine::otel::init_otlp(endpoint.as_deref()) }) {
                 Ok(guard) => Some(guard),
                 Err(e) => {
                     eprintln!(
-                        "keel: KEEL_OTEL set but OTLP init failed ({e}); span export disabled"
+                        "keel: OTel export enabled but OTLP init failed ({e}); export disabled"
                     );
                     None
                 }
@@ -163,7 +171,7 @@ mod bindings {
     /// No-op when the `otel` feature is off (the default): no OpenTelemetry
     /// dependency is linked and the addon never touches telemetry.
     #[cfg(not(feature = "otel"))]
-    fn maybe_init_otel(_runtime: &Runtime) {}
+    fn maybe_init_otel(_runtime: &Runtime, _policy_endpoint: Option<&str>) {}
 
     /// The async-effect callback shape: JS `(attempt: number) => Promise<object>`.
     /// `CalleeHandled = false` (5th generic) means napi passes only `attempt` —
@@ -248,10 +256,12 @@ mod bindings {
             let journal_path = options.and_then(|o| o.journal_path);
             let runtime = build_runtime(paused)
                 .map_err(|e| Error::from_reason(format!("KEEL-E040: runtime build failed: {e}")))?;
-            // Install OTLP export if built `--features otel` AND KEEL_OTEL is set
-            // (a no-op otherwise). Before `Engine::new` so the subscriber is up
-            // before any span is emitted.
-            maybe_init_otel(&runtime);
+            // Install OTLP export if built `--features otel` AND `KEEL_OTEL` is
+            // set (a no-op otherwise; no policy is known yet, so only the env can
+            // trigger it here — `configure` below tries again once
+            // `telemetry.otlp_endpoint` is known). Before `Engine::new` so the
+            // subscriber is up before any span is emitted.
+            maybe_init_otel(&runtime, None);
             // `Engine::new` reads `tokio::time::Instant::now()`; build it inside
             // the runtime so a paused clock's epoch is anchored (see `keel-ffi`).
             let mut engine = runtime.block_on(async { Engine::new() });
@@ -286,7 +296,15 @@ mod bindings {
         pub fn configure(&self, env: Env, policy: Value) -> Result<()> {
             self.engine
                 .configure(&policy)
-                .map_err(|e| throw_keel_from(env, &e))
+                .map_err(|e| throw_keel_from(env, &e))?;
+            // Retry OTLP init now that `telemetry.otlp_endpoint` is known — a
+            // no-op if construction's env-only attempt already exported
+            // (`OnceLock`).
+            maybe_init_otel(
+                &lock_recover(&self.runtime),
+                self.engine.telemetry_otlp_endpoint().as_deref(),
+            );
+            Ok(())
         }
 
         /// Run one intercepted call synchronously. The engine drives the layer

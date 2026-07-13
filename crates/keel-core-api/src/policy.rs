@@ -737,10 +737,14 @@ impl TryFrom<String> for JournalLocation {
     }
 }
 
-/// `[telemetry]` (`otlp_endpoint`, `console`). Parsed and carried, but inert in
-/// v0.1: OTel export is configured from the environment (see `keel-core`'s otel
-/// module), so setting this only validates — `Engine::configure` warns when it
-/// is present so the user is not silently surprised.
+/// `[telemetry]` (`otlp_endpoint`, `console`). Parsed and carried; `Engine`
+/// exposes `otlp_endpoint` back to native front ends (`telemetry_otlp_endpoint`)
+/// which feed it to `keel-core`'s `otel::init_otlp` when built with the `otel`
+/// feature — the standard `OTEL_*` environment variables take precedence over
+/// this table (see `keel-core`'s otel module for the exact precedence rules).
+/// `console` (the local pretty-console-summary switch) is validated and
+/// carried but has no consumer yet; `Engine::configure` warns on an explicit
+/// `false` so the user is not silently surprised.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryPolicy {
@@ -775,8 +779,9 @@ pub struct Policy {
     /// Journal location (schema-validated), honored by the real core at
     /// configure time (see [`JournalLocation`]).
     pub journal: Option<JournalLocation>,
-    /// Telemetry config (schema-validated). Parsed and carried but inert in
-    /// v0.1 (env-driven export); see [`TelemetryPolicy`].
+    /// Telemetry config (schema-validated); `otlp_endpoint` is honored by
+    /// native front ends (env still wins), `console` is not yet wired — see
+    /// [`TelemetryPolicy`].
     pub telemetry: Option<TelemetryPolicy>,
 }
 
