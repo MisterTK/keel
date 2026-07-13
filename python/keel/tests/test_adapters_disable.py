@@ -111,16 +111,21 @@ class DetectTest(unittest.TestCase):
         self.assertTrue(detection.matched)
         self.assertEqual(detection.name, "urllib3")
 
-    def test_available_packs_reports_six_registered(self) -> None:
+    def test_available_packs_reports_nine_registered(self) -> None:
+        # 6 library adapters (aiohttp, boto3, httpx, psycopg, requests,
+        # urllib3) + 3 framework packs (pydantic-ai, openai-agents, crewai,
+        # adapters._all_packs). Only the always-installed libraries are
+        # actually present here; aiohttp/boto3/psycopg are exercised (with
+        # structural fakes) in their own test files, and the framework packs
+        # are never installed in this repo's test environment (CLAUDE.md:
+        # framework deps never get added to a manifest), so all six report
+        # unmatched.
         packs = available_packs()
-        self.assertEqual(len(packs), 6, "aiohttp, boto3, httpx, psycopg, requests, urllib3")
+        self.assertEqual(len(packs), 9, "6 library adapters + 3 framework packs")
         present = {d.name for d in packs if d.matched}
-        # Only the always-installed libraries are actually present here;
-        # aiohttp/boto3/psycopg are exercised (with structural fakes) in their
-        # own test files.
         self.assertEqual(present, _ALWAYS_PRESENT)
         absent = [d for d in packs if not d.matched]
-        self.assertEqual(len(absent), 3)
+        self.assertEqual(len(absent), 6)
         self.assertTrue(all(d.name == "" for d in absent), "an unmatched pack reports no name")
 
 
