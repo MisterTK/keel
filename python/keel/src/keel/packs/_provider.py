@@ -24,13 +24,21 @@ from .._defaults import llm_defaults
 from ..adapters._pack import Detection, Seam, TargetDecl
 
 
-def detect_pack(module: str, name: str, pinned: tuple[str, ...]) -> Detection:
+def detect_pack(
+    module: str, name: str, pinned: tuple[str, ...], *, dist_name: str | None = None
+) -> Detection:
     """Present iff ``module`` is importable — decided WITHOUT importing it
-    (importability + installed version only, per adapter-pack rule 1)."""
+    (importability + installed version only, per adapter-pack rule 1).
+
+    ``dist_name`` is the PyPI distribution name to resolve the version from,
+    when it differs from the importable module name (e.g. the ``google-genai``
+    distribution installs the ``google.genai`` module); it defaults to
+    ``module`` for the common case where the two coincide (openai, anthropic).
+    """
     if importlib.util.find_spec(module) is None:
         return Detection(matched=False)
     try:
-        version = importlib.metadata.version(module)
+        version = importlib.metadata.version(dist_name or module)
     except importlib.metadata.PackageNotFoundError:
         version = ""
     confidence = "pinned" if _is_pinned(version, pinned) else "best_effort"

@@ -13,10 +13,10 @@ nothing — the runtime stays stdlib-only and ``keel run`` startup stays cheap,
 honoring the contract rule that a pack never imports its library unless it is
 present *and in use*.
 
-Framework packs (pydantic-ai / openai-agents / crewai / adk / …, ``keel.packs``
-— real seams, not transport libraries; see ``keel.packs``' module docstring)
-are armed through the identical lazy mechanism, keyed by their own ``MODULE``,
-via :func:`_framework_packs`.
+Framework packs (pydantic-ai / openai-agents / crewai / adk / langgraph / …,
+``keel.packs`` — real seams, not transport libraries; see ``keel.packs``'
+module docstring) are armed through the identical lazy mechanism, keyed by
+their own ``MODULE``, via :func:`_framework_packs`.
 """
 
 from __future__ import annotations
@@ -27,32 +27,22 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
-from ..packs import langgraph_pack
 from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
 #: Alphabetical by module name. Library adapters only (physically-patched,
-#: seam-owning packs that live in this package, or — for `langgraph_pack` —
-#: registered here because it too owns a real seam, `StateGraph.add_node`,
-#: not a semantic pack like `llm`/`tool`). Framework packs (pydantic-ai /
-#: openai-agents / crewai / adk / …, `keel.packs`) own a seam the same way
-#: but are registered via :func:`_framework_packs` — a lazily-imported
-#: cross-package reference, so `keel.packs` (which already imports
-#: `keel.adapters._pack`) never has to be imported at `keel.adapters`
-#: MODULE-import time (no init-order cycle). `langgraph_pack` avoids that
-#: cycle differently: it lives in `keel.packs` but is imported directly here
-#: at module level because (unlike the framework packs) `keel.packs.__init__`
-#: does not import `keel.adapters` back, so there is no cycle to break.
-PACKS = (
-    aiohttp_pack,
-    boto3_pack,
-    httpx_pack,
-    langgraph_pack,
-    psycopg_pack,
-    requests_pack,
-    urllib3_pack,
-)
+#: seam-owning packs that live in this package). Framework packs (pydantic-ai
+#: / openai-agents / crewai / adk / langgraph / …, `keel.packs`) own a seam
+#: the same way but are registered via :func:`_framework_packs` — a
+#: lazily-imported cross-package reference, so `keel.packs` (whose submodules
+#: import `keel.adapters._pack`, and some — `mcp_pack` — import names off
+#: `keel.adapters` itself) never has to be imported at `keel.adapters`
+#: MODULE-import time (no init-order cycle: `langgraph_pack` learned this the
+#: hard way — importing it eagerly here pulled in `keel.packs.__init__`,
+#: which imports `mcp_pack`, which needs `_AdapterFinder` from THIS module
+#: before it finishes executing).
+PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack)
 
 
 class _State:
@@ -67,9 +57,9 @@ def _framework_packs() -> tuple[Any, ...]:
     import time) to avoid a cycle: `keel.packs` submodules already import
     `keel.adapters._pack`, so importing `keel.packs` at the top of THIS module
     would make the two packages import each other mid-initialization."""
-    from ..packs import adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack
+    from ..packs import adk_pack, crewai_pack, langgraph_pack, openai_agents_pack, pydantic_ai_pack
 
-    return (adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack)
+    return (adk_pack, crewai_pack, langgraph_pack, openai_agents_pack, pydantic_ai_pack)
 
 
 def _all_packs() -> tuple[Any, ...]:

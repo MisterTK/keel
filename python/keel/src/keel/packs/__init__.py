@@ -2,11 +2,11 @@
 
 Unlike the *library* adapters in ``keel.adapters`` (httpx/requests), which own a
 monkey-patched seam, the *provider* packs here (``openai_pack``,
-``anthropic_pack``) are SEMANTIC: their targets are produced by the transport
-seams (the ``llm:<provider>`` host map) and they contribute only (a) a
-policy-defaults fragment merged UNDER user config and (b) — for the generic
-``llm`` pack — the dev-cache resolution. They carry zero resilience logic of
-their own (adapter-pack rule 3).
+``anthropic_pack``, ``google_genai_pack``) are SEMANTIC: their targets are
+produced by the transport seams (the ``llm:<provider>`` host map) and they
+contribute only (a) a policy-defaults fragment merged UNDER user config and
+(b) — for the generic ``llm`` pack — the dev-cache resolution. They carry zero
+resilience logic of their own (adapter-pack rule 3).
 
 The *framework* packs (``pydantic_ai_pack``, ``openai_agents_pack``,
 ``crewai_pack``, ``adk_pack``) DO own a seam — each patches its framework's
@@ -22,16 +22,21 @@ requests ride the provider SDKs over httpx/requests, so the transport seam
 already maps them to ``llm:<provider>`` (each pack's ``targets()`` documents
 the routing).
 
+``mcp_pack`` is a third kind of exception: it DOES own a seam
+(``mcp.client.session.ClientSession.send_request``), but is patched at
+bootstrap directly via :func:`install_mcp_pack` (not through ``PACKS`` or
+``_framework_packs``) — exactly like the Node front end's ``mcp:`` pack.
+
 The front end folds each PRESENT provider pack's ``defaults()`` fragment into
 the policy at bootstrap (``defaults < packs < user``); the generic ``llm`` pack
 supplies ``resolve_dev_cache``.
 
-``langgraph_pack`` is the one exception living in this package: it DOES own a
-real monkey-patched seam (``StateGraph.add_node``), so it is also registered
-in ``keel.adapters.PACKS`` for lazy install-on-import, exactly like httpx/
-requests. It lives here rather than in ``keel.adapters`` because its OTHER
-half — the `KeelSaver` checkpointer — is a framework-pack API surface (like
-`tool.wrap_tool`), not a library adapter.
+``langgraph_pack`` is the last exception, living in this package: it DOES own
+a real monkey-patched seam (``StateGraph.add_node``), so it is also
+registered in ``keel.adapters.PACKS`` for lazy install-on-import, exactly
+like httpx/requests. It lives here rather than in ``keel.adapters`` because
+its OTHER half — the `KeelSaver` checkpointer — is a framework-pack API
+surface (like `tool.wrap_tool`), not a library adapter.
 """
 
 from __future__ import annotations
@@ -42,17 +47,20 @@ from . import (
     adk_pack,
     anthropic_pack,
     crewai_pack,
+    google_genai_pack,
     langgraph_pack,
+    mcp_pack,
     openai_agents_pack,
     openai_pack,
     pydantic_ai_pack,
 )
 from .langgraph_pack import KeelSaver
 from .llm import DEV_CACHE_TTL, llm_pack, resolve_dev_cache
+from .mcp_pack import install_mcp_pack
 from .tool import is_valid_tool_name, tool_pack, wrap_tool
 
 #: Registration order = report order (stable, deterministic).
-PROVIDER_PACKS = (openai_pack, anthropic_pack)
+PROVIDER_PACKS = (openai_pack, anthropic_pack, google_genai_pack)
 
 #: Registration order = report order (stable, deterministic). Physical
 #: activation is `keel.adapters.install_adapters` (via `_framework_packs`);
@@ -76,6 +84,7 @@ __all__ = [
     "resolve_dev_cache",
     "openai_pack",
     "anthropic_pack",
+    "google_genai_pack",
     "pydantic_ai_pack",
     "openai_agents_pack",
     "crewai_pack",
@@ -85,4 +94,6 @@ __all__ = [
     "wrap_tool",
     "langgraph_pack",
     "KeelSaver",
+    "mcp_pack",
+    "install_mcp_pack",
 ]

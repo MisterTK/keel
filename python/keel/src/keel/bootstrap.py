@@ -27,7 +27,7 @@ from ._policy import extract_flow_entrypoints, extract_function_targets, load_po
 from ._runtime import clear_runtime, set_runtime
 from ._targets import clear_outbound_targets, install_outbound_targets
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import present_provider_defaults, resolve_dev_cache
+from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -42,6 +42,7 @@ class _State:
     finder: KeelFinder | None = None
     discovery: Discovery | None = None
     exit_registered: bool = False
+    mcp_uninstall: Any = None
 
 
 _STATE = _State()
@@ -102,8 +103,14 @@ def install_keel(
     # cheap.
     adapters = install_adapters()
 
+    # Framework packs: auto-detect and patch the MCP client SDK if present.
+    # Best-effort — an absent SDK is a silent no-op; never fatal (mirrors the
+    # Node front end's installMcpPack, called right after its fetch install).
+    mcp = install_mcp_pack()
+    _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
+
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets], adapters)
+    _banner(env, source, [t.key for t in targets], adapters, mcp)
 
     return {
         "enabled": True,
@@ -113,6 +120,7 @@ def install_keel(
         "function_targets": targets,
         "flow_entrypoints": flow_entrypoints,
         "adapters": adapters,
+        "mcp": mcp,
     }
 
 
@@ -141,6 +149,9 @@ def uninstall_keel() -> None:
     remove_import_hook(_STATE.finder)
     _STATE.finder = None
     uninstall_adapters()
+    if _STATE.mcp_uninstall is not None:
+        _STATE.mcp_uninstall()
+        _STATE.mcp_uninstall = None
     if _STATE.discovery is not None:
         _STATE.discovery.close()
         _STATE.discovery = None
@@ -166,6 +177,7 @@ def _banner(
     source: str,
     target_keys: list[str],
     adapters: list[Detection],
+    mcp: dict[str, Any] | None = None,
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
@@ -180,5 +192,7 @@ def _banner(
         pieces.append(f"{n} {noun} ({', '.join(sorted(target_keys))})")
     if adapters:
         pieces.append(", ".join(f"{d.name} {d.version}".strip() for d in adapters))
+    if mcp and mcp.get("active"):
+        pieces.append("mcp: transports")
     wrapped = " + ".join(pieces) if pieces else "nothing yet"
     sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")

@@ -18,14 +18,28 @@ test("llm: host map resolves to the exact contracted targets", () => {
   assert.equal(resolveTarget("api.openai.com"), "llm:openai");
   assert.equal(resolveTarget("api.anthropic.com"), "llm:anthropic");
   assert.equal(resolveTarget("generativelanguage.googleapis.com"), "llm:google-genai");
+  assert.equal(resolveTarget("aiplatform.googleapis.com"), "llm:google-genai");
 });
 
-test("the map has exactly the three contracted providers", () => {
+test("the map has exactly the four contracted providers", () => {
   assert.deepEqual(LLM_HOST_PROVIDERS, {
     "api.openai.com": "openai",
     "api.anthropic.com": "anthropic",
     "generativelanguage.googleapis.com": "google-genai",
+    "aiplatform.googleapis.com": "google-genai",
   });
+});
+
+test("Vertex AI regional endpoints resolve via the suffix rule (Python parity)", () => {
+  for (const host of [
+    "us-central1-aiplatform.googleapis.com",
+    "europe-west4-aiplatform.googleapis.com",
+    "asia-northeast1-aiplatform.googleapis.com",
+  ]) {
+    assert.equal(resolveTarget(host), "llm:google-genai", host);
+  }
+  // No hyphen before "aiplatform": not a documented Vertex regional host.
+  assert.equal(resolveTarget("evilaiplatform.googleapis.com"), "evilaiplatform.googleapis.com");
 });
 
 test("unmapped hosts resolve to the bare hostname", () => {
