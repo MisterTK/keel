@@ -1,0 +1,87 @@
+{
+  "name": "breaker-rate-mode-trip-and-recover",
+  "description": "Rate mode (window + failure_rate, no `failures`) trips once the trailing window holds >= min_calls outcomes with failed/total >= failure_rate — not on consecutive failures alone, since a success is interleaved here. A half-open probe success then closes it and clears the recorded outcomes.",
+  "policy": {
+    "target": {
+      "api.flaky.internal": {
+        "retry": { "attempts": 1 },
+        "breaker": { "window": "1m", "failure_rate": 0.5, "min_calls": 4, "cooldown": "15s" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 1 }],
+        "expect": { "result": "ok", "attempts": 1, "breaker": "closed" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": { "result": "error", "attempts": 1, "breaker": "closed" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 2 }],
+        "expect": { "result": "ok", "attempts": 1, "breaker": "closed" }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": {
+          "result": "error",
+          "attempts": 1,
+          "error": { "code": "KEEL-E010" },
+          "breaker": "open"
+        }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [],
+        "expect": {
+          "result": "error",
+          "attempts": 0,
+          "breaker": "open",
+          "error": { "code": "KEEL-E012" }
+        }
+      }
+    },
+    { "advance_ms": 15000 },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 3 }],
+        "expect": { "result": "ok", "attempts": 1, "payload": 3, "breaker": "closed" }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.flaky.internal": {
+            "calls": 6,
+            "attempts": 5,
+            "successes": 3,
+            "failures": 3,
+            "breaker_opens": 1,
+            "breaker_state": "closed"
+          }
+        }
+      }
+    }
+  ]
+}

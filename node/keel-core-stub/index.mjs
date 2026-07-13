@@ -6,9 +6,13 @@
  * serde types in contracts/core_api.rs.
  *
  * Simplifications (deliberate, documented): virtual clock (waits recorded,
- * not slept), no jitter, consecutive-failure breaker only, fixed-window rate
- * limiter, exact-match target resolution with defaults.llm / defaults.outbound
- * fallback, `timeout` validated but not enforced.
+ * not slept), no jitter, exact-match target resolution with defaults.llm /
+ * defaults.outbound fallback, `timeout` validated but not enforced.
+ *
+ * Bit-identical to the real core (parity rule, not a simplification): the
+ * breaker's count mode *and* rate mode (window + failure_rate + min_calls),
+ * and the rate limiter's token bucket (burst = the rate's limit, continuous
+ * refill).
  */
 
 export const ENVELOPE_VERSION = 1;
@@ -143,11 +147,32 @@ function validateTargetPolicy(path, v) {
       "failure_rate",
       "min_calls",
     ]);
-    const { failures, cooldown } = v.breaker;
+    const { failures, cooldown, window, failure_rate: failureRate, min_calls: minCalls } =
+      v.breaker;
     if (failures !== undefined && (!Number.isInteger(failures) || failures < 1))
       throw invalid(path, "breaker.failures must be an integer >= 1");
     if (cooldown !== undefined && parseDuration(cooldown) === null)
       throw invalid(path, "bad breaker.cooldown");
+    if (window !== undefined && parseDuration(window) === null)
+      throw invalid(path, "bad breaker.window");
+    if (
+      failureRate !== undefined &&
+      (typeof failureRate !== "number" || !(failureRate > 0 && failureRate <= 1))
+    )
+      throw invalid(path, "breaker.failure_rate must be greater than 0 and at most 1");
+    if (minCalls !== undefined && (!Number.isInteger(minCalls) || minCalls < 1))
+      throw invalid(path, "breaker.min_calls must be an integer >= 1");
+    // Two modes (frozen schema `$defs/breaker`): "Setting `failures` selects
+    // count mode." Otherwise a rate-mode knob without BOTH `window` and
+    // `failure_rate` is half-configured — reject it rather than silently
+    // running count mode on its defaults.
+    const hasRatePair = window !== undefined && failureRate !== undefined;
+    const hasAnyRateKnob = window !== undefined || failureRate !== undefined || minCalls !== undefined;
+    if (failures === undefined && hasAnyRateKnob && !hasRatePair)
+      throw invalid(
+        path,
+        "breaker rate mode requires both `window` and `failure_rate` (count mode sets `failures` instead)"
+      );
   }
   if (v.rate !== undefined && (typeof v.rate !== "string" || parseRate(v.rate) === null))
     throw invalid(path, "unparseable rate");
@@ -173,12 +198,71 @@ function validateTargetPolicy(path, v) {
   }
 }
 
+const DEFAULT_MIN_CALLS = 10;
+
+/** The mode a resolved `breaker` table selects, with defaults applied —
+ *  mirrors `BreakerPolicy::mode` in crates/keel-core-api. Returns
+ *  `{ mode: "count", failures }` or
+ *  `{ mode: "rate", windowMs, failureRate, minCalls }`. Configure-time
+ *  validation already rejected a half-configured rate mode, so `window`/
+ *  `failure_rate` are either both present or both irrelevant here. */
+function breakerMode(cfg) {
+  const { failures, window, failure_rate: failureRate, min_calls: minCalls } = cfg;
+  if (failures === undefined && window !== undefined && failureRate !== undefined) {
+    return {
+      mode: "rate",
+      windowMs: parseDuration(window),
+      failureRate,
+      minCalls: minCalls ?? DEFAULT_MIN_CALLS,
+    };
+  }
+  return { mode: "count", failures: failures ?? DEFAULT_BREAKER_FAILURES };
+}
+
+/** Rate mode: prune outcomes that aged out of the window (strictly: one
+ *  exactly `windowMs` old is evicted, per conformance/README.md §4), then
+ *  record this one. */
+function breakerObserve(b, nowMs, windowMs, failed) {
+  while (b.outcomes.length > 0 && nowMs - b.outcomes[0][0] >= windowMs) b.outcomes.shift();
+  b.outcomes.push([nowMs, failed]);
+}
+
+/** Rate mode's trip condition over the (already-pruned) window. */
+function breakerWindowRateReached(b, failureRate, minCalls) {
+  const total = b.outcomes.length;
+  if (total < minCalls) return false;
+  const failed = b.outcomes.filter(([, f]) => f).length;
+  return failed / total >= failureRate;
+}
+
+/** Token bucket: burst capacity `limit`, continuous refill of `limit` per
+ *  `windowMs`. Bit-identical to the real core's `TokenBucket::plan_admit`
+ *  (crates/keel-core/src/engine.rs) — same fixed-point integer arithmetic (1
+ *  token = `windowMs` scaled units), so no float drift between languages.
+ *  Returns the wait to admit this call (0 = immediate); the caller advances
+ *  the virtual clock by it, standing in for the real core's actual sleep. */
+function tokenBucketAdmit(cell, nowMs, limit, windowMs) {
+  const capacity = limit * windowMs;
+  if (!cell.primed) {
+    cell.primed = true;
+    cell.scaledTokens = capacity;
+    cell.lastRefillMs = nowMs;
+  }
+  const elapsed = Math.max(0, nowMs - cell.lastRefillMs);
+  cell.lastRefillMs = Math.max(cell.lastRefillMs, nowMs);
+  cell.scaledTokens = Math.min(capacity, cell.scaledTokens + elapsed * limit);
+  cell.scaledTokens -= windowMs;
+  if (cell.scaledTokens >= 0) return 0;
+  const deficit = -cell.scaledTokens;
+  return Math.ceil(deficit / limit);
+}
+
 export class KeelCoreStub {
   #policy = {};
   #nowMs = 0;
   #traceSeq = 0;
-  #breakers = new Map(); // target -> {consecutive, openUntil, opens}
-  #rateWindows = new Map(); // target -> {window, count}
+  #breakers = new Map(); // target -> {consecutive, openUntil, opens, outcomes}
+  #tokenBuckets = new Map(); // target -> {scaledTokens, lastRefillMs, primed}
   #cache = new Map(); // key -> {expires, payload}
   #metrics = new Map(); // target -> counters
 
@@ -282,33 +366,26 @@ export class KeelCoreStub {
       }
     }
 
-    // rate limiter (fixed windows on the virtual clock)
+    // rate limiter (token bucket: burst + continuous refill)
     if (typeof rate === "string") {
       const { limit, windowMs } = parseRate(rate);
-      const w = Math.floor(this.#nowMs / windowMs);
-      if (!this.#rateWindows.has(target)) this.#rateWindows.set(target, { window: w, count: 0 });
-      const cell = this.#rateWindows.get(target);
-      if (cell.window !== w) {
-        cell.window = w;
-        cell.count = 0;
-      }
-      if (cell.count >= limit) {
-        const next = (cell.window + 1) * windowMs;
-        out.throttle_wait_ms = next - this.#nowMs;
+      if (!this.#tokenBuckets.has(target))
+        this.#tokenBuckets.set(target, { scaledTokens: 0, lastRefillMs: 0, primed: false });
+      const cell = this.#tokenBuckets.get(target);
+      const wait = tokenBucketAdmit(cell, this.#nowMs, limit, windowMs);
+      if (wait > 0) {
+        out.throttle_wait_ms = wait;
         out.throttled = true;
-        this.#nowMs = next;
-        cell.window = Math.floor(next / windowMs);
-        cell.count = 0;
+        this.#nowMs += wait;
         m.throttled += 1;
       }
-      cell.count += 1;
     }
 
     // breaker check (observes post-retry call outcomes)
     let halfOpen = false;
     if (isTable(breakerCfg)) {
       if (!this.#breakers.has(target))
-        this.#breakers.set(target, { consecutive: 0, openUntil: null, opens: 0 });
+        this.#breakers.set(target, { consecutive: 0, openUntil: null, opens: 0, outcomes: [] });
       const b = this.#breakers.get(target);
       if (b.openUntil !== null) {
         if (this.#nowMs < b.openUntil) {
@@ -344,8 +421,19 @@ export class KeelCoreStub {
         m.successes += 1;
         if (isTable(breakerCfg)) {
           const b = this.#breakers.get(target);
+          // A live success is only reached while closed or half-open;
+          // `openUntil` set here means a probe just closed the breaker.
+          const closedAProbe = b.openUntil !== null;
           b.consecutive = 0;
           b.openUntil = null;
+          if (closedAProbe) {
+            // A closing probe resets the window: the pre-open failure
+            // history must not instantly re-trip a freshly-recovered target.
+            b.outcomes = [];
+          } else {
+            const resolved = breakerMode(breakerCfg);
+            if (resolved.mode === "rate") breakerObserve(b, this.#nowMs, resolved.windowMs, false);
+          }
         }
         if (cacheKey && cacheTtl !== null)
           this.#cache.set(cacheKey, { expires: this.#nowMs + cacheTtl, payload: res.payload });
@@ -387,23 +475,29 @@ export class KeelCoreStub {
     // terminal failure
     m.failures += 1;
     if (isTable(breakerCfg)) {
-      const failures = breakerCfg.failures ?? DEFAULT_BREAKER_FAILURES;
       const cooldown =
         breakerCfg.cooldown !== undefined
           ? parseDuration(breakerCfg.cooldown)
           : DEFAULT_BREAKER_COOLDOWN_MS;
       const b = this.#breakers.get(target);
+      let shouldTrip;
       if (halfOpen) {
+        shouldTrip = true; // failed probe: re-open for another full cooldown
+      } else {
+        const resolved = breakerMode(breakerCfg);
+        if (resolved.mode === "count") {
+          b.consecutive += 1;
+          shouldTrip = b.consecutive >= resolved.failures;
+        } else {
+          breakerObserve(b, this.#nowMs, resolved.windowMs, true);
+          shouldTrip = breakerWindowRateReached(b, resolved.failureRate, resolved.minCalls);
+        }
+      }
+      if (shouldTrip) {
         b.openUntil = this.#nowMs + cooldown;
         b.opens += 1;
         b.consecutive = 0;
-      } else {
-        b.consecutive += 1;
-        if (b.consecutive >= failures) {
-          b.openUntil = this.#nowMs + cooldown;
-          b.opens += 1;
-          b.consecutive = 0;
-        }
+        b.outcomes = [];
       }
     }
     out.error = terminal;

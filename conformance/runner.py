@@ -8,7 +8,7 @@ Usage:
 
 `--impl stub` (default) drives the pure-Python keel-core-stub; `--impl native`
 drives the PyO3 `keel_core` module (build it first with `maturin develop` in
-crates/keel-py). Both must pass 15/15 — the same scenarios and runner logic, only
+crates/keel-py). Both must pass 18/18 — the same scenarios and runner logic, only
 the injected core object differs. Exit code 0 iff every scenario passes.
 """
 

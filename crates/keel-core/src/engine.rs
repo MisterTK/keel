@@ -4,13 +4,13 @@
 //! `contracts/core_api.rs`.
 
 use core::fmt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate, ResolvedPolicy,
-    RetryPolicy,
+    BreakerMode, BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate,
+    ResolvedPolicy, RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -25,11 +25,18 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, warn};
 
-/// Count-mode circuit breaker (consecutive terminal failures). Observes
-/// post-retry call outcomes — layer order puts it outside the retry loop.
+/// Circuit breaker in count mode (consecutive terminal failures) or rate mode
+/// (failure rate over a sliding window; `BreakerPolicy::mode` selects).
+/// Observes post-retry call outcomes — layer order puts it outside the retry
+/// loop. Normative semantics: conformance/README.md §4.
 #[derive(Debug, Default)]
 struct Breaker {
+    /// Count mode: consecutive terminal failures.
     consecutive: u64,
+    /// Rate mode: post-retry outcomes `(completed_at, failed)` inside the
+    /// trailing window, oldest first. Pruned on every observation; cleared
+    /// when the breaker opens or a probe closes it.
+    outcomes: VecDeque<(Instant, bool)>,
     open_until: Option<Instant>,
     opens: u64,
 }
@@ -73,7 +80,7 @@ impl Breaker {
         }
     }
 
-    fn on_success(&mut self) -> BreakerTransition {
+    fn on_success(&mut self, now: Instant, config: &BreakerPolicy) -> BreakerTransition {
         // A live success is only reached while closed or half-open; an open
         // breaker fails fast (never runs the effect). So `open_until.is_some()`
         // here means a probe just closed the breaker.
@@ -81,10 +88,15 @@ impl Breaker {
         self.consecutive = 0;
         self.open_until = None;
         if closed_a_probe {
-            BreakerTransition::Closed
-        } else {
-            BreakerTransition::None
+            // A closing probe resets the window: the pre-open failure history
+            // must not instantly re-trip a freshly-recovered target.
+            self.outcomes.clear();
+            return BreakerTransition::Closed;
         }
+        if let BreakerMode::Rate { window, .. } = config.mode() {
+            self.observe(now, window, false);
+        }
+        BreakerTransition::None
     }
 
     fn on_terminal_failure(
@@ -96,46 +108,118 @@ impl Breaker {
         let should_trip = if admission == Admission::HalfOpen {
             true // failed probe: re-open for another full cooldown
         } else {
-            self.consecutive += 1;
-            self.consecutive >= config.failures.get()
+            match config.mode() {
+                BreakerMode::Count { failures } => {
+                    self.consecutive += 1;
+                    self.consecutive >= failures.get()
+                }
+                BreakerMode::Rate {
+                    window,
+                    failure_rate,
+                    min_calls,
+                } => {
+                    self.observe(now, window, true);
+                    self.window_rate_reached(failure_rate, min_calls)
+                }
+            }
         };
         if should_trip {
             self.open_until = Some(now + Duration::from_millis(config.cooldown.0));
             self.opens += 1;
             self.consecutive = 0;
+            self.outcomes.clear();
             BreakerTransition::Opened
         } else {
             BreakerTransition::None
         }
     }
+
+    /// Rate mode: prune outcomes that aged out of the window (strictly: an
+    /// outcome exactly `window` old is evicted, per conformance/README.md §4),
+    /// then record this one.
+    fn observe(&mut self, now: Instant, window: DurationMs, failed: bool) {
+        let window = Duration::from_millis(window.0);
+        while let Some(&(at, _)) = self.outcomes.front() {
+            if now.duration_since(at) >= window {
+                self.outcomes.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.outcomes.push_back((now, failed));
+    }
+
+    /// Rate mode's trip condition over the (already-pruned) window.
+    fn window_rate_reached(&self, failure_rate: f64, min_calls: core::num::NonZeroU32) -> bool {
+        let total = self.outcomes.len();
+        if (total as u64) < u64::from(min_calls.get()) {
+            return false;
+        }
+        let failed = self.outcomes.iter().filter(|&&(_, f)| f).count();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "window counts are bounded by the calls observed within one \
+                      breaker window — far below f64's 2^53 exact-integer range"
+        )]
+        let rate = failed as f64 / total as f64;
+        rate >= failure_rate
+    }
 }
 
-/// Fixed-window rate limiter over engine-elapsed milliseconds. Exceeding the
-/// limit delays the call to the next window (`throttled`), never fails it.
+/// Token-bucket rate limiter over engine-elapsed milliseconds (dx-spec §4.1
+/// promises token-bucket rate limiting), bit-identical to every stub (parity
+/// rule — `crates/keel-core-stub`, `python/keel-core-stub`,
+/// `node/keel-core-stub`). Burst capacity is the rate's `limit`; refill is
+/// continuous at `limit` per `window`. Exceeding the rate delays the call
+/// (`throttled`), never fails it.
+///
+/// All arithmetic is integer fixed-point — token amounts are scaled by
+/// `window_ms`, so one token is `window_ms` scaled units and refill is exactly
+/// `limit` scaled units per elapsed millisecond. No float drift: identical
+/// call timings plan identical waits, so conformance scenarios may assert the
+/// exact `throttle_wait_ms` (conformance/README.md §3).
 #[derive(Debug, Default)]
-struct RateWindow {
-    window: u64,
-    count: u64,
+struct TokenBucket {
+    /// Tokens in scaled units (1 token = `window_ms` units). Negative means
+    /// admissions were already booked ahead of refill — queued waiters, each
+    /// spaced `window/limit` apart.
+    scaled_tokens: i128,
+    /// Engine-elapsed ms of the last refill.
+    last_refill_ms: u64,
+    /// Whether the bucket has been filled to burst on first use (a `Default`
+    /// bucket cannot know the rate yet).
+    primed: bool,
 }
 
-impl RateWindow {
-    /// Plans one admission at `elapsed_ms`, pre-booking the slot the call
-    /// will occupy after sleeping. Returns the wait (0 = immediate).
+impl TokenBucket {
+    /// Plans one admission at `elapsed_ms`, pre-booking the token the call
+    /// will consume after sleeping. Returns the wait (0 = immediate): the time
+    /// until continuous refill covers this booking's deficit.
     fn plan_admit(&mut self, elapsed_ms: u64, rate: Rate) -> u64 {
-        let current = elapsed_ms / rate.window_ms;
-        if self.window != current {
-            self.window = current;
-            self.count = 0;
+        let limit = i128::from(rate.limit.get());
+        let window = i128::from(rate.window_ms);
+        let capacity = limit * window; // burst = `limit` whole tokens
+        if !self.primed {
+            self.primed = true;
+            self.scaled_tokens = capacity;
+            self.last_refill_ms = elapsed_ms;
         }
-        let mut wait = 0;
-        if self.count >= rate.limit.get() {
-            let next_window_start = (self.window + 1) * rate.window_ms;
-            wait = next_window_start - elapsed_ms;
-            self.window += 1;
-            self.count = 0;
+        // Concurrent planners may observe `elapsed_ms` before taking the state
+        // lock, so a reading older than the last refill credits nothing.
+        let elapsed = i128::from(elapsed_ms.saturating_sub(self.last_refill_ms));
+        self.last_refill_ms = self.last_refill_ms.max(elapsed_ms);
+        self.scaled_tokens = capacity.min(
+            self.scaled_tokens
+                .saturating_add(elapsed.saturating_mul(limit)),
+        );
+        self.scaled_tokens -= window;
+        if self.scaled_tokens >= 0 {
+            0
+        } else {
+            // ceil(deficit / refill-per-ms)
+            let deficit = -self.scaled_tokens;
+            u64::try_from((deficit + limit - 1) / limit).unwrap_or(u64::MAX)
         }
-        self.count += 1;
-        wait
     }
 }
 
@@ -262,7 +346,7 @@ struct Report<'a> {
 struct State {
     trace_seq: u64,
     breakers: HashMap<String, Breaker>,
-    rate_windows: HashMap<String, RateWindow>,
+    rate_buckets: HashMap<String, TokenBucket>,
     cache: HashMap<CacheKey, CacheEntry>,
     metrics: BTreeMap<String, TargetMetrics>,
 }
@@ -354,6 +438,43 @@ fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
             debug!(target = %target, transition = "closed", "breaker transition");
         }
         BreakerTransition::None => {}
+    }
+}
+
+/// Warn (once per offending table) when a breaker sets `failures` alongside
+/// rate-mode knobs: the frozen schema's "setting `failures` selects count
+/// mode" makes window/failure_rate/min_calls inert, and inert config must be
+/// loud (the same rule `configure` applies to `journal`/`telemetry`).
+fn warn_inert_breaker_knobs(policy: &Policy) {
+    let defaults = &policy.defaults;
+    let tables = defaults
+        .outbound
+        .iter()
+        .map(|t| (String::from("defaults.outbound"), t))
+        .chain(
+            defaults
+                .llm
+                .iter()
+                .map(|t| (String::from("defaults.llm"), t)),
+        )
+        .chain(
+            policy
+                .target
+                .iter()
+                .map(|(name, t)| (format!("target.\"{name}\""), t)),
+        );
+    for (path, table) in tables {
+        if table
+            .breaker
+            .as_ref()
+            .is_some_and(BreakerPolicy::has_inert_rate_knobs)
+        {
+            warn!(
+                "policy {path}.breaker sets `failures` (count mode) alongside rate-mode knobs \
+                 (window/failure_rate/min_calls), which are inert in count mode. Remove \
+                 `failures` to select rate mode."
+            );
+        }
     }
 }
 
@@ -488,6 +609,7 @@ impl Engine {
                  the environment (KEEL_OTEL_*). This table has no effect."
             );
         }
+        warn_inert_breaker_knobs(&policy);
         *self.policy.write().expect("policy lock poisoned") = policy;
         Ok(())
     }
@@ -750,8 +872,8 @@ impl Engine {
         let wait_ms = {
             let elapsed = self.elapsed_ms();
             let mut state = self.state();
-            let window = state.rate_windows.entry(target.to_owned()).or_default();
-            window.plan_admit(elapsed, rate)
+            let bucket = state.rate_buckets.entry(target.to_owned()).or_default();
+            bucket.plan_admit(elapsed, rate)
         };
         if wait_ms > 0 {
             out.throttled = true;
@@ -813,10 +935,10 @@ impl Engine {
                 Ok(payload) => {
                     state.metrics_for(target).successes += 1;
                     let mut transition = BreakerTransition::None;
-                    if resolved.breaker.is_some()
+                    if let Some(config) = &resolved.breaker
                         && let Some(breaker) = state.breakers.get_mut(target)
                     {
-                        transition = breaker.on_success();
+                        transition = breaker.on_success(now, config);
                     }
                     if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
                         && let Some(ttl) = cache.ttl
@@ -1119,9 +1241,86 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttemptResult, ENVELOPE_VERSION, Engine, Request};
+    use super::{
+        Admission, AttemptResult, Breaker, BreakerTransition, ENVELOPE_VERSION, Engine, Instant,
+        Request, TokenBucket,
+    };
+    use core::num::NonZeroU32;
     use core::time::Duration;
+    use keel_core_api::policy::{BreakerPolicy, DurationMs, Rate};
     use serde_json::json;
+
+    /// A failure recorded far enough in the past to have aged out of the
+    /// window must not count towards a later trip decision: without eviction,
+    /// this exact two-failure sequence (11s apart, `window: 10s`) would trip
+    /// at `min_calls: 2` (rate 1.0); with eviction the first failure is gone
+    /// by the time the second arrives, so the window only ever holds one.
+    #[test]
+    fn breaker_rate_mode_evicts_outcomes_older_than_the_window() {
+        let config = BreakerPolicy {
+            failures: None,
+            cooldown: DurationMs(15_000),
+            window: Some(DurationMs(10_000)),
+            failure_rate: Some(0.5),
+            min_calls: Some(NonZeroU32::new(2).unwrap()),
+        };
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+
+        assert_eq!(
+            breaker.on_terminal_failure(t0, &config, Admission::Closed),
+            BreakerTransition::None,
+            "one failure is below min_calls"
+        );
+        let t_11s = t0 + Duration::from_secs(11);
+        assert_eq!(
+            breaker.on_terminal_failure(t_11s, &config, Admission::Closed),
+            BreakerTransition::None,
+            "the stale failure must have aged out of the 10s window"
+        );
+    }
+
+    /// Burst capacity is `limit` tokens, never more — an idle gap refills the
+    /// bucket but is clamped at capacity, so it cannot bank unlimited tokens
+    /// for a future burst larger than the configured `limit`.
+    #[test]
+    fn token_bucket_caps_refill_at_burst_capacity() {
+        let rate = Rate {
+            limit: core::num::NonZeroU64::new(2).unwrap(),
+            window_ms: 1000,
+        };
+        let mut bucket = TokenBucket::default();
+
+        assert_eq!(bucket.plan_admit(0, rate), 0, "burst covers the first call");
+        assert_eq!(
+            bucket.plan_admit(0, rate),
+            0,
+            "burst covers the second call"
+        );
+        assert_eq!(
+            bucket.plan_admit(0, rate),
+            500,
+            "burst drained: paced at window/limit = 500ms"
+        );
+
+        // A long idle gap (50s, enough to "earn" 100 tokens at this rate) must
+        // not accrue more than the 2-token burst cap.
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            0,
+            "capacity refilled to burst"
+        );
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            0,
+            "both burst tokens available"
+        );
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            500,
+            "capacity clamp: idle time cannot bank more than `limit` tokens"
+        );
+    }
 
     fn req(target: &str, args_hash: &str) -> Request {
         Request {
