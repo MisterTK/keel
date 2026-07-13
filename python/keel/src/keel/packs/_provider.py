@@ -24,6 +24,21 @@ from .._defaults import llm_defaults
 from ..adapters._pack import Detection, Seam, TargetDecl
 
 
+def module_present(module: str) -> bool:
+    """Whether ``module`` is importable, decided WITHOUT importing it
+    (``importlib.util.find_spec``). Safe for dotted names: ``find_spec``
+    imports the PARENT package to resolve a dotted name, and raises
+    ``ModuleNotFoundError`` (rather than returning ``None``) when that parent
+    doesn't exist at all — e.g. ``find_spec("google.adk")`` on a machine with
+    no ``google`` namespace package raises instead of reporting absent. A
+    pack's ``detect()`` must never throw (adapter-pack rule 1's "never fatal"
+    contract), so this catches exactly that case."""
+    try:
+        return importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 def detect_pack(
     module: str, name: str, pinned: tuple[str, ...], *, dist_name: str | None = None
 ) -> Detection:
@@ -35,7 +50,7 @@ def detect_pack(
     distribution installs the ``google.genai`` module); it defaults to
     ``module`` for the common case where the two coincide (openai, anthropic).
     """
-    if importlib.util.find_spec(module) is None:
+    if not module_present(module):
         return Detection(matched=False)
     try:
         version = importlib.metadata.version(dist_name or module)

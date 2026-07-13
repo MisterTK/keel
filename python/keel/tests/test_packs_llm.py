@@ -34,6 +34,7 @@ from keel.packs import (
     present_provider_defaults,
     resolve_dev_cache,
 )
+from keel.packs._provider import module_present
 from keel_core_stub import KeelCoreStub
 
 
@@ -226,7 +227,7 @@ class ProviderPackTest(unittest.TestCase):
         self.assertEqual(anthropic_pack.defaults(), {"defaults": {"llm": llm_defaults()}})
 
     def test_google_genai_pack(self) -> None:
-        present = importlib.util.find_spec("google.genai") is not None
+        present = module_present("google.genai")
         self.assertEqual(google_genai_pack.detect().matched, present)
         self.assertEqual(google_genai_pack.seams(), [])
         targets = google_genai_pack.targets()

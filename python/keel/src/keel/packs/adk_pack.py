@@ -99,12 +99,12 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
-import importlib.util
 import os
 import sys
 from typing import Any, Callable
 
 from ..adapters._pack import Detection, Seam, TargetDecl
+from ._provider import module_present
 from .tool import is_valid_tool_name, wrap_tool
 
 MODULE = "google.adk"
@@ -136,7 +136,7 @@ def detect() -> Detection:
     """Present iff ``google.adk`` is importable — decided WITHOUT importing it
     (importability + installed distribution metadata only, adapter-pack rule
     1)."""
-    if importlib.util.find_spec(MODULE) is None:
+    if not module_present(MODULE):
         return Detection(matched=False)
     try:
         version = importlib.metadata.version(NAME)
