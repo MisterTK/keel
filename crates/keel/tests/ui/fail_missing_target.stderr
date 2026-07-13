@@ -1,0 +1,7 @@
+error: #[keel::wrap] requires `target = "..."`, e.g. #[keel::wrap(target = "orders-api")] (explicit-target-only in v1 — see crates/keel-macros/src/lib.rs for why signature inference is deferred)
+ --> tests/ui/fail_missing_target.rs:4:1
+  |
+4 | #[keel::wrap]
+  | ^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `keel::wrap` (in Nightly builds, run with -Z macro-backtrace for more info)
