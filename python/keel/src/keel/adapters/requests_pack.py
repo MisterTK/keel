@@ -48,7 +48,7 @@ from ._pack import Detection, Seam, TargetDecl
 MODULE = "requests"
 NAME = "requests"
 
-_PINNED = ("2.31", "2.32")
+_PINNED = ("2.33", "2.34")
 
 _installed = False
 _orig: dict[str, Any] = {}

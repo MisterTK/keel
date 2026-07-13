@@ -17,7 +17,6 @@ Requires the native core (Tier 2 is native-only); skips cleanly without it.
 from __future__ import annotations
 
 import json
-import os
 import signal
 import sqlite3
 import subprocess
@@ -26,6 +25,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+
+from . import child_env
 
 try:
     import keel_core  # noqa: F401
@@ -99,17 +100,15 @@ class ResumeDemoTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def _run(self, *, crash_at: int | None = None) -> subprocess.CompletedProcess:
-        env = dict(os.environ)
-        env.update(
-            {
-                "KEEL_DEMO_LOG": str(self.log),
-                "KEEL_FLOW_LEASE_MS": "800",  # short lease so the demo resumes fast
-                "KEEL_QUIET": "1",
-                "KEEL_BACKEND": "native",
-            }
-        )
+        extra = {
+            "KEEL_DEMO_LOG": str(self.log),
+            "KEEL_FLOW_LEASE_MS": "800",  # short lease so the demo resumes fast
+            "KEEL_QUIET": "1",
+            "KEEL_BACKEND": "native",
+        }
         if crash_at is not None:
-            env["KEEL_DEMO_CRASH_AT"] = str(crash_at)
+            extra["KEEL_DEMO_CRASH_AT"] = str(crash_at)
+        env = child_env(**extra)
         return subprocess.run(
             [sys.executable, "-m", "keel", "run", "pipeline.py"],
             cwd=self.dir,
