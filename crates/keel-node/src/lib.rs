@@ -18,6 +18,37 @@
 //!   **harness-only** virtual-clock controls (always present, not part of the
 //!   production surface).
 //!
+//! # Tier 2: durable flows (async-only, unlike `keel-py`)
+//!
+//! - `KeelCore.enterFlow(entrypoint, argsHash, codeHash?, explicitKey?,
+//!   leaseMs?)` — open (or resume) a durable flow and make it the handle's
+//!   active flow; returns `{ flowId, status, replay }`. Throws `KEEL-E030`
+//!   (lease held), `KEEL-E032` (dead flow), `KEEL-E040` (no journal attached).
+//! - `KeelCore.exitFlow(status)` — close the active flow (`"completed"` |
+//!   `"failed"`); a no-op if none is open.
+//! - `KeelCore.journalTime(key, nowMs)` / `KeelCore.journalRandom(key, bytes)`
+//!   — journal (or, on replay, substitute) a virtualized clock/random read.
+//!
+//! Node's intercepted effects are **async-only** (`backend.mjs` drives only
+//! `executeAsync`), unlike `keel-py`'s v0.1 flows, which are synchronous and
+//! therefore *refuse* an async effect while a flow is open. Here `executeAsync`
+//! instead routes through the open [`keel_engine::FlowHandle`]'s
+//! `execute_step` when a flow is active — the async `execute_step` bridge the
+//! core's module docs describe as future work. Concurrent effects inside one
+//! flow are serialized in await order (`conformance/README.md`'s "Async steps
+//! inside a flow" rule): `active_flow` is a [`tokio::sync::Mutex`] whose guard
+//! is deliberately held for the full `execute_step` `.await` (claim through
+//! terminal outcome) — the one lock in this crate that crosses an `.await`,
+//! by design, because the ordering rule requires exactly one admitted step at
+//! a time and an async mutex parks the *task*, not the OS thread, while a
+//! second concurrent effect waits. The synchronous `execute`/`enterFlow`/
+//! `exitFlow`/`journalTime`/`journalRandom` methods run on the JS thread
+//! (never inside a spawned future), so `blocking_lock`/`try_lock` there is
+//! safe — see each method's docs for why sync value reads use `try_lock`
+//! rather than `blocking_lock` (a `Date.now`/`Math.random` read must return
+//! synchronously and cannot await the admission queue without risking a
+//! same-thread deadlock against an in-flight effect's `Promise` resolution).
+//!
 //! # Runtime & clock (mirrors `keel-ffi` / `keel-py`)
 //!
 //! Each handle owns a current-thread tokio runtime (time driver only — the
@@ -98,17 +129,19 @@ mod bindings {
     //! The napi surface. Elided from `cargo test` (see the crate docs) but linted
     //! by `cargo clippy` and compiled into the cdylib addon.
 
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use keel_core_api::{AttemptResult, KeelError, Request};
-    use keel_engine::Engine;
-    use keel_journal::{SqliteJournal, SystemClock};
+    use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
+    use keel_journal::{FlowStatus, ProcessId, SqliteJournal, SystemClock};
     use napi::bindgen_prelude::*;
     use napi::threadsafe_function::ThreadsafeFunction;
     use napi_derive::napi;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio::runtime::Runtime;
+    use tokio::sync::Mutex as AsyncMutex;
 
     use super::{build_runtime, decode_attempt, request_from_value, synth_other};
 
@@ -208,6 +241,40 @@ mod bindings {
             .map_err(|e| throw_keel(env, "KEEL-E003", &format!("request envelope invalid: {e}")))
     }
 
+    /// The status token the front end reads back from `enterFlow`.
+    fn status_str(status: FlowStatus) -> &'static str {
+        status.as_str()
+    }
+
+    /// Marks the atomic "an effect is currently running" flag for the guard's
+    /// lifetime, clearing it on drop (so a panicking effect callback — never
+    /// actually reachable, `invoke_async_effect` degrades every failure to
+    /// `Error { class: other }` — still cannot leave the flag stuck on).
+    ///
+    /// One flag per `KeelCore`, not per-task: only one step is ever admitted at
+    /// a time inside a flow (the `active_flow` mutex enforces that), so exactly
+    /// one effect can be "running" at once. While set, `journalTime`/
+    /// `journalRandom` pass a nested clock/random read straight through instead
+    /// of journaling it or touching `active_flow` — journaling it would be
+    /// wrong for replay (the effect is substituted, not re-run, on a later
+    /// replay, so its incidental reads never happen again) and contending for
+    /// `active_flow` here would deadlock: this flag is set for the exact
+    /// window `active_flow`'s lock is held across the effect's `.await`.
+    struct EffectGuard<'a>(&'a AtomicBool);
+
+    impl<'a> EffectGuard<'a> {
+        fn enter(flag: &'a AtomicBool) -> Self {
+            flag.store(true, Ordering::SeqCst);
+            Self(flag)
+        }
+    }
+
+    impl Drop for EffectGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Await the asynchronous JS effect for one attempt: call it through the
     /// threadsafe function (yielding its `Promise`), await that on napi's runtime,
     /// then decode. Any failure degrades to `Error { class: other }`.
@@ -236,6 +303,15 @@ mod bindings {
 
     /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
     /// `runtime` (behind a `Mutex`) drives the synchronous / paused-clock paths.
+    ///
+    /// Tier 2 flow state (native-only): `active_flow` holds the
+    /// [`FlowHandle`] between `enterFlow`/`exitFlow`. It is a *tokio* mutex
+    /// (not `std::sync::Mutex`, unlike every other lock in this crate) because
+    /// `executeAsync` deliberately holds its guard across the `.await` that
+    /// runs a journaled step's effect — see the crate docs. `in_effect` is set
+    /// for exactly that window, so a nested clock/random read from inside the
+    /// running effect passes through instead of re-touching `active_flow`
+    /// (which would deadlock: the same task already holds it for this step).
     #[napi(js_name = "KeelCore")]
     #[derive(Debug)]
     pub struct KeelCore {
@@ -244,6 +320,8 @@ mod bindings {
         /// True when the runtime runs on tokio's paused virtual clock (harness
         /// only). `advanceClock` is valid only on such a handle.
         paused: bool,
+        active_flow: Arc<AsyncMutex<Option<FlowHandle>>>,
+        in_effect: Arc<AtomicBool>,
     }
 
     #[napi]
@@ -273,6 +351,8 @@ mod bindings {
                 engine: Arc::new(engine),
                 runtime: Mutex::new(runtime),
                 paused,
+                active_flow: Arc::new(AsyncMutex::new(None)),
+                in_effect: Arc::new(AtomicBool::new(false)),
             })
         }
 
@@ -311,6 +391,14 @@ mod bindings {
         /// chain on this handle's runtime; `effect(attempt)` is invoked on the
         /// main thread and returns an attempt-result object. Always returns an
         /// outcome object (engine-level failures are reported *in* the outcome).
+        ///
+        /// Refuses (KEEL-E005) while a durable flow is open: this path runs on
+        /// the bare engine, never the open [`FlowHandle`], so it would silently
+        /// downgrade a journaled step to Tier 1. The front end never calls this
+        /// while a flow is active (Node effects are async-only — `executeAsync`
+        /// is the flow-aware path); this guard exists so a future caller cannot
+        /// reintroduce the Level-0 surprise `keel-py`'s async guard was added to
+        /// prevent (mirrored, direction reversed).
         #[allow(
             clippy::needless_pass_by_value,
             reason = "napi passes the callback as an owned Function handle; it is called by reference per attempt"
@@ -323,6 +411,19 @@ mod bindings {
             effect: Function<'_, u32, Value>,
         ) -> Result<Value> {
             let request = decode_request(env, request)?;
+            // `try_lock`: a flow, once opened, is essentially never contended at
+            // this instant from the JS thread (no effect can be admitted without
+            // going through `executeAsync`'s async path first) — a contended lock
+            // here still means a flow is open, so it also refuses.
+            if self.active_flow.try_lock().map_or(true, |g| g.is_some()) {
+                return Err(throw_keel(
+                    env,
+                    "KEEL-E005",
+                    "synchronous execute() is not supported while a durable flow is open; \
+                     Node flows route intercepted calls through executeAsync so they are \
+                     journaled. This indicates a front-end bug, not a policy problem.",
+                ));
+            }
             let guard = lock_recover(&self.runtime);
             // Holding the runtime mutex across the synchronous `block_on`
             // serializes calls on this handle; no `.await` is held across it.
@@ -345,6 +446,16 @@ mod bindings {
         /// `Env::spawn_future`. `effect(attempt)` is an `async` JS function
         /// awaited on the caller's libuv loop, so it may perform real async IO.
         /// Runs on napi's runtime (real time), not the paused handle clock.
+        ///
+        /// **Tier 2:** while a durable flow is open, the call routes through the
+        /// flow's [`FlowHandle::execute_step`] instead of the bare engine, so it
+        /// is journaled and replayable — this is the async `execute_step` bridge
+        /// (`keel-core`'s flow module docs). `active_flow` is locked for the
+        /// FULL step (claim through terminal outcome, `in_effect` set for the
+        /// effect's own `.await`), which is what serializes concurrent effects
+        /// inside one flow in await order (`conformance/README.md`'s ordering
+        /// rule): a second concurrent call here just awaits the same async
+        /// mutex, parking its task without blocking napi's runtime thread.
         #[napi(ts_args_type = "request: object, effect: (attempt: number) => Promise<object>")]
         pub fn execute_async<'env>(
             &self,
@@ -355,18 +466,32 @@ mod bindings {
             // Sync prelude (holds `Env`): a bad envelope throws a proper `.code`.
             let request = decode_request(*env, request)?;
             let engine = Arc::clone(&self.engine);
+            let active_flow = Arc::clone(&self.active_flow);
+            let in_effect = Arc::clone(&self.in_effect);
             // `ThreadsafeFunction` is not `Clone`; wrap it once in an `Arc` so each
             // attempt gets an owned handle. A plain `FnMut` returning an
             // owned-capture `async move` future keeps every per-attempt future
             // `'static` + `Send`, as napi's runtime requires (mirrors keel-py).
             env.spawn_future(async move {
                 let effect = Arc::new(effect);
-                let outcome = engine
-                    .execute(&request, move |attempt: u32| {
-                        let effect = Arc::clone(&effect);
-                        async move { invoke_async_effect(&effect, attempt).await }
-                    })
-                    .await;
+                let effect_fn = move |attempt: u32| {
+                    let effect = Arc::clone(&effect);
+                    let in_effect = Arc::clone(&in_effect);
+                    async move {
+                        let _guard = EffectGuard::enter(&in_effect);
+                        invoke_async_effect(&effect, attempt).await
+                    }
+                };
+                // Hold the flow-admission lock across the ENTIRE step — claim
+                // through terminal outcome — per the ordering rule; a bare-engine
+                // call (no flow open) never touches it.
+                let mut guard = active_flow.lock().await;
+                let outcome = if let Some(handle) = guard.as_mut() {
+                    handle.execute_step(&request, effect_fn).await
+                } else {
+                    drop(guard);
+                    engine.execute(&request, effect_fn).await
+                };
                 serde_json::to_value(&outcome).map_err(|e| {
                     Error::from_reason(format!("KEEL-E040: outcome not encodable: {e}"))
                 })
@@ -399,6 +524,200 @@ mod bindings {
                 tokio::time::advance(Duration::from_millis(u64::from(ms))).await;
             });
             Ok(())
+        }
+
+        /// Open (begin or resume) a Tier 2 durable flow with this identity and
+        /// make it the active flow: subsequent `executeAsync` calls are
+        /// journaled steps and `journalTime`/`journalRandom` virtualize reads,
+        /// until `exitFlow`.
+        ///
+        /// Returns `{ flowId, status, replay }` — `status` is the flow's state
+        /// at entry (`"completed"` ⇒ a pure replay of a finished run), `replay`
+        /// is that predicate as a bool. Throws: `KEEL-E030` if another live
+        /// holder leases the flow, `KEEL-E032` if it is dead, `KEEL-E040` if
+        /// this core has no journal (Tier 2 requires the native core + a
+        /// journal). Called on the JS thread (never from inside a spawned
+        /// future), so `blocking_lock` on `active_flow` cannot deadlock here.
+        #[napi]
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "napi decodes JS strings/options into owned args"
+        )]
+        pub fn enter_flow(
+            &self,
+            env: Env,
+            entrypoint: String,
+            args_hash: String,
+            code_hash: Option<String>,
+            explicit_key: Option<String>,
+            lease_ms: Option<u32>,
+        ) -> Result<Value> {
+            // Read the journal LIVE from the engine: a `configure` whose policy
+            // carries a `journal` location replaces the construction
+            // attachment, and Tier 2 steps must land in the same store the
+            // engine caches through (never a stale construction-time snapshot).
+            let journal = self.engine.journal().ok_or_else(|| {
+                throw_keel(
+                    env,
+                    "KEEL-E040",
+                    "Tier 2 durable flows require a native core with a journal; this core is \
+                     in-memory. Pass a journalPath (the front end attaches one under .keel/).",
+                )
+            })?;
+            let desc = FlowDescriptor {
+                entrypoint,
+                args_hash,
+                explicit_key,
+                code_hash,
+            };
+            let default = FlowConfig::default();
+            let config = FlowConfig {
+                lease_ttl: lease_ms
+                    .map_or(default.lease_ttl, |ms| Duration::from_millis(u64::from(ms))),
+                max_attempts: default.max_attempts,
+            };
+            let holder = ProcessId::new(format!("pid-{}", std::process::id()));
+            let manager = FlowManager::with_config(
+                Arc::clone(&self.engine),
+                journal,
+                Arc::new(SystemClock),
+                holder,
+                config,
+            );
+            // Enter inside the runtime so the lease heartbeat can spawn (it
+            // no-ops outside a runtime); the enter itself is synchronous
+            // journal work.
+            let handle = {
+                let guard = lock_recover(&self.runtime);
+                guard.block_on(async { manager.enter_flow(&desc) })
+            }
+            .map_err(|e| throw_keel_from(env, &e))?;
+
+            let info = json!({
+                "flow_id": handle.flow_id().to_string(),
+                "status": status_str(handle.entry_status()),
+                "replay": handle.is_replay_only(),
+            });
+            // Not inside a spawned future here (this method never `.await`s), so
+            // no ambient tokio task context exists on this thread: `blocking_lock`
+            // is a plain blocking lock, not a panic risk.
+            *self.active_flow.blocking_lock() = Some(handle);
+            Ok(info)
+        }
+
+        /// Close the active flow, stamping its terminal `status` (`"completed"`
+        /// or `"failed"`) and aborting the lease heartbeat. A no-op if no flow
+        /// is open, so the front end can call it unconditionally on scope exit.
+        ///
+        /// Uses `try_lock`, deliberately NOT `blocking_lock`: `exitFlow` is
+        /// called on the JS thread after the front end has (or should have)
+        /// `await`ed every intercepted call inside the flow, at which point
+        /// `active_flow` is uncontended — but a flow body that fires an effect
+        /// WITHOUT awaiting it (a bug: the ordering rule already asks callers to
+        /// await sequentially) could still have a step in flight here. Were this
+        /// `blocking_lock`, that step's own effect could only ever resolve its
+        /// `Promise` by running JS on this SAME thread — a real deadlock, not a
+        /// hypothetical one. `try_lock` instead turns that misuse into a precise
+        /// `KEEL-E040` (fail loud) rather than hanging the process forever.
+        #[napi]
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "napi decodes the JS string into an owned String"
+        )]
+        pub fn exit_flow(&self, env: Env, status: String) -> Result<()> {
+            let final_status = match status.as_str() {
+                "completed" => FlowStatus::Completed,
+                "failed" => FlowStatus::Failed,
+                other => {
+                    return Err(throw_keel(
+                        env,
+                        "KEEL-E040",
+                        &format!(
+                            "exitFlow status must be \"completed\" or \"failed\", got {other:?}"
+                        ),
+                    ));
+                }
+            };
+            let Ok(mut guard) = self.active_flow.try_lock() else {
+                return Err(throw_keel(
+                    env,
+                    "KEEL-E040",
+                    "exitFlow could not acquire the flow (an intercepted call is still in \
+                     flight). Await every executeAsync/journalTime/journalRandom call inside \
+                     the flow before it returns — a fired-and-forgotten effect is never \
+                     journaled reliably and, here, would otherwise hang the process.",
+                ));
+            };
+            if let Some(mut handle) = guard.take() {
+                handle.complete(final_status);
+                // `handle` drops here, aborting the heartbeat task.
+            }
+            Ok(())
+        }
+
+        /// Journal (or, on replay, substitute) a virtualized clock read under
+        /// `key` (the front-end convention, e.g. `ts:Date.now#-`). Must be
+        /// called inside a flow (`KEEL-E040` otherwise).
+        ///
+        /// **Synchronous by necessity** (`Date.now` is a synchronous JS
+        /// builtin) but the flow-admission lock is async — so this uses
+        /// `try_lock`, never `blocking_lock`/`.await`. A read made from
+        /// *inside* a currently-running effect is never journaled (it passes
+        /// through to the live value — `in_effect` is set for exactly that
+        /// window); a read that genuinely races a *different*, currently
+        /// in-flight step (e.g. `Date.now()` called between starting and
+        /// awaiting an un-awaited `executeAsync`, or from a second racing
+        /// `Promise.all` branch) ALSO passes through unjournaled rather than
+        /// blocking the JS thread — blocking here could deadlock the process,
+        /// since the in-flight step's own effect can only resolve its `Promise`
+        /// by running JS on this same thread. This is a disclosed simplification:
+        /// keep flow dispatch sequential (`await` each effect) per
+        /// `conformance/README.md`'s ordering rule to get every top-level read
+        /// journaled; a racing read is already nondeterminism-adjacent territory
+        /// the ordering rule asks callers to avoid.
+        #[napi]
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "napi decodes the JS string into an owned String"
+        )]
+        pub fn journal_time(&self, env: Env, key: String, now_ms: i64) -> Result<i64> {
+            if self.in_effect.load(Ordering::SeqCst) {
+                return Ok(now_ms);
+            }
+            let Ok(mut guard) = self.active_flow.try_lock() else {
+                return Ok(now_ms); // racing a concurrently in-flight step: pass through
+            };
+            let handle = guard
+                .as_mut()
+                .ok_or_else(|| throw_keel(env, "KEEL-E040", "journalTime called outside a flow"))?;
+            handle
+                .journal_time(&key, now_ms)
+                .map_err(|e| throw_keel_from(env, &e))
+        }
+
+        /// Journal (or substitute) a virtualized random draw under `key` (e.g.
+        /// `ts:Math.random#-`). Must be inside a flow. As with [`journal_time`],
+        /// a draw made inside a running effect — or racing a different
+        /// in-flight step — passes through unjournaled rather than risking a
+        /// same-thread deadlock (see that method's docs).
+        #[napi]
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "napi decodes the JS string/buffer into owned args"
+        )]
+        pub fn journal_random(&self, env: Env, key: String, data: Vec<u8>) -> Result<Vec<u8>> {
+            if self.in_effect.load(Ordering::SeqCst) {
+                return Ok(data);
+            }
+            let Ok(mut guard) = self.active_flow.try_lock() else {
+                return Ok(data); // racing a concurrently in-flight step: pass through
+            };
+            let handle = guard.as_mut().ok_or_else(|| {
+                throw_keel(env, "KEEL-E040", "journalRandom called outside a flow")
+            })?;
+            handle
+                .journal_random(&key, data)
+                .map_err(|e| throw_keel_from(env, &e))
         }
     }
 }

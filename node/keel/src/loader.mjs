@@ -96,7 +96,9 @@ function matchingExportNames(url) {
   return names;
 }
 
-function relativePosix(fromDir, toPath) {
+/** `toPath` relative to `fromDir`, posix-separated (both must already be
+ * `/`-separated absolute paths). Exported for reuse by `src/flow.mjs`. */
+export function relativePosix(fromDir, toPath) {
   const a = fromDir.replace(/\\/g, "/").replace(/\/+$/, "").split("/");
   const b = toPath.replace(/\\/g, "/").split("/");
   let i = 0;
@@ -105,7 +107,13 @@ function relativePosix(fromDir, toPath) {
   return [...up, ...b.slice(i)].join("/");
 }
 
-function globToRegExp(glob) {
+/**
+ * `*`-and-`**` glob → anchored regex (`*` matches any run of non-`/` characters,
+ * `**` crosses `/`; everything else literal, `?` matches one character). Exported
+ * so other `ts:`-target consumers (Tier 2 flow entrypoints — `src/flow.mjs`) use
+ * the SAME glob dialect as function targets — one dialect per front end.
+ */
+export function globToRegExp(glob) {
   let re = "^";
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i];

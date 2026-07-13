@@ -12,7 +12,7 @@
  */
 
 import { register } from "node:module";
-import { loadPolicy, extractFunctionTargets } from "./policy.mjs";
+import { loadPolicy, extractFunctionTargets, extractFlowEntrypoints } from "./policy.mjs";
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { compileOutboundMatchers } from "./judge.mjs";
@@ -106,6 +106,11 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
 
   const functionTargets = extractFunctionTargets(policy);
   const wrappable = functionTargets.filter((t) => t.fn);
+  // Tier 2: `[flows] entrypoints` from the SAME effective policy — `hook.mjs`
+  // matches `process.argv[1]` against these before Node loads it as the main
+  // module (see `src/flow.mjs`'s module docs for why this must happen here,
+  // before the normal ESM entry runs).
+  const flowEntrypoints = extractFlowEntrypoints(policy);
   if (wrappable.length > 0 || eveDetection.matched) {
     register("./loader.mjs", import.meta.url, {
       data: {
@@ -124,6 +129,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
     backend,
     discovery,
     functionTargets,
+    flowEntrypoints,
     uninstallFetch,
     packs,
     eve: eveDetection,
