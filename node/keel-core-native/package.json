@@ -2,7 +2,7 @@
   "name": "@keel/core-native",
   "version": "0.1.0",
   "license": "Apache-2.0",
-  "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source only — binaries are built locally and never committed.",
+  "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source-only in a dev checkout — binaries are built locally by `npm run build` (or scripts/napi-prebuild.sh) and never committed; the release workflow builds+packs the npm/*/ platform packages below per platform.",
   "type": "module",
   "main": "index.mjs",
   "types": "index.d.ts",
@@ -13,5 +13,20 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "napi": {
+    "binaryName": "keel-core-native",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "optionalDependencies": {
+    "@keel/core-native-darwin-x64": "0.1.0",
+    "@keel/core-native-darwin-arm64": "0.1.0",
+    "@keel/core-native-linux-x64-gnu": "0.1.0",
+    "@keel/core-native-linux-arm64-gnu": "0.1.0"
   }
 }
