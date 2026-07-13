@@ -23,12 +23,23 @@ import { createHash } from "node:crypto";
  * Host → LLM provider map. This is a parity contract with the Python front end;
  * adding a host here changes which default pack (`defaults.llm`) applies, so it
  * is deliberately small and conservative. Extend in lockstep across languages.
+ *
+ * `aiplatform.googleapis.com` is Vertex AI's GLOBAL endpoint; Vertex's
+ * REGIONAL endpoints (`<location>-aiplatform.googleapis.com`, one per
+ * `--location`) vary by location and so cannot be listed exactly — they are
+ * matched by the suffix rule in `resolveTarget` below instead.
  */
 export const LLM_HOST_PROVIDERS = Object.freeze({
   "api.openai.com": "openai",
   "api.anthropic.com": "anthropic",
   "generativelanguage.googleapis.com": "google-genai",
+  "aiplatform.googleapis.com": "google-genai",
 });
+
+/** Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
+ *  "us-central1-aiplatform.googleapis.com". Parity contract with the Python
+ *  twin's identical suffix check in `adapters/_http.py`. */
+export const VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com";
 
 // The idempotent-method set is a cross-language parity contract with the Python
 // twin, so it includes TRACE per the brief's list even though WHATWG fetch
@@ -57,7 +68,7 @@ export function normalizeRequest(input, init) {
 }
 
 export function resolveTarget(hostname) {
-  const provider = LLM_HOST_PROVIDERS[hostname];
+  const provider = LLM_HOST_PROVIDERS[hostname] ?? (hostname.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
   return provider ? `llm:${provider}` : hostname;
 }
 

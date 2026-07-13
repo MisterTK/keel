@@ -48,13 +48,23 @@ RESPONSE_MARK = "__keel_http__"
 #: Host → LLM provider. A cross-language parity contract with the Node front
 #: end (``LLM_HOST_PROVIDERS`` in judge.mjs); extend in lockstep across
 #: languages, since adding a host here changes which default pack applies.
+#: ``aiplatform.googleapis.com`` is Vertex AI's GLOBAL endpoint; Vertex's
+#: REGIONAL endpoints (``<location>-aiplatform.googleapis.com``, one per
+#: ``--location``) vary by location and so cannot be listed exactly — they are
+#: matched by the suffix rule in :func:`resolve_target` instead.
 LLM_HOST_PROVIDERS: MappingProxyType[str, str] = MappingProxyType(
     {
         "api.openai.com": "openai",
         "api.anthropic.com": "anthropic",
         "generativelanguage.googleapis.com": "google-genai",
+        "aiplatform.googleapis.com": "google-genai",
     }
 )
+
+#: Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
+#: ``us-central1-aiplatform.googleapis.com``. Parity contract with the Node
+#: twin's identical suffix check in ``judge.mjs``.
+VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
 
 #: Methods whose semantics make a retry safe (RFC 9110 §9.2.2). Matches the
 #: Node twin's ``IDEMPOTENT_METHODS`` exactly — TRACE is included for parity of
@@ -102,8 +112,11 @@ def cache_configured(target: str) -> bool:
 
 def resolve_target(host: str) -> str:
     """The policy target for a host: ``llm:<provider>`` for a known provider
-    host, else the bare host string."""
+    host (exact match, or a Vertex AI regional endpoint via the suffix rule),
+    else the bare host string."""
     provider = LLM_HOST_PROVIDERS.get(host)
+    if provider is None and host.endswith(VERTEX_REGIONAL_SUFFIX):
+        provider = "google-genai"
     return f"llm:{provider}" if provider else host
 
 
@@ -344,6 +357,7 @@ __all__ = [
     "ENVELOPE_VERSION",
     "RESPONSE_MARK",
     "LLM_HOST_PROVIDERS",
+    "VERTEX_REGIONAL_SUFFIX",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
     "resolve_layer",
