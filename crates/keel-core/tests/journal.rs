@@ -331,25 +331,26 @@ async fn flows_land_in_the_policy_selected_journal() {
     assert_eq!(flow.status, FlowStatus::Completed);
 }
 
-/// `journal = "postgres://…"` is a valid policy this build cannot honor: the
-/// configure fails loudly with KEEL-E005 (exact message contract), the URL
-/// (which can carry credentials) never enters the diagnostic, and the previous
-/// configuration stays fully in force.
+/// `journal = "postgres://…"` selects the real Postgres/fleet backend
+/// (architecture spec §6); a malformed one still fails configure loudly
+/// (KEEL-E040, same taxonomy slot an unopenable `file:` path uses), the URL
+/// (which can carry credentials) never enters the diagnostic, and the
+/// previous configuration stays fully in force. This exercises only the
+/// failure path with a URL chosen to fail fast and offline (a real connection
+/// against a live cluster is `crates/keel-journal`'s integration coverage,
+/// and Tier 2 conformance over `PostgresJournal` is
+/// `tests/flows_conformance_postgres.rs`).
 #[tokio::test(start_paused = true)]
-async fn postgres_journal_fails_configure_with_e005() {
+async fn malformed_postgres_journal_fails_configure_with_e040() {
     let engine = Engine::new();
     engine
         .configure(&persistent_policy("api.catalog.internal", "5m"))
         .unwrap();
 
     let err = engine
-        .configure(&json!({ "journal": "postgres://keel:sekrit@db.internal/keel" }))
-        .expect_err("no postgres backend in this build");
-    assert_eq!(err.code.as_str(), "KEEL-E005");
-    assert_eq!(
-        err.message,
-        "Postgres journal not yet available in this build; use file: — see docs"
-    );
+        .configure(&json!({ "journal": "postgres://keel:sekrit@[not-a-valid-host/keel" }))
+        .expect_err("a malformed postgres:// location cannot be opened");
+    assert_eq!(err.code.as_str(), "KEEL-E040");
     assert!(
         !err.message.contains("sekrit"),
         "credentials never enter the diagnostic"

@@ -25,11 +25,14 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::clock::Clock;
-use crate::error::{Error, Result};
+use crate::convert::{
+    FLOW_COLUMNS, FlowRowData, StepRowData, duration_ms, flow_from_row, step_from_row, to_i64,
+};
+use crate::error::Result;
 use crate::journal::Journal;
 use crate::types::{
-    CacheKey, FlowDescriptor, FlowId, FlowStatus, NewFlow, ProcessId, StepKey, StepKind,
-    StepOutcome, StepStatus, error_class_from_db, error_class_str,
+    CacheKey, FlowDescriptor, FlowId, FlowStatus, NewFlow, ProcessId, StepKey, StepOutcome,
+    error_class_str,
 };
 
 /// The frozen schema, embedded so the compiled backend and the contract can
@@ -49,9 +52,6 @@ PRAGMA busy_timeout = 5000;
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 PRAGMA synchronous = NORMAL;";
-
-const FLOW_COLUMNS: &str = "flow_id, entrypoint, args_hash, code_hash, status, lease_holder, lease_expires, \
-     created_at, updated_at";
 
 /// A crash-durable [`Journal`] over a single WAL-mode SQLite file, generic over
 /// the [`Clock`] that stamps the timestamps the store originates.
@@ -286,30 +286,6 @@ impl<C: Clock> Journal for SqliteJournal<C> {
     }
 }
 
-/// A flow row exactly as the columns arrive from SQLite, before typing.
-struct FlowRowData {
-    flow_id: String,
-    entrypoint: String,
-    args_hash: String,
-    code_hash: Option<String>,
-    status: String,
-    lease_holder: Option<String>,
-    lease_expires: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-/// A step row as the columns arrive from SQLite, before typing.
-struct StepRowData {
-    kind: String,
-    attempt: i64,
-    outcome: String,
-    payload: Option<Vec<u8>>,
-    error_class: Option<String>,
-    started_at: i64,
-    ended_at: Option<i64>,
-}
-
 /// Extracts the raw flow columns inside the query closure (which must return a
 /// `rusqlite::Result`); typing happens afterwards in [`flow_from_row`].
 fn flow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRowData> {
@@ -342,38 +318,6 @@ fn step_row_from(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<StepR
         error_class: row.get(base + 4)?,
         started_at: row.get(base + 5)?,
         ended_at: row.get(base + 6)?,
-    })
-}
-
-fn flow_from_row(raw: FlowRowData) -> Result<FlowDescriptor> {
-    Ok(FlowDescriptor {
-        flow_id: FlowId::new(raw.flow_id),
-        entrypoint: raw.entrypoint,
-        args_hash: raw.args_hash,
-        code_hash: raw.code_hash,
-        status: FlowStatus::from_db(&raw.status)?,
-        lease_holder: raw.lease_holder.map(ProcessId::new),
-        lease_expires: raw.lease_expires,
-        created_at: raw.created_at,
-        updated_at: raw.updated_at,
-    })
-}
-
-fn step_from_row(raw: StepRowData) -> Result<StepOutcome> {
-    let error_class = raw
-        .error_class
-        .as_deref()
-        .map(|value| error_class_from_db("steps.error_class", value))
-        .transpose()?;
-    Ok(StepOutcome {
-        kind: StepKind::from_db(&raw.kind)?,
-        attempt: u32::try_from(raw.attempt)
-            .map_err(|_| Error::corrupt("steps.attempt", raw.attempt))?,
-        status: StepStatus::from_db(&raw.outcome)?,
-        payload: raw.payload,
-        error_class,
-        started_at: raw.started_at,
-        ended_at: raw.ended_at,
     })
 }
 
@@ -461,21 +405,11 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-/// Clamp a `Duration` to whole milliseconds as an `i64` (saturating; a TTL past
-/// the epoch's `i64` range is not a real configuration).
-fn duration_ms(ttl: Duration) -> i64 {
-    i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)
-}
-
-/// Narrow a `u64` sequence number to the schema's `INTEGER` (`i64`) domain.
-fn to_i64(column: &'static str, seq: u64) -> Result<i64> {
-    i64::try_from(seq).map_err(|_| Error::corrupt(column, seq))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::types::{StepKind, StepStatus};
     use keel_core_api::ErrorClass;
     use tempfile::TempDir;
 

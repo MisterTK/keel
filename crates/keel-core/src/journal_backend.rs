@@ -5,35 +5,29 @@
 //! [`JournalBackend::select`] splits a schema-validated
 //! [`JournalLocation`](keel_core_api::policy::JournalLocation) into one variant
 //! per frozen scheme, and [`open`] is the single factory the engine calls at
-//! configure time. **This is the seam a later slice extends**: the Postgres arm
-//! of [`open`] returns a real backend once one exists. Until then it fails
-//! loudly with `KEEL-E005` (unsupported-configuration — valid policy, missing
-//! capability) instead of warning and journaling somewhere the user did not
-//! ask for.
+//! configure time: `file:` opens (or creates) a [`SqliteJournal`], and
+//! `postgres://` opens (pooled) a [`PostgresJournal`] — the Level 3/fleet
+//! backend (architecture spec §6).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use keel_core_api::policy::JournalLocation;
 use keel_core_api::{ErrorCode, KeelError};
-use keel_journal::{Journal, SqliteJournal, SystemClock};
-
-/// The exact diagnostic for a `postgres://` journal in a build with no Postgres
-/// backend. Frozen as a message contract: the slice that ships the backend
-/// replaces the error, not the wording.
-pub(crate) const POSTGRES_UNAVAILABLE: &str =
-    "Postgres journal not yet available in this build; use file: — see docs";
+use keel_journal::{Journal, PostgresJournal, SqliteJournal, SystemClock};
 
 /// The backend kind a `journal` location names — one variant per scheme the
 /// frozen policy schema admits (`^(file:.+|postgres://.+)$`).
+///
+/// `Postgres` carries the full connection URL (needed to actually connect),
+/// but nothing in this module ever puts it in a log line or an error message
+/// verbatim — see [`redact_postgres_url`] — since it can embed credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JournalBackend {
     /// `file:<path>` — SQLite at `<path>`, resolved to an absolute path.
     File(PathBuf),
-    /// `postgres://…` — recognized and reserved; no backend in this build.
-    /// The URL is deliberately not carried: it can embed credentials, and
-    /// nothing in this build could use it anyway.
-    Postgres,
+    /// `postgres://…` — the full connection URL, as written in policy.
+    Postgres(String),
 }
 
 impl JournalBackend {
@@ -46,9 +40,26 @@ impl JournalBackend {
             Some(path) => Self::File(resolve_file_path(Path::new(path))),
             // `JournalLocation`'s validated grammar admits exactly two
             // schemes, so not-`file:` is `postgres://`.
-            None => Self::Postgres,
+            None => Self::Postgres(location.0.clone()),
         }
     }
+}
+
+/// Mask credentials in a `postgres://` URL for logging/error text: everything
+/// between `://` and the last `@` (the `user:password@` segment, if any)
+/// becomes `***`. Used instead of ever formatting the raw URL a caller handed
+/// us, since [`open`]'s failure path is the one place this build would
+/// otherwise be tempted to echo it back for diagnosis.
+fn redact_postgres_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return "postgres://<malformed>".to_owned();
+    };
+    let (scheme, rest) = url.split_at(scheme_end);
+    let after_scheme = &rest[3..];
+    after_scheme.rfind('@').map_or_else(
+        || url.to_owned(),
+        |at| format!("{scheme}://***@{}", &after_scheme[at + 1..]),
+    )
 }
 
 /// Absolutize a `file:` payload: absolute paths pass through, relative paths
@@ -63,13 +74,12 @@ fn resolve_file_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Open the selected backend. The single factory `Engine::configure` calls,
-/// and the one place a later slice adds the real Postgres store.
+/// Open the selected backend. The single factory `Engine::configure` calls.
 ///
 /// # Errors
-/// - `KEEL-E005` for [`JournalBackend::Postgres`] — this build has no Postgres
-///   backend (the [`POSTGRES_UNAVAILABLE`] message contract).
-/// - `KEEL-E040` when the `file:` store cannot be created or opened.
+/// - `KEEL-E040` when the `file:` store cannot be created or opened, or the
+///   `postgres://` store cannot be connected to (the URL is malformed,
+///   unreachable, or the schema batch fails).
 pub(crate) fn open(backend: &JournalBackend) -> Result<Arc<dyn Journal>, KeelError> {
     match backend {
         JournalBackend::File(path) => {
@@ -82,10 +92,10 @@ pub(crate) fn open(backend: &JournalBackend) -> Result<Arc<dyn Journal>, KeelErr
                 SqliteJournal::open(path, SystemClock).map_err(|e| open_failed(path, &e))?;
             Ok(Arc::new(journal))
         }
-        JournalBackend::Postgres => Err(KeelError {
-            code: ErrorCode::UnsupportedConfiguration,
-            message: POSTGRES_UNAVAILABLE.to_owned(),
-        }),
+        JournalBackend::Postgres(url) => {
+            let journal = PostgresJournal::open(url).map_err(|e| postgres_open_failed(url, &e))?;
+            Ok(Arc::new(journal))
+        }
     }
 }
 
@@ -100,6 +110,22 @@ fn open_failed(path: &Path, cause: &dyn core::fmt::Display) -> KeelError {
              directory permissions, or drop the `journal` key to use the default \
              .keel/journal.db.",
             path.display()
+        ),
+    }
+}
+
+/// The diagnostic for a `postgres://` journal that could not be opened: what
+/// failed and why, with the URL credential-redacted ([`redact_postgres_url`])
+/// so the failing location can be identified without echoing a password back
+/// into logs or a CLI's stderr.
+fn postgres_open_failed(url: &str, cause: &dyn core::fmt::Display) -> KeelError {
+    KeelError {
+        code: ErrorCode::Internal,
+        message: format!(
+            "could not open the policy-selected journal at {}: {cause}. Check the connection \
+             string, that the server is reachable, and that the connecting role can create \
+             tables, or drop the `journal` key to use the default .keel/journal.db.",
+            redact_postgres_url(url)
         ),
     }
 }
@@ -137,10 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn postgres_selects_the_reserved_backend() {
+    fn postgres_selects_the_backend_carrying_its_url() {
         assert_eq!(
             JournalBackend::select(&location("postgres://user:secret@db.internal/keel")),
-            JournalBackend::Postgres
+            JournalBackend::Postgres("postgres://user:secret@db.internal/keel".to_owned())
         );
     }
 
@@ -152,15 +178,33 @@ mod tests {
         }
     }
 
-    /// The exact KEEL-E005 message contract for the missing Postgres backend.
+    /// A malformed `postgres://` location fails loudly (KEEL-E040, same
+    /// taxonomy slot as an unopenable `file:` path) without ever attempting a
+    /// connection (so this test has no network dependency and cannot hang on
+    /// a connect timeout) and without echoing the URL's credentials back.
     #[test]
-    fn opening_postgres_fails_with_e005_and_the_frozen_message() {
-        let err = open_err(&JournalBackend::Postgres);
-        assert_eq!(err.code, ErrorCode::UnsupportedConfiguration);
-        assert_eq!(err.code.as_str(), "KEEL-E005");
+    fn opening_postgres_with_a_malformed_location_fails_loudly_without_leaking_credentials() {
+        let err = open_err(&JournalBackend::Postgres(
+            "postgres://user:s3cr3t@[not-a-valid-host/keel".to_owned(),
+        ));
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.code.as_str(), "KEEL-E040");
+        assert!(
+            !err.message.contains("s3cr3t"),
+            "credentials must be redacted"
+        );
+    }
+
+    #[test]
+    fn redact_postgres_url_masks_only_the_credential_segment() {
         assert_eq!(
-            err.message,
-            "Postgres journal not yet available in this build; use file: — see docs"
+            redact_postgres_url("postgres://user:secret@db.internal:5432/keel"),
+            "postgres://***@db.internal:5432/keel"
+        );
+        // No credentials to mask: passed through unchanged.
+        assert_eq!(
+            redact_postgres_url("postgres://db.internal/keel"),
+            "postgres://db.internal/keel"
         );
     }
 
