@@ -85,6 +85,47 @@ class NumericLiteralParityTest(unittest.TestCase):
         )
 
 
+class BreakerRateModeValidationTest(unittest.TestCase):
+    """Breaker rate mode (window + failure_rate + min_calls), parity with the
+    real core's `BreakerPolicy` (crates/keel-core-api/src/policy.rs): a
+    rate-mode knob without both `window` and `failure_rate` present (and
+    without `failures`) is KEEL-E001 at configure time, not a silent
+    degrade to count mode on its defaults."""
+
+    def _rejects(self, breaker: dict) -> None:
+        with self.assertRaises(KeelError) as ctx:
+            KeelCoreStub().configure({"target": {"x": {"breaker": breaker}}})
+        self.assertEqual(ctx.exception.code, "KEEL-E001")
+
+    def test_window_alone_is_half_configured(self) -> None:
+        self._rejects({"window": "30s"})
+
+    def test_failure_rate_alone_is_half_configured(self) -> None:
+        self._rejects({"failure_rate": 0.5})
+
+    def test_min_calls_alone_is_half_configured(self) -> None:
+        self._rejects({"min_calls": 4})
+
+    def test_out_of_range_failure_rate_rejected(self) -> None:
+        for rate in (0, -0.1, 1.1, 2):
+            self._rejects({"window": "30s", "failure_rate": rate})
+
+    def test_non_positive_min_calls_rejected(self) -> None:
+        self._rejects({"window": "30s", "failure_rate": 0.5, "min_calls": 0})
+
+    def test_both_rate_knobs_selects_rate_mode(self) -> None:
+        KeelCoreStub().configure(
+            {"target": {"x": {"breaker": {"window": "30s", "failure_rate": 0.5, "min_calls": 4}}}}
+        )
+
+    def test_failures_alongside_rate_knobs_is_still_valid_count_mode(self) -> None:
+        # Frozen schema precedence: "Setting `failures` selects count mode" —
+        # the rate knobs are inert, not rejected.
+        KeelCoreStub().configure(
+            {"target": {"x": {"breaker": {"failures": 3, "window": "30s", "failure_rate": 0.5}}}}
+        )
+
+
 class ValidTopLevelSectionsTest(unittest.TestCase):
     def test_flows_journal_telemetry_and_idempotency_accepted(self) -> None:
         KeelCoreStub().configure(

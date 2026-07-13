@@ -322,18 +322,126 @@ impl Default for RetryPolicy {
     }
 }
 
-/// `breaker = { failures, cooldown, ... }`. The stub implements count mode
-/// (`failures` consecutive terminal failures); the rate-mode knobs are
-/// accepted and validated per the schema but enforced only by the real core.
+/// `breaker = { failures, cooldown, window, failure_rate, min_calls }`.
+///
+/// Two modes per the frozen schema (`$defs/breaker`), enforced identically by
+/// the real core and every stub — normative rules in `conformance/README.md`:
+/// - **count mode**: selected when `failures` is set (or no rate knob is set;
+///   `failures` then defaults to 5) — `failures` consecutive terminal failures
+///   open the breaker.
+/// - **rate mode**: selected when `failures` is absent and both `window` and
+///   `failure_rate` are set — trips when the trailing `window` holds at least
+///   `min_calls` outcomes (default 10) with `failed/total >= failure_rate`.
+///
+/// A rate-mode knob without both `window` and `failure_rate` (and without
+/// `failures`) is rejected at deserialize time (KEEL-E001): a half-configured
+/// mode must fail loudly, never silently degrade to count-mode defaults.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "BreakerPolicyDe")]
 pub struct BreakerPolicy {
-    pub failures: NonZeroU64,
+    /// Count-mode threshold. `None` means "not set by the user" — see
+    /// [`BreakerPolicy::mode`] for how that selects the mode.
+    pub failures: Option<NonZeroU64>,
     pub cooldown: DurationMs,
     pub window: Option<DurationMs>,
-    #[serde(default, deserialize_with = "de_failure_rate")]
     pub failure_rate: Option<f64>,
     pub min_calls: Option<NonZeroU32>,
+}
+
+/// The breaker mode a [`BreakerPolicy`] resolves to, with every default
+/// applied — the engine/stubs consume this, never the raw knobs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BreakerMode {
+    /// `failures` consecutive terminal failures open the breaker.
+    Count { failures: NonZeroU64 },
+    /// Failure-rate tripping over a sliding window of post-retry outcomes.
+    Rate {
+        window: DurationMs,
+        failure_rate: f64,
+        min_calls: NonZeroU32,
+    },
+}
+
+impl BreakerPolicy {
+    /// Schema default for count mode's `failures`.
+    pub const DEFAULT_FAILURES: NonZeroU64 = NonZeroU64::new(5).unwrap();
+    /// Schema default for rate mode's `min_calls`.
+    pub const DEFAULT_MIN_CALLS: NonZeroU32 = NonZeroU32::new(10).unwrap();
+
+    /// The mode this policy selects (schema: "Setting `failures` selects count
+    /// mode"), with defaults applied. Deserialization already rejected
+    /// half-configured rate mode, so `window`+`failure_rate` are either both
+    /// present or irrelevant here.
+    #[must_use]
+    pub fn mode(&self) -> BreakerMode {
+        match (self.failures, self.window, self.failure_rate) {
+            (None, Some(window), Some(failure_rate)) => BreakerMode::Rate {
+                window,
+                failure_rate,
+                min_calls: self.min_calls.unwrap_or(Self::DEFAULT_MIN_CALLS),
+            },
+            (failures, _, _) => BreakerMode::Count {
+                failures: failures.unwrap_or(Self::DEFAULT_FAILURES),
+            },
+        }
+    }
+
+    /// Whether count mode was selected *while* rate-mode knobs are present —
+    /// those knobs are inert (the schema's precedence), which callers may want
+    /// to surface loudly rather than leave silent.
+    #[must_use]
+    pub fn has_inert_rate_knobs(&self) -> bool {
+        self.failures.is_some()
+            && (self.window.is_some() || self.failure_rate.is_some() || self.min_calls.is_some())
+    }
+}
+
+/// The raw deserialized shape of `breaker`, before mode-completeness
+/// validation promotes it to [`BreakerPolicy`].
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BreakerPolicyDe {
+    failures: Option<NonZeroU64>,
+    cooldown: DurationMs,
+    window: Option<DurationMs>,
+    #[serde(deserialize_with = "de_failure_rate")]
+    failure_rate: Option<f64>,
+    min_calls: Option<NonZeroU32>,
+}
+
+impl Default for BreakerPolicyDe {
+    fn default() -> Self {
+        Self {
+            failures: None,
+            cooldown: DurationMs(15_000),
+            window: None,
+            failure_rate: None,
+            min_calls: None,
+        }
+    }
+}
+
+impl TryFrom<BreakerPolicyDe> for BreakerPolicy {
+    type Error = String;
+
+    fn try_from(de: BreakerPolicyDe) -> Result<Self, Self::Error> {
+        let rate_pair = de.window.is_some() && de.failure_rate.is_some();
+        let any_rate_knob =
+            de.window.is_some() || de.failure_rate.is_some() || de.min_calls.is_some();
+        if de.failures.is_none() && any_rate_knob && !rate_pair {
+            return Err(String::from(
+                "breaker rate mode requires both `window` and `failure_rate` \
+                 (count mode sets `failures` instead)",
+            ));
+        }
+        Ok(Self {
+            failures: de.failures,
+            cooldown: de.cooldown,
+            window: de.window,
+            failure_rate: de.failure_rate,
+            min_calls: de.min_calls,
+        })
+    }
 }
 
 /// Validate `breaker.failure_rate` against the frozen schema range
@@ -358,7 +466,7 @@ where
 impl Default for BreakerPolicy {
     fn default() -> Self {
         Self {
-            failures: NonZeroU64::new(5).unwrap(),
+            failures: None,
             cooldown: DurationMs(15_000),
             window: None,
             failure_rate: None,
@@ -651,13 +759,91 @@ mod tests {
                 "out-of-range failure_rate {rate} must fail at its path"
             );
         }
-        // In-range values (0, 1] deserialize fine.
+        // In-range values (0, 1] deserialize fine (paired with `window`:
+        // rate mode requires both knobs).
         for rate in [0.01_f64, 0.5, 1.0] {
-            let doc = json!({ "target": { "x": { "breaker": { "failure_rate": rate } } } });
+            let doc = json!({
+                "target": { "x": { "breaker": { "window": "30s", "failure_rate": rate } } }
+            });
             let policy = serde_path_to_error::deserialize::<_, Policy>(&doc).unwrap();
             let breaker = policy.target["x"].breaker.as_ref().unwrap();
             assert_eq!(breaker.failure_rate, Some(rate));
         }
+    }
+
+    #[test]
+    fn breaker_mode_selection_follows_the_schema() {
+        let breaker = |doc: serde_json::Value| -> BreakerPolicy {
+            let doc = json!({ "target": { "x": { "breaker": doc } } });
+            let policy: Policy = serde_path_to_error::deserialize(&doc).unwrap();
+            policy.target["x"].breaker.clone().unwrap()
+        };
+
+        // Empty table: count mode on the schema default (failures = 5).
+        assert_eq!(
+            breaker(json!({})).mode(),
+            BreakerMode::Count {
+                failures: BreakerPolicy::DEFAULT_FAILURES
+            }
+        );
+
+        // Both rate knobs, no `failures`: rate mode, min_calls defaults to 10.
+        assert_eq!(
+            breaker(json!({ "window": "30s", "failure_rate": 0.5 })).mode(),
+            BreakerMode::Rate {
+                window: DurationMs(30_000),
+                failure_rate: 0.5,
+                min_calls: BreakerPolicy::DEFAULT_MIN_CALLS,
+            }
+        );
+        assert_eq!(
+            breaker(json!({ "window": "10s", "failure_rate": 1.0, "min_calls": 4 })).mode(),
+            BreakerMode::Rate {
+                window: DurationMs(10_000),
+                failure_rate: 1.0,
+                min_calls: NonZeroU32::new(4).unwrap(),
+            }
+        );
+
+        // "Setting `failures` selects count mode" (frozen schema): rate knobs
+        // present alongside it are inert, and the policy says so.
+        let mixed = breaker(json!({ "failures": 3, "window": "30s", "failure_rate": 0.5 }));
+        assert_eq!(
+            mixed.mode(),
+            BreakerMode::Count {
+                failures: NonZeroU64::new(3).unwrap()
+            }
+        );
+        assert!(mixed.has_inert_rate_knobs());
+        assert!(!breaker(json!({ "failures": 3 })).has_inert_rate_knobs());
+    }
+
+    #[test]
+    fn half_configured_breaker_rate_mode_is_rejected() {
+        // A rate-mode knob without both `window` and `failure_rate` (and
+        // without `failures`) must fail at configure, not silently run count
+        // mode the user never asked for.
+        for doc in [
+            json!({ "window": "30s" }),
+            json!({ "failure_rate": 0.5 }),
+            json!({ "min_calls": 10 }),
+            json!({ "window": "30s", "min_calls": 10 }),
+            json!({ "failure_rate": 0.5, "min_calls": 10 }),
+        ] {
+            let policy = json!({ "target": { "x": { "breaker": doc } } });
+            let err = serde_path_to_error::deserialize::<_, Policy>(&policy).unwrap_err();
+            assert_eq!(err.path().to_string(), "target.x.breaker", "doc: {doc}");
+            assert!(
+                err.inner().to_string().contains("rate mode requires both"),
+                "doc {doc}: got {}",
+                err.inner()
+            );
+        }
+        // `failures` present makes any knob combination count mode (schema
+        // precedence), so those documents stay valid.
+        let policy =
+            json!({ "target": { "x": { "breaker": { "failures": 3, "window": "30s" } } } });
+        assert!(serde_path_to_error::deserialize::<_, Policy>(&policy).is_ok());
     }
 
     #[test]

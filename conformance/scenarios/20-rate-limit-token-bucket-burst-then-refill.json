@@ -1,0 +1,54 @@
+{
+  "name": "rate-limit-token-bucket-burst-then-refill",
+  "description": "Token bucket parity (core + every stub): burst capacity equals the rate's limit, so the first `limit` calls are immediate; once the bucket is drained, each further call is delayed by exactly the refill period (window/limit) — deterministic fixed-point arithmetic, so unlike rate-limit-storm this scenario pins the exact `throttle_wait_ms` and `clock_ms`.",
+  "policy": {
+    "target": {
+      "api.limited.internal": {
+        "rate": "2/s"
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 1 }],
+        "expect": { "result": "ok", "throttled": false, "throttle_wait_ms": 0 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 2 }],
+        "expect": { "result": "ok", "throttled": false, "throttle_wait_ms": 0 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 3 }],
+        "expect": { "result": "ok", "throttled": true, "throttle_wait_ms": 500 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.limited.internal",
+        "request": { "op": "GET api.limited.internal/x", "idempotent": true },
+        "effect": [{ "status": "ok", "payload": 4 }],
+        "expect": { "result": "ok", "throttled": true, "throttle_wait_ms": 500 }
+      }
+    },
+    {
+      "report_expect": {
+        "v": 1,
+        "clock_ms": 1000,
+        "targets": {
+          "api.limited.internal": { "calls": 4, "attempts": 4, "throttled": 2, "successes": 4 }
+        }
+      }
+    }
+  ]
+}

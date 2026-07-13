@@ -5,9 +5,12 @@ lives in conformance/README.md. Envelopes are plain dicts shaped like the
 serde types in contracts/core_api.rs.
 
 Simplifications (deliberate, documented): virtual clock (waits recorded, not
-slept), no jitter, consecutive-failure breaker only, fixed-window rate
-limiter, exact-match target resolution with defaults.llm / defaults.outbound
-fallback, `timeout` validated but not enforced.
+slept), no jitter, exact-match target resolution with defaults.llm /
+defaults.outbound fallback, `timeout` validated but not enforced.
+
+Bit-identical to the real core (parity rule, not a simplification): the
+breaker's count mode *and* rate mode (window + failure_rate + min_calls), and
+the rate limiter's token bucket (burst = the rate's limit, continuous refill).
 
 Tier 2 parity note: this stub is Tier 1 only — it has no journal and no durable
 flows (conformance scenarios 16-17 are skipped on the stub). Durable-flow
@@ -31,6 +34,7 @@ _DEFAULT_ATTEMPTS = 3
 _DEFAULT_ON = ["conn", "timeout", "429", "5xx"]
 _DEFAULT_BREAKER_FAILURES = 5
 _DEFAULT_BREAKER_COOLDOWN_MS = 15_000
+_DEFAULT_MIN_CALLS = 10
 
 # ASCII digits only (`[0-9]`, not `\d` which also matches unicode digits) and no
 # embedded whitespace — matching Node's regexes and the Rust core, so the same
@@ -118,6 +122,64 @@ def _schedule_wait(sched: tuple[int, float, int], attempt: int) -> int:
     return round(min(base * factor ** (attempt - 1), cap))
 
 
+def _breaker_mode(cfg: dict[str, Any]) -> tuple[str, Any]:
+    """The mode `cfg` (a resolved `breaker` table) selects, with defaults
+    applied — mirrors `BreakerPolicy::mode` in crates/keel-core-api. Returns
+    `("count", failures)` or `("rate", (window_ms, failure_rate, min_calls))`.
+    Configure-time validation already rejected a half-configured rate mode, so
+    `window`/`failure_rate` are either both present or both irrelevant here.
+    """
+    failures = cfg.get("failures")
+    window = cfg.get("window")
+    failure_rate = cfg.get("failure_rate")
+    if failures is None and window is not None and failure_rate is not None:
+        min_calls = cfg.get("min_calls", _DEFAULT_MIN_CALLS)
+        return ("rate", (_parse_duration(window), failure_rate, min_calls))
+    return ("count", failures if failures is not None else _DEFAULT_BREAKER_FAILURES)
+
+
+def _breaker_observe(b: dict[str, Any], now_ms: int, window_ms: int, failed: bool) -> None:
+    """Rate mode: prune outcomes that aged out of the window (strictly: one
+    exactly `window_ms` old is evicted, per conformance/README.md §4), then
+    record this one."""
+    outcomes: list[tuple[int, bool]] = b["outcomes"]
+    while outcomes and now_ms - outcomes[0][0] >= window_ms:
+        outcomes.pop(0)
+    outcomes.append((now_ms, failed))
+
+
+def _breaker_window_rate_reached(b: dict[str, Any], failure_rate: float, min_calls: int) -> bool:
+    """Rate mode's trip condition over the (already-pruned) window."""
+    outcomes: list[tuple[int, bool]] = b["outcomes"]
+    total = len(outcomes)
+    if total < min_calls:
+        return False
+    failed = sum(1 for _, f in outcomes if f)
+    return failed / total >= failure_rate
+
+
+def _token_bucket_admit(cell: dict[str, int], now_ms: int, limit: int, window_ms: int) -> int:
+    """Token bucket: burst capacity `limit`, continuous refill of `limit` per
+    `window_ms`. Bit-identical to the real core's `TokenBucket::plan_admit`
+    (crates/keel-core/src/engine.rs) — same fixed-point integer arithmetic (1
+    token = `window_ms` scaled units), so no float drift between languages.
+    Returns the wait to admit this call (0 = immediate); the caller advances
+    the virtual clock by it, standing in for the real core's actual sleep."""
+    capacity = limit * window_ms
+    if not cell["primed"]:
+        cell["primed"] = True
+        cell["scaled_tokens"] = capacity
+        cell["last_refill_ms"] = now_ms
+    elapsed = max(0, now_ms - cell["last_refill_ms"])
+    cell["last_refill_ms"] = max(cell["last_refill_ms"], now_ms)
+    cell["scaled_tokens"] = min(capacity, cell["scaled_tokens"] + elapsed * limit)
+    cell["scaled_tokens"] -= window_ms
+    if cell["scaled_tokens"] >= 0:
+        return 0
+    deficit = -cell["scaled_tokens"]
+    return -(-deficit // limit)  # ceil(deficit / limit) via floor-division negation
+
+
 def _condition_matches(cond: str, cls: str, http_status: int | None) -> bool:
     if cond in ("conn", "timeout", "cancelled", "other"):
         return cond == cls
@@ -136,7 +198,7 @@ class KeelCoreStub:
         self._now_ms = 0
         self._trace_seq = 0
         self._breakers: dict[str, dict[str, Any]] = {}
-        self._rate_windows: dict[str, list[int]] = {}
+        self._token_buckets: dict[str, dict[str, int]] = {}
         self._cache: dict[str, tuple[int, Any]] = {}
         self._metrics: dict[str, dict[str, int]] = {}
 
@@ -268,6 +330,39 @@ class KeelCoreStub:
                 not isinstance(cooldown, str) or _parse_duration(cooldown) is None
             ):
                 raise cls._invalid(path, "bad breaker.cooldown")
+            window = breaker.get("window")
+            if window is not None and (
+                not isinstance(window, str) or _parse_duration(window) is None
+            ):
+                raise cls._invalid(path, "bad breaker.window")
+            failure_rate = breaker.get("failure_rate")
+            if failure_rate is not None and (
+                isinstance(failure_rate, bool)
+                or not isinstance(failure_rate, (int, float))
+                or not (failure_rate > 0.0 and failure_rate <= 1.0)
+            ):
+                raise cls._invalid(
+                    path, "breaker.failure_rate must be greater than 0 and at most 1"
+                )
+            min_calls = breaker.get("min_calls")
+            if min_calls is not None and (
+                not isinstance(min_calls, int) or isinstance(min_calls, bool) or min_calls < 1
+            ):
+                raise cls._invalid(path, "breaker.min_calls must be an integer >= 1")
+            # Two modes (frozen schema `$defs/breaker`): "Setting `failures`
+            # selects count mode." Otherwise a rate-mode knob without BOTH
+            # `window` and `failure_rate` is half-configured — reject it rather
+            # than silently running count mode on its defaults.
+            has_rate_pair = window is not None and failure_rate is not None
+            has_any_rate_knob = (
+                window is not None or failure_rate is not None or min_calls is not None
+            )
+            if failures is None and has_any_rate_knob and not has_rate_pair:
+                raise cls._invalid(
+                    path,
+                    "breaker rate mode requires both `window` and `failure_rate` "
+                    "(count mode sets `failures` instead)",
+                )
         rate = v.get("rate")
         if rate is not None and (not isinstance(rate, str) or _parse_rate(rate) is None):
             raise cls._invalid(path, "unparseable rate")
@@ -405,27 +500,25 @@ class KeelCoreStub:
                 )
                 return out
 
-        # rate limiter (fixed windows on the virtual clock)
+        # rate limiter (token bucket: burst + continuous refill)
         if isinstance(rate, str):
             limit, window_ms = _parse_rate(rate)
-            w = self._now_ms // window_ms
-            cell = self._rate_windows.setdefault(target, [w, 0])
-            if cell[0] != w:
-                cell[0], cell[1] = w, 0
-            if cell[1] >= limit:
-                nxt = (cell[0] + 1) * window_ms
-                out["throttle_wait_ms"] = nxt - self._now_ms
+            cell = self._token_buckets.setdefault(
+                target, {"scaled_tokens": 0, "last_refill_ms": 0, "primed": False}
+            )
+            wait = _token_bucket_admit(cell, self._now_ms, limit, window_ms)
+            if wait > 0:
+                out["throttle_wait_ms"] = wait
                 out["throttled"] = True
-                self._now_ms = nxt
-                cell[0], cell[1] = nxt // window_ms, 0
+                self._now_ms += wait
                 m["throttled"] += 1
-            cell[1] += 1
 
         # breaker check (observes post-retry call outcomes)
         half_open = False
         if isinstance(breaker_cfg, dict):
             b = self._breakers.setdefault(
-                target, {"consecutive": 0, "open_until": None, "opens": 0}
+                target,
+                {"consecutive": 0, "open_until": None, "opens": 0, "outcomes": []},
             )
             if b["open_until"] is not None:
                 if self._now_ms < b["open_until"]:
@@ -458,7 +551,21 @@ class KeelCoreStub:
                 m["successes"] += 1
                 if isinstance(breaker_cfg, dict):
                     b = self._breakers[target]
+                    # A live success is only reached while closed or half-open;
+                    # `open_until` set here means a probe just closed the
+                    # breaker.
+                    closed_a_probe = b["open_until"] is not None
                     b["consecutive"], b["open_until"] = 0, None
+                    if closed_a_probe:
+                        # A closing probe resets the window: the pre-open
+                        # failure history must not instantly re-trip a
+                        # freshly-recovered target.
+                        b["outcomes"] = []
+                    else:
+                        mode, params = _breaker_mode(breaker_cfg)
+                        if mode == "rate":
+                            window_ms, _, _ = params
+                            _breaker_observe(b, self._now_ms, window_ms, False)
                 payload = res.get("payload")
                 if cache_key and cache_ttl is not None:
                     self._cache[cache_key] = (self._now_ms + cache_ttl, payload)
@@ -506,7 +613,6 @@ class KeelCoreStub:
         # terminal failure
         m["failures"] += 1
         if isinstance(breaker_cfg, dict):
-            failures = breaker_cfg.get("failures", _DEFAULT_BREAKER_FAILURES)
             cooldown = (
                 _parse_duration(breaker_cfg["cooldown"])
                 if "cooldown" in breaker_cfg
@@ -514,15 +620,21 @@ class KeelCoreStub:
             )
             b = self._breakers[target]
             if half_open:
+                should_trip = True  # failed probe: re-open for another full cooldown
+            else:
+                mode, params = _breaker_mode(breaker_cfg)
+                if mode == "count":
+                    b["consecutive"] += 1
+                    should_trip = b["consecutive"] >= params
+                else:
+                    window_ms, failure_rate, min_calls = params
+                    _breaker_observe(b, self._now_ms, window_ms, True)
+                    should_trip = _breaker_window_rate_reached(b, failure_rate, min_calls)
+            if should_trip:
                 b["open_until"] = self._now_ms + cooldown
                 b["opens"] += 1
                 b["consecutive"] = 0
-            else:
-                b["consecutive"] += 1
-                if b["consecutive"] >= failures:
-                    b["open_until"] = self._now_ms + cooldown
-                    b["opens"] += 1
-                    b["consecutive"] = 0
+                b["outcomes"] = []
         out["error"] = terminal
         out["breaker"] = self._breaker_state(target)
         return out

@@ -62,7 +62,8 @@
 //! key per read.
 
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use keel_core_api::policy::NondeterminismResponse;
 use keel_core_api::{
@@ -262,7 +263,14 @@ impl FlowManager {
         // here would fail (a completed flow is not `running`) and wrongly report
         // KEEL-E030; instead the rerun reconstructs its result from the journal.
         if status == FlowStatus::Completed {
-            return Ok(self.new_handle(flow_id.clone(), status, false, None, true));
+            return Ok(self.new_handle(
+                flow_id.clone(),
+                status,
+                false,
+                None,
+                LeaseHeartbeatMonitor::new(),
+                true,
+            ));
         }
 
         // Flow-level attempt cap (distinct from Tier 1 step attempts): each
@@ -332,26 +340,42 @@ impl FlowManager {
             _ => false,
         };
 
+        // Seeded now, right after we confirmed via `acquire_lease` that we hold
+        // it: the monotonic reference point every subsequent `lease_lost` check
+        // measures elapsed real time against (architecture-spec §6).
+        let lease_monitor = LeaseHeartbeatMonitor::new();
         let heartbeat = spawn_heartbeat(
             Arc::clone(&self.journal),
             flow_id.clone(),
             self.holder.clone(),
             self.config.lease_ttl,
+            lease_monitor.clone(),
         );
 
-        Ok(self.new_handle(flow_id.clone(), status, code_hash_fenced, heartbeat, false))
+        Ok(self.new_handle(
+            flow_id.clone(),
+            status,
+            code_hash_fenced,
+            heartbeat,
+            lease_monitor,
+            false,
+        ))
     }
 
     /// Assemble a [`FlowHandle`] over this manager's shared engine/journal/clock.
     /// `replay_only` marks a completed-flow re-entry (pure replay: every step is
     /// substituted, no effect fires) — the handle is born already `completed` so
     /// dropping it is quiet and a front-end `exit_flow` is a harmless re-stamp.
+    /// `lease_monitor` is unused by a replay-only handle (it never runs a live
+    /// step, so `lease_lost` is never consulted), but every path constructs one
+    /// so the field is never `Option`.
     fn new_handle(
         &self,
         flow_id: FlowId,
         entry_status: FlowStatus,
         code_hash_fenced: bool,
         heartbeat: Option<HeartbeatHandle>,
+        lease_monitor: LeaseHeartbeatMonitor,
         replay_only: bool,
     ) -> FlowHandle {
         FlowHandle {
@@ -367,6 +391,8 @@ impl FlowManager {
             completed: replay_only,
             entry_status,
             heartbeat,
+            lease_ttl: self.config.lease_ttl,
+            lease_monitor,
         }
     }
 }
@@ -404,6 +430,12 @@ pub struct FlowHandle {
     /// The lease-renewal thread; stopped and joined when the handle drops so a
     /// completed or crashed flow stops heart-beating.
     heartbeat: Option<HeartbeatHandle>,
+    /// This handle's lease TTL, for [`FlowHandle::lease_lost`]'s monotonic
+    /// freshness check.
+    lease_ttl: Duration,
+    /// Monotonic view of our own last successful lease renewal, updated by the
+    /// heartbeat thread — see [`LeaseHeartbeatMonitor`].
+    lease_monitor: LeaseHeartbeatMonitor,
 }
 
 impl core::fmt::Debug for FlowHandle {
@@ -466,23 +498,33 @@ impl FlowHandle {
         self.clock.now_ms()
     }
 
-    /// Whether this handle has definitively lost its lease: the flow's recorded
-    /// holder is no longer us, or the lease has expired against our clock (so
-    /// another process may steal and resume it). A missing flow row or a journal
-    /// read error is *not* treated as loss (resilience-first: at-least-once still
-    /// holds via the `running` marker), so a transient hiccup does not stall a
-    /// legitimately-held flow.
+    /// Whether this handle has definitively lost its lease. Two independent
+    /// checks (architecture-spec §6: generous TTLs absorb cross-machine clock
+    /// skew; heartbeats judge freshness on a *monotonic* clock):
+    ///
+    /// - **Cross-process arbitration** (journal wall clock, read-only here): has
+    ///   another holder's `acquire_lease` overwritten `lease_holder`? That CAS
+    ///   already did the wall-clock expiry comparison against the journal's own
+    ///   record when it stole the row, so re-deriving it from *our* wall clock
+    ///   here would be redundant — and exactly the redundant read that lets a
+    ///   local NTP step spuriously flip the verdict.
+    /// - **Local freshness** (monotonic, never wall clock): has our own
+    ///   heartbeat actually renewed within `lease_ttl` of *real elapsed time*?
+    ///   [`LeaseHeartbeatMonitor`] tracks this with [`Instant`], which cannot
+    ///   jump backwards or forwards under an NTP correction the way comparing
+    ///   two `SystemTime` readings can — so a wall-clock step on this process
+    ///   can neither spuriously expire a healthy lease nor paper over a
+    ///   genuinely starved heartbeat.
+    ///
+    /// A missing flow row or a journal read error is *not* treated as loss
+    /// (resilience-first: at-least-once still holds via the `running` marker),
+    /// so a transient hiccup does not stall a legitimately-held flow.
     fn lease_lost(&self) -> bool {
-        match self.journal.get_flow(&self.flow_id) {
-            Ok(Some(flow)) => {
-                let held = flow.lease_holder.as_ref() == Some(&self.holder)
-                    && flow
-                        .lease_expires
-                        .is_some_and(|expires| expires >= self.now());
-                !held
-            }
-            Ok(None) | Err(_) => false,
-        }
+        let still_recorded_holder = match self.journal.get_flow(&self.flow_id) {
+            Ok(Some(flow)) => flow.lease_holder.as_ref() == Some(&self.holder),
+            Ok(None) | Err(_) => true,
+        };
+        !still_recorded_holder || self.lease_monitor.elapsed() >= self.lease_ttl
     }
 
     /// Decide how the step at `seq` (with `key`) resolves against the journal.
@@ -866,6 +908,45 @@ impl Drop for FlowHandle {
     }
 }
 
+/// The monotonic timestamp of this handle's last successful lease renewal,
+/// shared between the heartbeat thread (writer, [`Self::mark_renewed`]) and the
+/// owning [`FlowHandle`] (reader, [`Self::elapsed`]). Built on [`Instant`], the
+/// standard library's guaranteed-non-decreasing clock — unlike [`SystemTime`]
+/// (used for every *stored* journal timestamp), it cannot be stepped backwards
+/// by an NTP correction or a manual clock change, which is exactly the
+/// property architecture-spec §6 asks lease heartbeats to have.
+///
+/// [`SystemTime`]: std::time::SystemTime
+#[derive(Debug, Clone)]
+struct LeaseHeartbeatMonitor(Arc<Mutex<Instant>>);
+
+impl LeaseHeartbeatMonitor {
+    /// Starts "fresh" as of now — used both when a lease is first acquired
+    /// (before the heartbeat thread has ticked even once) and for the unused
+    /// monitor a replay-only handle is handed.
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    /// Record a successful renewal at the current instant.
+    fn mark_renewed(&self) {
+        let mut at = self
+            .0
+            .lock()
+            .expect("lease heartbeat monitor lock poisoned");
+        *at = Instant::now();
+    }
+
+    /// Real time elapsed since the last successful renewal (or since
+    /// construction, if none has happened yet).
+    fn elapsed(&self) -> Duration {
+        self.0
+            .lock()
+            .expect("lease heartbeat monitor lock poisoned")
+            .elapsed()
+    }
+}
+
 /// A running lease-renewal thread. Dropping this signals the thread to stop (by
 /// disconnecting the channel) and joins it.
 struct HeartbeatHandle {
@@ -891,13 +972,17 @@ impl Drop for HeartbeatHandle {
 /// a long blocking step or pure-caller compute between steps — letting the lease
 /// lapse while the flow is still alive. A std thread renews on real wall-clock
 /// time regardless of whether any runtime is being polled. Renews every `ttl/2`
-/// against the journal's clock; a lost lease (`Ok(false)`) is logged loudly
-/// (the step-level fence is what actually prevents double execution).
+/// against the journal (which does its own wall-clock CAS — see
+/// [`FlowHandle::lease_lost`]); every successful renewal also marks `monitor`,
+/// the *monotonic* freshness signal the owning handle consults. A lost lease
+/// (`Ok(false)`) is logged loudly (the step-level fence is what actually
+/// prevents double execution).
 fn spawn_heartbeat(
     journal: Arc<dyn Journal>,
     flow: FlowId,
     holder: ProcessId,
     ttl: Duration,
+    monitor: LeaseHeartbeatMonitor,
 ) -> Option<HeartbeatHandle> {
     use std::sync::mpsc::{RecvTimeoutError, channel};
 
@@ -911,7 +996,7 @@ fn spawn_heartbeat(
             // ends; a `Timeout` is a renewal tick.
             while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(period) {
                 match journal.acquire_lease(&flow, &holder, ttl) {
-                    Ok(true) => {}
+                    Ok(true) => monitor.mark_renewed(),
                     Ok(false) => {
                         warn!(flow = %flow, "lease heartbeat: lease lost to another holder");
                     }
@@ -1103,8 +1188,35 @@ fn base_outcome(trace_id: String) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_payload, encode_payload};
+    use super::{LeaseHeartbeatMonitor, decode_payload, encode_payload};
+    use core::time::Duration;
     use serde_json::json;
+
+    /// `LeaseHeartbeatMonitor` measures real elapsed time (architecture-spec
+    /// §6's monotonic heartbeat), not a value anyone can inject — so this is
+    /// necessarily a real-clock test with small real sleeps, the same
+    /// precedent `the_heartbeat_renews_the_lease_on_a_real_clock` sets in
+    /// `crates/keel-core/tests/flows.rs`.
+    #[test]
+    fn lease_heartbeat_monitor_tracks_real_elapsed_time_since_the_last_renewal() {
+        let monitor = LeaseHeartbeatMonitor::new();
+        assert!(
+            monitor.elapsed() < Duration::from_millis(50),
+            "freshly constructed: elapsed should be ~0"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            monitor.elapsed() >= Duration::from_millis(60),
+            "elapsed grows with real time when nothing renews"
+        );
+
+        monitor.mark_renewed();
+        assert!(
+            monitor.elapsed() < Duration::from_millis(50),
+            "a renewal resets elapsed back to ~0"
+        );
+    }
 
     #[test]
     fn payload_round_trips_through_the_schema_tag() {

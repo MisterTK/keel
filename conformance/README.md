@@ -65,15 +65,44 @@ journal layers sit inside this order in the real core; scenarios inject
    request carries `args_hash`: a fresh entry returns `from_cache: true`
    with `attempts: 0` and no effect invocation; a successful live call
    stores its payload for `ttl`.
-3. **Rate.** Exceeding the configured rate delays the call (`throttled:
-   true`) rather than failing it. Exact wait time is implementation-defined
-   (the stub uses fixed windows; the real core may use a token bucket), so
-   scenarios assert `throttled`, never `throttle_wait_ms`.
-4. **Breaker.** Observes post-retry call outcomes. In count mode
-   (`failures = N`, default cooldown 15s): N consecutive terminal failures
-   open it; while open, calls fail fast with `KEEL-E012` and `attempts: 0`;
-   after `cooldown`, one probe is admitted (half-open) — success closes,
-   failure re-opens for another cooldown.
+3. **Rate.** Token bucket, bit-identical across the real core and every stub
+   (parity rule): burst capacity equals the rate's `limit`, refilling
+   continuously at `limit` scaled units per elapsed millisecond (1 token =
+   `window_ms` scaled units — fixed-point integer arithmetic everywhere, no
+   float drift). Each admission pre-books one token; exceeding the rate
+   delays the call (`throttled: true`, `throttle_wait_ms` = the deficit's
+   refill time, rounded up) rather than failing it — the delay is then
+   applied to the clock (the real core actually sleeps it; every stub
+   advances its virtual clock by it), so the *next* call sees the refilled
+   state. Because the arithmetic is pinned exactly, scenarios may assert
+   `throttle_wait_ms` (and derived `clock_ms`), not just `throttled` —
+   see `20-rate-limit-token-bucket-burst-then-refill.json`; scenarios
+   written before token-bucket parity landed (e.g. `13-rate-limit-storm`)
+   still deliberately assert only `throttled`.
+4. **Breaker.** Observes post-retry call outcomes (never cache hits or
+   breaker rejections, which don't invoke the effect). Two modes, selected
+   per the frozen schema (`$defs/breaker`: "Setting `failures` selects
+   count mode"):
+   - **Count mode** — when `failures` is set, or when neither `window` nor
+     `failure_rate` is set (`failures` defaults to 5): `failures`
+     consecutive terminal failures open the breaker. Rate knobs present
+     alongside `failures` are inert (count mode wins).
+   - **Rate mode** — when `failures` is absent and both `window` and
+     `failure_rate` are set: every post-retry outcome is recorded at its
+     completion time on the core clock; after recording a terminal
+     failure, the breaker opens iff the trailing `window` holds at least
+     `min_calls` outcomes (default 10) and `failed / total >=
+     failure_rate` (IEEE double division). An outcome recorded at `t` is
+     inside the window while `now - t < window` (strict: an outcome
+     exactly `window` old is evicted). Opening — and a half-open probe
+     success closing — clears the recorded outcomes.
+
+   A rate-mode knob (`window`, `failure_rate`, `min_calls`) without both
+   `window` and `failure_rate` present (and without `failures`) is
+   `KEEL-E001` at configure time. While open (both modes), calls fail fast
+   with `KEEL-E012` and `attempts: 0`; after `cooldown` (default 15s), one
+   probe is admitted (half-open) — success closes, failure re-opens for
+   another cooldown.
 5. **Retry.** `attempts` is the total attempt budget (default 3 when a
    `retry` table is present; 1 when absent). After a failed attempt, in
    order:

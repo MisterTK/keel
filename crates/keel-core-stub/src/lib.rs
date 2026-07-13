@@ -18,12 +18,15 @@
 //! - virtual clock: waits are recorded and advance an internal ms counter,
 //!   never slept
 //! - jitter is parsed but not applied (deterministic waits)
-//! - breaker: consecutive-failure count mode only
-//! - rate limiter: fixed windows aligned to clock zero
 //! - target resolution: exact key match only (no globs), fallback to
 //!   `defaults.llm` for `llm:*` targets, then `defaults.outbound`
 //! - `timeout` is validated but not enforced (scenarios inject `timeout`
 //!   error classes instead)
+//!
+//! Bit-identical to the real core (parity rule, not a simplification):
+//! - breaker count mode (consecutive failures) *and* rate mode
+//!   (window + failure_rate + min_calls, `BreakerPolicy::mode` selects)
+//! - rate limiter: token bucket (burst = the rate's limit, continuous refill)
 
 mod runtime;
 

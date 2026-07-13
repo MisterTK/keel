@@ -2,7 +2,7 @@
 //! metrics) on a virtual clock, orchestrated by [`KeelCoreStub`]'s
 //! [`KeelCore`] implementation. Semantics: `conformance/README.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelCore, KeelError,
@@ -11,7 +11,9 @@ use keel_core_api::{
 use serde::Serialize;
 use serde_json::Value;
 
-use keel_core_api::policy::{BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy};
+use keel_core_api::policy::{
+    BreakerMode, BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy,
+};
 
 /// The stub never sleeps: waits advance this counter and are recorded in the
 /// outcome. Conformance scenarios drive it via `advance_clock`.
@@ -26,11 +28,19 @@ impl VirtualClock {
     }
 }
 
-/// Count-mode circuit breaker (consecutive terminal failures). Observes
-/// post-retry call outcomes — layer order puts it outside the retry loop.
+/// Circuit breaker in count mode (consecutive terminal failures) or rate mode
+/// (failure rate over a sliding window; `BreakerPolicy::mode` selects).
+/// Observes post-retry call outcomes — layer order puts it outside the retry
+/// loop. Normative semantics and parity with the real core:
+/// `conformance/README.md` §4.
 #[derive(Debug, Default)]
 struct Breaker {
+    /// Count mode: consecutive terminal failures.
     consecutive: u64,
+    /// Rate mode: post-retry outcomes `(completed_at_ms, failed)` inside the
+    /// trailing window, oldest first. Pruned on every observation; cleared
+    /// when the breaker opens or a probe closes it.
+    outcomes: VecDeque<(u64, bool)>,
     open_until: Option<u64>,
     opens: u64,
 }
@@ -62,54 +72,131 @@ impl Breaker {
         }
     }
 
-    fn on_success(&mut self) {
+    fn on_success(&mut self, now_ms: u64, config: &BreakerPolicy) {
+        // A live success is only reached while closed or half-open; an open
+        // breaker fails fast (never runs the effect). So `open_until.is_some()`
+        // here means a probe just closed the breaker.
+        let closed_a_probe = self.open_until.is_some();
         self.consecutive = 0;
         self.open_until = None;
+        if closed_a_probe {
+            // A closing probe resets the window: the pre-open failure history
+            // must not instantly re-trip a freshly-recovered target.
+            self.outcomes.clear();
+            return;
+        }
+        if let BreakerMode::Rate { window, .. } = config.mode() {
+            self.observe(now_ms, window.0, false);
+        }
     }
 
     fn on_terminal_failure(&mut self, now_ms: u64, config: &BreakerPolicy, admission: Admission) {
         let should_trip = if admission == Admission::HalfOpen {
             true // failed probe: re-open for another full cooldown
         } else {
-            self.consecutive += 1;
-            self.consecutive >= config.failures.get()
+            match config.mode() {
+                BreakerMode::Count { failures } => {
+                    self.consecutive += 1;
+                    self.consecutive >= failures.get()
+                }
+                BreakerMode::Rate {
+                    window,
+                    failure_rate,
+                    min_calls,
+                } => {
+                    self.observe(now_ms, window.0, true);
+                    self.window_rate_reached(failure_rate, min_calls)
+                }
+            }
         };
         if should_trip {
             self.open_until = Some(now_ms + config.cooldown.0);
             self.opens += 1;
             self.consecutive = 0;
+            self.outcomes.clear();
         }
+    }
+
+    /// Rate mode: prune outcomes that aged out of the window (strictly: an
+    /// outcome exactly `window_ms` old is evicted, per
+    /// `conformance/README.md` §4), then record this one.
+    fn observe(&mut self, now_ms: u64, window_ms: u64, failed: bool) {
+        while let Some(&(at, _)) = self.outcomes.front() {
+            if now_ms.saturating_sub(at) >= window_ms {
+                self.outcomes.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.outcomes.push_back((now_ms, failed));
+    }
+
+    /// Rate mode's trip condition over the (already-pruned) window.
+    fn window_rate_reached(&self, failure_rate: f64, min_calls: core::num::NonZeroU32) -> bool {
+        let total = self.outcomes.len();
+        if (total as u64) < u64::from(min_calls.get()) {
+            return false;
+        }
+        let failed = self.outcomes.iter().filter(|&&(_, f)| f).count();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "window counts are bounded by the calls observed within one \
+                      breaker window — far below f64's 2^53 exact-integer range"
+        )]
+        let rate = failed as f64 / total as f64;
+        rate >= failure_rate
     }
 }
 
-/// Fixed-window rate limiter aligned to clock zero (documented stub
-/// simplification; the real core may use a token bucket, which is why
-/// scenarios assert `throttled`, never the exact wait).
+/// Token-bucket rate limiter over the virtual clock: burst capacity is the
+/// rate's `limit`, refill is continuous at `limit` per `window`. Exceeding the
+/// rate delays the call (`throttled`), never fails it. Bit-identical to the
+/// real core's `crates/keel-core/src/engine.rs` `TokenBucket` (parity rule) —
+/// same fixed-point integer arithmetic, no float drift.
 #[derive(Debug, Default)]
-struct RateWindow {
-    window: u64,
-    count: u64,
+struct TokenBucket {
+    /// Tokens in scaled units (1 token = `window_ms` units). Negative means
+    /// admissions were already booked ahead of refill.
+    scaled_tokens: i128,
+    /// Virtual-clock ms of the last refill.
+    last_refill_ms: u64,
+    /// Whether the bucket has been filled to burst on first use.
+    primed: bool,
 }
 
-impl RateWindow {
-    /// Admits one call, advancing the clock past the window boundary when the
-    /// limit is exhausted. Returns the throttle wait applied (0 = immediate).
+impl TokenBucket {
+    /// Plans one admission at `elapsed_ms`, pre-booking the token the call
+    /// will consume, and advances the virtual clock by the resulting wait (the
+    /// stub's stand-in for the real core physically sleeping it). Returns the
+    /// wait applied (0 = immediate).
     fn admit(&mut self, clock: &mut VirtualClock, rate: Rate) -> u64 {
-        let current = clock.now_ms / rate.window_ms;
-        if self.window != current {
-            self.window = current;
-            self.count = 0;
+        let elapsed_ms = clock.now_ms;
+        let limit = i128::from(rate.limit.get());
+        let window = i128::from(rate.window_ms);
+        let capacity = limit * window; // burst = `limit` whole tokens
+        if !self.primed {
+            self.primed = true;
+            self.scaled_tokens = capacity;
+            self.last_refill_ms = elapsed_ms;
         }
-        let mut waited = 0;
-        if self.count >= rate.limit.get() {
-            let next_window_start = (self.window + 1) * rate.window_ms;
-            waited = next_window_start - clock.now_ms;
-            clock.now_ms = next_window_start;
-            self.window = next_window_start / rate.window_ms;
-            self.count = 0;
+        let elapsed = i128::from(elapsed_ms.saturating_sub(self.last_refill_ms));
+        self.last_refill_ms = self.last_refill_ms.max(elapsed_ms);
+        self.scaled_tokens = capacity.min(
+            self.scaled_tokens
+                .saturating_add(elapsed.saturating_mul(limit)),
+        );
+        self.scaled_tokens -= window;
+        let wait = if self.scaled_tokens >= 0 {
+            0
+        } else {
+            // ceil(deficit / refill-per-ms)
+            let deficit = -self.scaled_tokens;
+            u64::try_from((deficit + limit - 1) / limit).unwrap_or(u64::MAX)
+        };
+        if wait > 0 {
+            clock.advance(wait);
         }
-        self.count += 1;
-        waited
+        wait
     }
 }
 
@@ -173,7 +260,7 @@ pub struct KeelCoreStub {
     clock: VirtualClock,
     trace_seq: u64,
     breakers: HashMap<String, Breaker>,
-    rate_windows: HashMap<String, RateWindow>,
+    rate_buckets: HashMap<String, TokenBucket>,
     cache: HashMap<CacheKey, CacheEntry>,
     metrics: BTreeMap<String, TargetMetrics>,
 }
@@ -364,10 +451,10 @@ impl KeelCoreStub {
             return;
         }
 
-        // rate limiter
+        // rate limiter (token bucket: burst + continuous refill)
         if let Some(rate) = resolved.rate {
-            let window = self.rate_windows.entry(target.to_owned()).or_default();
-            let waited = window.admit(&mut self.clock, rate);
+            let bucket = self.rate_buckets.entry(target.to_owned()).or_default();
+            let waited = bucket.admit(&mut self.clock, rate);
             if waited > 0 {
                 out.throttled = true;
                 out.throttle_wait_ms = waited;
@@ -404,10 +491,10 @@ impl KeelCoreStub {
         match self.run_attempts(request, &retry, effect, out) {
             Ok(payload) => {
                 self.metrics_for(target).successes += 1;
-                if resolved.breaker.is_some()
+                if let Some(config) = &resolved.breaker
                     && let Some(breaker) = self.breakers.get_mut(target)
                 {
-                    breaker.on_success();
+                    breaker.on_success(self.clock.now_ms, config);
                 }
                 if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
                     && let Some(ttl) = cache.ttl
