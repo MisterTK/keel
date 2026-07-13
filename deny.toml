@@ -1,0 +1,97 @@
+# cargo-deny configuration — enforces NFR6 (architecture-spec.md §1.2):
+# "no copyleft/BSL contamination from dependencies in the core path."
+#
+# Run: `cargo deny check` (installed via `cargo install cargo-deny --locked`
+# or `brew install cargo-deny`; CI pins a version — see
+# .github/workflows/ci.yml `license-audit` job). `cargo deny check licenses`
+# / `check bans` / `check advisories` / `check sources` run the individual
+# sections; plain `check` runs all four.
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the license/advisory/ban graph across every feature combination we
+# actually ship (including the opt-in `otel` feature — see keel-core/Cargo.toml)
+# so a feature-gated dependency cannot sneak a disallowed license past a
+# default-features-only scan.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ------------------------------------------------------------------------
+# Licenses — the NFR6 gate.
+# ------------------------------------------------------------------------
+[licenses]
+version = 2
+# Permissive-only allowlist. Every entry here is compatible with shipping
+# Keel under Apache-2.0 (LICENSE) with no copyleft/BSL obligations passed to
+# downstream users. A crate whose license expression is satisfiable by ANY
+# term in this list passes (cargo-deny evaluates SPDX OR-expressions
+# disjunctively) — e.g. `MIT OR Apache-2.0 OR LGPL-2.1-or-later` passes on the
+# MIT term alone without pulling in the LGPL obligation.
+# Every entry below is currently exercised by the dependency graph (verified
+# with `cargo deny check licenses --all-features`); an unmatched allowance
+# just means dead config, so the list is kept minimal on purpose. Add a new
+# permissive SPDX id here (never a copyleft/BSL one) the moment a dependency
+# actually needs it — do not pre-populate speculatively.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+]
+# A crate with no SPDX-recognizable license (e.g. only a LICENSE file cargo-deny
+# cannot classify) fails loudly rather than silently passing.
+confidence-threshold = 0.8
+
+[[licenses.exceptions]]
+# r-efi: MIT OR Apache-2.0 OR LGPL-2.1-or-later. Pulled in transitively as a
+# UEFI-target dependency (not exercised on the macOS/Linux targets Keel ships
+# for); satisfied on the MIT term alone, but spelled out here because the
+# expression contains an LGPL term and a reviewer should be able to see at a
+# glance why it's not a violation without re-deriving the OR-satisfiability
+# argument above.
+allow = ["MIT", "Apache-2.0"]
+name = "r-efi"
+
+# ------------------------------------------------------------------------
+# Bans — duplicate-version and explicitly-forbidden crates.
+# ------------------------------------------------------------------------
+[bans]
+# Multiple versions of the same crate in the graph are a maintenance smell,
+# not a license or security problem on their own — warn, don't block CI on
+# something normal dependency drift produces.
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace `path = "../foo"` deps carry no version requirement by
+# design (a workspace crate is pinned by the workspace lockfile itself, not by
+# a semver range) — only a THIRD-PARTY wildcard ("*"/no version) dependency is
+# the smell this check exists to catch.
+allow-wildcard-paths = true
+# Crates that are themselves copyleft or BSL-licensed, or historically known
+# to relicense that way, are denied outright even if a permissive OR-term
+# would technically satisfy `[licenses]` above — belt and suspenders for NFR6.
+deny = [
+    { crate = "openssl", reason = "prefer rustls; also avoids a copyleft-adjacent vendored license surface" },
+]
+
+# ------------------------------------------------------------------------
+# Sources — only crates.io, no arbitrary git/registry dependencies (keeps the
+# license/advisory graph auditable).
+# ------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# ------------------------------------------------------------------------
+# Advisories — RUSTSEC vulnerability / unmaintained / unsound database.
+# ------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "deny"
