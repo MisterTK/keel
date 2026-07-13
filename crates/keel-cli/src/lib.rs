@@ -4,15 +4,15 @@
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
 //! report; `--effective-policy` prints the composed `defaults < packs < user`
 //! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
-//! [`explain`] (the frozen error taxonomy), the Tier 2 flow inspectors
-//! [`flows`] (list durable flows), [`flows::trace`] (`keel trace`), and
-//! [`replay`] (`keel replay` — a journal-driven dry run of what a re-entry
-//! would substitute vs. re-execute), [`mcp`] (`keel mcp`: the CLI doubles
-//! as an MCP server over stdio whose six tools return the same bytes as the
-//! corresponding `--json` twins), and the Level 2 on-ramp
-//! [`flows_suggest`] (`keel flows suggest`, a replay-safety analysis over
-//! candidate entrypoints) and [`flows_add`] (`keel flows add <entrypoint>`,
-//! one-command durability designation).
+//! [`explain`] (the frozen error taxonomy), [`tail`] (the live Tier 1 event
+//! view), the Tier 2 flow inspectors [`flows`] (list durable flows),
+//! [`flows::trace`] (`keel trace`), and [`replay`] (`keel replay` — a
+//! journal-driven dry run of what a re-entry would substitute vs. re-execute),
+//! [`mcp`] (`keel mcp`: the CLI doubles as an MCP server over stdio whose six
+//! tools return the same bytes as the corresponding `--json` twins), and the
+//! Level 2 on-ramp [`flows_suggest`] (`keel flows suggest`, a replay-safety
+//! analysis over candidate entrypoints) and [`flows_add`] (`keel flows add
+//! <entrypoint>`, one-command durability designation).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -33,6 +33,7 @@ pub mod replay;
 pub mod run;
 pub mod scan;
 pub mod status;
+pub mod tail;
 
 mod evidence;
 

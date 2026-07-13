@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use keel_cli::render::emit;
 use keel_cli::{
     doctor, effective, explain, flows, flows_add, flows_suggest, init, mcp, replay, run, status,
+    tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -86,6 +87,17 @@ enum Command {
         /// Show one recorded step in full detail (payload, timings, action).
         #[arg(long, value_name = "SEQ")]
         step: Option<i64>,
+    },
+    /// Live view of attempts, backoffs, and breaker transitions while your
+    /// program runs (reads `.keel/events/`; no daemon). `--json` streams the
+    /// raw NDJSON events with sorted keys.
+    Tail {
+        /// Print the recorded events and exit instead of following live.
+        #[arg(long)]
+        no_follow: bool,
+        /// Tail a specific run id instead of the newest run.
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
     Trace {
@@ -174,6 +186,24 @@ fn main() {
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
+        Command::Tail { no_follow, run } => {
+            let opts = tail::TailOptions {
+                color: tail::color_enabled(),
+                follow: !no_follow,
+                json,
+                run,
+            };
+            let mut stdout = std::io::stdout().lock();
+            match tail::run(
+                &project,
+                &opts,
+                &mut stdout,
+                &mut tail::SleepTicker::default(),
+            ) {
+                Ok(()) => keel_cli::EXIT_OK,
+                Err(report) => emit(&report, json),
+            }
+        }
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };

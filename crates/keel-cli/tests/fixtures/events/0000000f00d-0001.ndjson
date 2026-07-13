@@ -1,0 +1,27 @@
+{"v":1,"seq":0,"ms":0,"event":"run_start","run":"0000000f00d-0001","wall_ms":1783728000000,"pid":4242}
+{"v":1,"seq":1,"ms":5,"event":"call_start","call":"t-000001","target":"api.example.com","op":"GET api.example.com"}
+{"v":1,"seq":2,"ms":5,"event":"cache_miss","call":"t-000001","target":"api.example.com","scope":"memory"}
+{"v":1,"seq":3,"ms":5,"event":"attempt_start","call":"t-000001","target":"api.example.com","attempt":1}
+{"v":1,"seq":4,"ms":55,"event":"attempt_error","call":"t-000001","target":"api.example.com","attempt":1,"class":"http","http_status":503}
+{"v":1,"seq":5,"ms":55,"event":"backoff","call":"t-000001","target":"api.example.com","attempt":1,"wait_ms":200}
+{"v":1,"seq":6,"ms":255,"event":"attempt_start","call":"t-000001","target":"api.example.com","attempt":2}
+{"v":1,"seq":7,"ms":310,"event":"call_end","call":"t-000001","target":"api.example.com","result":"ok","attempts":2}
+{"v":1,"seq":8,"ms":400,"event":"call_start","call":"t-000002","target":"llm:openai","op":"POST api.openai.com/v1/chat/completions"}
+{"v":1,"seq":9,"ms":400,"event":"cache_hit","call":"t-000002","target":"llm:openai","scope":"persistent"}
+{"v":1,"seq":10,"ms":400,"event":"call_end","call":"t-000002","target":"llm:openai","result":"ok","attempts":0}
+{"v":1,"seq":11,"ms":500,"event":"call_start","call":"t-000003","target":"api.flaky.internal","op":"GET api.flaky.internal"}
+{"v":1,"seq":12,"ms":500,"event":"throttle","call":"t-000003","target":"api.flaky.internal","wait_ms":150}
+{"v":1,"seq":13,"ms":650,"event":"attempt_start","call":"t-000003","target":"api.flaky.internal","attempt":1}
+{"v":1,"seq":14,"ms":700,"event":"attempt_error","call":"t-000003","target":"api.flaky.internal","attempt":1,"class":"conn"}
+{"v":1,"seq":15,"ms":700,"event":"breaker_open","call":"t-000003","target":"api.flaky.internal","cooldown_ms":30000}
+{"v":1,"seq":16,"ms":700,"event":"call_end","call":"t-000003","target":"api.flaky.internal","result":"error","code":"KEEL-E015","attempts":1}
+{"v":1,"seq":17,"ms":900,"event":"call_start","call":"t-000004","target":"api.flaky.internal","op":"GET api.flaky.internal"}
+{"v":1,"seq":18,"ms":900,"event":"breaker_reject","call":"t-000004","target":"api.flaky.internal"}
+{"v":1,"seq":19,"ms":900,"event":"call_end","call":"t-000004","target":"api.flaky.internal","result":"error","code":"KEEL-E012","attempts":0}
+{"v":1,"seq":20,"ms":31000,"event":"call_start","call":"t-000005","target":"api.flaky.internal","op":"GET api.flaky.internal"}
+{"v":1,"seq":21,"ms":31000,"event":"breaker_half_open","call":"t-000005","target":"api.flaky.internal"}
+{"v":1,"seq":22,"ms":31000,"event":"attempt_start","call":"t-000005","target":"api.flaky.internal","attempt":1}
+{"v":1,"seq":23,"ms":31080,"event":"breaker_close","call":"t-000005","target":"api.flaky.internal"}
+{"v":1,"seq":24,"ms":31080,"event":"call_end","call":"t-000005","target":"api.flaky.internal","result":"ok","attempts":1}
+this line is not JSON and must be skipped by both views
+{"v":1,"seq":25,"ms":32000,"event":"budget_exceeded","call":"t-000006","target":"llm:openai","spent_usd":5}
