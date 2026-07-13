@@ -31,12 +31,46 @@
  *   - on final failure the original provider error propagates unchanged, with a
  *     non-enumerable `keelOutcome` attached (DX invariant 5), exactly like the
  *     fetch seam.
+ *
+ * Coverage of the SDK's four core generation ops (generateText, streamText,
+ * generateObject, streamObject) — verified against the `ai` v5 middleware docs
+ * (content/docs/03-ai-sdk-core/40-middleware.mdx): `LanguageModelV2Middleware`
+ * exposes exactly two hooks, `wrapGenerate`/`wrapStream`, because ai@5
+ * `generateObject`/`streamObject` are themselves built on the SAME
+ * `doGenerate`/`doStream` calls as `generateText`/`streamText` (object mode is
+ * a `responseFormat`/`mode` value inside `params`, not a separate model
+ * method). There is no third or fourth middleware hook to implement — the two
+ * hooks below already cover all four ops transparently, since `params` is
+ * opaque to Keel except as a dev-cache key (a `generateObject` call with a
+ * `responseFormat` field hashes and replays exactly like `generateText`, and a
+ * `streamObject` call establishes/retries exactly like `streamText` — proven
+ * for both in test/ai-sdk.test.mjs). Documented honestly here so nobody goes
+ * looking for `wrapGenerateObject`/`wrapStreamObject` hooks that do not exist
+ * in the SDK's own middleware contract.
+ *
+ * Streaming honesty note (all four "stream…" surfaces, since streamObject
+ * shares this path): retry is applied ONLY to stream ESTABLISHMENT — i.e. only
+ * before the first token/chunk is ever produced. A provider error thrown by
+ * `doStream()` itself (rejecting before any bytes exist) is retried per
+ * policy; once `doStream()` resolves and the raw stream is handed back, Keel
+ * NEVER buffers, inspects, retries, or otherwise touches it again — a
+ * mid-stream drop is the caller's problem exactly as it would be without
+ * Keel. This is a deliberate, spec-driven limit (a live stream is not
+ * replayable), not an oversight.
  */
 
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { join } from "node:path";
 import { getBackend, getDiscovery, attachOutcome } from "../runtime.mjs";
 import { KeelError } from "../engine.mjs";
 import { parseRetryAfter } from "../judge.mjs";
+import { llmDefaults } from "../defaults.mjs";
+
+const PKG_SPECIFIER = "ai/package.json";
+// The fixture pin (../../fixtures/ai-sdk-model.d.ts) mirrors ai@5.0.0's
+// middleware shape; any 5.0.x install is covered by the same contract tests.
+const PINNED_MAJOR_MINOR = "5.0.";
 
 /** Derive `llm:<provider>` from a model's provider id (base segment). */
 export function providerTarget(model) {
@@ -184,5 +218,72 @@ export function keelMiddleware(options = {}) {
     // stream: resilience on ESTABLISHMENT only; chunks pass through unchanged.
     wrapStream: ({ doStream, params, model }) =>
       run({ effect: doStream, params, model, kind: "stream", cacheable: false }),
+  };
+}
+
+function resolveFrom(cwd, specifier) {
+  // Resolve first from the user's project, then from Keel's own deps.
+  try {
+    return createRequire(join(cwd, "package.json")).resolve(specifier);
+  } catch {
+    try {
+      return createRequire(import.meta.url).resolve(specifier);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** The `ai-sdk` pack — the four uniform operations (adapter-pack.md). Unlike
+ *  `mcp:`, this pack never patches anything: `wrapLanguageModel` is the
+ *  framework's OWN blessed extension point, wired in explicitly by the user's
+ *  code (module doc comment). `detect()`/`seams()`/`targets()` exist so the
+ *  pack is machine-reportable — `keel doctor`/the startup banner can say "ai
+ *  SDK detected" and print the (API, not patch) seam rationale — per
+ *  contracts/adapter-pack.md: "a pack whose seam it cannot explain does not
+ *  ship". */
+export function aiSdkPack({ cwd = process.cwd() } = {}) {
+  return {
+    detect() {
+      const pkgPath = resolveFrom(cwd, PKG_SPECIFIER);
+      if (!pkgPath) return { matched: false };
+      let version;
+      try {
+        version = createRequire(import.meta.url)(pkgPath)?.version;
+      } catch {
+        /* version unknown */
+      }
+      const pinned = typeof version === "string" && version.startsWith(PINNED_MAJOR_MINOR);
+      return { matched: true, name: "ai", version, confidence: pinned ? "pinned" : "best_effort" };
+    },
+    seams() {
+      return [
+        {
+          patchPoint: "wrapLanguageModel middleware (wrapGenerate/wrapStream)",
+          upstreamApi: "ai — LanguageModelV2Middleware (wrapLanguageModel)",
+          whyStable:
+            "the framework's own blessed extension point for wrapping a LanguageModelV2 — an API seam, not a monkey patch: the user opts in explicitly (`wrapLanguageModel({ model, middleware: keelMiddleware() })`); nothing is patched, so there is nothing to auto-arm at bootstrap",
+        },
+      ];
+    },
+    targets() {
+      return [
+        {
+          pattern: "llm:<provider>",
+          kind: "llm",
+          idempotencyRule:
+            "generate and stream calls are treated as retryable (idempotent) so 429/5xx/timeout retry per policy; resilience wraps stream ESTABLISHMENT only (before the first token) — once returned, a stream's chunks are never retried or observed",
+          argsHashRule:
+            "sha256 over the (key-sorted) call params for generate — covers generateText and generateObject alike, since both route through doGenerate; null for streams (streamText/streamObject via doStream) because a live stream is not cache-replayable",
+        },
+      ];
+    },
+    /** Policy fragment merged UNDER user config: the generic `[defaults.llm]`
+     *  (the same fragment the `llm:` pack ships — ai-sdk targets ARE `llm:`
+     *  targets, so this is documentation of an already-applied default, not
+     *  an extra layer folded in separately at bootstrap). */
+    defaults() {
+      return { defaults: { llm: llmDefaults() } };
+    },
   };
 }

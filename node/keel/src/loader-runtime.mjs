@@ -11,9 +11,16 @@
  *
  * Contract: listing a `ts:` target in keel.toml is the user's assertion that
  * the function is safe to retry, so wrapped function targets are treated as
- * idempotent. A function that throws is class `other`, which is NOT in the
- * default retry.on — so by default failures propagate unchanged (no retries);
- * add `other` to the target's retry.on to retry function failures.
+ * idempotent by default. A function that throws is class `other`, which is
+ * NOT in the default retry.on — so by default failures propagate unchanged
+ * (no retries); add `other` to the target's retry.on to retry function
+ * failures.
+ *
+ * `wrapExport`'s `idempotent` option (default `true`) lets a caller override
+ * that default — used by the eve pack (packs/eve.mjs), whose `tool:<name>`
+ * targets are discovered automatically rather than opted into by name in
+ * keel.toml, so they default to non-idempotent (Level 0 hard rule: never
+ * retry a call the developer didn't explicitly bless).
  */
 
 import { createHash } from "node:crypto";
@@ -40,11 +47,11 @@ function jsonSafe(v) {
   }
 }
 
-export function wrapExport(target, fn) {
+export function wrapExport(target, fn, { idempotent = true } = {}) {
   const wrapped = async function (...args) {
     const backend = getBackend();
     if (!backend) return fn.apply(this, args); // disabled: transparent passthrough
-    const request = { v: 1, target, op: target, idempotent: true, args_hash: hashArgs(args) };
+    const request = { v: 1, target, op: target, idempotent, args_hash: hashArgs(args) };
     const self = this;
     const started = performance.now();
     // Keep the live result / error side-band so the core payload can stay JSON
@@ -77,4 +84,24 @@ export function wrapExport(target, fn) {
   };
   Object.defineProperty(wrapped, "name", { value: fn.name || "keelWrapped", configurable: true });
   return wrapped;
+}
+
+/**
+ * Runtime half of the eve pack's `defineTool` rewrite (packs/eve.mjs's
+ * `transformEveTool` injects a call to this for every rewritten module). Wraps
+ * only the tool definition's `execute` function through `wrapExport` — with
+ * `idempotent: false` (eve's filesystem-discovered tools get no per-target
+ * opt-in, unlike a `ts:` target) — and hands eve back an otherwise-identical
+ * definition object, so `description`/`inputSchema`/anything else the real
+ * `defineTool` needs passes through untouched.
+ *
+ * `def` shapes that don't match the documented eve convention (no function
+ * `execute`) are passed to the real `defineTool` completely untouched — a
+ * pack never changes success-path semantics for a shape it doesn't recognize.
+ */
+export function wrapEveTool(target, realDefineTool, def) {
+  if (def === null || typeof def !== "object" || typeof def.execute !== "function") {
+    return realDefineTool(def);
+  }
+  return realDefineTool({ ...def, execute: wrapExport(target, def.execute, { idempotent: false }) });
 }

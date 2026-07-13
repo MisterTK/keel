@@ -21,30 +21,56 @@
  * is a live-binding `const`, so a call to the export DURING the defining
  * module's own top-level evaluation would hit the temporal dead zone; targets
  * are meant to be entry functions called by importers, not during self-eval.
+ *
+ * The same hook also drives the eve pack's `tool:<name>` rewrite (packs/eve.mjs
+ * `transformEveTool`) — a second, independent source-text transform for eve's
+ * `export default defineTool({...})` tool-module convention, armed whenever
+ * eve is detected at bootstrap (`data.eveEnabled`), regardless of whether any
+ * `ts:` targets are configured.
  */
+
+import { transformEveTool, toolTargetFromPath } from "./packs/eve.mjs";
 
 let FUNCTION_TARGETS = [];
 let CWD = process.cwd();
 let RUNTIME_URL = "";
+let EVE_ENABLED = false;
 
 export async function initialize(data) {
   FUNCTION_TARGETS = data?.functionTargets?.filter((t) => t.fn) ?? [];
   CWD = data?.cwd ?? process.cwd();
   RUNTIME_URL = data?.runtimeUrl ?? "";
+  EVE_ENABLED = Boolean(data?.eveEnabled);
 }
 
 export async function load(url, context, nextLoad) {
   const result = await nextLoad(url, context);
-  if (FUNCTION_TARGETS.length === 0 || result.format !== "module" || result.source == null)
-    return result;
-
-  const names = matchingExportNames(url);
-  if (names.size === 0) return result;
-
+  if (result.format !== "module" || result.source == null) return result;
   const source = toStringSource(result.source);
-  const { code, wrapped } = transform(source, names, RUNTIME_URL);
-  if (wrapped.length === 0) return result;
-  return { ...result, source: code };
+
+  if (FUNCTION_TARGETS.length > 0) {
+    const names = matchingExportNames(url);
+    if (names.size > 0) {
+      const { code, wrapped } = transform(source, names, RUNTIME_URL);
+      if (wrapped.length > 0) return { ...result, source: code };
+    }
+  }
+
+  if (EVE_ENABLED) {
+    const rewritten = transformEveTool(source, toolTargetFromPath(urlToPath(url)), RUNTIME_URL);
+    if (rewritten != null) return { ...result, source: rewritten };
+  }
+
+  return result;
+}
+
+/** `file:` URL → filesystem path; any other URL scheme passes through as-is. */
+function urlToPath(url) {
+  try {
+    return url.startsWith("file:") ? new URL(url).pathname : url;
+  } catch {
+    return url;
+  }
 }
 
 function toStringSource(source) {
