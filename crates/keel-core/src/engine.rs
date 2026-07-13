@@ -1338,6 +1338,21 @@ impl Engine {
             .error
             .as_ref()
             .is_some_and(|e| e.code == ErrorCode::BreakerOpen);
+        // "Observed, not retried" (dx-spec §1 Level 0 hard rule): the call
+        // failed and the retry layer refused to re-send it (KEEL-E014).
+        let not_retried = out
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::NonIdempotentNotRetried);
+        // Coverage: the front end resolves globs to the exact policy-table key
+        // before `execute`, so an exact lookup answers "did an explicit
+        // [target."…"] entry apply?" — defaults-only calls count as unwrapped.
+        let wrapped = self
+            .policy
+            .read()
+            .expect("policy lock poisoned")
+            .target
+            .contains_key(&request.target);
         let observation = CallObservation {
             target: request.target.clone(),
             result,
@@ -1345,6 +1360,8 @@ impl Engine {
             latency_ms,
             throttled: out.throttled,
             breaker_opened,
+            not_retried,
+            wrapped,
             error,
         };
         if let Err(error) = discovery.record(&observation) {

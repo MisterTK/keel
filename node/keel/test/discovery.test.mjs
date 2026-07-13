@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
-import { createDiscovery } from "../src/discovery.mjs";
+import { createDiscovery, SCHEMA_VERSION, RETENTION_DAYS, MS_PER_DAY } from "../src/discovery.mjs";
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite");
@@ -51,6 +51,8 @@ const CANONICAL_COLUMNS = [
   { name: "last_seen_ms", type: "INTEGER", notnull: 1, pk: 0 },
   { name: "last_error_class", type: "TEXT", notnull: 0, pk: 0 },
   { name: "last_error_status", type: "INTEGER", notnull: 0, pk: 0 },
+  { name: "not_retried", type: "INTEGER", notnull: 1, pk: 0 },
+  { name: "unwrapped_calls", type: "INTEGER", notnull: 1, pk: 0 },
 ];
 
 test("discovery.db uses the canonical schema (WITHOUT ROWID, no meta/hosts)", () => {
@@ -185,5 +187,165 @@ test("flush is a no-op (returns false) when nothing was observed", () => {
   withDir((dir) => {
     const disc = createDiscovery(dir);
     assert.equal(disc.flushSync(), false);
+  });
+});
+
+test("KEEL-E014 counts as not_retried (observed, not retried)", () => {
+  withDir((dir) => {
+    const disc = createDiscovery(dir, { now: () => 1 });
+    disc.observe("t", fail(1, "other", null, "KEEL-E014"), 0);
+    disc.observe("t", fail(1, "other", null, "KEEL-E010"), 0); // not E014
+    disc.flushSync();
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    try {
+      const r = db.prepare("SELECT not_retried, failures FROM discovery WHERE target='t'").get();
+      assert.equal(r.not_retried, 1);
+      assert.equal(r.failures, 2);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("a target with an explicit policy entry is wrapped; others are not", () => {
+  withDir((dir) => {
+    const disc = createDiscovery(dir, { now: () => 1, knownTargets: new Set(["api.example.com"]) });
+    disc.observe("api.example.com", ok(1), 1);
+    disc.observe("api.other.com", ok(1), 1);
+    disc.flushSync();
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    try {
+      const wrapped = db.prepare("SELECT unwrapped_calls FROM discovery WHERE target=?").get("api.example.com");
+      const unwrapped = db.prepare("SELECT unwrapped_calls FROM discovery WHERE target=?").get("api.other.com");
+      assert.equal(wrapped.unwrapped_calls, 0);
+      assert.equal(unwrapped.unwrapped_calls, 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("no knownTargets means every call is counted unwrapped", () => {
+  withDir((dir) => {
+    const disc = createDiscovery(dir, { now: () => 1 });
+    disc.observe("api.example.com", ok(1), 1);
+    disc.flushSync();
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    try {
+      const r = db.prepare("SELECT unwrapped_calls FROM discovery WHERE target=?").get("api.example.com");
+      assert.equal(r.unwrapped_calls, 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("a daily bucket is written alongside the lifetime row", () => {
+  withDir((dir) => {
+    const disc = createDiscovery(dir, { now: () => 5 * MS_PER_DAY + 1234 });
+    disc.observe("t", ok(2), 10); // 1 retry
+    disc.flushSync();
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    try {
+      const bucket = db.prepare("SELECT * FROM discovery_daily WHERE target='t'").get();
+      assert.equal(bucket.day, 5);
+      assert.equal(bucket.calls, 1);
+      assert.equal(bucket.retries, 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("PRAGMA user_version is stamped to the current schema version", () => {
+  withDir((dir) => {
+    const disc = createDiscovery(dir, { now: () => 1 });
+    disc.observe("t", ok(1), 1);
+    disc.flushSync();
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    try {
+      const { user_version } = db.prepare("PRAGMA user_version").get();
+      assert.equal(user_version, SCHEMA_VERSION);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("a legacy (v1) discovery.db is migrated in place, preserving rows", () => {
+  withDir((dir) => {
+    const dbDir = join(dir, ".keel");
+    require("node:fs").mkdirSync(dbDir, { recursive: true });
+    const dbPath = join(dbDir, "discovery.db");
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE discovery (
+        target            TEXT PRIMARY KEY,
+        calls             INTEGER NOT NULL DEFAULT 0,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        retries           INTEGER NOT NULL DEFAULT 0,
+        successes         INTEGER NOT NULL DEFAULT 0,
+        failures          INTEGER NOT NULL DEFAULT 0,
+        cache_hits        INTEGER NOT NULL DEFAULT 0,
+        throttled         INTEGER NOT NULL DEFAULT 0,
+        breaker_opens     INTEGER NOT NULL DEFAULT 0,
+        total_latency_ms  INTEGER NOT NULL DEFAULT 0,
+        max_latency_ms    INTEGER NOT NULL DEFAULT 0,
+        first_seen_ms     INTEGER NOT NULL,
+        last_seen_ms      INTEGER NOT NULL,
+        last_error_class  TEXT,
+        last_error_status INTEGER
+      ) WITHOUT ROWID;
+    `);
+    legacy.prepare(
+      "INSERT INTO discovery VALUES ('api.old', 10, 12, 2, 8, 2, 0, 1, 0, 500, 90, ?, ?, 'http', 503)"
+    ).run(1_783_728_000_000, 1_783_728_001_000);
+    legacy.close();
+
+    const disc = createDiscovery(dir, { now: () => 1_783_728_005_000, knownTargets: new Set(["api.old"]) });
+    disc.observe("api.old", ok(1), 5);
+    assert.equal(disc.flushSync(), true);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const { user_version } = db.prepare("PRAGMA user_version").get();
+      assert.equal(user_version, SCHEMA_VERSION);
+      const r = db.prepare("SELECT * FROM discovery WHERE target='api.old'").get();
+      assert.equal(r.calls, 11, "old row's count plus the new call");
+      assert.equal(r.last_error_status, 503, "legacy data preserved");
+      assert.equal(r.not_retried, 0);
+      assert.equal(r.unwrapped_calls, 0, "recorded call was wrapped");
+      const daily = db.prepare("SELECT COUNT(*) AS n FROM discovery_daily").get();
+      assert.equal(daily.n, 1, "the daily table now exists with one bucket");
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("daily buckets older than retention are pruned when the day advances", () => {
+  withDir((dir) => {
+    const dbDir = join(dir, ".keel");
+    require("node:fs").mkdirSync(dbDir, { recursive: true });
+    const dbPath = join(dbDir, "discovery.db");
+
+    // Seed a fresh v2 file with a stale bucket, then flush a live call on a
+    // much later day — the flush path must prune it.
+    const seed = createDiscovery(dir, { now: () => 0 });
+    seed.observe("t", ok(1), 1); // creates day-0 bucket + stamps schema
+    seed.flushSync();
+
+    const later = createDiscovery(dir, { now: () => (RETENTION_DAYS + 10) * MS_PER_DAY });
+    later.observe("t", ok(1), 1);
+    later.flushSync();
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const days = db.prepare("SELECT day FROM discovery_daily ORDER BY day").all().map((r) => r.day);
+      assert.ok(!days.includes(0), "the stale day-0 bucket was pruned");
+      assert.deepEqual(days, [RETENTION_DAYS + 10]);
+    } finally {
+      db.close();
+    }
   });
 });
