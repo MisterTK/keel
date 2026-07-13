@@ -354,8 +354,9 @@ fn q(e: &rusqlite::Error) -> String {
     format!("journal query failed: {e}")
 }
 
-/// A read failure (exit 1, on stderr) — mirrors `keel status`.
-fn soft_error(message: &str) -> Rendered {
+/// A read failure (exit 1, on stderr) — mirrors `keel status`. Shared with
+/// `keel flows suggest` (same failure mode: a corrupt `.keel/discovery.db`).
+pub(crate) fn soft_error(message: &str) -> Rendered {
     #[derive(Serialize)]
     struct ErrReport<'a> {
         error: &'a str,

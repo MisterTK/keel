@@ -1,0 +1,38 @@
+{
+  "candidates": [
+    {
+      "already_designated": true,
+      "calls_observed": 50,
+      "display": "pipeline:ingest",
+      "effects": 3,
+      "entrypoint": "py:pipeline:ingest",
+      "file": "pipeline.py",
+      "idempotent_unsafe": 1,
+      "line": 16,
+      "random_reads": 1,
+      "replay_safe": true,
+      "time_reads": 1,
+      "unsafe_reasons": []
+    },
+    {
+      "already_designated": false,
+      "calls_observed": 50,
+      "display": "pipeline:export_report",
+      "effects": 1,
+      "entrypoint": "py:pipeline:export_report",
+      "file": "pipeline.py",
+      "idempotent_unsafe": 0,
+      "line": 25,
+      "random_reads": 0,
+      "replay_safe": false,
+      "time_reads": 0,
+      "unsafe_reasons": [
+        "subprocess use at pipeline.py:27"
+      ]
+    }
+  ],
+  "count": 2,
+  "js_attribution_note": "JS/TS attribution is a line-oriented heuristic: it cannot see class methods, object-literal methods, or a function whose opening `{` sits on its own line. Python attribution is exact (real `ast` containment).",
+  "python_available": true,
+  "replay_safe_count": 1
+}

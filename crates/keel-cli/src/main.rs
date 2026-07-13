@@ -9,7 +9,7 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, effective, explain, flows, init, run, status};
+use keel_cli::{doctor, effective, explain, flows, flows_add, flows_suggest, init, run, status};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -62,11 +62,15 @@ enum Command {
     },
     /// Show one screen of coverage and flow state.
     Status,
-    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age.
+    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age. Or, with
+    /// a subcommand, the Level 2 on-ramp: `suggest` candidates, `add` one.
     Flows {
         /// Show only `dead` flows (those that exhausted their resume cap).
+        /// Ignored when a subcommand is given.
         #[arg(long)]
         dead: bool,
+        #[command(subcommand)]
+        action: Option<FlowsCommand>,
     },
     /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
     Trace {
@@ -78,6 +82,26 @@ enum Command {
         /// The error code, e.g. `KEEL-E014`.
         code: String,
     },
+}
+
+/// `keel flows <action>` — the Level 2 on-ramp (dx-spec §1).
+#[derive(Debug, Subcommand)]
+enum FlowsCommand {
+    /// Designate `<entrypoint>` as a durable flow: appends it to `[flows]
+    /// entrypoints` in `keel.toml` (creating the table if absent). Idempotent —
+    /// re-running with the same entrypoint is a no-op.
+    Add {
+        /// `py:module.path:function`, `ts:path/file.ts#function`, or a bare
+        /// form printed by `keel flows suggest` (its language is inferred).
+        entrypoint: String,
+        /// Preview the change as a diff without writing `keel.toml`.
+        #[arg(long)]
+        diff: bool,
+    },
+    /// Analyze candidate flow entrypoints for replay-safety: effect counts,
+    /// idempotent-unsafe effects, time/random reads Tier 2 would virtualize,
+    /// and an estimated replay-safe verdict.
+    Suggest,
 }
 
 fn main() {
@@ -121,7 +145,13 @@ fn main() {
             emit(&r, json)
         }
         Command::Status => emit(&status::run(&project), json),
-        Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Flows { dead, action } => match action {
+            Some(FlowsCommand::Add { entrypoint, diff }) => {
+                emit(&flows_add::run(&project, &entrypoint, diff), json)
+            }
+            Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(&project), json),
+            None => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        },
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use keel_cli::render::json_string;
-use keel_cli::{doctor, effective, explain, flows, init, scan, status};
+use keel_cli::{doctor, effective, explain, flows, flows_add, flows_suggest, init, scan, status};
 use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
@@ -460,6 +460,130 @@ fn flows_and_status_honor_the_policy_journal_location() {
     assert_eq!(
         s.json["flows"]["total"], 1,
         "status reads the custom journal"
+    );
+}
+
+// ---- flows suggest / flows add: the Level 2 on-ramp (dx-spec §1) ----
+
+/// A JS project needs no interpreter to scan (pure Rust regex pass), so this
+/// golden runs everywhere: one candidate, replay-safe, no discovery evidence.
+#[test]
+fn flows_suggest_json_matches_golden_for_a_js_project() {
+    let r = flows_suggest::run(&fixtures().join("node_fetch"));
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("flows_suggest_node.json", &json_string(&r.json));
+}
+
+/// The full picture through the real scan + a real `.keel/discovery.db`: a
+/// replay-safe candidate with idempotent-unsafe effects and virtualized
+/// time/random reads (already designated in `keel.toml`), a replay-unsafe
+/// candidate (subprocess use), and a pure helper that is not a candidate at
+/// all. Exercises the discovery join (`FunctionFacts::targets` → observed
+/// calls) end to end, not just the pure ranking unit test.
+#[test]
+fn flows_suggest_json_matches_golden_with_discovery_and_designation() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("py_flow_candidates").join("pipeline.py"),
+        dir.path().join("pipeline.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "[flows]\nentrypoints = [\"py:pipeline:ingest\"]\n",
+    )
+    .unwrap();
+    let keel_dir = dir.path().join(".keel");
+    std::fs::create_dir_all(&keel_dir).unwrap();
+    let store = DiscoveryStore::open(keel_dir.join("discovery.db"), ManualClock::new(T0)).unwrap();
+    store
+        .merge_report(&[TargetStats {
+            target: "api.example.com".to_owned(),
+            calls: 50,
+            attempts: 50,
+            retries: 0,
+            successes: 50,
+            failures: 0,
+            cache_hits: 0,
+            throttled: 0,
+            breaker_opens: 0,
+            total_latency_ms: 1_000,
+            max_latency_ms: 50,
+            first_seen_ms: T0,
+            last_seen_ms: T0,
+            last_error_class: None,
+            last_error_status: None,
+        }])
+        .unwrap();
+
+    let r = flows_suggest::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("flows_suggest_py.json", &json_string(&r.json));
+}
+
+/// `keel flows add`'s `--json` twin, both for a fresh `keel.toml` (the
+/// `/dev/null`-headed creation patch) and for appending a second entrypoint —
+/// the two shapes `keel init --diff` already golden-tests for policy edits in
+/// general (dx-spec §5, diffs as the lingua franca).
+#[test]
+fn flows_add_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let created = flows_add::run(dir.path(), "pipeline.ingest:main", false);
+    assert_eq!(created.exit, keel_cli::EXIT_OK);
+    check_golden("flows_add_create.json", &json_string(&created.json));
+
+    let appended = flows_add::run(dir.path(), "jobs/nightly.ts#run", false);
+    assert_eq!(appended.exit, keel_cli::EXIT_OK);
+    check_golden("flows_add_append.json", &json_string(&appended.json));
+}
+
+/// The property `keel init --diff` is already golden-tested for: the emitted
+/// patch applies cleanly with the real `git apply` and reproduces exactly what
+/// a direct write would have produced.
+#[test]
+fn flows_add_patch_applies_cleanly_with_git_apply() {
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let r = flows_add::run(dir.path(), "pipeline.ingest:main", true);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert!(
+        !dir.path().join("keel.toml").exists(),
+        "--diff never writes"
+    );
+    let patch = r.json["patch"].as_str().unwrap();
+    assert!(
+        patch.starts_with("--- /dev/null\n+++ b/keel.toml\n"),
+        "{patch}"
+    );
+
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    // The applied file matches what a direct (non-diff) write for the same
+    // entrypoint would have produced.
+    let direct = tempfile::TempDir::new().unwrap();
+    let w = flows_add::run(direct.path(), "pipeline.ingest:main", false);
+    assert_eq!(w.exit, keel_cli::EXIT_OK);
+    assert_eq!(
+        applied,
+        std::fs::read_to_string(direct.path().join("keel.toml")).unwrap(),
+        "diff-then-apply reproduces a direct write"
     );
 }
 

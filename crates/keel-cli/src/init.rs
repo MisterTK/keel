@@ -628,7 +628,10 @@ fn update_gitignore(project: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn has_python_files(project: &Path) -> bool {
+/// Whether `project` contains any `.py` file — used to distinguish "python3
+/// was not found" from "there was nothing to scan" in both `init` and `flows
+/// suggest`'s warnings.
+pub(crate) fn has_python_files(project: &Path) -> bool {
     fn walk(dir: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -673,7 +676,8 @@ fn config_error(message: &str) -> Rendered {
     .with_exit(EXIT_USAGE)
 }
 
-fn plural(n: usize) -> &'static str {
+/// `"s"` unless `n == 1` — shared by every report that pluralizes a count noun.
+pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 

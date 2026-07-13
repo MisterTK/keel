@@ -1,0 +1,16 @@
+{
+  "added": true,
+  "already_designated": false,
+  "changes": [
+    {
+      "after": [
+        "py:pipeline.ingest:main"
+      ],
+      "before": null,
+      "path": "flows.entrypoints"
+    }
+  ],
+  "entrypoint": "py:pipeline.ingest:main",
+  "patch": "--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,2 @@\n+[flows]\n+entrypoints = [\"py:pipeline.ingest:main\"]\n",
+  "written": true
+}

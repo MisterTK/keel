@@ -13,10 +13,30 @@
 //! The tradeoff (accepted here): a URL built by concatenation, or an exotic
 //! import form, is missed — exactly the ~20% the import-time and observed-run
 //! evidence sources exist to catch (dx-spec §2). Line numbers are exact.
+//!
+//! ## Function attribution (for `keel flows suggest`) — what this pass CAN
+//! and CANNOT do
+//!
+//! Being line-oriented, the attribution is a brace-depth heuristic, not a
+//! parse. It **can** attribute to *top-level named functions*: declarations
+//! (`function f(…) {`, `export async function f(…) {`) and initializers
+//! (`const f = async (…) => {`, `const f = function (…) {`), including
+//! single-line arrow bodies. Everything found between a tracked declaration
+//! and the brace that closes it counts toward that function — so effects
+//! inside nested callbacks, inner arrows, and helper closures attribute to
+//! the enclosing top-level function (usually what you want for a flow
+//! verdict, but it is containment-by-lines, not by scope).
+//!
+//! It **cannot** attribute: class methods, unnamed `export default` values,
+//! object-literal methods, functions whose opening `{` sits on its own line
+//! (Allman style), or code after a template-literal `${…}` that desyncs the
+//! per-line quote tracking. Those findings still appear in the file-level
+//! scan; they are just not credited to a function. The Python pass has none
+//! of these limits (real AST); `keel flows suggest` says so in its notes.
 
 use std::path::Path;
 
-use super::{LangFindings, SKIP_DIRS, Sighting, host_from_url};
+use super::{FunctionFacts, LangFindings, SKIP_DIRS, Sighting, host_from_url};
 
 /// Extensions the scan reads.
 const JS_EXTS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
@@ -28,6 +48,9 @@ pub struct JsScan {
     pub files_scanned: usize,
     /// Findings, ready to merge.
     pub findings: LangFindings,
+    /// Per-function attribution (top-level named functions only — see the
+    /// module docs for the heuristic's honest limits).
+    pub functions: Vec<FunctionFacts>,
 }
 
 /// Scan `project` for JS/TS effect seams.
@@ -44,6 +67,7 @@ pub fn scan(project: &Path) -> JsScan {
         result.files_scanned += 1;
         let rel = relative(project, path);
         scan_source(&src, &rel, &mut result.findings);
+        result.functions.extend(scan_functions(&src, &rel));
     }
     result
 }
@@ -195,6 +219,205 @@ fn contains_call(line: &str, name: &str) -> bool {
     false
 }
 
+// ---- per-function attribution (line heuristic; limits in the module docs) ----
+
+/// A top-level function whose body is currently being attributed.
+struct OpenFunction {
+    facts: FunctionFacts,
+    /// Brace depth before the declaration line; the function closes when the
+    /// running depth returns to this value.
+    base_depth: i32,
+}
+
+/// Attribute effects / time / random / unsafe lines to top-level named
+/// functions by brace-depth tracking. Split out so it is unit-testable.
+fn scan_functions(src: &str, rel: &str) -> Vec<FunctionFacts> {
+    let mut out = Vec::new();
+    let mut open: Option<OpenFunction> = None;
+    let mut depth: i32 = 0;
+    for (idx, line) in src.lines().enumerate() {
+        let lineno = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        let (opens, closes) = brace_deltas(line);
+        if open.is_none()
+            && depth == 0
+            && let Some(name) = function_decl_name(line)
+        {
+            let mut facts = FunctionFacts {
+                entrypoint: format!("ts:{rel}#{name}"),
+                file: rel.to_owned(),
+                line: lineno,
+                ..FunctionFacts::default()
+            };
+            // The declaration line itself may carry the whole body
+            // (`const f = () => fetch(u);`).
+            attribute_line(line, rel, lineno, &mut facts);
+            if opens > closes {
+                open = Some(OpenFunction {
+                    facts,
+                    base_depth: depth,
+                });
+            } else {
+                out.push(facts);
+            }
+            depth += opens - closes;
+            continue;
+        }
+        if let Some(of) = open.as_mut() {
+            attribute_line(line, rel, lineno, &mut of.facts);
+        }
+        depth += opens - closes;
+        if let Some(of) = open.as_ref()
+            && depth <= of.base_depth
+        {
+            out.push(open.take().expect("checked Some above").facts);
+        }
+    }
+    if let Some(of) = open {
+        out.push(of.facts); // EOF closed the file mid-function; keep the facts.
+    }
+    out
+}
+
+/// If `line` declares a top-level named function, return its name. Recognized:
+/// `[export] [default] [async] function[*] NAME(` and
+/// `[export] const|let|var NAME = …` where the initializer is a function or
+/// arrow (`function` / `=>` on the same line).
+fn function_decl_name(line: &str) -> Option<String> {
+    let mut t = line.trim_start();
+    for prefix in ["export ", "default ", "async "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim_start();
+        }
+    }
+    if let Some(rest) = t.strip_prefix("function") {
+        // Require a real keyword boundary (`functional(…)` is not a decl).
+        if !rest.starts_with([' ', '\t', '*']) {
+            return None;
+        }
+        let rest = rest
+            .trim_start()
+            .strip_prefix('*')
+            .unwrap_or(rest)
+            .trim_start();
+        let name = leading_identifier(rest)?;
+        if rest[name.len()..].trim_start().starts_with('(') {
+            return Some(name.to_owned());
+        }
+        return None;
+    }
+    for kw in ["const ", "let ", "var "] {
+        if let Some(rest) = t.strip_prefix(kw) {
+            let rest = rest.trim_start();
+            let name = leading_identifier(rest)?;
+            let after = rest[name.len()..].trim_start();
+            let assigns =
+                after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>");
+            if assigns && (line.contains("=>") || line.contains("function")) {
+                return Some(name.to_owned());
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// The leading JS identifier of `s`, if any.
+fn leading_identifier(s: &str) -> Option<&str> {
+    let first = s.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return None;
+    }
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(s.len());
+    Some(&s[..end])
+}
+
+/// `(opens, closes)` braces on this line, skipping quoted strings and the tail
+/// of a `//` comment. Template-literal `${…}` interpolation is not tracked —
+/// a documented limit of the line heuristic.
+fn brace_deltas(line: &str) -> (i32, i32) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut quote: Option<char> = None;
+    let mut prev = '\0';
+    for c in line.chars() {
+        if let Some(q) = quote {
+            if c == q && prev != '\\' {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '{' => opens += 1,
+                '}' => closes += 1,
+                '/' if prev == '/' => break,
+                _ => {}
+            }
+        }
+        prev = c;
+    }
+    (opens, closes)
+}
+
+/// Fold one body line into the open function's facts.
+fn attribute_line(line: &str, rel: &str, lineno: u32, f: &mut FunctionFacts) {
+    let fetches = count_calls(line, "fetch");
+    f.effects += fetches;
+    // Same-line method literal only: a POST/PATCH in a multi-line options
+    // object is missed (documented limit of the line heuristic).
+    if fetches > 0
+        && ["\"POST\"", "'POST'", "\"PATCH\"", "'PATCH'"]
+            .iter()
+            .any(|m| line.contains(m))
+    {
+        f.idempotent_unsafe += 1;
+    }
+    for needle in ["Date.now(", "new Date(", "performance.now("] {
+        f.time_reads += count_substr(line, needle);
+    }
+    for needle in [
+        "Math.random(",
+        "crypto.randomUUID(",
+        "crypto.getRandomValues(",
+    ] {
+        f.random_reads += count_substr(line, needle);
+    }
+    for host in hosts_in_line(line) {
+        f.targets.insert(host);
+    }
+    for needle in ["child_process", "worker_threads"] {
+        if line.contains(needle) {
+            f.unsafe_reasons
+                .push(format!("{needle} use at {rel}:{lineno}"));
+        }
+    }
+}
+
+/// How many times `name(` occurs as a call on this line (the counting twin of
+/// [`contains_call`]).
+fn count_calls(line: &str, name: &str) -> u32 {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(name) {
+        let at = from + rel;
+        let after = at + name.len();
+        let before_ok = at == 0
+            || !line.as_bytes()[at - 1].is_ascii_alphanumeric() && line.as_bytes()[at - 1] != b'_';
+        let after_ok = line[after..].trim_start().starts_with('(');
+        if before_ok && after_ok {
+            count += 1;
+        }
+        from = after;
+    }
+    count
+}
+
+/// Non-overlapping occurrences of `needle` in `line`.
+fn count_substr(line: &str, needle: &str) -> u32 {
+    u32::try_from(line.matches(needle).count()).unwrap_or(u32::MAX)
+}
+
 /// Recursively collect scannable files, skipping [`SKIP_DIRS`] and dotdirs.
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -273,5 +496,106 @@ mod tests {
         let f = findings("x(\"https://a.example.com\", \"https://b.example.com/p\")\n");
         let hosts: Vec<_> = f.hosts.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(hosts, ["a.example.com", "b.example.com"]);
+    }
+
+    // ---- function attribution (line heuristic) ----
+
+    #[test]
+    fn attributes_fetch_time_random_to_top_level_functions() {
+        let src = "\
+export async function ingest(rows) {
+  const started = Date.now();
+  const res = await fetch(\"https://api.example.com/v1/x\", { method: \"POST\" });
+  const id = crypto.randomUUID();
+  return { started, id, body: await res.json() };
+}
+
+function pure(a, b) {
+  return a + b;
+}
+";
+        let fns = scan_functions(src, "app.mjs");
+        assert_eq!(fns.len(), 2);
+        let ingest = &fns[0];
+        assert_eq!(ingest.entrypoint, "ts:app.mjs#ingest");
+        assert_eq!((ingest.file.as_str(), ingest.line), ("app.mjs", 1));
+        assert_eq!(ingest.effects, 1);
+        assert_eq!(ingest.idempotent_unsafe, 1, "same-line POST literal");
+        assert_eq!(ingest.time_reads, 1);
+        assert_eq!(ingest.random_reads, 1);
+        assert!(ingest.targets.contains("api.example.com"));
+        assert!(ingest.unsafe_reasons.is_empty());
+        assert_eq!(fns[1].entrypoint, "ts:app.mjs#pure");
+        assert_eq!(fns[1].effects, 0);
+    }
+
+    #[test]
+    fn single_line_arrow_and_nested_callback_attribution() {
+        let src = "\
+const ping = () => fetch(\"https://a.example.com/health\");
+const nightly = async () => {
+  const results = await Promise.all(urls.map((u) => fetch(u)));
+  return results;
+};
+";
+        let fns = scan_functions(src, "jobs.ts");
+        assert_eq!(fns.len(), 2);
+        assert_eq!(fns[0].entrypoint, "ts:jobs.ts#ping");
+        assert_eq!(fns[0].effects, 1);
+        // The nested map callback's fetch attributes to the enclosing
+        // top-level function — containment-by-lines, per the module docs.
+        assert_eq!(fns[1].entrypoint, "ts:jobs.ts#nightly");
+        assert_eq!(fns[1].effects, 1);
+    }
+
+    #[test]
+    fn child_process_defeats_the_replay_safe_estimate() {
+        let src = "\
+export function shellOut() {
+  const { execSync } = require(\"child_process\");
+  execSync(\"ls\");
+  return fetch(\"https://api.example.com/v1/x\");
+}
+";
+        let fns = scan_functions(src, "run.js");
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].effects, 1);
+        assert_eq!(
+            fns[0].unsafe_reasons,
+            vec!["child_process use at run.js:2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn class_methods_and_plain_calls_are_not_tracked_as_functions() {
+        let src = "\
+class Api {
+  async load() {
+    return fetch(\"https://a.example.com\");
+  }
+}
+functional(1, 2);
+const url = \"https://b.example.com\";
+";
+        assert!(scan_functions(src, "app.ts").is_empty());
+    }
+
+    #[test]
+    fn braces_in_strings_and_comments_do_not_desync_depth() {
+        let src = "\
+function outer() {
+  const s = \"{ not a brace }\";
+  // } neither is this
+  return fetch(\"https://a.example.com\");
+}
+function after() {
+  return Date.now();
+}
+";
+        let fns = scan_functions(src, "app.ts");
+        assert_eq!(fns.len(), 2);
+        assert_eq!(fns[0].effects, 1);
+        assert_eq!(fns[1].entrypoint, "ts:app.ts#after");
+        assert_eq!(fns[1].time_reads, 1);
     }
 }
