@@ -131,7 +131,7 @@ impl Worker {
                 // `client` (and the private Tokio runtime it owns) drops
                 // here, on this thread — never inside a caller's runtime.
             })
-            .expect("spawn postgres journal worker thread");
+            .map_err(Error::WorkerSpawnFailed)?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 tx: Some(tx),

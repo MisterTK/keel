@@ -30,8 +30,12 @@ use serde_json::{Map, Value};
 use crate::render::to_json;
 use crate::{EXIT_OK, EXIT_USAGE, Rendered, evidence, scan};
 
-/// The frozen smart-defaults pack, compiled in (contracts/defaults.toml).
-const DEFAULTS_TOML: &str = include_str!("../../../contracts/defaults.toml");
+/// The frozen smart-defaults pack, compiled in (contracts/defaults.toml) via
+/// the crate-local vendored copy (`build.rs` asserts it stays byte-identical
+/// to the repo original) — the same copy `init.rs`/`explain.rs` embed, so
+/// `cargo package`/`cargo publish` (which cannot ship files outside the crate
+/// directory) still build correctly from a standalone crates.io tarball.
+const DEFAULTS_TOML: &str = include_str!("../contract/defaults.toml");
 
 /// Canonical key order inside a policy layer table (the order the contract
 /// file and `keel init` write); keys outside this list follow, sorted.

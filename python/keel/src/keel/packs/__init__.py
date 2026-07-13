@@ -32,11 +32,16 @@ the policy at bootstrap (``defaults < packs < user``); the generic ``llm`` pack
 supplies ``resolve_dev_cache``.
 
 ``langgraph_pack`` is the last exception, living in this package: it DOES own
-a real monkey-patched seam (``StateGraph.add_node``), so it is also
-registered in ``keel.adapters.PACKS`` for lazy install-on-import, exactly
-like httpx/requests. It lives here rather than in ``keel.adapters`` because
-its OTHER half — the `KeelSaver` checkpointer — is a framework-pack API
-surface (like `tool.wrap_tool`), not a library adapter.
+a real monkey-patched seam (``StateGraph.add_node``). Despite that, it is
+registered for lazy on-import activation the SAME way as the tool.wrap_tool
+-seam packs above — via ``keel.adapters._framework_packs`` — not in
+``keel.adapters.PACKS``: importing it eagerly at ``keel.adapters`` module
+scope would recreate the exact cross-package init-order cycle
+``_framework_packs`` exists to avoid (``keel.packs.mcp_pack`` needs a name off
+``keel.adapters`` that isn't defined until later in that module's own
+execution). It lives here rather than in ``keel.adapters`` because its OTHER
+half — the `KeelSaver` checkpointer — is a framework-pack API surface (like
+`tool.wrap_tool`), not a library adapter.
 """
 
 from __future__ import annotations
@@ -63,9 +68,16 @@ from .tool import is_valid_tool_name, tool_pack, wrap_tool
 PROVIDER_PACKS = (openai_pack, anthropic_pack, google_genai_pack)
 
 #: Registration order = report order (stable, deterministic). Physical
-#: activation is `keel.adapters.install_adapters` (via `_framework_packs`);
+#: activation is `keel.adapters.install_adapters` (via `_framework_packs`,
+#: which arms every pack listed here plus `langgraph_pack` the identical way);
 #: this tuple is the discoverability/reporting twin of `PROVIDER_PACKS`.
-FRAMEWORK_PACKS = (adk_pack, crewai_pack, openai_agents_pack, pydantic_ai_pack)
+FRAMEWORK_PACKS = (
+    adk_pack,
+    crewai_pack,
+    langgraph_pack,
+    openai_agents_pack,
+    pydantic_ai_pack,
+)
 
 
 def present_provider_defaults() -> list[dict[str, Any]]:

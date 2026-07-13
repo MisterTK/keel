@@ -415,3 +415,34 @@ test("native: exitFlow with an unawaited in-flight effect fails loud (KEEL-E040)
   assert.equal(outcome.result, "ok");
   core.exitFlow("completed"); // now uncontended — succeeds
 });
+
+test("native: enterFlow with a prior unawaited in-flight effect fails loud (KEEL-E040), not a hang", gate, async (t) => {
+  const core = tmpJournalCore(t);
+  core.enterFlow("ts:pipeline.mjs#first", "ah-enter-race");
+  // Fire an effect WITHOUT awaiting it, then immediately try to enter a
+  // SECOND flow on the same core while the first flow's step is still in
+  // flight — enterFlow must throw a precise error rather than block the JS
+  // thread forever (the in-flight step can only resolve its own Promise by
+  // running JS on this SAME thread, so a blocking wait here could never
+  // return).
+  const pending = core.executeAsync(
+    { v: 1, target: "api.x", op: "api.x", idempotent: true },
+    async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      return { status: "ok", payload: 1 };
+    }
+  );
+  assert.throws(
+    () => core.enterFlow("ts:pipeline.mjs#second", "ah-enter-race-2"),
+    (err) => err.code === "KEEL-E040"
+  );
+  const outcome = await pending; // let it drain so the first flow's slot frees up
+  assert.equal(outcome.result, "ok");
+  core.exitFlow("completed"); // close the first flow — enterFlow never got to stash
+  // "second"'s handle (the refusal happened before that), so it was never
+  // left open here; a real re-entry of "second" would still hit KEEL-E030
+  // (lease held) until its 30s default lease expires, since the refused
+  // attempt's journal/lease work runs to completion before the slot check —
+  // that lease-recovery path is exercised by the flow-lease-held-and-takeover
+  // conformance scenario, not repeated here.
+});

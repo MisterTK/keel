@@ -128,10 +128,16 @@ fn redact_postgres(url: &str) -> String {
     let Some(rest) = url.strip_prefix("postgres://") else {
         return url.to_owned();
     };
-    match rest.split_once('@') {
-        // Only redact an '@' inside the authority (before any path slash).
-        Some((userinfo, tail)) if !userinfo.contains('/') => format!("postgres://\u{2026}@{tail}"),
-        _ => url.to_owned(),
+    // The authority (userinfo@host:port) ends at the first '/' that starts the
+    // path, or at the end of the string if there is no path. A password may
+    // itself contain '@' (common in generated credentials), so within the
+    // authority the split point is the LAST '@', not the first — `split_once`
+    // on the first '@' leaks everything after a password's own '@' verbatim.
+    let path_start = rest.find('/').unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(path_start);
+    match authority.rfind('@') {
+        Some(at) => format!("postgres://\u{2026}@{}{tail}", &authority[at + 1..]),
+        None => url.to_owned(),
     }
 }
 
@@ -221,6 +227,22 @@ mod tests {
         assert!(!r.display.contains("sekrit"), "credentials never printed");
         // Evidence readers fall back to the default file (no local pg reader).
         assert_eq!(r.path, dir.path().join(".keel").join("journal.db"));
+    }
+
+    /// A password containing `@` (common in generated credentials) must not
+    /// leak its trailing portion — splitting on the FIRST `@` instead of the
+    /// LAST one within the authority does exactly that.
+    #[test]
+    fn a_password_containing_at_is_fully_redacted() {
+        let dir =
+            project_with_policy("journal = \"postgres://user:p@ssw0rd@db.internal:5432/keel\"\n");
+        let r = resolved_journal(dir.path());
+        assert_eq!(r.display, "postgres://\u{2026}@db.internal:5432/keel");
+        assert!(
+            !r.display.contains("ssw0rd"),
+            "no credential fragment leaks"
+        );
+        assert!(!r.display.contains("p@ssw0rd"));
     }
 
     #[test]

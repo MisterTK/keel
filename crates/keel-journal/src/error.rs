@@ -28,6 +28,11 @@ pub enum Error {
     /// panicked while executing a previous job, before this call's job could
     /// be dispatched or its result received.
     WorkerUnavailable,
+    /// The OS refused to spawn a dedicated Postgres worker thread (e.g. a
+    /// `ulimit -u` thread-count cap, or memory exhaustion) — a real, if rare,
+    /// condition on a thread-constrained host, surfaced as an error rather
+    /// than a process-aborting panic.
+    WorkerSpawnFailed(std::io::Error),
     /// A stored string fell outside the frozen schema's `CHECK` set, or an
     /// integer fell outside its domain type — i.e. the database is corrupt or
     /// was written by something that does not honour the contract.
@@ -56,6 +61,9 @@ impl fmt::Display for Error {
             Self::WorkerUnavailable => {
                 write!(f, "journal connection worker thread is no longer running")
             }
+            Self::WorkerSpawnFailed(e) => {
+                write!(f, "could not spawn a journal connection worker thread: {e}")
+            }
             Self::Corrupt { column, value } => write!(
                 f,
                 "journal column `{column}` holds a value outside the schema contract: {value:?}"
@@ -69,6 +77,7 @@ impl core::error::Error for Error {
         match self {
             Self::Sqlite(e) => Some(e),
             Self::Postgres(e) => Some(e),
+            Self::WorkerSpawnFailed(e) => Some(e),
             Self::WorkerUnavailable | Self::Corrupt { .. } => None,
         }
     }

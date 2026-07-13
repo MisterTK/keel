@@ -552,8 +552,21 @@ mod bindings {
         /// is that predicate as a bool. Throws: `KEEL-E030` if another live
         /// holder leases the flow, `KEEL-E032` if it is dead, `KEEL-E040` if
         /// this core has no journal (Tier 2 requires the native core + a
-        /// journal). Called on the JS thread (never from inside a spawned
-        /// future), so `blocking_lock` on `active_flow` cannot deadlock here.
+        /// journal).
+        ///
+        /// Uses `try_lock`, deliberately NOT `blocking_lock`: this method runs
+        /// synchronously on the JS thread, so it never itself holds a tokio
+        /// runtime context that `blocking_lock` could panic inside — but a
+        /// PRIOR `executeAsync` call left un-awaited (a caller bug: the
+        /// ordering rule asks callers to await sequentially) can still be
+        /// holding `active_flow`'s guard, on napi's own background runtime
+        /// thread, across its effect's `.await` — and that effect's own
+        /// `Promise` can only settle by running JS on THIS same thread. A
+        /// blocking wait here would then never return: this thread can never
+        /// drain the microtask queue the pending effect needs to finish, so
+        /// the lock can never be released. `try_lock` turns that misuse into
+        /// a precise `KEEL-E040` (fail loud) instead of hanging the process
+        /// forever — mirroring `exitFlow`/`journalTime`/`journalRandom`.
         #[napi]
         #[allow(
             clippy::needless_pass_by_value,
@@ -614,10 +627,24 @@ mod bindings {
                 "status": status_str(handle.entry_status()),
                 "replay": handle.is_replay_only(),
             });
-            // Not inside a spawned future here (this method never `.await`s), so
-            // no ambient tokio task context exists on this thread: `blocking_lock`
-            // is a plain blocking lock, not a panic risk.
-            *self.active_flow.blocking_lock() = Some(handle);
+            let Ok(mut guard) = self.active_flow.try_lock() else {
+                // `handle` drops here: its `Drop` impl stops the heartbeat
+                // (never actively releases the lease — a dropped, incomplete
+                // handle models a crash, per flow.rs's own doc comment), so
+                // the flow this call just journaled as entered is left
+                // `running` with its lease, to be resumed once that lease
+                // expires — the same recovery path a real process crash
+                // takes, not an orphaned or corrupted state.
+                return Err(throw_keel(
+                    env,
+                    "KEEL-E040",
+                    "enterFlow could not acquire the flow slot (a previous intercepted call is \
+                     still in flight). Await every executeAsync/journalTime/journalRandom call \
+                     before entering the next flow — a fired-and-forgotten effect is never \
+                     journaled reliably and, here, would otherwise hang the process.",
+                ));
+            };
+            *guard = Some(handle);
             Ok(info)
         }
 

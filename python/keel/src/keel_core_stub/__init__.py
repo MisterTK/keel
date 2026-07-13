@@ -118,7 +118,15 @@ def _parse_primary(s: str) -> tuple[int, float, int] | None:
 
 def _primary_wait(primary: tuple[int, float, int], local_attempt: int) -> int:
     base, factor, cap = primary
-    return round(min(base * factor ** (local_attempt - 1), cap))
+    natural = min(base * factor ** (local_attempt - 1), cap)
+    # Round-half-AWAY-FROM-ZERO, matching Rust's `f64::round()` (the real
+    # core) and JS's `Math.round()` (the Node stub) exactly — Python's
+    # builtin `round()` is round-half-to-even ("banker's rounding"), which
+    # disagrees with both on an exact .5ms boundary (e.g. a natural wait of
+    # 4.5ms: `round(4.5) == 4` in Python, but 5 everywhere else). Waits here
+    # are always non-negative, so `floor(x + 0.5)` is the correct, simple
+    # equivalent.
+    return math.floor(natural + 0.5)
 
 
 # A schedule segment: (primary, up_to_ms). `up_to_ms` is the `upTo` bound on
