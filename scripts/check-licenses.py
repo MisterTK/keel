@@ -7,12 +7,19 @@ cargo-deny (deny.toml) covers the Rust dependency graph; this is its light
 Python twin. Two checks, both mechanical and offline (no PyPI calls — the
 allowlist below is asserted, not looked up):
 
-  1. Every front end's `[project].dependencies` in pyproject.toml is `[]`.
-     Python's stdlib-only front end (python/keel) and the stub package
-     (python/keel-core-stub) must stay this way; a future pack that adds a
-     runtime dependency there breaks the zero-code-changes promise's cost
-     model and must be a deliberate, reviewed decision — not a stray `pip
-     install` a maintainer forgets to undo.
+  1. Every front end's `[project].dependencies` in pyproject.toml is `[]`,
+     with ONE documented exception: `python/keel` depends on its own
+     first-party sibling wheel `keel-core` (the native core; same repo, same
+     release, version-locked) so `pip install keel` actually resolves the
+     compiled module per dx-spec §6's install-surface promise — see the
+     comment above `dependencies = [...]` in that pyproject.toml. This is
+     not a third-party dependency in the sense rule 12 guards against (an
+     arbitrary library sneaking into the zero-code-changes cost model); it
+     ships from this repo. `python/keel-core-stub` (the pure-Python
+     fallback) has no such exception and must stay `[]` — a future pack
+     that adds a REAL third-party runtime dependency to either manifest
+     must be a deliberate, reviewed decision — not a stray `pip install` a
+     maintainer forgets to undo.
   2. Every dev/test-only dependency (the adapter contract-test farm: httpx,
      requests, ...) is in the LICENSE_ALLOWLIST below with a permissive
      license. Adding a new dev dependency without adding it here fails the
@@ -36,6 +43,14 @@ ZERO_DEP_MANIFESTS = (
     "python/keel/pyproject.toml",
     "python/keel-core-stub/pyproject.toml",
 )
+
+# The one documented exception to ZERO_DEP_MANIFESTS: `python/keel` pinning
+# its own first-party sibling wheel (see the module docstring). Keyed by
+# manifest path -> allowed bare distribution names (version-pin agnostic, so
+# a version bump via scripts/bump-version.sh never needs a matching edit here).
+FIRST_PARTY_EXEMPT: dict[str, set[str]] = {
+    "python/keel/pyproject.toml": {"keel-core"},
+}
 
 # Package (PEP 508 name, lowercased) -> (license SPDX-ish id, why it's here).
 # Scope: only `python/keel/pyproject.toml`'s `[project.optional-dependencies]`
@@ -77,11 +92,15 @@ def check_zero_runtime_deps() -> list[str]:
         with path.open("rb") as f:
             data = tomllib.load(f)
         deps = data.get("project", {}).get("dependencies", [])
-        if deps:
+        exempt = FIRST_PARTY_EXEMPT.get(rel, set())
+        unexpected = [d for d in deps if _dep_name(d) not in exempt]
+        if unexpected:
             errors.append(
                 f"{rel}: [project].dependencies must stay [] (zero runtime deps "
-                f"invariant, engineering-manifesto rule 12); found {deps!r}. If this "
-                "is deliberate, it needs a documented decision, not a silent add."
+                f"invariant, engineering-manifesto rule 12) beyond the documented "
+                f"first-party exception {sorted(exempt)!r}; found {unexpected!r}. "
+                "If this is deliberate, it needs a documented decision, not a "
+                "silent add."
             )
     return errors
 
