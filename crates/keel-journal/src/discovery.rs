@@ -214,6 +214,11 @@ pub struct ObservedError {
 
 /// One intercepted call, as the engine observed it.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent observed facts (throttled/breaker/not-retried/wrapped), \
+              not a state machine — each is set from a distinct, orthogonal condition"
+)]
 pub struct CallObservation {
     /// The resolved target, e.g. `"api.stripe.com"` or `"py:pipeline.enrich"`.
     pub target: String,

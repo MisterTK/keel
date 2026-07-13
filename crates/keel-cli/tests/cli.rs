@@ -125,6 +125,8 @@ fn build_discovery(project: &Path) {
                 last_seen_ms: T0 + 120_000,
                 last_error_class: Some(keel_journal::ErrorClass::Http),
                 last_error_status: Some(503),
+                not_retried: 1,
+                unwrapped_calls: 0,
             },
             TargetStats {
                 target: "llm:openai".to_owned(),
@@ -142,6 +144,8 @@ fn build_discovery(project: &Path) {
                 last_seen_ms: T0 + 60_000,
                 last_error_class: None,
                 last_error_status: None,
+                not_retried: 0,
+                unwrapped_calls: 5,
             },
         ])
         .unwrap();
@@ -206,6 +210,8 @@ fn init_observed_llm_matches_golden() {
         last_seen_ms: T0 + 120_000,
         last_error_class: None,
         last_error_status: None,
+        not_retried: 0,
+        unwrapped_calls: 0,
     }];
     let out = init::render_keel_toml(&scanned, &discovery, None);
     check_golden("init_llm_observed.toml", &out);
@@ -357,7 +363,7 @@ fn status_json_matches_golden() {
     let dir = tempfile::TempDir::new().unwrap();
     build_journal(dir.path());
     build_discovery(dir.path());
-    let r = status::run(dir.path());
+    let r = status::run(dir.path(), T0);
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("status.json", &json_string(&r.json));
 }
@@ -456,7 +462,7 @@ fn flows_and_status_honor_the_policy_journal_location() {
     assert_eq!(f.json["journal_present"], true, "custom journal found");
     assert_eq!(f.json["count"], 1, "the completed fixture flow is listed");
 
-    let s = status::run(dir.path());
+    let s = status::run(dir.path(), T0);
     assert_eq!(
         s.json["flows"]["total"], 1,
         "status reads the custom journal"
@@ -695,7 +701,7 @@ fn status_json_parity_with_human() {
     let dir = tempfile::TempDir::new().unwrap();
     build_journal(dir.path());
     build_discovery(dir.path());
-    let r = status::run(dir.path());
+    let r = status::run(dir.path(), T0);
 
     // Every top-level integer fact in the JSON twin must be shown to humans.
     for key in [

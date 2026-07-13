@@ -129,7 +129,7 @@ fn main() {
             };
             emit(&r, json)
         }
-        Command::Status => emit(&status::run(&project), json),
+        Command::Status => emit(&status::run(&project, SystemClock.now_ms()), json),
         Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),

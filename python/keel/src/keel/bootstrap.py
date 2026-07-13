@@ -73,7 +73,11 @@ def install_keel(
     policy = apply_journal_env_override(policy, env)
     backend.configure(policy)  # raises KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
-    discovery = Discovery(cwd)
+    # The explicit `[target."…"]` keys of the SAME effective policy the core
+    # just configured — discovery's "wrapped" classification (dx-spec §2's
+    # coverage gap) must agree with what actually applied.
+    known_targets = frozenset(policy.get("target") or {})
+    discovery = Discovery(cwd, known_targets)
     _STATE.discovery = discovery
     set_runtime(backend, discovery)
 

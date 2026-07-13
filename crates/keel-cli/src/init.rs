@@ -737,6 +737,8 @@ mod tests {
             last_seen_ms,
             last_error_class: None,
             last_error_status: None,
+            not_retried: 0,
+            unwrapped_calls: 0,
         }
     }
 
@@ -822,6 +824,8 @@ mod tests {
             last_seen_ms: 120_000, // 2 minutes → 60/min
             last_error_class: None,
             last_error_status: None,
+            not_retried: 0,
+            unwrapped_calls: 0,
         };
         let out = render_keel_toml(&scan, std::slice::from_ref(&stats), None);
         assert!(out.contains("[target.\"api.dynamic.com\"]"));

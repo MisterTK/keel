@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use keel_core_api::policy::{JournalLocation, Policy};
-use keel_journal::{DiscoveryStore, SystemClock, TargetStats};
+use keel_journal::{DailyStats, DiscoveryStore, SystemClock, TargetStats};
 
 /// `<project>/keel.toml` — the policy file.
 pub fn keel_toml(project: &Path) -> PathBuf {
@@ -150,6 +150,23 @@ pub fn read_discovery(project: &Path) -> Result<Vec<TargetStats>, String> {
         .map_err(|e| format!("could not open {}: {e}", path.display()))?;
     store
         .snapshot()
+        .map_err(|e| format!("could not read {}: {e}", path.display()))
+}
+
+/// Read the rolling daily buckets if `.keel/discovery.db` exists, else an empty
+/// vec (and, on a legacy v1 file, [`DiscoveryStore::daily_snapshot`] itself
+/// returns empty — there is no bucket table to read). This is what turns
+/// lifetime `discovery` totals into a real trailing-window answer ("retries
+/// saved this week") in `keel status`.
+pub fn read_discovery_daily(project: &Path) -> Result<Vec<DailyStats>, String> {
+    let path = discovery_db(project);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = DiscoveryStore::open_readonly(&path, SystemClock)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    store
+        .daily_snapshot()
         .map_err(|e| format!("could not read {}: {e}", path.display()))
 }
 

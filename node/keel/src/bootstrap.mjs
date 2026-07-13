@@ -45,7 +45,11 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   );
   backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
-  const discovery = createDiscovery(cwd);
+  // The explicit `[target."…"]` keys of the SAME effective policy the core
+  // just configured — discovery's "wrapped" classification (dx-spec §2's
+  // coverage gap) must agree with what actually applied.
+  const knownTargets = new Set(Object.keys(policy.target ?? {}));
+  const discovery = createDiscovery(cwd, { knownTargets });
   setRuntime({ enabled: true, backend, discovery });
 
   const uninstallFetch = installFetch(backend, discovery);
