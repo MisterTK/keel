@@ -14,35 +14,54 @@ applied at intercepted call boundaries, backed by a single local journal file.
 No daemon, no port, no login. Uninstalling the package removes the behavior and
 nothing else; your code runs identically without it.
 
-## Status (2026-07-12)
+## Status (2026-07-13)
 
-Tier 1 works end-to-end in **both languages** on the **real native core**, plus
-the CLI and **Tier 2 durable flows with crash resume**:
+Tier 1 **and** Tier 2 (including async durable flows) work end-to-end in
+**both languages** on the **real native core**, plus the CLI, a Postgres
+journal backend for fleet durability, and a scoped Rust front end:
 
 - **Real Rust core** (`crates/keel-core`): async tokio engine, layer chain
-  cache → rate → breaker → timeout → retry, per-attempt timeouts, equal-jitter
-  backoff, SQLite discovery + flow journal, opt-in OTel spans (off by default —
-  see below), and an FFI facade (`crates/keel-ffi`, MessagePack over a C ABI)
-  with PyO3 + napi async bridges.
-- **Python front end** (`python/keel`): `keel run`, import-hook wrapping, httpx +
-  requests adapters, `llm:openai`/`llm:anthropic` packs with the dev cache, and
-  durable-flow designation from `[flows]`.
+  cache → rate (token-bucket) → breaker (count or failure-rate mode) →
+  timeout → retry (with schedule composition), per-attempt timeouts,
+  equal-jitter backoff, idempotency-key injection, a Tier-1 NDJSON event feed
+  (`keel tail`), SQLite or Postgres discovery + flow journal, opt-in OTel
+  spans and metrics (off by default — see below), and an FFI facade
+  (`crates/keel-ffi`, MessagePack over a C ABI) with PyO3 + napi async
+  bridges, both including the Tier-2 flow surface.
+- **Python front end** (`python/keel`): `keel run`, import-hook wrapping,
+  httpx/requests/aiohttp/urllib3/boto3/psycopg adapters, `llm:` packs
+  (openai/anthropic/google-genai) with the dev cache and model fallback
+  chains, `tool:`/`mcp:` semantic targets, agent-framework packs
+  (pydantic-ai/openai-agents/crewai/adk/LangGraph), and durable-flow
+  designation from `[flows]` — synchronous or async.
 - **Node front end** (`node/keel`): loader + `fetch`/undici interception,
-  AI-SDK middleware, `mcp:`/`llm:` packs, `pg`/`ioredis`/`mysql2` database
-  adapters, discovery.
-- **CLI** (`crates/keel-cli`): `run · init · doctor · status · explain · flows ·
-  trace`, every command with a deterministic `--json` twin.
-- **Tier 2**: durable flows in the core + Python front end; `kill -9` a flow
-  mid-run and `keel run` resumes it, replaying completed steps without re-firing
-  their effects (proven by a real subprocess `kill -9` test).
+  AI-SDK middleware (all four ops) + eve integration, `mcp:`/`llm:` packs,
+  `pg`/`ioredis`/`mysql2` database adapters, discovery, and durable-flow
+  designation from `[flows]` (async-only, matching Node's own effect model).
+- **CLI** (`crates/keel-cli`): `run · init · doctor (--effective-policy) ·
+  status · explain · flows (suggest/add/resume) · trace · replay · tail ·
+  fsck · mcp · record (run/list/test) · sim`, every command with a
+  deterministic `--json` twin.
+- **Tier 2**: durable flows in the core + both front ends, on SQLite or
+  Postgres; `kill -9` a flow mid-run and `keel run` resumes it, replaying
+  completed steps without re-firing their effects (proven by real subprocess
+  `kill -9` tests in both languages) — including concurrent async effects
+  inside one flow, which serialize deterministically in await order.
+- **A scoped Rust front end** (`crates/keel` + `crates/keel-macros`):
+  `#[keel::wrap(target = "...")]` plus a `reqwest-middleware` adapter — no
+  `cargo-keel` subcommand or Rust static scanner yet (documented as
+  deferred, not silently missing).
 
-**Overhead:** the worst-case wrapped-call path (cache-miss) measures **~0.56 µs**
+**Overhead:** the worst-case wrapped-call path measures **~0.8 µs**
 against the **10 µs** budget (DX invariant 8), emitted as a CI artifact by
 `scripts/bench-overhead.sh`.
 
-**Honest packaging gap:** wheels (`pip install keel`) and the npm package
-(`npm i -D keel`) are **not published yet** — today you build from source (below).
-The native Python module builds with `maturin`; the CLI with `cargo build`.
+**Honest packaging gap:** wheels (`pip install keel`), the npm package
+(`npm i -D keel`), and the crate (`cargo add keel`) are **not published
+yet** — today you build from source (below). The registry names `keel`/
+`keel-core` collide with unrelated existing projects on npm/PyPI/crates.io;
+see `docs/naming-decision.md` for the options. The native Python module
+builds with `maturin`; the CLI with `cargo build`.
 
 Licensed under [Apache-2.0](LICENSE).
 
@@ -110,20 +129,25 @@ here is the definition of done (normative semantics: `conformance/README.md`).
 
 | Harness | Command | Result |
 |---------|---------|--------|
-| Real Rust core — Tier 1 | `cargo test -p keel-core --test conformance` | 15/15 (paused tokio clock) |
-| Real Rust core — Tier 2 | `cargo test -p keel-core --test flows_conformance` | scenarios 16–17 |
-| Rust stub | `cargo test -p keel-core-stub` | 15/15 (2 Tier 2 skipped: no journal) |
-| Python stub | `python3 conformance/runner.py` | 15/15 (2 Tier 2 skipped) |
-| Node stub | `cd node/keel-core-stub && node --test` | 15/15 (2 Tier 2 skipped) |
-| Python native | `python3 conformance/runner.py --impl native` | 15/15 Tier 1 |
+| Real Rust core — Tier 1 | `cargo test -p keel-core --test conformance` | 21/21 (paused tokio clock) |
+| Real Rust core — Tier 2 (SQLite) | `cargo test -p keel-core --test flows_conformance` | scenarios 16–27 |
+| Real Rust core — Tier 2 (Postgres) | `cargo test -p keel-core --test flows_conformance_postgres` | a real scratch cluster, no docker |
+| Rust stub | `cargo test -p keel-core-stub` | 21/21 (Tier 2 skipped: no journal) |
+| Python stub | `python3 conformance/runner.py` | 21/21 (Tier 2 skipped) |
+| Node stub | `cd node/keel-core-stub && node --test` | 21/21 (Tier 2 skipped) |
+| Python native | `python3 conformance/runner.py --impl native` | 21/21 Tier 1 |
 
-Scenarios 01–15 are Tier 1; **16–17** are Tier 2 (flow resume/substitution and
-`fail`-mode nondeterminism), which need a journal — so the stubs *and* the
-`runner.py` harness (both impls) skip them, and the Tier 2 scenarios are driven
-by the real core's `flows_conformance` binary. Tier 2 **through the native front
-end** is covered by `python/keel/tests/test_resume_demo.py` (real `kill -9` +
-resume) and `test_flows.py`. Plus: `python3 conformance/check_schema.py`
-(policies vs. `policy.schema.json`) and
+Scenarios 01–15 plus 18/19/20/21–22/23 are Tier 1 (the last five added
+breaker rate-mode, token-bucket, schedule composition, and idempotency-key
+injection); **16–27** are Tier 2 (resume/substitution, every nondeterminism
+mode, lease contention, attempt caps, value-step replay, crash-mid-step
+re-execution, pure replay, and replay under a changed policy), which need a
+journal — so the stubs *and* the `runner.py` harness (both impls) skip them,
+and the Tier 2 scenarios are driven by the real core's `flows_conformance`
+(SQLite) and `flows_conformance_postgres` (Postgres) binaries. Tier 2
+**through the native front ends** is covered by real subprocess `kill -9` +
+resume tests in both `python/keel/tests/` and `node/keel/test/`. Plus:
+`python3 conformance/check_schema.py` (policies vs. `policy.schema.json`) and
 `python3 conformance/fixtures/journal/build_fixtures.py` (golden journal DBs).
 
 ## Repo layout
@@ -132,20 +156,24 @@ resume) and `test_flows.py`. Plus: `python3 conformance/check_schema.py`
 contracts/            frozen interfaces (policy schema, FFI, journal, adapter packs) — CCR to change
 crates/
   keel-core-api/      contract types + shared typed policy model
-  keel-core/          THE REAL CORE (Tier 1 + Tier 2 flows): tokio engine, journal, flows
+  keel-core/          THE REAL CORE (Tier 1 + Tier 2 flows): tokio engine, journal, flows, events
+  keel-journal/        SQLite + Postgres Journal implementations
   keel-ffi/           C-ABI facade (MessagePack) + async bridge
-  keel-py/            PyO3 native module (keel_core)
-  keel-node/          napi native addon
-  keel-cli/           the `keel` binary (run|init|doctor|status|explain|flows|trace|mcp)
+  keel-py/            PyO3 native module (keel_core), incl. the Tier-2 async flow bridge
+  keel-node/          napi native addon, incl. the Tier-2 async flow bridge
+  keel-cli/           the `keel` binary (run|init|doctor|status|explain|flows|trace|replay|
+                        tail|fsck|mcp|record|sim), each with a scan/ static scanner (py, oxc-js)
+  keel/                scoped Rust front end: #[keel::wrap] + reqwest-middleware
+  keel-macros/          the #[keel::wrap] proc macro
   keel-core-stub/     in-memory reference stub (Rust); keel-conformance/ shared harness
-python/keel/          Python front end (import hook, adapters, llm packs, flows)
+python/keel/          Python front end (import hook, adapters, packs, flows, record, sim)
 python/keel-core-stub/  the same stub, pure Python
-node/keel/            Node front end (loader, fetch, ai-sdk/mcp/llm packs)
+node/keel/            Node front end (loader, fetch, packs, flows, record, sim)
 node/keel-core-stub/    the same stub, pure Node
 conformance/          scenario matrix + runners; fixtures/journal/ golden DBs
 demos/                four runnable demos + the storyboard
-tools/faultproxy/     scriptable deterministic fault-injecting proxy (demos + tests)
-docs/                 the specs + sprint plan
+tools/faultproxy/     scriptable deterministic fault-injecting proxy (demos, tests, keel sim)
+docs/                 the specs, sprint plan, CCRs, and the recording/sim/targeting format docs
 ```
 
 ## How work proceeds
