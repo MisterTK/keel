@@ -5,8 +5,9 @@
 //! Two scanners, one merged result:
 //! - [`python`] shells an `ast`-walker out to `python3 -` for precise Python
 //!   parsing (imports of known effect libraries, URL/DSN string literals).
-//! - [`js`] does a **documented-simplification** regex scan of JS/TS for
-//!   `fetch`/`undici`/`node:http` usage, provider-SDK imports, and URL literals.
+//! - [`js`] parses JS/TS/JSX in-process with oxc (no Node toolchain needed)
+//!   for `fetch`/`undici`/`node:http` usage, provider-SDK imports, effect-lib
+//!   call sites, and URL literals.
 //!
 //! Both label every finding with `file:line`, so the generated `keel.toml` can
 //! cite where each target was found and trust stays inspectable.
@@ -26,6 +27,26 @@ pub enum TargetClass {
     Host,
     /// A semantic `llm:<provider>` target — from a provider SDK import.
     Llm,
+}
+
+/// One effect call site with enclosing-function attribution — an internal
+/// detail of the JS/TS pass ([`js`]), which uses it to verify its real
+/// scope-chain tracking (dotted paths like `Class.method`) independently of
+/// the coarser top-level-only [`FunctionFacts`] attribution `keel flows
+/// suggest` consumes. Not exposed on [`ScanResult`]. Field order is the sort
+/// order (file, then line).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallSite {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// 1-based line of the call expression.
+    pub line: u32,
+    /// What is called, rooted at the effect library where the receiver is
+    /// known (`fetch`, `undici.request`, `openai.chat.completions.create`).
+    pub callee: String,
+    /// Dotted enclosing-scope path (`Class.method`, `outer.inner`), or `None`
+    /// at module top level. Anonymous scopes inherit the nearest named scope.
+    pub function: Option<String>,
 }
 
 /// One place a target was seen: a project-relative path and 1-based line.
@@ -58,9 +79,12 @@ pub struct TargetEvidence {
 /// Each language pass attributes what it finds *inside* a function definition
 /// to that function: intercepted-effect call sites, calls that read time or
 /// randomness (virtualized under Tier 2 replay), and constructs that defeat
-/// replay outright (threads, subprocesses, raw sockets). Precision is the
-/// language pass's business: the Python walker attributes by real AST
-/// containment; the JS pass is a documented line-heuristic (see [`js`]).
+/// replay outright (threads, subprocesses, raw sockets). Both passes
+/// attribute by real containment: the Python walker via `ast` module-level
+/// def bodies, the JS/TS pass via a real oxc scope walk (see [`js`]) — an
+/// entry opens only for a function bound directly at module top level; class
+/// methods and nested/inner functions roll up into the enclosing top-level
+/// entry rather than opening their own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionFacts {
     /// The full flow-entrypoint ref this function would be designated as —
@@ -159,6 +183,8 @@ pub struct LangFindings {
     pub http_in_use: bool,
     /// Effect-library names detected (for `keel doctor`'s registry cross-check).
     pub libs: BTreeSet<String>,
+    /// Effect call sites with enclosing-function attribution.
+    pub call_sites: Vec<CallSite>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {

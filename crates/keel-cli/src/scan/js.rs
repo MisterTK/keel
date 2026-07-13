@@ -1,55 +1,84 @@
-//! The JS/TS static scan — a **documented simplification**.
+//! The JS/TS static scan — a real parse on [oxc](https://oxc.rs).
 //!
-//! Unlike the Python pass (which uses a real parser), this is a line-oriented
-//! textual scan: no JS AST, no dependency on a Node toolchain at `keel init`
-//! time. It looks for the seams `keel init` needs and nothing more:
+//! oxc is pure Rust, so `keel init` still needs no Node toolchain (the design
+//! constraint the old line-oriented scan existed to satisfy — this replaces
+//! that documented simplification with an actual AST walk, dx-spec §2). Per
+//! file, [`ast`] extracts:
 //!
-//! - HTTP in use: a `fetch(` call, or an import/require of `undici` or
-//!   `node:http`/`node:https` (`http`/`https`).
-//! - provider SDKs: an import/require of `openai` or `@anthropic-ai/sdk`
-//!   (also bare `anthropic`) → `llm:*` targets.
-//! - URL literals: `http(s)://host…` inside a string → host targets.
+//! - HTTP in use: a `fetch(…)` call, or an import/require/dynamic-import of a
+//!   known outbound client (`undici`, `node:http`/`https`, `axios`, `got`,
+//!   `node-fetch`, `superagent`, DB clients like `pg`/`redis`) — including
+//!   multi-line and aliased forms the old regex missed.
+//! - provider SDKs: `openai`, `@anthropic-ai/sdk` (also bare `anthropic`),
+//!   AI-SDK provider packages → `llm:*` targets. TS `import type` is excluded:
+//!   type-only imports are erased at runtime and are not evidence.
+//! - URL literals: hosts from string literals *and* template-literal quasis
+//!   (`` `https://api.x.com/${id}` `` resolves; `` `${scheme}://x` `` no
+//!   longer false-positives).
+//! - effect call sites with enclosing-function attribution
+//!   ([`super::CallSite`]) for `keel flows suggest`, and a relative-import
+//!   module graph ([`JsScan::imports`]).
 //!
 //! The tradeoff (accepted here): a URL built by concatenation, or an exotic
 //! import form, is missed — exactly the ~20% the import-time and observed-run
 //! evidence sources exist to catch (dx-spec §2). Line numbers are exact.
 //!
-//! ## Function attribution (for `keel flows suggest`) — what this pass CAN
-//! and CANNOT do
+//! ## Function attribution (for `keel flows suggest`)
 //!
-//! Being line-oriented, the attribution is a brace-depth heuristic, not a
-//! parse. It **can** attribute to *top-level named functions*: declarations
-//! (`function f(…) {`, `export async function f(…) {`) and initializers
-//! (`const f = async (…) => {`, `const f = function (…) {`), including
-//! single-line arrow bodies. Everything found between a tracked declaration
-//! and the brace that closes it counts toward that function — so effects
-//! inside nested callbacks, inner arrows, and helper closures attribute to
-//! the enclosing top-level function (usually what you want for a flow
-//! verdict, but it is containment-by-lines, not by scope).
+//! [`ast::ScanVisitor`] tracks a real enclosing-scope stack, so attribution
+//! is exact scope containment, not a line heuristic. A [`super::FunctionFacts`]
+//! entry opens for a **function bound directly at module top level**: a
+//! function declaration (`function f(…) {`, `export async function f(…) {`),
+//! a named function expression, or an arrow assigned directly to a top-level
+//! `const`/`let`/`var` (`const f = () => {…}`, `const f = function () {…}`).
+//! Everything lexically nested inside it — inner arrows, callbacks, helper
+//! closures — attributes to that top-level entry, exactly like the Python
+//! pass's real `ast` containment (`scan::python`).
 //!
-//! It **cannot** attribute: class methods, unnamed `export default` values,
-//! object-literal methods, functions whose opening `{` sits on its own line
-//! (Allman style), or code after a template-literal `${…}` that desyncs the
-//! per-line quote tracking. Those findings still appear in the file-level
-//! scan; they are just not credited to a function. The Python pass has none
-//! of these limits (real AST); `keel flows suggest` says so in its notes.
+//! Class methods and object-literal methods do **not** open their own entry
+//! — even though the scope walk names them (`Class.method` shows up in
+//! [`super::CallSite::function`] for call-site evidence), a class body is not
+//! a flow entrypoint any more than a Python `class` body is. A `fetch` inside
+//! `class Api { async load() {…} }` is evidenced in the file-level scan (host
+//! literals, call sites) but not credited to a function. The same holds for
+//! anonymous top-level values (`export default function () {…}`): still
+//! evidenced, never a flow candidate. This is strictly more precise than the
+//! old line-heuristic scan it replaces, which additionally missed Allman-brace
+//! functions and desynced on template-literal interpolation.
+//!
+//! A file that fails to parse is warned about on stderr and skipped — never a
+//! crash, and never silent narrowing (mirrors the Python pass's
+//! parse-or-skip). `files_scanned` counts parsed files only.
 
+mod ast;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::{FunctionFacts, LangFindings, SKIP_DIRS, Sighting, host_from_url};
+use super::{FunctionFacts, LangFindings, SKIP_DIRS};
 
 /// Extensions the scan reads.
 const JS_EXTS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
+/// Extensions tried, in order, when resolving an extensionless relative
+/// import (`./x` → `x.ts`, …, then `x/index.ts`, …).
+const RESOLVE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
 /// The JS pass result.
 #[derive(Debug, Clone, Default)]
 pub struct JsScan {
-    /// Files read.
+    /// Files parsed (a file that failed to parse is not counted).
     pub files_scanned: usize,
+    /// Project-relative paths that failed to parse (warned on stderr, skipped).
+    pub parse_failures: Vec<String>,
+    /// Module graph: file → project-local files it imports. Relative
+    /// specifiers only, resolved against the scanned file set (exact path,
+    /// then per-extension, then `…/index.<ext>`).
+    pub imports: BTreeMap<String, BTreeSet<String>>,
     /// Findings, ready to merge.
     pub findings: LangFindings,
-    /// Per-function attribution (top-level named functions only — see the
-    /// module docs for the heuristic's honest limits).
+    /// Per-function attribution (top-level named functions only — real AST
+    /// scope containment, see the module docs for the exact policy).
     pub functions: Vec<FunctionFacts>,
 }
 
@@ -59,363 +88,74 @@ pub fn scan(project: &Path) -> JsScan {
     collect(project, &mut files);
     files.sort();
 
+    let rels: Vec<String> = files.iter().map(|p| relative(project, p)).collect();
+    let known: BTreeSet<&str> = rels.iter().map(String::as_str).collect();
+
     let mut result = JsScan::default();
-    for path in &files {
+    for (path, rel) in files.iter().zip(&rels) {
         let Ok(src) = std::fs::read_to_string(path) else {
             continue;
         };
-        result.files_scanned += 1;
-        let rel = relative(project, path);
-        scan_source(&src, &rel, &mut result.findings);
-        result.functions.extend(scan_functions(&src, &rel));
+        if let Some(extras) = ast::scan_source(&src, rel, &mut result.findings) {
+            result.files_scanned += 1;
+            result.functions.extend(extras.functions);
+            let resolved: BTreeSet<String> = extras
+                .relative_imports
+                .iter()
+                .filter_map(|spec| resolve_relative(rel, spec, &known))
+                .collect();
+            if !resolved.is_empty() {
+                result.imports.insert(rel.clone(), resolved);
+            }
+        } else {
+            eprintln!("keel: warning: skipped {rel}: JS/TS parse failed");
+            result.parse_failures.push(rel.clone());
+        }
     }
     result
 }
 
-/// Scan one file's text. Split out so it is unit-testable without touching the
-/// filesystem.
-fn scan_source(src: &str, rel: &str, findings: &mut LangFindings) {
-    for (idx, line) in src.lines().enumerate() {
-        let lineno = u32::try_from(idx + 1).unwrap_or(u32::MAX);
-        if line_uses_http(line) {
-            findings.http_in_use = true;
-            record_http_libs(line, findings);
-        }
-        if let Some(provider) = provider_import(line) {
-            findings.libs.insert(provider.to_owned());
-            findings.llm.push((
-                provider.to_owned(),
-                Sighting {
-                    file: rel.to_owned(),
-                    line: lineno,
-                },
-            ));
-        }
-        for host in hosts_in_line(line) {
-            findings.hosts.push((
-                host,
-                Sighting {
-                    file: rel.to_owned(),
-                    line: lineno,
-                },
-            ));
+/// Resolve a relative import specifier against the scanned file set:
+/// exact path, then `<spec>.<ext>`, then `<spec>/index.<ext>`.
+fn resolve_relative(importer: &str, spec: &str, known: &BTreeSet<&str>) -> Option<String> {
+    let dir = importer.rsplit_once('/').map_or("", |(d, _)| d);
+    let joined = normalize(dir, spec)?;
+    if known.contains(joined.as_str()) {
+        return Some(joined);
+    }
+    for ext in RESOLVE_EXTS {
+        let candidate = format!("{joined}.{ext}");
+        if known.contains(candidate.as_str()) {
+            return Some(candidate);
         }
     }
-}
-
-/// Does this line evidence an HTTP client? (`fetch(`, or an `undici`/`node:http`
-/// import/require.)
-fn line_uses_http(line: &str) -> bool {
-    if contains_call(line, "fetch") {
-        return true;
-    }
-    [
-        "undici",
-        "node:http",
-        "node:https",
-        "\"http\"",
-        "'http'",
-        "\"https\"",
-        "'https'",
-    ]
-    .iter()
-    .any(|needle| line.contains(needle) && (line.contains("import") || line.contains("require")))
-}
-
-/// Record which HTTP library names a line references, for `keel doctor`.
-fn record_http_libs(line: &str, findings: &mut LangFindings) {
-    if contains_call(line, "fetch") {
-        findings.libs.insert("fetch".to_owned());
-    }
-    if line.contains("undici") && (line.contains("import") || line.contains("require")) {
-        findings.libs.insert("undici".to_owned());
-    }
-    let http_specifiers = [
-        "node:http",
-        "node:https",
-        "\"http\"",
-        "'http'",
-        "\"https\"",
-        "'https'",
-    ];
-    if http_specifiers.iter().any(|n| line.contains(n))
-        && (line.contains("import") || line.contains("require"))
-    {
-        findings.libs.insert("http".to_owned());
-    }
-}
-
-/// If this line imports/requires a known provider SDK, return the provider key.
-fn provider_import(line: &str) -> Option<&'static str> {
-    if !(line.contains("import") || line.contains("require")) {
-        return None;
-    }
-    // Match the module specifier inside quotes to avoid matching a variable
-    // named `openai`.
-    let openai = ["\"openai\"", "'openai'"];
-    let anthropic = [
-        "\"@anthropic-ai/sdk\"",
-        "'@anthropic-ai/sdk'",
-        "\"anthropic\"",
-        "'anthropic'",
-    ];
-    if openai.iter().any(|q| line.contains(q)) {
-        Some("openai")
-    } else if anthropic.iter().any(|q| line.contains(q)) {
-        Some("anthropic")
-    } else {
-        None
-    }
-}
-
-/// Every `scheme://host` host named in a string literal on this line.
-fn hosts_in_line(line: &str) -> Vec<String> {
-    let mut hosts = Vec::new();
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while let Some(rel) = line[i..].find("://") {
-        let scheme_end = i + rel;
-        // walk back over the scheme to its start.
-        let mut start = scheme_end;
-        while start > 0 {
-            let c = bytes[start - 1];
-            if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-') {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        // the literal runs until a quote/backtick/whitespace/closing paren.
-        let tail_start = scheme_end + 3;
-        let end = line[tail_start..]
-            .find(|c: char| c == '"' || c == '\'' || c == '`' || c.is_whitespace() || c == ')')
-            .map_or(line.len(), |off| tail_start + off);
-        let candidate = &line[start..end];
-        if let Some(host) = host_from_url(candidate) {
-            hosts.push(host);
-        }
-        i = end.max(scheme_end + 3);
-    }
-    hosts
-}
-
-/// A crude "identifier `(`" check: `name` immediately followed (after optional
-/// spaces) by `(`, not preceded by an identifier char (so `myfetch(` and
-/// `.fetch(` on an unrelated object still count only as a `fetch(` call, which
-/// is acceptable for this heuristic).
-fn contains_call(line: &str, name: &str) -> bool {
-    let mut from = 0;
-    while let Some(rel) = line[from..].find(name) {
-        let at = from + rel;
-        let after = at + name.len();
-        let before_ok = at == 0
-            || !line.as_bytes()[at - 1].is_ascii_alphanumeric() && line.as_bytes()[at - 1] != b'_';
-        let after_ok = line[after..].trim_start().starts_with('(');
-        if before_ok && after_ok {
-            return true;
-        }
-        from = after;
-    }
-    false
-}
-
-// ---- per-function attribution (line heuristic; limits in the module docs) ----
-
-/// A top-level function whose body is currently being attributed.
-struct OpenFunction {
-    facts: FunctionFacts,
-    /// Brace depth before the declaration line; the function closes when the
-    /// running depth returns to this value.
-    base_depth: i32,
-}
-
-/// Attribute effects / time / random / unsafe lines to top-level named
-/// functions by brace-depth tracking. Split out so it is unit-testable.
-fn scan_functions(src: &str, rel: &str) -> Vec<FunctionFacts> {
-    let mut out = Vec::new();
-    let mut open: Option<OpenFunction> = None;
-    let mut depth: i32 = 0;
-    for (idx, line) in src.lines().enumerate() {
-        let lineno = u32::try_from(idx + 1).unwrap_or(u32::MAX);
-        let (opens, closes) = brace_deltas(line);
-        if open.is_none()
-            && depth == 0
-            && let Some(name) = function_decl_name(line)
-        {
-            let mut facts = FunctionFacts {
-                entrypoint: format!("ts:{rel}#{name}"),
-                file: rel.to_owned(),
-                line: lineno,
-                ..FunctionFacts::default()
-            };
-            // The declaration line itself may carry the whole body
-            // (`const f = () => fetch(u);`).
-            attribute_line(line, rel, lineno, &mut facts);
-            if opens > closes {
-                open = Some(OpenFunction {
-                    facts,
-                    base_depth: depth,
-                });
-            } else {
-                out.push(facts);
-            }
-            depth += opens - closes;
-            continue;
-        }
-        if let Some(of) = open.as_mut() {
-            attribute_line(line, rel, lineno, &mut of.facts);
-        }
-        depth += opens - closes;
-        if let Some(of) = open.as_ref()
-            && depth <= of.base_depth
-        {
-            out.push(open.take().expect("checked Some above").facts);
-        }
-    }
-    if let Some(of) = open {
-        out.push(of.facts); // EOF closed the file mid-function; keep the facts.
-    }
-    out
-}
-
-/// If `line` declares a top-level named function, return its name. Recognized:
-/// `[export] [default] [async] function[*] NAME(` and
-/// `[export] const|let|var NAME = …` where the initializer is a function or
-/// arrow (`function` / `=>` on the same line).
-fn function_decl_name(line: &str) -> Option<String> {
-    let mut t = line.trim_start();
-    for prefix in ["export ", "default ", "async "] {
-        if let Some(rest) = t.strip_prefix(prefix) {
-            t = rest.trim_start();
-        }
-    }
-    if let Some(rest) = t.strip_prefix("function") {
-        // Require a real keyword boundary (`functional(…)` is not a decl).
-        if !rest.starts_with([' ', '\t', '*']) {
-            return None;
-        }
-        let rest = rest
-            .trim_start()
-            .strip_prefix('*')
-            .unwrap_or(rest)
-            .trim_start();
-        let name = leading_identifier(rest)?;
-        if rest[name.len()..].trim_start().starts_with('(') {
-            return Some(name.to_owned());
-        }
-        return None;
-    }
-    for kw in ["const ", "let ", "var "] {
-        if let Some(rest) = t.strip_prefix(kw) {
-            let rest = rest.trim_start();
-            let name = leading_identifier(rest)?;
-            let after = rest[name.len()..].trim_start();
-            let assigns =
-                after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>");
-            if assigns && (line.contains("=>") || line.contains("function")) {
-                return Some(name.to_owned());
-            }
-            return None;
+    for ext in RESOLVE_EXTS {
+        let candidate = format!("{joined}/index.{ext}");
+        if known.contains(candidate.as_str()) {
+            return Some(candidate);
         }
     }
     None
 }
 
-/// The leading JS identifier of `s`, if any.
-fn leading_identifier(s: &str) -> Option<&str> {
-    let first = s.chars().next()?;
-    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
-        return None;
-    }
-    let end = s
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-        .unwrap_or(s.len());
-    Some(&s[..end])
-}
-
-/// `(opens, closes)` braces on this line, skipping quoted strings and the tail
-/// of a `//` comment. Template-literal `${…}` interpolation is not tracked —
-/// a documented limit of the line heuristic.
-fn brace_deltas(line: &str) -> (i32, i32) {
-    let mut opens = 0;
-    let mut closes = 0;
-    let mut quote: Option<char> = None;
-    let mut prev = '\0';
-    for c in line.chars() {
-        if let Some(q) = quote {
-            if c == q && prev != '\\' {
-                quote = None;
+/// Join `dir` and a `./`/`../` specifier, normalizing `.` and `..` segments.
+/// `None` when `..` escapes the project root.
+fn normalize(dir: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
             }
-        } else {
-            match c {
-                '"' | '\'' | '`' => quote = Some(c),
-                '{' => opens += 1,
-                '}' => closes += 1,
-                '/' if prev == '/' => break,
-                _ => {}
-            }
-        }
-        prev = c;
-    }
-    (opens, closes)
-}
-
-/// Fold one body line into the open function's facts.
-fn attribute_line(line: &str, rel: &str, lineno: u32, f: &mut FunctionFacts) {
-    let fetches = count_calls(line, "fetch");
-    f.effects += fetches;
-    // Same-line method literal only: a POST/PATCH in a multi-line options
-    // object is missed (documented limit of the line heuristic).
-    if fetches > 0
-        && ["\"POST\"", "'POST'", "\"PATCH\"", "'PATCH'"]
-            .iter()
-            .any(|m| line.contains(m))
-    {
-        f.idempotent_unsafe += 1;
-    }
-    for needle in ["Date.now(", "new Date(", "performance.now("] {
-        f.time_reads += count_substr(line, needle);
-    }
-    for needle in [
-        "Math.random(",
-        "crypto.randomUUID(",
-        "crypto.getRandomValues(",
-    ] {
-        f.random_reads += count_substr(line, needle);
-    }
-    for host in hosts_in_line(line) {
-        f.targets.insert(host);
-    }
-    for needle in ["child_process", "worker_threads"] {
-        if line.contains(needle) {
-            f.unsafe_reasons
-                .push(format!("{needle} use at {rel}:{lineno}"));
+            other => parts.push(other),
         }
     }
-}
-
-/// How many times `name(` occurs as a call on this line (the counting twin of
-/// [`contains_call`]).
-fn count_calls(line: &str, name: &str) -> u32 {
-    let mut count = 0;
-    let mut from = 0;
-    while let Some(rel) = line[from..].find(name) {
-        let at = from + rel;
-        let after = at + name.len();
-        let before_ok = at == 0
-            || !line.as_bytes()[at - 1].is_ascii_alphanumeric() && line.as_bytes()[at - 1] != b'_';
-        let after_ok = line[after..].trim_start().starts_with('(');
-        if before_ok && after_ok {
-            count += 1;
-        }
-        from = after;
-    }
-    count
-}
-
-/// Non-overlapping occurrences of `needle` in `line`.
-fn count_substr(line: &str, needle: &str) -> u32 {
-    u32::try_from(line.matches(needle).count()).unwrap_or(u32::MAX)
+    Some(parts.join("/"))
 }
 
 /// Recursively collect scannable files, skipping [`SKIP_DIRS`] and dotdirs.
@@ -453,12 +193,37 @@ fn relative(project: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Parse one in-memory source as `name` and return its findings and
+    /// per-top-level-function attribution.
+    fn scan_str_named(src: &str, name: &str) -> (LangFindings, Vec<FunctionFacts>) {
+        let mut f = LangFindings::default();
+        let extras = ast::scan_source(src, name, &mut f).expect("fixture failed to parse");
+        (f, extras.functions)
+    }
+
+    /// Parse one in-memory source as `name` and return its findings.
+    fn findings_named(src: &str, name: &str) -> LangFindings {
+        scan_str_named(src, name).0
+    }
 
     fn findings(src: &str) -> LangFindings {
-        let mut f = LangFindings::default();
-        scan_source(src, "app.ts", &mut f);
-        f
+        findings_named(src, "app.ts")
     }
+
+    /// Parse one in-memory source as `name` and return its per-top-level-
+    /// function attribution.
+    fn functions_named(src: &str, name: &str) -> Vec<FunctionFacts> {
+        scan_str_named(src, name).1
+    }
+
+    fn functions(src: &str) -> Vec<FunctionFacts> {
+        functions_named(src, "app.ts")
+    }
+
+    // ---- conformance with the old regex scan (same inputs, same findings) ----
 
     #[test]
     fn fetch_and_url_literal_are_found() {
@@ -467,6 +232,7 @@ mod tests {
         assert_eq!(f.hosts.len(), 1);
         assert_eq!(f.hosts[0].0, "api.example.com");
         assert_eq!(f.hosts[0].1.line, 1);
+        assert!(f.libs.contains("fetch"));
     }
 
     #[test]
@@ -477,12 +243,15 @@ mod tests {
         let providers: Vec<_> = f.llm.iter().map(|(p, _)| p.as_str()).collect();
         assert!(providers.contains(&"openai"));
         assert!(providers.contains(&"anthropic"));
+        assert_eq!(f.llm[0].1.line, 1);
+        assert_eq!(f.llm[1].1.line, 2);
     }
 
     #[test]
     fn undici_import_marks_http_in_use() {
         let f = findings("import { request } from \"undici\";\n");
         assert!(f.http_in_use);
+        assert!(f.libs.contains("undici"));
     }
 
     #[test]
@@ -493,12 +262,256 @@ mod tests {
 
     #[test]
     fn multiple_hosts_on_one_line() {
-        let f = findings("x(\"https://a.example.com\", \"https://b.example.com/p\")\n");
+        let f = findings("fetch(1);\nx(\"https://a.example.com\", \"https://b.example.com/p\");\n");
         let hosts: Vec<_> = f.hosts.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(hosts, ["a.example.com", "b.example.com"]);
+        assert_eq!(f.hosts[0].1.line, 2);
     }
 
-    // ---- function attribution (line heuristic) ----
+    #[test]
+    fn member_fetch_still_counts() {
+        // The old scan accepted `.fetch(` — keep that looseness: it is how
+        // `globalThis.fetch(…)` and `this.fetch(…)` appear.
+        let f = findings("globalThis.fetch(\"https://api.example.com\");\n");
+        assert!(f.http_in_use);
+        assert!(f.libs.contains("fetch"));
+    }
+
+    // ---- cases the regex provably got wrong, now correct ----
+
+    #[test]
+    fn multi_line_import_is_found() {
+        // The specifier and the `import` keyword sit on different lines: the
+        // line-oriented scan missed this entirely.
+        let f = findings("import {\n  request,\n} from \"undici\";\n");
+        assert!(f.http_in_use);
+        assert!(f.libs.contains("undici"));
+    }
+
+    #[test]
+    fn import_type_is_not_runtime_evidence() {
+        // `import type` is erased by tsc: the regex flagged it as an OpenAI
+        // dependency; the AST walk knows better.
+        let f = findings("import type { ChatModel } from \"openai\";\n");
+        assert!(f.llm.is_empty());
+        assert!(!f.http_in_use);
+    }
+
+    #[test]
+    fn type_only_specifier_is_skipped_but_value_binds() {
+        let f =
+            findings("import { type ClientOptions, request } from \"undici\";\nrequest(\"x\");\n");
+        assert!(f.http_in_use);
+        let callees: Vec<_> = f.call_sites.iter().map(|c| c.callee.as_str()).collect();
+        assert_eq!(callees, ["undici.request"]);
+    }
+
+    #[test]
+    fn template_literal_host_is_found() {
+        let f = findings("const id = 1;\nawait fetch(`https://api.example.com/v1/${id}`);\n");
+        assert_eq!(f.hosts.len(), 1);
+        assert_eq!(f.hosts[0].0, "api.example.com");
+        assert_eq!(f.hosts[0].1.line, 2);
+    }
+
+    #[test]
+    fn interpolated_scheme_is_not_a_false_positive_host() {
+        // The regex walked back from `://` across the `}` and reported
+        // `internal` as a host. The quasi has no scheme, so no host.
+        let f = findings("const scheme = \"https\";\nconst u = `${scheme}://internal`;\n");
+        assert!(f.hosts.is_empty());
+    }
+
+    #[test]
+    fn require_and_dynamic_import_are_imports() {
+        let cjs = findings_named(
+            "const { request } = require(\"undici\");\nrequest(\"https://api.example.com\");\n",
+            "app.cjs",
+        );
+        assert!(cjs.http_in_use);
+        assert!(cjs.libs.contains("undici"));
+        assert_eq!(cjs.call_sites[0].callee, "undici.request");
+
+        let dynamic = findings("const undici = await import(\"undici\");\n");
+        assert!(dynamic.http_in_use);
+        assert!(dynamic.libs.contains("undici"));
+    }
+
+    #[test]
+    fn subpath_import_classifies_by_package() {
+        let f = findings("import { toFile } from \"openai/uploads\";\n");
+        assert_eq!(f.llm.len(), 1);
+        assert_eq!(f.llm[0].0, "openai");
+    }
+
+    // ---- new evidence the regex never had ----
+
+    #[test]
+    fn effect_lib_imports_gate_hosts() {
+        // A pg import plus a DSN literal yields the DB host (the Python pass
+        // resolves the same shape via psycopg + DSN).
+        let f = findings(
+            "import { Client } from \"pg\";\nconst DSN = \"postgres://db.internal:5432/app\";\n",
+        );
+        assert!(f.http_in_use);
+        assert!(f.libs.contains("pg"));
+        assert_eq!(f.hosts[0].0, "db.internal");
+    }
+
+    #[test]
+    fn axios_default_import_call_sites() {
+        let f = findings(
+            "import axios from \"axios\";\nawait axios.get(\"https://api.example.com\");\n",
+        );
+        assert!(f.http_in_use);
+        assert!(f.libs.contains("axios"));
+        assert_eq!(f.call_sites[0].callee, "axios.get");
+    }
+
+    #[test]
+    fn client_instance_traces_back_to_provider() {
+        let f = findings(
+            "import OpenAI from \"openai\";\nconst client = new OpenAI();\n\
+             export async function ask() {\n  return client.chat.completions.create({});\n}\n",
+        );
+        assert_eq!(f.call_sites.len(), 1);
+        let site = &f.call_sites[0];
+        assert_eq!(site.callee, "openai.chat.completions.create");
+        assert_eq!(site.function.as_deref(), Some("ask"));
+        assert_eq!(site.line, 4);
+    }
+
+    #[test]
+    fn ai_sdk_provider_packages_pin_llm_targets() {
+        let f = findings("import { anthropic } from \"@ai-sdk/anthropic\";\n");
+        assert!(f.libs.contains("ai-sdk"));
+        assert_eq!(f.llm[0].0, "anthropic");
+    }
+
+    // ---- attribution ----
+
+    #[test]
+    fn attribution_covers_functions_methods_and_arrows() {
+        let f = findings(
+            "class Api {\n  async load() {\n    return fetch(\"https://a.x\");\n  }\n}\n\
+             function outer() {\n  const inner = async () => fetch(\"https://b.x\");\n  return inner;\n}\n\
+             const top = fetch(\"https://c.x\");\n",
+        );
+        let sites: Vec<(&str, Option<&str>)> = f
+            .call_sites
+            .iter()
+            .map(|c| (c.callee.as_str(), c.function.as_deref()))
+            .collect();
+        assert_eq!(
+            sites,
+            [
+                ("fetch", Some("Api.load")),
+                ("fetch", Some("outer.inner")),
+                ("fetch", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn tsx_parses_with_jsx_and_types() {
+        let f = findings_named(
+            "type Props = { url: string };\n\
+             export function Widget({ url }: Props) {\n\
+               const load = () => fetch(\"https://api.example.com\");\n\
+               return <button onClick={load}>go</button>;\n\
+             }\n",
+            "widget.tsx",
+        );
+        assert!(f.http_in_use);
+        assert_eq!(f.hosts[0].0, "api.example.com");
+        assert_eq!(
+            f.call_sites[0].function.as_deref(),
+            Some("Widget.load"),
+            "arrow inside a component attributes to Widget.load"
+        );
+    }
+
+    // ---- pass-level behavior (filesystem) ----
+
+    #[test]
+    fn broken_file_is_skipped_never_fatal() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("broken.ts"), "function (((\n").unwrap();
+        fs::write(dir.path().join("ok.ts"), "import \"undici\";\n").unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(scan.files_scanned, 1, "only the parseable file counts");
+        assert_eq!(scan.parse_failures, ["broken.ts"]);
+        assert!(scan.findings.http_in_use);
+    }
+
+    #[test]
+    fn import_graph_resolves_relative_specifiers() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("lib")).unwrap();
+        fs::write(
+            dir.path().join("app.ts"),
+            "import { helper } from \"./lib/helper\";\nimport { util } from \"./util\";\n\
+             import express from \"express\";\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("util.ts"), "export const util = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("lib").join("helper.ts"),
+            "import { util } from \"../util\";\nexport const helper = util;\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(scan.files_scanned, 3);
+        assert_eq!(
+            scan.imports.get("app.ts"),
+            Some(&BTreeSet::from([
+                "lib/helper.ts".to_owned(),
+                "util.ts".to_owned()
+            ]))
+        );
+        assert_eq!(
+            scan.imports.get("lib/helper.ts"),
+            Some(&BTreeSet::from(["util.ts".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn import_graph_resolves_index_files() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("api")).unwrap();
+        fs::write(dir.path().join("app.js"), "import api from \"./api\";\n").unwrap();
+        fs::write(
+            dir.path().join("api").join("index.js"),
+            "export default 1;\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(
+            scan.imports.get("app.js"),
+            Some(&BTreeSet::from(["api/index.js".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn deterministic_across_runs() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            "import { request } from \"undici\";\nrequest(\"https://a.example.com\");\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.ts"),
+            "await fetch(\"https://b.example.com\");\n",
+        )
+        .unwrap();
+        let one = scan(dir.path());
+        let two = scan(dir.path());
+        assert_eq!(format!("{:?}", one.findings), format!("{:?}", two.findings));
+        assert_eq!(one.imports, two.imports);
+    }
+
+    // ---- function attribution (real AST scope containment) ----
 
     #[test]
     fn attributes_fetch_time_random_to_top_level_functions() {
@@ -514,13 +527,13 @@ function pure(a, b) {
   return a + b;
 }
 ";
-        let fns = scan_functions(src, "app.mjs");
+        let fns = functions_named(src, "app.mjs");
         assert_eq!(fns.len(), 2);
         let ingest = &fns[0];
         assert_eq!(ingest.entrypoint, "ts:app.mjs#ingest");
         assert_eq!((ingest.file.as_str(), ingest.line), ("app.mjs", 1));
         assert_eq!(ingest.effects, 1);
-        assert_eq!(ingest.idempotent_unsafe, 1, "same-line POST literal");
+        assert_eq!(ingest.idempotent_unsafe, 1, "object-literal POST method");
         assert_eq!(ingest.time_reads, 1);
         assert_eq!(ingest.random_reads, 1);
         assert!(ingest.targets.contains("api.example.com"));
@@ -538,12 +551,12 @@ const nightly = async () => {
   return results;
 };
 ";
-        let fns = scan_functions(src, "jobs.ts");
+        let fns = functions_named(src, "jobs.ts");
         assert_eq!(fns.len(), 2);
         assert_eq!(fns[0].entrypoint, "ts:jobs.ts#ping");
         assert_eq!(fns[0].effects, 1);
         // The nested map callback's fetch attributes to the enclosing
-        // top-level function — containment-by-lines, per the module docs.
+        // top-level function — real scope containment, not a line heuristic.
         assert_eq!(fns[1].entrypoint, "ts:jobs.ts#nightly");
         assert_eq!(fns[1].effects, 1);
     }
@@ -557,7 +570,7 @@ export function shellOut() {
   return fetch(\"https://api.example.com/v1/x\");
 }
 ";
-        let fns = scan_functions(src, "run.js");
+        let fns = functions_named(src, "run.js");
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].effects, 1);
         assert_eq!(
@@ -577,11 +590,15 @@ class Api {
 functional(1, 2);
 const url = \"https://b.example.com\";
 ";
-        assert!(scan_functions(src, "app.ts").is_empty());
+        assert!(functions(src).is_empty());
     }
 
     #[test]
     fn braces_in_strings_and_comments_do_not_desync_depth() {
+        // A regression fixture from the old line-oriented scan, where braces
+        // inside string/comment text could desync brace-depth tracking. A
+        // real parse never has this problem by construction — kept as a
+        // cheap sanity check that nothing about the new pass reintroduces it.
         let src = "\
 function outer() {
   const s = \"{ not a brace }\";
@@ -592,7 +609,7 @@ function after() {
   return Date.now();
 }
 ";
-        let fns = scan_functions(src, "app.ts");
+        let fns = functions(src);
         assert_eq!(fns.len(), 2);
         assert_eq!(fns[0].effects, 1);
         assert_eq!(fns[1].entrypoint, "ts:app.ts#after");

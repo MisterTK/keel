@@ -49,9 +49,12 @@ use crate::{Rendered, evidence};
 /// A fixed, honest note about the JS/TS scanner's attribution limits, carried
 /// in the report itself so a `--json` consumer learns about it without
 /// reading Rust source.
-const JS_ATTRIBUTION_NOTE: &str = "JS/TS attribution is a line-oriented heuristic: it cannot see \
-     class methods, object-literal methods, or a function whose opening `{` sits on its own \
-     line. Python attribution is exact (real `ast` containment).";
+const JS_ATTRIBUTION_NOTE: &str = "JS/TS attribution is a real AST parse (oxc): effects, time/\
+     random reads, and unsafe constructs are attributed by real scope containment, not a line \
+     heuristic. Only top-level named functions are tracked as flow candidates — effects inside \
+     class methods, object-literal methods, or nested functions/callbacks roll up to the \
+     enclosing top-level function (or are not tracked, for methods). Python attribution is the \
+     same real containment, over Python's own AST.";
 
 /// One candidate flow entrypoint — the machine twin of one `keel flows
 /// suggest` line.
@@ -455,7 +458,7 @@ mod tests {
             json["js_attribution_note"]
                 .as_str()
                 .unwrap()
-                .contains("line-oriented heuristic")
+                .contains("real AST parse")
         );
     }
 
