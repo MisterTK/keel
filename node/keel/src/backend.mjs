@@ -56,6 +56,21 @@ class NativeBackend {
   get persistent() {
     return this.#core.persistent === true;
   }
+  // --- Tier 2: durable flows (native-only; absent on the stub) --------------
+  // Present only when the loaded addon exposes them (checked once at load
+  // time, below) — `_flow.mjs`'s `backendSupportsFlows` probes for these.
+  enterFlow(entrypoint, argsHash, { codeHash, explicitKey, leaseMs } = {}) {
+    return this.#core.enterFlow(entrypoint, argsHash, codeHash, explicitKey, leaseMs);
+  }
+  exitFlow(status) {
+    this.#core.exitFlow(status);
+  }
+  journalTime(key, nowMs) {
+    return this.#core.journalTime(key, nowMs);
+  }
+  journalRandom(key, data) {
+    return this.#core.journalRandom(key, data);
+  }
   layer(target, key) {
     const t = this.#policy.target;
     if (isTable(t) && isTable(t[target]) && t[target][key] !== undefined) return t[target][key];

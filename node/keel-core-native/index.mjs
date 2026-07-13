@@ -4,7 +4,9 @@
  * — `KeelCore` with `configure` / `execute` / `executeAsync` / `report` and the
  * harness-only `advanceClock` + `new KeelCore({ paused: true })` — so it is a
  * drop-in native backend behind node/keel/src/backend.mjs (which probes
- * `KeelCoreNative`).
+ * `KeelCoreNative`). It ALSO exposes the Tier 2 durable-flow surface the stub
+ * does not: `enterFlow` / `exitFlow` / `journalTime` / `journalRandom` — see
+ * node/keel/src/flow.mjs and crates/keel-node/src/lib.rs.
  *
  * Resolution order (first that loads wins):
  *
