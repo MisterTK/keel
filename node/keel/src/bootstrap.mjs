@@ -27,6 +27,7 @@ import { installMysql2Pack } from "./packs/mysql2.mjs";
 import { evePack } from "./packs/eve.mjs";
 import { aiSdkPack } from "./packs/ai-sdk.mjs";
 import { installRecording } from "./record.mjs";
+import { installSim } from "./sim.mjs";
 
 export function isDisabled(env = process.env) {
   return isTruthy(env.KEEL_DISABLE);
@@ -66,18 +67,26 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   );
   backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
+  // `keel sim <plan>`: adapter-level fault injection driven by a declarative
+  // plan (docs/sim-format.md), wired BEFORE the recording tee below so a run
+  // that is somehow both simulated and recorded captures what actually
+  // happened (including any injected faults).
+  const simBackend = env.KEEL_SIM_PLAN
+    ? installSim(backend, { planPath: env.KEEL_SIM_PLAN, env })
+    : backend;
+
   // `keel record run`: tee every intercepted effect into a recording file
   // (docs/recording-format.md). A pure observer — never changes what a
   // wrapped call sees — so `effectiveBackend` (not `backend`) is what every
   // seam below actually wires up.
   const effectiveBackend = env.KEEL_RECORD
-    ? installRecording(backend, {
+    ? installRecording(simBackend, {
         path: env.KEEL_RECORD,
         target: process.argv[1] ?? "",
         args: process.argv.slice(2),
         env,
       })
-    : backend;
+    : simBackend;
 
   // The explicit `[target."…"]` keys of the SAME effective policy the core
   // just configured — discovery's "wrapped" classification (dx-spec §2's
@@ -136,7 +145,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
     });
   }
 
-  installExitFlush(discovery);
+  installExitFlush(discovery, { backend: effectiveBackend });
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection);
   return {
     enabled: true,
@@ -180,7 +189,7 @@ export function applyJournalEnvOverride(policy, env) {
  * terminates with code 128+signum) or step aside (when the app has its own
  * handler that owns termination). We never swallow the signal.
  */
-export function installExitFlush(discovery, { proc = process } = {}) {
+export function installExitFlush(discovery, { proc = process, backend = null } = {}) {
   let flushed = false;
   const flush = () => {
     if (flushed) return;
@@ -189,6 +198,16 @@ export function installExitFlush(discovery, { proc = process } = {}) {
       discovery.flushSync();
     } catch {
       /* best-effort — discovery never throws into the user's program */
+    }
+    // The native engine's live NDJSON event feed (`.keel/events/`) flushes
+    // its writer thread whenever the queue drains, which a long-lived
+    // process never needs help with — but a short-lived script can exit
+    // before its last few events land on disk. Best-effort: the JS engine
+    // (non-native) backend has no such method.
+    try {
+      backend?.flushEvents?.();
+    } catch {
+      /* best-effort — event flush never throws into the user's program */
     }
   };
   proc.once("exit", flush); // normal exit / process.exit()

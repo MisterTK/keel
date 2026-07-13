@@ -24,7 +24,7 @@ from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_flow_entrypoints, extract_function_targets, load_policy
-from ._runtime import clear_runtime, set_runtime
+from ._runtime import clear_runtime, get_backend, set_runtime
 from ._targets import clear_outbound_targets, install_outbound_targets
 from .adapters import Detection, install_adapters, uninstall_adapters
 from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
@@ -168,6 +168,18 @@ def _register_exit_flush() -> None:
     def _flush() -> None:
         if _STATE.discovery is not None:
             _STATE.discovery.close()
+        # The native engine's live NDJSON event feed (`.keel/events/`,
+        # `KEEL_EVENTS`) flushes its writer thread whenever the queue drains,
+        # which a long-lived `keel tail`'d process never needs help with —
+        # but a short-lived `keel run`/`keel sim` script can exit before its
+        # last few events land on disk. Read the CURRENT runtime backend
+        # (`_runtime.get_backend()`, not a snapshot taken at registration
+        # time) since `keel run`/`keel sim` may have since wrapped it in a
+        # RecordingBackend/SimBackend that delegates `flush_events` through.
+        # Best-effort: the stub backend has no such method.
+        flush_events = getattr(get_backend(), "flush_events", None)
+        if callable(flush_events):
+            flush_events()
 
     atexit.register(_flush)
 

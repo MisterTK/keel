@@ -166,6 +166,9 @@ export class RecordingBackend {
   layer(target, key) {
     return this.#inner.layer(target, key);
   }
+  flushEvents() {
+    this.#inner.flushEvents?.();
+  }
   #record(request, outcome, elapsedMs) {
     if (request === null || typeof request !== "object") return;
     if (outcome === null || typeof outcome !== "object") return;

@@ -506,6 +506,22 @@ mod bindings {
             guard.block_on(async { self.engine.report() })
         }
 
+        /// Block until every event emitted so far on this handle's live NDJSON
+        /// feed (`.keel/events/`, `KEEL_EVENTS`) is written and flushed to
+        /// disk. A no-op when no sink is attached. The writer thread already
+        /// flushes whenever its queue drains, so a long-lived process (a
+        /// `keel tail`'d server) needs this for nothing — but a short-lived
+        /// script (`--import keel/hook`, `keel sim`) can exit before its last
+        /// few events drain on their own; the front end calls this once at
+        /// process exit (`installExitFlush`) so a one-shot run's feed is
+        /// always complete for `keel tail`/`keel sim` to read afterward.
+        #[napi]
+        pub fn flush_events(&self) {
+            if let Some(sink) = self.engine.events() {
+                sink.flush();
+            }
+        }
+
         /// Harness-only: advance the paused virtual clock by `ms` milliseconds.
         /// Requires a `{ paused: true }` handle (tokio panics otherwise). `u32`
         /// (a plain JS `number`) covers every virtual-clock advance the suite

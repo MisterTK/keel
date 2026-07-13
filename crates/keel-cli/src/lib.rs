@@ -38,6 +38,7 @@ pub mod replay;
 pub mod resume;
 pub mod run;
 pub mod scan;
+pub mod sim;
 pub mod status;
 pub mod tail;
 
