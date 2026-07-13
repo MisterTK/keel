@@ -1,5 +1,7 @@
-//! Tier-2 conformance (scenarios 16–17, `conformance/scenarios/`) driven
-//! against the real core's [`FlowManager`] over a real [`PostgresJournal`],
+//! Tier-2 conformance (the baseline-shaped scenarios in
+//! `conformance/scenarios/` — currently 16, 17, 24, 25, and 26; see
+//! [`needs_extended_shape`] for what disqualifies the rest) driven against
+//! the real core's [`FlowManager`] over a real [`PostgresJournal`],
 //! not [`SqliteJournal`](keel_journal::SqliteJournal) — see
 //! `tests/flows_conformance.rs` for that leg, which this file deliberately
 //! does **not** parametrize alongside.
@@ -26,6 +28,19 @@
 //! Everything else — scenario shape, step execution, subset-matching against
 //! `expect` — is copied from `flows_conformance.rs` verbatim; see that file
 //! for the format doc.
+//!
+//! This file's `FlowScenario`/`RunSpec`/`StepSpec` are frozen at that
+//! baseline shape and deliberately do NOT grow alongside
+//! `flows_conformance.rs`'s later extended fields (`holder`/`hold`, run-scoped
+//! `policy`/`code_hash` overrides, `expect_enter_error`, `inject_running`,
+//! `expect_journal`, a value-step `kind`): several of those exist to model
+//! things (a second real holder, a 30s-TTL-scaled clock jump) that don't fit
+//! this file's real-clock, single-holder, short-lease design at all. Rather
+//! than hand-panic on the resulting shape mismatch, [`needs_extended_shape`]
+//! detects it and this file skips those scenarios — they are exercised in
+//! full by the SQLite leg (`flows_conformance.rs`), and this file keeps
+//! covering the baseline semantics (crash/resume, nondeterminism-fail,
+//! idempotency-key resume-reuse) against a REAL `PostgresJournal`.
 
 mod support;
 
@@ -99,6 +114,33 @@ struct StepSpec {
     effect: AttemptResult,
     #[serde(default)]
     expect: Value,
+}
+
+/// Whether `scenario` (the raw JSON `Value`) uses a `RunSpec`/`StepSpec` field
+/// this file's baseline structs don't have — either a run missing `steps`
+/// (relying on the richer interpreter's default) or one of its extended keys,
+/// or a step selecting a virtualized `kind` instead of an effect. See the
+/// module doc for why this file skips these instead of implementing them.
+fn needs_extended_shape(scenario: &Value) -> bool {
+    const RUN_KEYS: [&str; 8] = [
+        "holder",
+        "advance_before_ms",
+        "policy",
+        "code_hash",
+        "hold",
+        "expect_enter_error",
+        "inject_running",
+        "expect_journal",
+    ];
+    scenario["runs"].as_array().is_some_and(|runs| {
+        runs.iter().any(|run| {
+            !run.get("steps").is_some_and(Value::is_array)
+                || RUN_KEYS.iter().any(|k| run.get(*k).is_some())
+                || run["steps"]
+                    .as_array()
+                    .is_some_and(|steps| steps.iter().any(|s| s.get("kind").is_some()))
+        })
+    })
 }
 
 async fn run_flow_scenario(scn: &FlowScenario, journal: Arc<dyn Journal>) -> Vec<String> {
@@ -229,6 +271,14 @@ async fn tier2_flow_conformance_over_postgres() {
         let value: Value = serde_json::from_str(&text).expect("scenario is valid JSON");
         if value.get("tier").and_then(Value::as_u64) != Some(2) {
             continue; // Tier 1 scenarios are covered by conformance.rs.
+        }
+        if needs_extended_shape(&value) {
+            // Exercised in full by the SQLite leg; see the module doc.
+            println!(
+                "skip  {} (needs the extended SQLite-leg shape)",
+                path.display()
+            );
+            continue;
         }
         let scenario: FlowScenario = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("bad tier-2 scenario {}: {e}", path.display()));

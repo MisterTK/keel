@@ -1,0 +1,39 @@
+{
+  "name": "flow-code-hash-downgrade",
+  "tier": 2,
+  "description": "Tier 2: policy is on_nondeterminism=fail, but the code_hash presented on resume differs from the one recorded at first entry (a changed deploy). A code_hash mismatch downgrades fail to warn for THIS handle (a deploy that changed the code is expected to diverge), so the same divergence that would halt with KEEL-E031 under a matching code_hash instead continues live. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-20",
+    "code_hash": "ch-20a"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "v": 1 } },
+          "expect": { "result": "ok", "payload": { "v": 1 } }
+        }
+      ]
+    },
+    {
+      "code_hash": "ch-20b",
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.b.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "v": 2 } },
+          "expect": { "result": "ok", "payload": { "v": 2 } }
+        }
+      ]
+    }
+  ]
+}

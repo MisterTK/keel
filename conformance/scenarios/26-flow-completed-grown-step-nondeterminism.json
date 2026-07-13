@@ -1,0 +1,44 @@
+{
+  "name": "flow-completed-grown-step-nondeterminism",
+  "tier": 2,
+  "description": "Tier 2: a completed flow whose code grew a step since it finished. Re-entry replays the one recorded step fine, but reaching the new (unrecorded) second step on a replay-only handle is refused with KEEL-E031 rather than run live — no effect fires for the grown step either. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-26",
+    "code_hash": "ch-26"
+  },
+  "runs": [
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 1 } },
+          "expect": { "result": "ok", "payload": { "n": 1 } }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 0,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 9 } },
+          "expect": { "result": "ok", "payload": { "n": 1 } }
+        },
+        {
+          "target": "api.new.internal",
+          "args_hash": "2",
+          "effect": { "status": "ok", "payload": { "n": 9 } },
+          "expect": { "result": "error", "error": { "code": "KEEL-E031" } }
+        }
+      ]
+    }
+  ]
+}
