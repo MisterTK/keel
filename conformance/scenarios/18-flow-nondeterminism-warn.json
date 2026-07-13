@@ -1,0 +1,42 @@
+{
+  "name": "flow-nondeterminism-warn",
+  "tier": 2,
+  "description": "Tier 2: with on_nondeterminism=warn, a step recorded under one key crashes; on resume a differently-keyed step at the same seq diverges. Warn journals a flow:branch:warn marker IN PLACE (at the divergent seq itself, not a high seq lane) and continues live from the next seq — the divergent effect DOES run. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "warn" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-18",
+    "code_hash": "ch-18"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "v": 1 } },
+          "expect": { "result": "ok", "payload": { "v": 1 } }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.b.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "v": 2 } },
+          "expect": { "result": "ok", "payload": { "v": 2 } }
+        }
+      ],
+      "expect_journal": [
+        { "seq": 1, "key": "flow:branch:warn", "kind": "marker", "status": "ok" },
+        { "seq": 2, "key": "api.b.internal#q2", "kind": "effect", "status": "ok" }
+      ]
+    }
+  ]
+}

@@ -45,6 +45,22 @@ def main() -> int:
             note = "  (invalid, as designed)" if expect_invalid else ""
             print(f"ok    {f.name}{note}")
 
+        # Tier-2 (flow) scenarios may reconfigure the engine mid-scenario via a
+        # per-run policy override (e.g. to prove a replayed step ignores a
+        # changed retry policy) — each override must validate too. Unlike the
+        # top-level policy, no run override is ever expected to be invalid.
+        for i, run in enumerate(scenario.get("runs", [])):
+            if "policy" not in run:
+                continue
+            run_errors = list(validator.iter_errors(run["policy"]))
+            if run_errors:
+                failures += [
+                    f"{f.name}: runs[{i}].policy: {e.json_path}: {e.message}"
+                    for e in run_errors
+                ]
+            else:
+                print(f"ok    {f.name} runs[{i}].policy")
+
     for m in failures:
         print(f"FAIL  {m}", file=sys.stderr)
     return 1 if failures else 0

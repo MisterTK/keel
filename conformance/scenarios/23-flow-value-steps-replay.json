@@ -1,0 +1,30 @@
+{
+  "name": "flow-value-steps-replay",
+  "tier": 2,
+  "description": "Tier 2: virtualized clock reads and random draws are journaled as value steps. On a fresh run the live value is recorded and returned as-is; after a crash and resume, the recorded value is substituted verbatim regardless of what live value is now offered — so a resumed flow observes the same 'now' and randomness as its first run (spec 4.4). Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-23",
+    "code_hash": "ch-23"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 0,
+      "steps": [
+        { "kind": "time", "key": "py:time.time#-", "live_value": 1000, "expect_value": 1000 },
+        { "kind": "random", "key": "py:random.random#-", "live_value": [1, 2, 3], "expect_value": [1, 2, 3] }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 0,
+      "steps": [
+        { "kind": "time", "key": "py:time.time#-", "live_value": 9999, "expect_value": 1000 },
+        { "kind": "random", "key": "py:random.random#-", "live_value": [9, 9, 9], "expect_value": [1, 2, 3] }
+      ]
+    }
+  ]
+}
