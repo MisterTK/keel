@@ -44,6 +44,11 @@ tempfile = "3.23"
 # the frozen schema (rusqlite), the discovery store via keel-journal's own API.
 keel-journal = { path = "../keel-journal" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+# The `keel tail` parity leg (tests/tail.rs): the real engine writes an event
+# feed through its sink and the CLI must render it byte-exactly, so the tail
+# renderer can never drift from the engine's event vocabulary unnoticed.
+keel-core = { path = "../keel-core" }
+tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

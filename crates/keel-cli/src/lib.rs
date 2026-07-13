@@ -4,8 +4,9 @@
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
 //! report; `--effective-policy` prints the composed `defaults < packs < user`
 //! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
-//! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
-//! [`flows`] (list durable flows) and [`flows::trace`] (`keel trace`).
+//! [`explain`] (the frozen error taxonomy), [`tail`] (the live Tier 1 event
+//! view), and the Tier 2 flow inspectors [`flows`] (list durable flows) and
+//! [`flows::trace`] (`keel trace`).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -22,6 +23,7 @@ pub mod render;
 pub mod run;
 pub mod scan;
 pub mod status;
+pub mod tail;
 
 mod evidence;
 

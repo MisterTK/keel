@@ -1,0 +1,26 @@
+00:00.000  run 0000000f00d-0001 (pid 4242)
+00:00.005  t-000001  api.example.com          call     GET api.example.com
+00:00.005  t-000001  api.example.com          cache    miss (memory)
+00:00.005  t-000001  api.example.com          attempt  #1
+00:00.055  t-000001  api.example.com          fail     #1 http 503
+00:00.055  t-000001  api.example.com          backoff  200ms → #2
+00:00.255  t-000001  api.example.com          attempt  #2
+00:00.310  t-000001  api.example.com          ok       2 attempts
+00:00.400  t-000002  llm:openai               call     POST api.openai.com/v1/chat/completions
+00:00.400  t-000002  llm:openai               cache    hit (persistent)
+00:00.400  t-000002  llm:openai               ok       0 attempts
+00:00.500  t-000003  api.flaky.internal       call     GET api.flaky.internal
+00:00.500  t-000003  api.flaky.internal       rate     queued 150ms
+00:00.650  t-000003  api.flaky.internal       attempt  #1
+00:00.700  t-000003  api.flaky.internal       fail     #1 conn
+00:00.700  t-000003  api.flaky.internal       breaker  opened (cooldown 30s)
+00:00.700  t-000003  api.flaky.internal       error    KEEL-E015 after 1 attempt
+00:00.900  t-000004  api.flaky.internal       call     GET api.flaky.internal
+00:00.900  t-000004  api.flaky.internal       breaker  rejected — open, failing fast
+00:00.900  t-000004  api.flaky.internal       error    KEEL-E012 after 0 attempts
+00:31.000  t-000005  api.flaky.internal       call     GET api.flaky.internal
+00:31.000  t-000005  api.flaky.internal       breaker  half-open — probing
+00:31.000  t-000005  api.flaky.internal       attempt  #1
+00:31.080  t-000005  api.flaky.internal       breaker  closed
+00:31.080  t-000005  api.flaky.internal       ok       1 attempt
+00:32.000  t-000006  llm:openai               budget_exceeded
