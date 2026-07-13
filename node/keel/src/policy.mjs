@@ -270,3 +270,38 @@ export function extractFunctionTargets(policy) {
   }
   return out;
 }
+
+/**
+ * Tier 2 `[flows] entrypoints` declared in policy (architecture-spec §4.1's
+ * example: `flows = ["py:pipeline.ingest:main", "ts:jobs/nightly.ts#run"]`).
+ * Mirrors `python/keel/src/keel/_policy.py`'s `extract_flow_entrypoints`,
+ * adapted to Node's file-path identity space: the Node front end owns only
+ * `ts:` entries (the frozen `entrypointRef` grammar `^(py|ts|rs):[^\s]+$`
+ * covers `py`/`rs` too, but those belong to other front ends and are skipped
+ * here — `ts:` is the SAME prefix `extractFunctionTargets` uses for every
+ * `.mjs`/`.js`/`.ts` module, per that function's own convention).
+ *
+ * Grammar: `ts:<pathGlob>#<exportName>` — the SAME `module#export` shape as a
+ * `[target."ts:…"]` function target, so one glob dialect (`loader.mjs`'s
+ * `globToRegExp`) covers both. `<exportName>` must be concrete (no `*`): the
+ * flow body must be a specific, named export. Malformed or non-`ts:` entries
+ * are skipped, not guessed — designating a flow is an explicit assertion.
+ */
+export function extractFlowEntrypoints(policy) {
+  const flows = policy?.flows;
+  if (flows === null || typeof flows !== "object") return [];
+  const entrypoints = flows.entrypoints;
+  if (!Array.isArray(entrypoints)) return [];
+  const out = [];
+  for (const raw of entrypoints) {
+    if (typeof raw !== "string" || !raw.startsWith("ts:")) continue;
+    const body = raw.slice(3);
+    const hash = body.indexOf("#");
+    if (hash < 0) continue; // needs #exportName; a bare module is never guessed
+    const glob = body.slice(0, hash);
+    const fn = body.slice(hash + 1);
+    if (!glob || !fn || fn.includes("*")) continue; // the flow body must be concrete
+    out.push({ raw, glob, fn });
+  }
+  return out;
+}

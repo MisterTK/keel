@@ -1,0 +1,4 @@
+{"v":1,"seq":0,"ms":0,"event":"run_start","run":"0000000f00e-0002","wall_ms":1783728100000,"pid":4243}
+{"v":1,"seq":1,"ms":2,"event":"call_start","call":"t-000001","target":"api.example.com","op":"GET api.example.com"}
+{"v":1,"seq":2,"ms":2,"event":"attempt_start","call":"t-000001","target":"api.example.com","attempt":1}
+{"v":1,"seq":3,"ms":9,"event":"call_end","call":"t-000001","target":"api.example.com","result":"ok","attempts":1}

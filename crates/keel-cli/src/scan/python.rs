@@ -14,11 +14,15 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use super::{LangFindings, Sighting};
+use super::{FunctionFacts, LangFindings, Sighting};
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
 /// in sorted order, output keys are sorted. Finds imports of the known effect
-/// libraries and URL/DSN string literals, each with `file:line`.
+/// libraries and URL/DSN string literals, each with `file:line` — and, for
+/// `keel flows suggest`, attributes effect / time / random / replay-unsafe
+/// calls to their enclosing **module-level** function defs (real AST
+/// containment: nested defs and lambdas inside a function count toward it;
+/// class methods are not flow entrypoints and are not attributed).
 const AST_WALKER: &str = r#"
 import ast, json, os, sys
 from urllib.parse import urlsplit
@@ -27,6 +31,16 @@ HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
 LLM_LIBS = {"openai", "anthropic"}
 OTHER_LIBS = {"psycopg", "boto3"}
 KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS
+TIME_LIBS = {"time", "datetime"}
+RANDOM_LIBS = {"random", "uuid", "secrets"}
+UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
+TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | {"os"}
+TIME_NAMES = {"time", "time_ns", "monotonic", "monotonic_ns",
+              "perf_counter", "perf_counter_ns", "gmtime", "localtime"}
+DT_NAMES = {"now", "utcnow", "today"}
+UUID_NAMES = {"uuid1", "uuid3", "uuid4", "uuid5"}
+OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
+             "execvp", "execvpe", "spawnl", "spawnv", "spawnvp"}
 SKIP = {".keel", ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", "dist", "build", "target"}
 
@@ -47,9 +61,117 @@ def host(s):
     return parts.hostname
 
 
+def call_root(f):
+    """The Name at the base of a call's attribute chain, or None. Deliberately
+    does NOT see through intermediate calls: in `httpx.get(u).json()` only the
+    inner `httpx.get(u)` has a root, so a chained method on a call result is
+    never double-counted as a second effect."""
+    while isinstance(f, ast.Attribute):
+        f = f.value
+    return f.id if isinstance(f, ast.Name) else None
+
+
+# Call names that construct a handle rather than perform an effect: CapWords
+# constructors (OpenAI(), Client()) plus the well-known factory methods.
+FACTORY_NAMES = {"client", "resource", "session", "connect"}
+
+
+def is_constructor(name):
+    return name is None or name[:1].isupper() or name in FACTORY_NAMES
+
+
+def aliases_of(tree):
+    """Binding name -> tracked top-level module. Also follows one hop of
+    constructor assignment (client = OpenAI() -> client is an openai handle),
+    the dominant SDK-client pattern."""
+    a = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                t = top(al.name)
+                if t in TRACKED:
+                    a[(al.asname or al.name).split(".", 1)[0]] = t
+        elif isinstance(node, ast.ImportFrom):
+            t = top(node.module or "")
+            if t in TRACKED:
+                for al in node.names:
+                    a[al.asname or al.name] = t
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            lib = a.get(call_root(node.value.func))
+            if lib in KNOWN:
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        a[tgt.id] = lib
+    return a
+
+
+def url_consts_of(tree):
+    """Module-level NAME = "scheme://host/..." constants -> host, so a URL
+    hoisted to a constant still attributes to the functions that use it."""
+    consts = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            h = host(node.value.value)
+            if h:
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        consts[tgt.id] = h
+    return consts
+
+
+def fn_facts(fn, rel, mod, aliases, url_consts):
+    effects = unsafe_idem = t_reads = r_reads = 0
+    targets = set()
+    reasons = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id in url_consts:
+            targets.add(url_consts[node.id])
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            h = host(node.value)
+            if h:
+                targets.add(h)
+        if not isinstance(node, ast.Call):
+            continue
+        lib = aliases.get(call_root(node.func))
+        if lib is None:
+            continue
+        attr = node.func.attr if isinstance(node.func, ast.Attribute) else None
+        name = attr if attr is not None else call_root(node.func)
+        if lib in KNOWN:
+            if is_constructor(name):
+                continue  # a handle being built, not an effect performed
+            effects += 1
+            if name in {"post", "patch"}:
+                unsafe_idem += 1
+            if lib in LLM_LIBS:
+                targets.add("llm:" + lib)
+        elif lib == "time" and name in TIME_NAMES:
+            t_reads += 1
+        elif lib == "datetime" and name in DT_NAMES:
+            t_reads += 1
+        elif lib in {"random", "secrets"}:
+            r_reads += 1
+        elif lib == "uuid" and name in UUID_NAMES:
+            r_reads += 1
+        elif lib == "os" and name == "urandom":
+            r_reads += 1
+        elif lib in UNSAFE_LIBS:
+            reasons.append((node.lineno, "%s use at %s:%d" % (lib, rel, node.lineno)))
+        elif lib == "os" and name in OS_UNSAFE:
+            reasons.append((node.lineno, "os.%s at %s:%d" % (name, rel, node.lineno)))
+    return {"effects": effects, "file": rel, "idempotent_unsafe": unsafe_idem,
+            "line": fn.lineno, "module": mod, "name": fn.name,
+            "random_reads": r_reads, "targets": sorted(targets),
+            "time_reads": t_reads,
+            "unsafe_reasons": [t for _, t in sorted(reasons)]}
+
+
 root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
+functions = []
 files = 0
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not d.startswith("."))
@@ -78,9 +200,17 @@ for dirpath, dirnames, filenames in os.walk(root):
                 h = host(node.value)
                 if h:
                     urls.append({"host": h, "file": rel, "line": node.lineno})
+        mod = rel[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        aliases = aliases_of(tree)
+        consts = url_consts_of(tree)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append(fn_facts(node, rel, mod, aliases, consts))
 
-print(json.dumps({"files_scanned": files, "imports": imports, "urls": urls},
-                 sort_keys=True))
+print(json.dumps({"files_scanned": files, "functions": functions,
+                  "imports": imports, "urls": urls}, sort_keys=True))
 "#;
 
 /// One import finding from the walker.
@@ -99,10 +229,27 @@ struct Url {
     line: u32,
 }
 
+/// One module-level function's facts from the walker.
+#[derive(Debug, Deserialize)]
+struct PyFunction {
+    effects: u32,
+    file: String,
+    idempotent_unsafe: u32,
+    line: u32,
+    module: String,
+    name: String,
+    random_reads: u32,
+    targets: Vec<String>,
+    time_reads: u32,
+    unsafe_reasons: Vec<String>,
+}
+
 /// The walker's JSON output, typed.
 #[derive(Debug, Deserialize)]
 struct WalkerOutput {
     files_scanned: usize,
+    #[serde(default)]
+    functions: Vec<PyFunction>,
     imports: Vec<Import>,
     urls: Vec<Url>,
 }
@@ -116,6 +263,8 @@ pub struct PyScan {
     pub files_scanned: usize,
     /// Findings, ready to merge.
     pub findings: LangFindings,
+    /// Per-function attribution (module-level defs), for `keel flows suggest`.
+    pub functions: Vec<FunctionFacts>,
 }
 
 const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3"];
@@ -158,10 +307,26 @@ pub fn scan(project: &Path) -> PyScan {
             },
         ));
     }
+    let functions = output
+        .functions
+        .into_iter()
+        .map(|f| FunctionFacts {
+            entrypoint: format!("py:{}:{}", f.module, f.name),
+            file: f.file,
+            line: f.line,
+            effects: f.effects,
+            idempotent_unsafe: f.idempotent_unsafe,
+            time_reads: f.time_reads,
+            random_reads: f.random_reads,
+            unsafe_reasons: f.unsafe_reasons,
+            targets: f.targets.into_iter().collect(),
+        })
+        .collect();
     PyScan {
         available: true,
         files_scanned: output.files_scanned,
         findings,
+        functions,
     }
 }
 
@@ -225,6 +390,98 @@ mod tests {
                 .hosts
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
+        );
+    }
+
+    #[test]
+    fn attributes_effects_time_random_to_module_level_functions() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pipeline.py"),
+            r#"import time
+import random
+import httpx
+from openai import OpenAI
+
+API = "https://api.example.com/v1/data"
+client = OpenAI()
+
+
+def main():
+    started = time.time()
+    seed = random.random()
+    data = httpx.get(API).json()
+    httpx.post(API, json=data)
+    client.responses.create(model="gpt-4.1", input="hi")
+    return started, seed
+
+
+def helper():
+    return 41 + 1
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let main = s
+            .functions
+            .iter()
+            .find(|f| f.entrypoint == "py:pipeline:main")
+            .expect("main attributed");
+        // get + post + create — the chained .json() must NOT double-count.
+        assert_eq!(main.effects, 3);
+        assert_eq!(main.idempotent_unsafe, 1, "only the POST");
+        assert_eq!(main.time_reads, 1);
+        assert_eq!(main.random_reads, 1);
+        assert!(main.unsafe_reasons.is_empty());
+        assert!(main.targets.contains("api.example.com"), "URL via constant");
+        assert!(main.targets.contains("llm:openai"), "client = OpenAI() hop");
+        assert_eq!((main.file.as_str(), main.line), ("pipeline.py", 10));
+        let helper = s
+            .functions
+            .iter()
+            .find(|f| f.entrypoint == "py:pipeline:helper")
+            .expect("helper attributed");
+        assert_eq!(helper.effects, 0);
+    }
+
+    #[test]
+    fn threads_and_subprocess_defeat_the_replay_safe_estimate() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("jobs.py"),
+            r#"import subprocess
+import threading
+import requests
+
+
+def risky():
+    requests.post("https://api.example.com/v1/x")
+    threading.Thread(target=print).start()
+    subprocess.run(["ls"])
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let f = s
+            .functions
+            .iter()
+            .find(|f| f.entrypoint == "py:jobs:risky")
+            .expect("risky attributed");
+        assert_eq!(f.effects, 1);
+        assert_eq!(
+            f.unsafe_reasons,
+            vec![
+                "threading use at jobs.py:8".to_owned(),
+                "subprocess use at jobs.py:9".to_owned(),
+            ]
         );
     }
 

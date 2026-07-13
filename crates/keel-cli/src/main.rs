@@ -9,7 +9,10 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, explain, flows, init, run, status};
+use keel_cli::{
+    doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record, replay,
+    resume, run, sim, status, tail,
+};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -54,14 +57,76 @@ enum Command {
         agents: bool,
     },
     /// Report coverage, adapters, and policy validity (the honesty report).
-    Doctor,
+    Doctor {
+        /// Print the composed effective policy (defaults < packs < user) that
+        /// `keel_configure` receives, instead of the coverage report.
+        #[arg(long)]
+        effective_policy: bool,
+    },
     /// Show one screen of coverage and flow state.
     Status,
-    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age.
+    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age. Or, with
+    /// a subcommand, the Level 2 on-ramp (`suggest` candidates, `add` one) or
+    /// `resume` (re-invoke a resumable flow's recorded entrypoint).
     Flows {
         /// Show only `dead` flows (those that exhausted their resume cap).
+        /// Ignored when a subcommand is given.
         #[arg(long)]
         dead: bool,
+        #[command(subcommand)]
+        action: Option<FlowsCommand>,
+    },
+    /// Journal integrity check, safe repairs, and retention pruning
+    /// (architecture spec §6).
+    Fsck {
+        /// Apply the safe repairs (orphan steps, dangling leases, stale
+        /// running steps, expired cache) and checkpoint the WAL.
+        #[arg(long)]
+        fix: bool,
+        /// Prune `completed` flows (and their steps) not updated for this age,
+        /// e.g. `30d`, `12h`, `45m`, `90s`. There is no retention key in the
+        /// frozen policy schema, so this is an explicit operator action.
+        #[arg(long, value_name = "AGE")]
+        prune: Option<String>,
+    },
+    /// Serve this project over MCP on stdio (JSON-RPC 2.0). Six tools —
+    /// get_status, get_doctor_report, propose_policy, get_trace, list_flows,
+    /// explain_error — each byte-identical to the matching `--json` command.
+    Mcp,
+    /// Capture effects during a run, then turn the capture into a replayable
+    /// offline test fixture (`docs/recording-format.md`).
+    Record {
+        #[command(subcommand)]
+        action: RecordCommand,
+    },
+    /// Inspect what re-entering a flow would do — a journal-driven dry run:
+    /// which steps substitute, which re-execute, where replay resumes.
+    Replay {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        flow: String,
+        /// Show one recorded step in full detail (payload, timings, action).
+        #[arg(long, value_name = "SEQ")]
+        step: Option<i64>,
+    },
+    /// Fault/latency/crash-restart simulation over a declarative plan
+    /// (`docs/sim-format.md`): dispatches the plan's target like `keel run`,
+    /// re-invokes it across a `"crash"` directive's kill-restart, then grades
+    /// the run against the plan's `assert` block — a doctor-style pass/fail
+    /// report.
+    Sim {
+        /// The fault-plan JSON file.
+        plan: String,
+    },
+    /// Live view of attempts, backoffs, and breaker transitions while your
+    /// program runs (reads `.keel/events/`; no daemon). `--json` streams the
+    /// raw NDJSON events with sorted keys.
+    Tail {
+        /// Print the recorded events and exit instead of following live.
+        #[arg(long)]
+        no_follow: bool,
+        /// Tail a specific run id instead of the newest run.
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
     Trace {
@@ -72,6 +137,69 @@ enum Command {
     Explain {
         /// The error code, e.g. `KEEL-E014`.
         code: String,
+    },
+}
+
+/// `keel flows <action>` — the Level 2 on-ramp (dx-spec §1).
+#[derive(Debug, Subcommand)]
+enum FlowsCommand {
+    /// Designate `<entrypoint>` as a durable flow: appends it to `[flows]
+    /// entrypoints` in `keel.toml` (creating the table if absent). Idempotent —
+    /// re-running with the same entrypoint is a no-op.
+    Add {
+        /// `py:module.path:function`, `ts:path/file.ts#function`, or a bare
+        /// form printed by `keel flows suggest` (its language is inferred).
+        entrypoint: String,
+        /// Preview the change as a diff without writing `keel.toml`.
+        #[arg(long)]
+        diff: bool,
+    },
+    /// Analyze candidate flow entrypoints for replay-safety: effect counts,
+    /// idempotent-unsafe effects, time/random reads Tier 2 would virtualize,
+    /// and an estimated replay-safe verdict.
+    Suggest,
+    /// Re-invoke a resumable flow's recorded entrypoint through `keel run`.
+    /// See [`keel_cli::resume`] for what it can and cannot know.
+    Resume {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        /// Omit and pass `--all` to resume every resumable flow instead.
+        flow: Option<String>,
+        /// Resume every currently-resumable flow (no live lease) instead of
+        /// naming one.
+        #[arg(long)]
+        all: bool,
+        /// Arguments forwarded to the resumed script (single-flow only —
+        /// `--all` cannot forward args since different flows may need
+        /// different ones).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// `keel record <action>` (`docs/recording-format.md`).
+#[derive(Debug, Subcommand)]
+enum RecordCommand {
+    /// List recordings under `.keel/recordings/`.
+    List,
+    /// Run a script under Keel, teeing every intercepted effect's
+    /// request/outcome envelope into a fresh recording.
+    Run {
+        /// The script to run — same targets `keel run` accepts.
+        target: String,
+        /// Arguments passed through to the program unchanged.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Generate a replayable offline test fixture (a pytest fixture for a
+    /// Python recording, a `node:test` file for a Node recording) from a
+    /// completed recording.
+    Test {
+        /// A recording id, path, or unambiguous id substring.
+        recording: String,
+        /// Write the generated file under this directory instead of next to
+        /// the recording.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
     },
 }
 
@@ -107,11 +235,91 @@ fn main() {
             );
             emit(&r, json)
         }
-        Command::Doctor => emit(&doctor::run(&project), json),
-        Command::Status => emit(&status::run(&project), json),
-        Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Doctor { effective_policy } => {
+            let r = if effective_policy {
+                effective::run(&project)
+            } else {
+                doctor::run(&project)
+            };
+            emit(&r, json)
+        }
+        Command::Status => emit(&status::run(&project, SystemClock.now_ms()), json),
+        Command::Flows { dead, action } => dispatch_flows(&project, dead, action, json),
+        Command::Fsck { fix, prune } => {
+            let options = fsck::FsckOptions { fix, prune };
+            emit(&fsck::run(&project, &options, SystemClock.now_ms()), json)
+        }
+        Command::Mcp => {
+            // The server speaks JSON-RPC regardless of --json; it exits on EOF.
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
+        }
+        Command::Record { action } => dispatch_record(&project, action, json),
+        Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
+        Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
+        Command::Tail { no_follow, run } => {
+            let opts = tail::TailOptions {
+                color: tail::color_enabled(),
+                follow: !no_follow,
+                json,
+                run,
+            };
+            let mut stdout = std::io::stdout().lock();
+            match tail::run(
+                &project,
+                &opts,
+                &mut stdout,
+                &mut tail::SleepTicker::default(),
+            ) {
+                Ok(()) => keel_cli::EXIT_OK,
+                Err(report) => emit(&report, json),
+            }
+        }
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };
     exit(code);
+}
+
+/// `keel flows [--dead] [<action>]` (extracted from `main` — clippy's
+/// `too_many_lines`).
+fn dispatch_flows(
+    project: &std::path::Path,
+    dead: bool,
+    action: Option<FlowsCommand>,
+    json: bool,
+) -> i32 {
+    match action {
+        Some(FlowsCommand::Add { entrypoint, diff }) => {
+            emit(&flows_add::run(project, &entrypoint, diff), json)
+        }
+        Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(project), json),
+        Some(FlowsCommand::Resume { flow, all, args }) => {
+            let options = resume::ResumeOptions { flow, all, args };
+            let (rendered, code) = resume::run(project, &options, SystemClock.now_ms());
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        None => emit(&flows::flows(project, dead, SystemClock.now_ms()), json),
+    }
+}
+
+/// `keel record <action>` (extracted from `main` — clippy's `too_many_lines`).
+fn dispatch_record(project: &std::path::Path, action: RecordCommand, json: bool) -> i32 {
+    match action {
+        RecordCommand::List => emit(&record::list(project), json),
+        RecordCommand::Run { target, args } => {
+            let (rendered, code) = record::run(project, &target, &args);
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        RecordCommand::Test { recording, out } => {
+            emit(&record::test_gen(project, &recording, out.as_deref()), json)
+        }
+    }
 }

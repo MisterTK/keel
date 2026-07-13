@@ -6,9 +6,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { AsyncEngine, virtualClock } from "../src/engine.mjs";
-import { applyPackDefaults } from "../src/defaults.mjs";
+import { applyPackDefaults, llmDefaults } from "../src/defaults.mjs";
 import { resolveDevCache } from "../src/packs/llm.mjs";
-import { keelMiddleware, providerTarget, classifyModelError } from "../src/packs/ai-sdk.mjs";
+import {
+  keelMiddleware,
+  providerTarget,
+  classifyModelError,
+  aiSdkPack,
+} from "../src/packs/ai-sdk.mjs";
+import { resetLlmBudgets, recordSpend, spentCents } from "../src/llm-policy.mjs";
 
 const llmBackend = (env = {}) => {
   const b = new AsyncEngine(virtualClock());
@@ -174,4 +180,241 @@ test("keelMiddleware is a transparent pass-through when no backend is active", a
   assert.equal(called, 1);
   assert.equal(r.text, "raw");
   assert.equal(r.keelOutcome, undefined, "no keelOutcome attached when disabled");
+});
+
+test("aiSdkPack implements the adapter-pack four operations", () => {
+  const p = aiSdkPack({ cwd: "/nonexistent-project" });
+  const d = p.detect();
+  // `ai` is not a dependency anywhere in this repo, so a project-scoped
+  // resolution normally reports absent; `resolveFrom`'s second tier (mirrors
+  // mcpPack's own "resolve from Keel's own deps" fallback) walks up from this
+  // module's OWN location, so on a machine with an unrelated `ai` install
+  // somewhere above the checkout, detection can legitimately succeed —
+  // assert the shape either way rather than pin a filesystem-dependent value.
+  if (d.matched) {
+    assert.equal(d.name, "ai");
+    assert.ok(["pinned", "best_effort"].includes(d.confidence));
+  } else {
+    assert.deepEqual(d, { matched: false });
+  }
+  const seams = p.seams();
+  assert.equal(seams.length, 1);
+  assert.equal(seams[0].patchPoint, "wrapLanguageModel middleware (wrapGenerate/wrapStream)");
+  assert.match(seams[0].whyStable, /API seam, not a monkey patch/);
+  const targets = p.targets();
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].pattern, "llm:<provider>");
+  assert.equal(targets[0].kind, "llm");
+  assert.match(targets[0].argsHashRule, /generateObject/);
+  assert.match(targets[0].argsHashRule, /streamObject/);
+  assert.deepEqual(p.defaults(), { defaults: { llm: llmDefaults() } });
+});
+
+// generateObject/streamObject coverage: ai@5's LanguageModelV2Middleware has
+// exactly wrapGenerate/wrapStream (verified against the SDK's own middleware
+// docs — see the module doc comment); generateObject/streamObject route
+// through the SAME doGenerate/doStream calls as generateText/streamText, with
+// an object-mode marker (e.g. `responseFormat`) inside the opaque `params`.
+// These tests drive that shape explicitly so all four ops are demonstrably
+// covered by the two hooks above, not just asserted in a comment.
+test("wrapGenerate covers generateObject: an object-mode call dev-caches like generateText", async () => {
+  const mw = keelMiddleware({ backend: llmBackend() });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    return { content: [{ type: "text", text: `{"ok":${calls}}` }] };
+  };
+  const model = { provider: "openai.chat", modelId: "gpt-x" };
+  // The shape generateObject passes doGenerate: same params bag, plus a
+  // responseFormat marker — opaque to Keel, just more hashed material.
+  const objectParams = {
+    prompt: [{ role: "user", content: "give me json" }],
+    responseFormat: { type: "json", schema: { type: "object", properties: { ok: { type: "number" } } } },
+  };
+  const r1 = await mw.wrapGenerate({ doGenerate, params: objectParams, model });
+  const r2 = await mw.wrapGenerate({ doGenerate, params: { ...objectParams }, model });
+  assert.equal(calls, 1, "identical generateObject-shaped params replay from the dev cache");
+  assert.deepEqual(r2.content, r1.content);
+  assert.equal(r2.keelOutcome.from_cache, true);
+});
+
+test("wrapGenerate covers generateObject: a retried 429 recovers exactly like generateText", async () => {
+  const mw = keelMiddleware({ backend: llmBackend() });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    if (calls === 1) throw Object.assign(new Error("rate limited"), { statusCode: 429 });
+    return { content: [{ type: "text", text: '{"ok":true}' }] };
+  };
+  const result = await mw.wrapGenerate({
+    doGenerate,
+    params: { prompt: "hi", responseFormat: { type: "json" } },
+    model: { provider: "openai.chat", modelId: "gpt-x" },
+  });
+  assert.equal(calls, 2, "retried exactly once, same as a generateText 429");
+  assert.equal(result.keelOutcome.result, "ok");
+  assert.equal(result.keelOutcome.attempts, 2);
+});
+
+test("wrapStream covers streamObject: establishment retries, chunks pass through unchanged", async () => {
+  const mw = keelMiddleware({ backend: llmBackend() });
+  let starts = 0;
+  const rawStream = new ReadableStream({
+    start(c) {
+      c.enqueue({ type: "object-delta", objectDelta: { ok: true } });
+      c.close();
+    },
+  });
+  const doStream = async () => {
+    starts++;
+    if (starts === 1) throw Object.assign(new Error("overloaded"), { statusCode: 503 });
+    return { stream: rawStream };
+  };
+  // The shape streamObject passes doStream: same params bag + responseFormat.
+  const established = await mw.wrapStream({
+    doStream,
+    params: { prompt: "hi", responseFormat: { type: "json" } },
+    model: { provider: "openai.chat", modelId: "gpt-x" },
+  });
+  assert.equal(starts, 2, "establishment retried on 503, same as a streamText 503");
+  assert.equal(established.stream, rawStream, "the raw object-mode stream is untouched");
+  const seen = [];
+  for await (const c of established.stream) seen.push(c);
+  assert.deepEqual(seen, [{ type: "object-delta", objectDelta: { ok: true } }]);
+});
+
+test("wrapStream covers streamObject: never dev-cached, just like streamText", async () => {
+  const mw = keelMiddleware({ backend: llmBackend() });
+  let starts = 0;
+  const doStream = async () => {
+    starts++;
+    return { stream: new ReadableStream({ start: (c) => c.close() }) };
+  };
+  const params = { prompt: "hi", responseFormat: { type: "json" } };
+  const model = { provider: "openai" };
+  await mw.wrapStream({ doStream, params, model });
+  await mw.wrapStream({ doStream, params: { ...params }, model });
+  assert.equal(starts, 2, "identical streamObject calls each re-establish (never replayed)");
+});
+
+// --- LLM budget caps + model fallback chains (llm-policy.mjs) ---------------
+
+test("ai-sdk budget: usage on the doGenerate result is priced and blocks the next call", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$1.00/run" } } });
+  const mw = keelMiddleware({ backend });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    return { text: "hi", usage: { inputTokens: 1_000_000, outputTokens: 1_000_000 } };
+  };
+  const model = { provider: "openai", modelId: "gpt-4o" };
+  const r1 = await mw.wrapGenerate({ doGenerate, params: { prompt: "hi" }, model });
+  assert.equal(calls, 1);
+  assert.equal(r1.text, "hi");
+  assert.ok(spentCents("llm:openai") >= 100, "usage from the result was priced and recorded");
+
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: { prompt: "again" }, model }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      assert.match(e.message, /budget cap/i);
+      return true;
+    }
+  );
+  assert.equal(calls, 1, "the second call was blocked before doGenerate ran");
+});
+
+test("ai-sdk budget: a pre-exhausted budget blocks before any dispatch", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 5);
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run" } } });
+  const mw = keelMiddleware({ backend });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    return { text: "hi" };
+  };
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(calls, 0);
+});
+
+test("ai-sdk fallback: re-dispatches to an alternate LanguageModelV2 (cross-provider) on a qualifying failure", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({
+    target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["claude-fallback"] } },
+  });
+  let openaiCalls = 0;
+  let claudeCalls = 0;
+  const doGenerate = async () => {
+    openaiCalls++;
+    throw Object.assign(new Error("overloaded"), { statusCode: 503 });
+  };
+  const altModel = {
+    provider: "anthropic.messages",
+    modelId: "claude-haiku-4.5",
+    doGenerate: async () => {
+      claudeCalls++;
+      return { text: "from claude" };
+    },
+  };
+  const mw = keelMiddleware({ backend, models: { "claude-fallback": altModel } });
+  const result = await mw.wrapGenerate({
+    doGenerate,
+    params: { prompt: "hi" },
+    model: { provider: "openai.chat", modelId: "gpt-4o" },
+  });
+  // ai-sdk requests are always `idempotent: true` (LLM generate/stream calls
+  // are treated as retryable), so the primary hop exhausts its full 3-attempt
+  // budget (KEEL-E010) before the chain moves to the fallback model.
+  assert.equal(openaiCalls, 3);
+  assert.equal(claudeCalls, 1, "the fallback model was actually invoked, not just named");
+  assert.equal(result.text, "from claude");
+  assert.equal(result.keelOutcome.result, "ok");
+});
+
+test("ai-sdk fallback: an unresolved chain entry (no matching `models` map key) stops the chain honestly", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["nobody-provided-this-one"] } } });
+  const mw = keelMiddleware({ backend }); // no `models` map at all
+  const boom = Object.assign(new Error("down"), { statusCode: 503 });
+  const doGenerate = async () => {
+    throw boom;
+  };
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e, boom, "the original (only) failure propagates unchanged");
+      return true;
+    }
+  );
+});
+
+test("ai-sdk fallback: does NOT chase a budget-exceeded block", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 10);
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run", fallback: ["claude-fallback"] } } });
+  let claudeCalls = 0;
+  const altModel = { provider: "anthropic", doGenerate: async () => { claudeCalls++; return { text: "x" }; } };
+  const mw = keelMiddleware({ backend, models: { "claude-fallback": altModel } });
+  const doGenerate = async () => ({ text: "unreached" });
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(claudeCalls, 0, "budget block happens before any hop, fallback never engages");
 });

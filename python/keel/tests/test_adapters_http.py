@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from requests.models import PreparedRequest
 
+from keel import _targets
 from keel.adapters import _http, httpx_pack, requests_pack
 
 
@@ -27,6 +28,64 @@ class ResolveTargetTest(unittest.TestCase):
     def test_unknown_host_is_its_own_target(self) -> None:
         self.assertEqual(_http.resolve_target("example.com"), "example.com")
         self.assertEqual(_http.resolve_target("127.0.0.1"), "127.0.0.1")
+
+
+class ResolvePolicyTargetTest(unittest.TestCase):
+    """`resolve_policy_target` (docs/targeting.md): the LLM host map first,
+    then `_targets`'s exact/pattern/default resolution, driven by whatever
+    outbound matchers are process-installed (`_targets.install_outbound_targets`,
+    as `bootstrap.install_keel` does from the effective policy)."""
+
+    def tearDown(self) -> None:
+        _targets.clear_outbound_targets()
+
+    def test_no_matchers_installed_matches_resolve_target(self) -> None:
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "api.stripe.com"), "api.stripe.com"
+        )
+        self.assertEqual(
+            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
+        )
+
+    def test_llm_host_map_wins_even_over_an_installed_pattern(self) -> None:
+        _targets.install_outbound_targets({"target": {"*.openai.com": {}}})
+        self.assertEqual(
+            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
+        )
+
+    def test_exact_host_key_beats_an_installed_pattern(self) -> None:
+        _targets.install_outbound_targets(
+            {"target": {"api.internal": {}, "*.internal": {}}}
+        )
+        self.assertEqual(_http.resolve_policy_target("GET", "api.internal"), "api.internal")
+
+    def test_pattern_key_selected_by_method_port_and_path(self) -> None:
+        _targets.install_outbound_targets(
+            {"target": {"GET api.catalog.internal/*": {}}}
+        )
+        self.assertEqual(
+            _http.resolve_policy_target(
+                "GET", "api.catalog.internal", scheme="https", path="/items/5"
+            ),
+            "GET api.catalog.internal/*",
+        )
+        self.assertEqual(
+            _http.resolve_policy_target(
+                "POST", "api.catalog.internal", scheme="https", path="/items/5"
+            ),
+            "api.catalog.internal",
+            "a POST does not match a GET-prefixed pattern -> falls through",
+        )
+
+    def test_wildcard_host_segment_matches_subdomains(self) -> None:
+        _targets.install_outbound_targets({"target": {"*.internal.corp": {}}})
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "db.internal.corp"), "*.internal.corp"
+        )
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "unrelated.example.com"),
+            "unrelated.example.com",
+        )
 
 
 class IdempotencyTest(unittest.TestCase):
@@ -46,6 +105,72 @@ class IdempotencyTest(unittest.TestCase):
         self.assertTrue(_http.is_idempotent("POST", ["My-Key"], idempotency_header="My-Key"))
         # With a configured header, the defaults no longer apply.
         self.assertFalse(_http.is_idempotent("POST", ["Idempotency-Key"], idempotency_header="My-Key"))
+
+
+class IdempotencyInjectionTest(unittest.TestCase):
+    """contracts/adapter-pack.md "Idempotency-key injection" — the mint+inject
+    decision, pinned independently of any HTTP library."""
+
+    def test_no_configured_header_means_no_injection(self) -> None:
+        self.assertIsNone(_http.resolve_idempotency_injection("POST", [], None))
+
+    def test_idempotent_methods_are_never_injected(self) -> None:
+        for m in ("GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"):
+            self.assertIsNone(
+                _http.resolve_idempotency_injection(m, [], "Idempotency-Key"), m
+            )
+
+    def test_caller_supplied_key_always_wins_never_overwritten(self) -> None:
+        self.assertIsNone(
+            _http.resolve_idempotency_injection(
+                "POST", ["idempotency-key"], "Idempotency-Key"
+            )
+        )
+        # Case-insensitive match.
+        self.assertIsNone(
+            _http.resolve_idempotency_injection(
+                "POST", ["IDEMPOTENCY-KEY"], "Idempotency-Key"
+            )
+        )
+
+    def test_unsafe_method_with_configured_header_mints_a_key(self) -> None:
+        key = _http.resolve_idempotency_injection("POST", [], "Idempotency-Key")
+        self.assertIsInstance(key, str)
+        self.assertTrue(key)
+
+    def test_mint_is_deterministic_under_test(self) -> None:
+        # rule 2 requires a fresh mint per logical call; the source is
+        # injectable (a plain module attribute) so tests never depend on real
+        # randomness.
+        orig = _http.new_idempotency_key
+        try:
+            calls = iter(["fixed-key-1", "fixed-key-2"])
+            _http.new_idempotency_key = lambda: next(calls)  # type: ignore[assignment]
+            self.assertEqual(
+                _http.resolve_idempotency_injection("POST", [], "Idempotency-Key"),
+                "fixed-key-1",
+            )
+            self.assertEqual(
+                _http.resolve_idempotency_injection("PATCH", [], "Idempotency-Key"),
+                "fixed-key-2",
+            )
+        finally:
+            _http.new_idempotency_key = orig
+
+    def test_a_tier2_recorded_key_is_reused_verbatim_rule_3(self) -> None:
+        # A resume that re-executes a crashed step injects the SAME key the
+        # journal recorded — never a fresh mint — so the provider can dedup.
+        self.assertEqual(
+            _http.resolve_idempotency_injection(
+                "POST", [], "Idempotency-Key", recorded_key="ik-recorded"
+            ),
+            "ik-recorded",
+        )
+
+    def test_new_idempotency_key_mints_distinct_opaque_values(self) -> None:
+        a, b = _http.new_idempotency_key(), _http.new_idempotency_key()
+        self.assertNotEqual(a, b)
+        self.assertTrue(a)
 
 
 class ArgsHashTest(unittest.TestCase):
@@ -101,10 +226,10 @@ class CrossJudgeParityTest(unittest.TestCase):
 
     def test_no_body_get_hashes_identically_across_judges(self) -> None:
         url = "https://example.com/p"
-        _, _, _, hx_hash = httpx_pack._judge(httpx.Request("GET", url))
+        _, _, _, hx_hash, _ = httpx_pack._judge(httpx.Request("GET", url))
         prepared = PreparedRequest()
         prepared.prepare(method="GET", url=url)
-        _, _, _, rq_hash = requests_pack._judge(prepared)
+        _, _, _, rq_hash, _ = requests_pack._judge(prepared)
         self.assertIsNotNone(hx_hash)
         self.assertEqual(hx_hash, rq_hash)
         self.assertEqual(hx_hash, _http.args_hash("GET", url))  # no trailing body separator

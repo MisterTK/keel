@@ -1,0 +1,5 @@
+error: #[keel::wrap] requires a `-> Result<T, E>` return type
+ --> tests/ui/fail_non_result_return.rs:5:34
+  |
+5 | async fn fetch_order(id: u32) -> u32 {
+  |                                  ^^^

@@ -31,12 +31,66 @@
  *   - on final failure the original provider error propagates unchanged, with a
  *     non-enumerable `keelOutcome` attached (DX invariant 5), exactly like the
  *     fetch seam.
+ *
+ * Coverage of the SDK's four core generation ops (generateText, streamText,
+ * generateObject, streamObject) — verified against the `ai` v5 middleware docs
+ * (content/docs/03-ai-sdk-core/40-middleware.mdx): `LanguageModelV2Middleware`
+ * exposes exactly two hooks, `wrapGenerate`/`wrapStream`, because ai@5
+ * `generateObject`/`streamObject` are themselves built on the SAME
+ * `doGenerate`/`doStream` calls as `generateText`/`streamText` (object mode is
+ * a `responseFormat`/`mode` value inside `params`, not a separate model
+ * method). There is no third or fourth middleware hook to implement — the two
+ * hooks below already cover all four ops transparently, since `params` is
+ * opaque to Keel except as a dev-cache key (a `generateObject` call with a
+ * `responseFormat` field hashes and replays exactly like `generateText`, and a
+ * `streamObject` call establishes/retries exactly like `streamText` — proven
+ * for both in test/ai-sdk.test.mjs). Documented honestly here so nobody goes
+ * looking for `wrapGenerateObject`/`wrapStreamObject` hooks that do not exist
+ * in the SDK's own middleware contract.
+ *
+ * Streaming honesty note (all four "stream…" surfaces, since streamObject
+ * shares this path): retry is applied ONLY to stream ESTABLISHMENT — i.e. only
+ * before the first token/chunk is ever produced. A provider error thrown by
+ * `doStream()` itself (rejecting before any bytes exist) is retried per
+ * policy; once `doStream()` resolves and the raw stream is handed back, Keel
+ * NEVER buffers, inspects, retries, or otherwise touches it again — a
+ * mid-stream drop is the caller's problem exactly as it would be without
+ * Keel. This is a deliberate, spec-driven limit (a live stream is not
+ * replayable), not an oversight.
+ *
+ *   - `budget` (per-run spend cap) and `fallback` (model fallback chain) — see
+ *     `llm-policy.mjs` for the shared design. This seam is the ONE place a
+ *     fallback hop can be a genuinely DIFFERENT PROVIDER (not just a same-host
+ *     model swap like the fetch seam manages): pass `keelMiddleware({ models })`
+ *     with a map of fallback name → an already-constructed `LanguageModelV2`
+ *     instance for that model, and a qualifying failure re-dispatches to it.
+ *     Without a matching entry in `models`, fallback for that hop is a no-op
+ *     (the chain stops there and the current failure is delivered) — an
+ *     unresolvable name is not silently pretended away.
  */
 
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { join } from "node:path";
 import { getBackend, getDiscovery, attachOutcome } from "../runtime.mjs";
 import { KeelError } from "../engine.mjs";
 import { parseRetryAfter } from "../judge.mjs";
+import { llmDefaults } from "../defaults.mjs";
+import {
+  parseBudgetCents,
+  spentCents,
+  recordSpend,
+  estimateCostUsd,
+  normalizeUsage,
+  budgetMessage,
+  budgetBlockedOutcome,
+  shouldFallback,
+} from "../llm-policy.mjs";
+
+const PKG_SPECIFIER = "ai/package.json";
+// The fixture pin (../../fixtures/ai-sdk-model.d.ts) mirrors ai@5.0.0's
+// middleware shape; any 5.0.x install is covered by the same contract tests.
+const PINNED_MAJOR_MINOR = "5.0.";
 
 /** Derive `llm:<provider>` from a model's provider id (base segment). */
 export function providerTarget(model) {
@@ -118,8 +172,7 @@ export function classifyModelError(err) {
   return { class: "other", message: err?.message ?? String(err) };
 }
 
-function settle(outcome, target, discovery, latencyMs, held) {
-  discovery?.observe(target, outcome, latencyMs);
+function deliver(outcome, held) {
   if (outcome.result === "ok") {
     // Live call → the real provider result unchanged (identity + a live stream
     // preserved, byte-transparent). Cache hit → the round-tripped JSON payload
@@ -140,41 +193,85 @@ function settle(outcome, target, discovery, latencyMs, held) {
  * installed by the hook. `options.backend`/`options.discovery` allow injection
  * for embedding and tests. When no backend is active (Keel disabled / not
  * installed) the middleware is a transparent pass-through (DX invariant 2).
+ * `options.models` maps a `fallback` chain entry (by name) to an alternate
+ * `LanguageModelV2` instance — see the module doc's fallback section.
  */
 export function keelMiddleware(options = {}) {
   const backendOf = () => options.backend ?? getBackend();
   const discoveryOf = () => options.discovery ?? getDiscovery();
+  const modelsOf = () => (options.models && typeof options.models === "object" ? options.models : {});
 
-  const run = async ({ effect, params, model, kind, cacheable }) => {
+  const run = async ({ effect: primaryEffect, params, model: primaryModel, kind, cacheable }) => {
     const backend = backendOf();
-    if (!backend) return effect(); // disabled: transparent pass-through
-    const target = providerTarget(model);
-    const op = `${kind} ${target}${model?.modelId ? ` ${model.modelId}` : ""}`;
-    const request = {
-      v: 1,
-      target,
-      op,
-      idempotent: true,
-      args_hash: cacheable ? hashParams(params) : null,
-    };
-    const started = performance.now();
-    // Live result/error held side-band so the core payload stays JSON: the native
-    // core cannot round-trip a live stream/Date/Error. On the success path we
-    // hand back the real object (identity + streams preserved); only a cache HIT
-    // uses the JSON payload. A stream result must NEVER cross the core, so a
-    // non-cacheable effect (streams) sends no payload at all.
-    const held = { liveResult: undefined, haveResult: false, liveErr: undefined };
-    const outcome = await backend.execute(request, async () => {
-      try {
-        held.liveResult = await effect();
-        held.haveResult = true;
-        return { status: "ok", payload: cacheable ? jsonClone(held.liveResult) : null };
-      } catch (err) {
-        held.liveErr = err;
-        return { status: "error", ...classifyModelError(err) };
+    if (!backend) return primaryEffect(); // disabled: transparent pass-through
+
+    let currentModel = primaryModel;
+    let currentEffect = primaryEffect;
+    let hopIndex = 0;
+    let target;
+    let outcome;
+    let held;
+
+    // Bounded by the primary target's `fallback` chain length (re-checked below).
+    for (;;) {
+      target = providerTarget(currentModel);
+
+      if (hopIndex === 0) {
+        // Budget is gated ONLY on the PRIMARY target, once, before any dispatch
+        // (parity with fetch.mjs's design) — a fallback hop's own target is not
+        // itself budget-gated in v0.1 (documented scope; see llm-policy.mjs).
+        const capCents = parseBudgetCents(backend.layer(target, "budget"));
+        if (capCents !== null && spentCents(target) >= capCents) {
+          const message = budgetMessage(target, capCents, spentCents(target));
+          const blocked = budgetBlockedOutcome(message);
+          discoveryOf()?.observe(target, blocked, 0);
+          throw attachOutcome(new KeelError("KEEL-E012", message), blocked);
+        }
       }
-    });
-    return settle(outcome, target, discoveryOf(), performance.now() - started, held);
+
+      const capForUsage = parseBudgetCents(backend.layer(target, "budget"));
+      const op = `${kind} ${target}${currentModel?.modelId ? ` ${currentModel.modelId}` : ""}`;
+      const request = {
+        v: 1,
+        target,
+        op,
+        idempotent: true,
+        args_hash: cacheable ? hashParams(params) : null,
+      };
+      held = { liveResult: undefined, haveResult: false, liveErr: undefined };
+      const started = performance.now();
+      outcome = await backend.execute(request, async () => {
+        try {
+          held.liveResult = await currentEffect();
+          held.haveResult = true;
+          return { status: "ok", payload: cacheable ? jsonClone(held.liveResult) : null };
+        } catch (err) {
+          held.liveErr = err;
+          return { status: "error", ...classifyModelError(err) };
+        }
+      });
+      discoveryOf()?.observe(target, outcome, performance.now() - started);
+
+      if (outcome.result === "ok") {
+        if (capForUsage !== null && held.haveResult && !outcome.from_cache) {
+          const usage = normalizeUsage(held.liveResult);
+          if (usage) recordSpend(target, estimateCostUsd(currentModel?.modelId, usage));
+        }
+        break;
+      }
+
+      const fallbackCfg = backend.layer(target, "fallback");
+      const chain = Array.isArray(fallbackCfg) ? fallbackCfg.filter((m) => typeof m === "string" && m) : [];
+      if (hopIndex >= chain.length || !shouldFallback(outcome.error)) break;
+      const altModel = modelsOf()[chain[hopIndex]];
+      const methodName = kind === "generate" ? "doGenerate" : "doStream";
+      if (!altModel || typeof altModel[methodName] !== "function") break; // unresolvable — stop, honestly
+      currentModel = altModel;
+      currentEffect = () => altModel[methodName](params);
+      hopIndex += 1;
+    }
+
+    return deliver(outcome, held);
   };
 
   return {
@@ -184,5 +281,72 @@ export function keelMiddleware(options = {}) {
     // stream: resilience on ESTABLISHMENT only; chunks pass through unchanged.
     wrapStream: ({ doStream, params, model }) =>
       run({ effect: doStream, params, model, kind: "stream", cacheable: false }),
+  };
+}
+
+function resolveFrom(cwd, specifier) {
+  // Resolve first from the user's project, then from Keel's own deps.
+  try {
+    return createRequire(join(cwd, "package.json")).resolve(specifier);
+  } catch {
+    try {
+      return createRequire(import.meta.url).resolve(specifier);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** The `ai-sdk` pack — the four uniform operations (adapter-pack.md). Unlike
+ *  `mcp:`, this pack never patches anything: `wrapLanguageModel` is the
+ *  framework's OWN blessed extension point, wired in explicitly by the user's
+ *  code (module doc comment). `detect()`/`seams()`/`targets()` exist so the
+ *  pack is machine-reportable — `keel doctor`/the startup banner can say "ai
+ *  SDK detected" and print the (API, not patch) seam rationale — per
+ *  contracts/adapter-pack.md: "a pack whose seam it cannot explain does not
+ *  ship". */
+export function aiSdkPack({ cwd = process.cwd() } = {}) {
+  return {
+    detect() {
+      const pkgPath = resolveFrom(cwd, PKG_SPECIFIER);
+      if (!pkgPath) return { matched: false };
+      let version;
+      try {
+        version = createRequire(import.meta.url)(pkgPath)?.version;
+      } catch {
+        /* version unknown */
+      }
+      const pinned = typeof version === "string" && version.startsWith(PINNED_MAJOR_MINOR);
+      return { matched: true, name: "ai", version, confidence: pinned ? "pinned" : "best_effort" };
+    },
+    seams() {
+      return [
+        {
+          patchPoint: "wrapLanguageModel middleware (wrapGenerate/wrapStream)",
+          upstreamApi: "ai — LanguageModelV2Middleware (wrapLanguageModel)",
+          whyStable:
+            "the framework's own blessed extension point for wrapping a LanguageModelV2 — an API seam, not a monkey patch: the user opts in explicitly (`wrapLanguageModel({ model, middleware: keelMiddleware() })`); nothing is patched, so there is nothing to auto-arm at bootstrap",
+        },
+      ];
+    },
+    targets() {
+      return [
+        {
+          pattern: "llm:<provider>",
+          kind: "llm",
+          idempotencyRule:
+            "generate and stream calls are treated as retryable (idempotent) so 429/5xx/timeout retry per policy; resilience wraps stream ESTABLISHMENT only (before the first token) — once returned, a stream's chunks are never retried or observed",
+          argsHashRule:
+            "sha256 over the (key-sorted) call params for generate — covers generateText and generateObject alike, since both route through doGenerate; null for streams (streamText/streamObject via doStream) because a live stream is not cache-replayable",
+        },
+      ];
+    },
+    /** Policy fragment merged UNDER user config: the generic `[defaults.llm]`
+     *  (the same fragment the `llm:` pack ships — ai-sdk targets ARE `llm:`
+     *  targets, so this is documentation of an already-applied default, not
+     *  an extra layer folded in separately at bootstrap). */
+    defaults() {
+      return { defaults: { llm: llmDefaults() } };
+    },
   };
 }

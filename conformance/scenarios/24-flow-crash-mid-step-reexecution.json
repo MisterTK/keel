@@ -1,0 +1,49 @@
+{
+  "name": "flow-crash-mid-step-reexecution",
+  "tier": 2,
+  "description": "Tier 2: step 1 completes live, then step 2 is left journaled 'running' (a crash mid-effect, before its terminal outcome was recorded) via a direct journal write rather than a completed execute_step call. On resume, step 1's terminal record substitutes as usual, but step 2's running record re-executes LIVE (the at-least-once honesty rule: a running record, unlike a terminal one, is never substituted). Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-24",
+    "code_hash": "ch-24"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 1 } },
+          "expect": { "result": "ok", "payload": { "n": 1 } }
+        }
+      ],
+      "inject_running": { "seq": 2, "target": "api.crash.internal", "args_hash": "c1" },
+      "expect_journal": [
+        { "seq": 1, "key": "api.a.internal#1", "kind": "effect", "status": "ok" },
+        { "seq": 2, "key": "api.crash.internal#c1", "kind": "effect", "status": "running" }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 9 } },
+          "expect": { "result": "ok", "payload": { "n": 1 } }
+        },
+        {
+          "target": "api.crash.internal",
+          "args_hash": "c1",
+          "effect": { "status": "ok", "payload": { "charged": true } },
+          "expect": { "result": "ok", "payload": { "charged": true }, "attempts": 1 }
+        }
+      ]
+    }
+  ]
+}

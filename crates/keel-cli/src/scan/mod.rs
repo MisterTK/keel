@@ -5,8 +5,9 @@
 //! Two scanners, one merged result:
 //! - [`python`] shells an `ast`-walker out to `python3 -` for precise Python
 //!   parsing (imports of known effect libraries, URL/DSN string literals).
-//! - [`js`] does a **documented-simplification** regex scan of JS/TS for
-//!   `fetch`/`undici`/`node:http` usage, provider-SDK imports, and URL literals.
+//! - [`js`] parses JS/TS/JSX in-process with oxc (no Node toolchain needed)
+//!   for `fetch`/`undici`/`node:http` usage, provider-SDK imports, effect-lib
+//!   call sites, and URL literals.
 //!
 //! Both label every finding with `file:line`, so the generated `keel.toml` can
 //! cite where each target was found and trust stays inspectable.
@@ -26,6 +27,26 @@ pub enum TargetClass {
     Host,
     /// A semantic `llm:<provider>` target — from a provider SDK import.
     Llm,
+}
+
+/// One effect call site with enclosing-function attribution — an internal
+/// detail of the JS/TS pass ([`js`]), which uses it to verify its real
+/// scope-chain tracking (dotted paths like `Class.method`) independently of
+/// the coarser top-level-only [`FunctionFacts`] attribution `keel flows
+/// suggest` consumes. Not exposed on [`ScanResult`]. Field order is the sort
+/// order (file, then line).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallSite {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// 1-based line of the call expression.
+    pub line: u32,
+    /// What is called, rooted at the effect library where the receiver is
+    /// known (`fetch`, `undici.request`, `openai.chat.completions.create`).
+    pub callee: String,
+    /// Dotted enclosing-scope path (`Class.method`, `outer.inner`), or `None`
+    /// at module top level. Anonymous scopes inherit the nearest named scope.
+    pub function: Option<String>,
 }
 
 /// One place a target was seen: a project-relative path and 1-based line.
@@ -53,6 +74,46 @@ pub struct TargetEvidence {
     pub sightings: BTreeSet<Sighting>,
 }
 
+/// Per-function effect attribution — the evidence behind `keel flows suggest`.
+///
+/// Each language pass attributes what it finds *inside* a function definition
+/// to that function: intercepted-effect call sites, calls that read time or
+/// randomness (virtualized under Tier 2 replay), and constructs that defeat
+/// replay outright (threads, subprocesses, raw sockets). Both passes
+/// attribute by real containment: the Python walker via `ast` module-level
+/// def bodies, the JS/TS pass via a real oxc scope walk (see [`js`]) — an
+/// entry opens only for a function bound directly at module top level; class
+/// methods and nested/inner functions roll up into the enclosing top-level
+/// entry rather than opening their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionFacts {
+    /// The full flow-entrypoint ref this function would be designated as —
+    /// `py:pipeline.ingest:main` or `ts:jobs/nightly.ts#run` (the `ts:`
+    /// namespace covers all JS/TS files).
+    pub entrypoint: String,
+    /// Project-relative path of the defining file.
+    pub file: String,
+    /// 1-based line of the `def`/`function`.
+    pub line: u32,
+    /// Intercepted-effect call sites (HTTP / LLM / DSN-bearing libraries).
+    pub effects: u32,
+    /// Effect calls that are not idempotent-safe to re-send (POST/PATCH-shaped)
+    /// and carry no idempotency evidence.
+    pub idempotent_unsafe: u32,
+    /// Wall-clock reads (`time.time`, `datetime.now`, `Date.now`, …) — these
+    /// are virtualized (journaled + replayed) under Tier 2.
+    pub time_reads: u32,
+    /// Randomness reads (`random.*`, `uuid4`, `Math.random`, …) — also
+    /// virtualized under Tier 2.
+    pub random_reads: u32,
+    /// Why replay would be unsafe (empty = the replay-safe estimate holds).
+    /// Each reason cites `what at file:line`; sorted, deterministic.
+    pub unsafe_reasons: Vec<String>,
+    /// Targets referenced inside the function (hosts from URL literals,
+    /// `llm:<provider>` from SDK calls) — the join key into `.keel/discovery.db`.
+    pub targets: BTreeSet<String>,
+}
+
 /// The merged output of both scanners.
 #[derive(Debug, Clone, Default)]
 pub struct ScanResult {
@@ -69,6 +130,9 @@ pub struct ScanResult {
     /// `openai`, `boto3`, `fetch`). `keel doctor` cross-references these against
     /// its adapter registry to classify coverage.
     pub libs: BTreeSet<String>,
+    /// Per-function attribution (see [`FunctionFacts`]), sorted by
+    /// `(file, line)` — deterministic across runs.
+    pub functions: Vec<FunctionFacts>,
 }
 
 impl ScanResult {
@@ -95,11 +159,16 @@ pub fn scan(project: &Path) -> ScanResult {
     result.python_available = py.available;
     result.files_scanned += py.files_scanned;
     merge_lang(&mut result, &py.findings);
+    result.functions.extend(py.functions);
 
     let js = js::scan(project);
     result.files_scanned += js.files_scanned;
     merge_lang(&mut result, &js.findings);
+    result.functions.extend(js.functions);
 
+    result
+        .functions
+        .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
     result
 }
 
@@ -114,6 +183,8 @@ pub struct LangFindings {
     pub http_in_use: bool,
     /// Effect-library names detected (for `keel doctor`'s registry cross-check).
     pub libs: BTreeSet<String>,
+    /// Effect call sites with enclosing-function attribution.
+    pub call_sites: Vec<CallSite>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {

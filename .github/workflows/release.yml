@@ -1,0 +1,634 @@
+# Release pipeline — BUILD INFRA ONLY, no publishing.
+#
+# Produces every artifact docs/sprint-plan.md's release-candidate line
+# promises (wheels macOS/Linux x86-64/aarch64, npm package, CLI binaries,
+# brew formula draft) plus the CLI/Windows/musl legs architecture-spec's NFR5
+# adds, attaches them all to a DRAFT GitHub Release, and stops. Every
+# `cargo publish`/`twine upload`/`npm publish` step is either `--dry-run` or
+# fully commented out behind a manual `workflow_dispatch` input — see the
+# `publish` job at the bottom. Nothing in this file talks to a real package
+# registry.
+#
+# Why: docs/naming-decision.md is not resolved yet (PyPI `keel`/npm `keel`/
+# crates.io `keel`+`keel-core` are all taken by someone else). Wave 0 fixed
+# every manifest's name as-is until that decision lands; this workflow builds
+# artifacts under those names without publishing them anywhere.
+#
+# Triggers on `vX.Y.Z` tags (the version MUST already match every manifest —
+# scripts/check-versions.py --tag is the gate) and on workflow_dispatch for
+# dry runs against any branch (no tag-version check in that mode).
+#
+# Local verification of the pieces this workflow automates (see also
+# scripts/check-release-metadata.sh --full, which several jobs below run
+# verbatim):
+#
+#   actionlint .github/workflows/release.yml
+#   PATH="$HOME/.rustup/toolchains/1.97.0-aarch64-apple-darwin/bin:$PATH" \
+#     maturin build --release -m crates/keel-py/Cargo.toml -o dist   # native wheel
+#   maturin build --release -m crates/keel-cli/Cargo.toml -o dist    # CLI wheel
+#   uvx --from ./dist/keel_cli-*.whl keel --help                    # uvx entrypoint
+#   (cd node/keel && npm pack) && ...                                # npm tarball
+#   ruby -c packaging/homebrew/keel.rb                                # brew draft
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Run the (fully commented-out) real publish steps. Left true here
+          does NOTHING today — see the `publish` job; this exists so the gate
+          is visible in the UI before any registry credentials ever land.
+        type: boolean
+        default: false
+
+# One release build per ref at a time; never cancel one mid-upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default; only the job that files the GitHub Release
+# elevates to `contents: write`.
+permissions:
+  contents: read
+
+env:
+  # rustup's own toolchain (pinned by rust-toolchain.toml) is what every
+  # `rustup toolchain install` step below activates; unlike the maintainer's
+  # local machine this repo's CI runners have no conflicting Homebrew cargo
+  # ahead of it on PATH, so no PATH surgery is needed here (contrast
+  # CLAUDE.md's local-dev note).
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: the tag (if any) matches every version declaration, and the cheap
+  # release-metadata invariants (vendored copies, cargo package listings,
+  # manifest shape) hold. Every other job depends on this.
+  # ---------------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Assert tag matches every version declaration
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/check-versions.py --tag "$TAG"
+      - name: Release-metadata invariants (cheap mode)
+        run: bash scripts/check-release-metadata.sh
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 1a. keel_core wheels (PyO3/abi3, one wheel per platform — see
+  # crates/keel-py/pyproject.toml's abi3-py311 feature) + a source distribution.
+  # rusqlite's `bundled` feature (crates/keel-journal) statically compiles
+  # SQLite, so there is no manylinux system-library problem in this matrix.
+  #
+  # macOS: GitHub no longer offers a free Intel (x86_64) runner, so both
+  # macOS legs run on the same arm64 `macos-14` box — aarch64-apple-darwin
+  # natively, x86_64-apple-darwin cross-compiled via `rustup target add`
+  # (Xcode's linker/SDK support this without a separate toolchain; Rosetta 2,
+  # preinstalled on these runners, is only needed to *run* the result, which
+  # is why its import smoke below is skipped rather than Rosetta-wrapped).
+  # ---------------------------------------------------------------------------
+  wheels-core:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            smoke: true # native to the runner
+          - os: macos-14
+            target: x86_64-apple-darwin
+            smoke: false # cross-compiled; importing into the arm64 python would mis-match arch
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+            smoke: true # native to the runner
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2_28"
+            smoke: false # cross-compiled under QEMU; not worth the emulated python cost here
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU (linux/aarch64 cross build)
+        if: runner.os == 'Linux' && matrix.target == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build wheel (keel_core)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist -m crates/keel-py/Cargo.toml
+      - name: Install + import smoke (native-arch legs only)
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-smoke
+          .venv-smoke/bin/pip install --quiet --disable-pip-version-check dist/keel_core-*.whl
+          .venv-smoke/bin/python -c 'import keel_core; c = keel_core.KeelCore(); c.configure({}); print("keel_core import OK:", c.report())'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-core-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist-core:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m crates/keel-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist-core
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 1b. The pure-Python `keel` front-end wheel (setuptools, platform-independent
+  # — see python/keel/pyproject.toml). One build covers every platform.
+  # ---------------------------------------------------------------------------
+  wheel-frontend:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m pip install --upgrade pip build
+      - run: python3 -m build --wheel --sdist --outdir dist python/keel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-frontend
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 1c. The `keel` CLI as a pip-installable wheel (maturin `bin` bindings —
+  # crates/keel-cli/pyproject.toml) so `uvx keel-cli run ...` — and, once
+  # docs/naming-decision.md resolves the PyPI name, `uvx keel run ...` —
+  # "just works" from a wheel with no Rust toolchain. Same platform matrix as
+  # the core wheels (macOS x2, manylinux x2); Windows/musl CLI binaries are
+  # produced separately by `cli-binaries` below (raw binaries, not wheels —
+  # pip/uvx are out of scope for those per docs/dx-spec.md §6's install
+  # surface, which only promises pip/npm on macOS/Linux).
+  # ---------------------------------------------------------------------------
+  wheel-cli:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # See wheels-core's comment: no free Intel macOS runner exists
+          # anymore, so x86_64-apple-darwin is cross-compiled on the arm64
+          # `macos-14` box.
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2_28"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU (linux/aarch64 cross build)
+        if: runner.os == 'Linux' && matrix.target == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build wheel (keel-cli, bin bindings)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist -m crates/keel-cli/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cli-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # The literal docs/sprint-plan.md release-gate spelling (`uvx keel run`)
+  # needs the PyPI name `keel`, which is blocked on docs/naming-decision.md;
+  # this proves the mechanism works via `uvx --from`, which is what changes
+  # once that name lands (no other code changes required).
+  cli-wheel-uvx-smoke:
+    needs: wheel-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-cli-ubuntu-latest-x86_64
+          path: dist
+      - name: uvx --from ./dist/keel_cli-*.whl keel ...
+        run: |
+          set -euo pipefail
+          uvx --from ./dist/keel_cli-*.whl keel --help
+          uvx --from ./dist/keel_cli-*.whl keel --version
+          out="$(uvx --from ./dist/keel_cli-*.whl keel explain KEEL-E011 --json)"
+          echo "$out"
+          echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"] == "KEEL-E011", d'
+
+  # ---------------------------------------------------------------------------
+  # 2. napi native-addon prebuilds for `keel-core-native`, staged into the
+  # per-platform npm layout (node/keel-core-native/npm/<platform>/ —
+  # package.json's `napi` config + optionalDependencies; see
+  # scripts/napi-prebuild.sh for why this doesn't shell out to @napi-rs/cli).
+  # Then `npm pack` of the front-end `keel` package for the tarball-install
+  # smoke test (docs/dx-spec.md §6: "no toolchain, no compile, ever").
+  # ---------------------------------------------------------------------------
+  npm-native-prebuilds:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No free Intel macOS runner exists anymore (see wheels-core); both
+          # darwin legs build on the arm64 `macos-14` box.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform_key: darwin-x64
+            native: false # cross-compiled: an arm64 Node process can't dlopen an x86_64 addon
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform_key: darwin-arm64
+            native: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform_key: linux-x64-gnu
+            native: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform_key: linux-arm64-gnu
+            native: false # cross-compiled; can't execute on an x86_64 runner
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install cross (linux/aarch64 cross build)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: rustup target add ${{ matrix.target }}
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: rustup target add "${{ matrix.target }}"
+      - name: cargo build --target ${{ matrix.target }}
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo build -p keel-node --release --locked --target "${{ matrix.target }}"
+      - name: cross build --target ${{ matrix.target }}
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build -p keel-node --release --locked --target "${{ matrix.target }}"
+      - name: Stage into node/keel-core-native/npm/${{ matrix.platform_key }}
+        run: bash scripts/napi-prebuild.sh "${{ matrix.target }}"
+      - name: Native conformance against the staged addon (host-arch legs only)
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          cp "node/keel-core-native/npm/${{ matrix.platform_key }}/keel-core-native.${{ matrix.platform_key }}.node" \
+            node/keel-core-native/keel-core-native.node
+          (cd node/keel-core-native && node --test)
+          rm node/keel-core-native/keel-core-native.node
+      - name: npm pack the platform package
+        run: npm pack --pack-destination "$RUNNER_TEMP/npm-dist" "./node/keel-core-native/npm/${{ matrix.platform_key }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-native-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+
+  npm-pack-root:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Full release-metadata check (npm tarball smoke + python wheel + keel-core sdist compile)
+        run: bash scripts/check-release-metadata.sh --full
+      - name: npm pack keel (front end) + @keel/core-native (source wrapper)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel-core-native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-pack-root
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. `keel` CLI release binaries — architecture-spec.md NFR5: "a static Rust
+  # binary (musl) for macOS/Linux/Windows". musl legs use `cross` (Docker
+  # images with the musl toolchain preinstalled); rusqlite's `bundled` SQLite
+  # (crates/keel-journal) compiles fine there and under MSVC (both are plain
+  # `cc`-crate C compiles, no external SQLite dependency).
+  # ---------------------------------------------------------------------------
+  cli-binaries:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No free Intel macOS runner exists anymore (see wheels-core): both
+          # darwin legs build on the arm64 `macos-14` box.
+          # x86_64-apple-darwin is `rustup target add` + native `cargo build`
+          # (Xcode cross-links it directly, no Docker/`cross` involved — that
+          # tool doesn't support macOS targets anyway); Rosetta 2, preinstalled
+          # on this runner, executes the resulting binary for the smoke test.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            cross: false
+            runnable: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            cross: false
+            runnable: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            cross: true
+            runnable: true # static musl binary; x86_64 host can run it directly
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            cross: true
+            runnable: false # different CPU arch than the x86_64 runner
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            cross: false
+            runnable: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install cross (musl targets)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: rustup target add ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: rustup target add "${{ matrix.target }}"
+      - name: cargo build --target ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: cargo build -p keel-cli --release --locked --target "${{ matrix.target }}"
+      - name: cross build --target ${{ matrix.target }}
+        if: matrix.cross
+        run: cross build -p keel-cli --release --locked --target "${{ matrix.target }}"
+      - name: Smoke test (native-arch legs only)
+        if: matrix.runnable && matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/keel"
+          "$bin" --version
+          out="$("$bin" explain KEEL-E011 --json)"
+          echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"] == "KEEL-E011", d'
+      - name: Smoke test (Windows)
+        if: matrix.runnable && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/keel.exe"
+          & $bin --version
+          $out = & $bin explain KEEL-E011 --json
+          $out | ConvertFrom-Json | Select-Object -ExpandProperty code
+      - name: Package archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="keel-${{ needs.preflight.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/keel" "$stage/"
+          cp LICENSE README.md "$stage/"
+          tar czf "$stage.tar.gz" "$stage"
+          shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+      - name: Package archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "keel-${{ needs.preflight.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/keel.exe" -Destination $stage
+          Copy-Item LICENSE,README.md -Destination $stage
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          (Get-FileHash -Algorithm SHA256 "$stage.zip").Hash.ToLower() + "  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: |
+            keel-*.tar.gz
+            keel-*.tar.gz.sha256
+            keel-*.zip
+            keel-*.zip.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 4. Homebrew formula draft: syntax + style check always; on an actual tag,
+  # additionally render the real url/sha256 from the tag's source tarball and
+  # attach that rendered copy to the release (the checked-in
+  # packaging/homebrew/keel.rb keeps a placeholder sha256 so it is
+  # syntax-checkable without a tag exising — see scripts/render-homebrew-formula.sh).
+  # ---------------------------------------------------------------------------
+  homebrew-formula:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ruby -c (syntax)
+        run: ruby -c packaging/homebrew/keel.rb
+      - name: brew style (full lint, best-effort)
+        run: brew style packaging/homebrew/keel.rb || echo "::warning::brew style reported issues (non-fatal for a draft formula)"
+      - name: Render for this tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-homebrew
+          bash scripts/render-homebrew-formula.sh "$TAG" dist-homebrew/keel.rb
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: homebrew-formula
+          path: dist-homebrew/keel.rb
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 5. `cargo publish --dry-run` for the publishable crates, in dependency
+  # order. `--no-verify` is required for the FIRST release of an
+  # interdependent crate graph: dry-run verification otherwise tries to
+  # resolve path dependencies (keel-core-api, keel-journal) against the
+  # registry, which doesn't have them yet. This is advisory, not a hard gate —
+  # continue-on-error, since a clean local `cargo package` (checked by
+  # scripts/check-release-metadata.sh) is the meaningful signal pre-publish.
+  # ---------------------------------------------------------------------------
+  cargo-publish-dry-run:
+    needs: preflight
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: cargo publish --dry-run (keel-core-api, keel-journal, keel-core, keel-cli)
+        run: |
+          set -euo pipefail
+          for crate in keel-core-api keel-journal keel-core keel-cli; do
+            echo "::group::cargo publish --dry-run -p $crate"
+            cargo publish --dry-run --no-verify --locked -p "$crate"
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 6. File (or update) a DRAFT GitHub Release with every artifact above.
+  # Tag pushes only — workflow_dispatch dry runs stop after building/smoking.
+  # ---------------------------------------------------------------------------
+  draft-release:
+    needs:
+      - preflight
+      - wheels-core
+      - sdist-core
+      - wheel-frontend
+      - wheel-cli
+      - cli-wheel-uvx-smoke
+      - npm-native-prebuilds
+      - npm-pack-root
+      - cli-binaries
+      - homebrew-formula
+      - cargo-publish-dry-run
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten + checksum
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          (cd dist && shasum -a 256 -- * > SHA256SUMS.txt)
+          ls -la dist
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: keel ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
+
+  # ---------------------------------------------------------------------------
+  # 7. Real publishing — NOT WIRED UP. Every command below is a comment.
+  # Gated on workflow_dispatch's `publish` input so it never runs from a tag
+  # push. Uncommenting requires: (a) docs/naming-decision.md resolved for
+  # every registry, (b) `CARGO_REGISTRY_TOKEN` / `PYPI_API_TOKEN` /
+  # `NPM_TOKEN` secrets provisioned, (c) node/keel-core-native's + its
+  # npm/*/ platform packages' `"private": true` flipped to `false`.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: draft-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: release # requires a manual approval gate configured in repo settings
+    steps:
+      - name: Publishing is not enabled
+        run: |
+          echo "::notice::This job is a placeholder. See the commented commands below the checkout step in .github/workflows/release.yml — nothing here talks to a registry."
+      # - uses: actions/checkout@v4
+      # - uses: actions/download-artifact@v4
+      #   with:
+      #     path: dist
+      #
+      # # crates.io (dependency order; needs docs/naming-decision.md's renames
+      # # first — the crate names below are today's in-repo names, not the
+      # # eventual published ones):
+      # - run: cargo publish --locked -p keel-core-api
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # - run: cargo publish --locked -p keel-journal
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # - run: cargo publish --locked -p keel-core
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # - run: cargo publish --locked -p keel-cli
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #
+      # # PyPI (twine; the keel-core wheels + sdist, then the keel-cli wheels,
+      # # then the pure-Python keel front end):
+      # - run: python3 -m pip install twine
+      # - run: twine upload dist/keel_core-*.whl dist/keel_core-*.tar.gz
+      #   env:
+      #     TWINE_USERNAME: __token__
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      # - run: twine upload dist/keel_cli-*.whl
+      #   env:
+      #     TWINE_USERNAME: __token__
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      # - run: twine upload dist/keel-*.whl dist/keel-*.tar.gz
+      #   env:
+      #     TWINE_USERNAME: __token__
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      #
+      # # npm (platform packages first, so the root package's optionalDependency
+      # # resolution has something to find; flip `"private": true` -> `false`
+      # # in each package.json before this can succeed):
+      # - run: |
+      #     for tgz in dist/keel-core-native-*.tgz; do
+      #       npm publish --access public "$tgz"
+      #     done
+      #     npm publish --access public dist/keel-core-native-*.tgz
+      #     npm publish --access public dist/keel-*.tgz
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

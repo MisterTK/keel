@@ -1,0 +1,19 @@
+{
+  "added": true,
+  "already_designated": false,
+  "changes": [
+    {
+      "after": [
+        "py:pipeline.ingest:main",
+        "ts:jobs/nightly.ts#run"
+      ],
+      "before": [
+        "py:pipeline.ingest:main"
+      ],
+      "path": "flows.entrypoints"
+    }
+  ],
+  "entrypoint": "ts:jobs/nightly.ts#run",
+  "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,2 @@\n [flows]\n-entrypoints = [\"py:pipeline.ingest:main\"]\n+entrypoints = [\"py:pipeline.ingest:main\", \"ts:jobs/nightly.ts#run\"]\n",
+  "written": true
+}

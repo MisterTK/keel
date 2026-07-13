@@ -14,6 +14,7 @@
     "total": 3
   },
   "journal_present": true,
+  "not_retried": 1,
   "retries": 12,
   "success_rate": 0.9818,
   "successes": 108,
@@ -23,22 +24,39 @@
       "cache_hits": 10,
       "calls": 100,
       "failures": 2,
+      "not_retried": 1,
       "retries": 12,
       "successes": 88,
       "target": "api.example.com",
-      "throttled": 3
+      "throttled": 3,
+      "unwrapped_calls": 0
     },
     {
       "breaker_opens": 0,
       "cache_hits": 20,
       "calls": 40,
       "failures": 0,
+      "not_retried": 0,
       "retries": 0,
       "successes": 20,
       "target": "llm:openai",
-      "throttled": 0
+      "throttled": 0,
+      "unwrapped_calls": 5
     }
   ],
   "targets_wrapped": 2,
-  "throttled": 3
+  "throttled": 3,
+  "unwrapped_calls": 5,
+  "week": {
+    "breaker_opens": 1,
+    "cache_hits": 30,
+    "calls": 140,
+    "failures": 2,
+    "not_retried": 1,
+    "retries": 12,
+    "successes": 108,
+    "throttled": 3,
+    "unwrapped_calls": 5
+  },
+  "wrapped_coverage": 0.9643
 }

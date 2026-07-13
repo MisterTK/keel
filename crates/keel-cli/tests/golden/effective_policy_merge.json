@@ -1,0 +1,41 @@
+{
+  "defaults": {
+    "llm": {
+      "breaker": {
+        "cooldown": "30s",
+        "failures": 5
+      },
+      "cache": {
+        "mode": "dev"
+      },
+      "retry": {
+        "attempts": 2
+      },
+      "timeout": "120s"
+    },
+    "outbound": {
+      "breaker": {
+        "cooldown": "15s",
+        "failures": 5
+      },
+      "retry": {
+        "attempts": 3,
+        "on": [
+          "conn",
+          "timeout",
+          "429",
+          "5xx"
+        ],
+        "schedule": "exp(200ms, x2, max 30s, jitter)"
+      },
+      "timeout": "10s"
+    }
+  },
+  "target": {
+    "api.example.com": {
+      "retry": {
+        "attempts": 5
+      }
+    }
+  }
+}

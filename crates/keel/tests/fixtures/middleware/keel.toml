@@ -1,0 +1,6 @@
+# Fixture for crates/keel/tests/middleware_integration.rs. The mock server
+# always binds 127.0.0.1, so the target key is that literal host (module docs
+# on `crates/keel/src/middleware.rs`: v1 targets are the exact request host,
+# no glob/pattern matching).
+[target."127.0.0.1"]
+retry = { attempts = 3, schedule = "fixed(1ms)", on = ["5xx"] }

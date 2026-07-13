@@ -1,0 +1,38 @@
+{
+  "candidates": [
+    {
+      "already_designated": true,
+      "calls_observed": 50,
+      "display": "pipeline:ingest",
+      "effects": 3,
+      "entrypoint": "py:pipeline:ingest",
+      "file": "pipeline.py",
+      "idempotent_unsafe": 1,
+      "line": 16,
+      "random_reads": 1,
+      "replay_safe": true,
+      "time_reads": 1,
+      "unsafe_reasons": []
+    },
+    {
+      "already_designated": false,
+      "calls_observed": 50,
+      "display": "pipeline:export_report",
+      "effects": 1,
+      "entrypoint": "py:pipeline:export_report",
+      "file": "pipeline.py",
+      "idempotent_unsafe": 0,
+      "line": 25,
+      "random_reads": 0,
+      "replay_safe": false,
+      "time_reads": 0,
+      "unsafe_reasons": [
+        "subprocess use at pipeline.py:27"
+      ]
+    }
+  ],
+  "count": 2,
+  "js_attribution_note": "JS/TS attribution is a real AST parse (oxc): effects, time/random reads, and unsafe constructs are attributed by real scope containment, not a line heuristic. Only top-level named functions are tracked as flow candidates — effects inside class methods, object-literal methods, or nested functions/callbacks roll up to the enclosing top-level function (or are not tracked, for methods). Python attribution is the same real containment, over Python's own AST.",
+  "python_available": true,
+  "replay_safe_count": 1
+}

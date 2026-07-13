@@ -26,6 +26,18 @@
     },
     {
       "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
       "lib": "openai",
       "status": "pinned",
       "target": "llm:openai"
@@ -65,6 +77,24 @@
       "lib": "mcp",
       "status": "best-effort",
       "target": "mcp:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
     }
   ],
   "coverage": {
@@ -88,6 +118,12 @@
       "topic": "invisible"
     }
   ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
   "ok": true,
   "policy": {
     "field": null,

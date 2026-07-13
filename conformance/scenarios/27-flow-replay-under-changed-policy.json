@@ -1,0 +1,52 @@
+{
+  "name": "flow-replay-under-changed-policy",
+  "tier": 2,
+  "description": "Tier 2: run 1 records a step under a policy with no retry table (attempt budget 1). Run 2 reconfigures the engine with a new retry policy (attempts=3) before resuming: the recorded step still substitutes verbatim with its ORIGINAL attempts=1, completely unaffected by the new policy, while a brand-new live step in the same run is retried per the NEW policy (attempts=3) before it is exhausted. Recorded steps and live policy never contaminate each other (spec 4.3 tier boundary). Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-27",
+    "code_hash": "ch-27"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 1 } },
+          "expect": { "result": "ok", "payload": { "n": 1 }, "attempts": 1 }
+        }
+      ]
+    },
+    {
+      "policy": {
+        "flows": { "on_nondeterminism": "fail" },
+        "defaults": {
+          "outbound": {
+            "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+          }
+        }
+      },
+      "end": "failed",
+      "expect_effect_calls": 3,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "n": 9 } },
+          "expect": { "result": "ok", "payload": { "n": 1 }, "attempts": 1 }
+        },
+        {
+          "target": "api.b.internal",
+          "args_hash": "2",
+          "effect": { "status": "error", "class": "timeout", "message": "read timeout" },
+          "expect": { "result": "error", "attempts": 3, "error": { "code": "KEEL-E010", "class": "timeout" } }
+        }
+      ]
+    }
+  ]
+}

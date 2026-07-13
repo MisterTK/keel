@@ -27,6 +27,7 @@ fn bench_overhead(c: &mut Criterion) {
     group.bench_function("a_empty", |b| b.iter(|| cases.empty()));
     group.bench_function("b_cache_miss", |b| b.iter(|| cases.miss()));
     group.bench_function("c_cache_hit", |b| b.iter(|| cases.hit()));
+    group.bench_function("d_events", |b| b.iter(|| cases.events()));
     group.finish();
 }
 
@@ -39,6 +40,7 @@ fn emit_json() {
     p50.insert("a_empty", support::median_ns(|| cases.empty()));
     p50.insert("b_cache_miss", support::median_ns(|| cases.miss()));
     p50.insert("c_cache_hit", support::median_ns(|| cases.hit()));
+    p50.insert("d_events", support::median_ns(|| cases.events()));
 
     let json = serde_json::to_string_pretty(&p50).expect("p50 map serialization is infallible");
     let path =

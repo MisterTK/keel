@@ -17,6 +17,7 @@ use std::path::Path;
 use keel_journal::TargetStats;
 use serde::Serialize;
 
+use crate::diff::{ChangeHunk, PolicyOp, PolicyPath, propose};
 use crate::render::to_json;
 use crate::scan::{ScanResult, TargetClass, TargetEvidence};
 use crate::{EXIT_USAGE, Rendered, evidence, scan};
@@ -59,6 +60,8 @@ Useful commands (all support `--json`):
 - `keel status` — coverage, retries saved, breaker events, resumable flows.
 - `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
 - `keel flows` / `keel trace <flow>` — durable (Tier 2) flow state and step ledger.
+- `keel mcp` — the same surfaces as MCP tools over stdio (get_status,
+  get_doctor_report, propose_policy, get_trace, list_flows, explain_error).
 
 Do not hand-write retry loops or backoff around calls Keel already wraps; edit
 `keel.toml` instead. Uninstalling Keel removes the behavior and nothing else —
@@ -154,10 +157,14 @@ struct WroteReport {
     wrote: String,
 }
 
-/// The machine twin of `--diff`.
+/// The machine twin of `--diff`: the target-name summary plus the applyable
+/// forms (dx-spec §5, diffs as the lingua franca) — `patch` for `git apply`,
+/// `changes` for structured consumption.
 #[derive(Debug, Serialize)]
 struct DiffReport {
     added: Vec<String>,
+    changes: Vec<ChangeHunk>,
+    patch: String,
     removed: Vec<String>,
     unchanged: Vec<String>,
 }
@@ -178,7 +185,7 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
 
     let toml_path = evidence::keel_toml(project);
     if opts.diff {
-        return diff(&toml_path, &targets);
+        return diff(&toml_path, &scan, &discovery, &targets, &content);
     }
     if toml_path.exists() {
         return config_error(&format!(
@@ -265,18 +272,22 @@ pub fn render_keel_toml(
         out.push('\n');
         let evidence = scan.targets.get(&target);
         let stats = by_target.get(target.as_str()).copied();
-        write_block(&mut out, &target, evidence, stats);
+        out.push_str(&render_target_block(&target, evidence, stats));
     }
     out
 }
 
-/// Write one `[target."…"]` block: header + evidence comment(s) + policy body.
-fn write_block(
-    out: &mut String,
+/// Render one `[target."…"]` block (no leading blank line): header + evidence
+/// comment(s) + policy body. Shared by the full render and the `--diff` add
+/// hunks, so an added block in the patch is byte-identical to what a fresh
+/// `keel init` would write.
+fn render_target_block(
     target: &str,
     evidence: Option<&TargetEvidence>,
     stats: Option<&TargetStats>,
-) {
+) -> String {
+    let mut buf = String::new();
+    let out = &mut buf;
     let header = format!("[target.\"{target}\"]");
     let seen_comment = evidence.map(|e| {
         let labels = e
@@ -322,6 +333,7 @@ fn write_block(
         // host rate is deliberately out of scope for v0.1.
         _ => out.push_str(&policy_body(class)),
     }
+    buf
 }
 
 /// Outbound-host policy body. Mirrors the frozen smart-defaults pack
@@ -473,10 +485,30 @@ fn pad_comment(line: &str, comment: &str) -> String {
     format!("{line:<width$}{comment}")
 }
 
-/// `--diff`: compare generated targets against those already in `keel.toml`.
-fn diff(toml_path: &Path, generated: &[String]) -> Rendered {
-    let existing = match read_existing_targets(toml_path) {
+/// `--diff`: what `keel init` would add/remove, as a target-name summary *and*
+/// an applyable patch (dx-spec §5, diffs as the lingua franca). Adds append
+/// whole evidence-cited blocks; removes drop `[target."…"]` tables no longer
+/// found in code; targets present on both sides are never touched, so user
+/// tuning and comments outside the changed blocks survive byte-for-byte. With
+/// no existing file the patch creates the whole generated keel.toml
+/// (`--- /dev/null`).
+fn diff(
+    toml_path: &Path,
+    scan: &ScanResult,
+    discovery: &[TargetStats],
+    generated: &[String],
+    content: &str,
+) -> Rendered {
+    let existing_text = match read_existing(toml_path) {
         Ok(t) => t,
+        Err(e) => return config_error(&e),
+    };
+    let existing = match existing_text
+        .as_deref()
+        .map(|text| existing_targets(text, toml_path))
+        .transpose()
+    {
+        Ok(set) => set.unwrap_or_default(),
         Err(e) => return config_error(&e),
     };
     let generated_set: BTreeSet<&str> = generated.iter().map(String::as_str).collect();
@@ -496,6 +528,31 @@ fn diff(toml_path: &Path, generated: &[String]) -> Rendered {
         .map(|t| (*t).to_owned())
         .collect();
 
+    let ops = if existing_text.is_none() {
+        // No file yet: the patch creates the whole generated keel.toml, header
+        // comments included.
+        vec![PolicyOp::AppendBlock {
+            text: content.to_owned(),
+        }]
+    } else {
+        let by_target: BTreeMap<&str, &TargetStats> =
+            discovery.iter().map(|s| (s.target.as_str(), s)).collect();
+        let mut ops: Vec<PolicyOp> = removed
+            .iter()
+            .map(|t| PolicyOp::Remove {
+                path: PolicyPath::new(["target", t.as_str()]),
+            })
+            .collect();
+        ops.extend(added.iter().map(|t| PolicyOp::AppendBlock {
+            text: render_target_block(t, scan.targets.get(t), by_target.get(t.as_str()).copied()),
+        }));
+        ops
+    };
+    let proposal = match propose(existing_text.as_deref(), &ops) {
+        Ok(p) => p,
+        Err(e) => return config_error(&e.to_string()),
+    };
+
     let mut human = String::from("keel \u{25b8} keel init --diff\n");
     if added.is_empty() && removed.is_empty() {
         human.push_str("  no changes: every discovered target is already in keel.toml.\n");
@@ -509,22 +566,33 @@ fn diff(toml_path: &Path, generated: &[String]) -> Rendered {
             human.push_str(&line);
         }
     }
+    if !proposal.patch.is_empty() {
+        human.push_str("\napply with `git apply` (or `patch -p1`):\n\n");
+        human.push_str(&proposal.patch);
+    }
     let report = DiffReport {
         added,
+        changes: proposal.changes,
+        patch: proposal.patch,
         removed,
         unchanged,
     };
     Rendered::ok(human, to_json(&report))
 }
 
-/// The set of `[target."…"]` keys already declared in an existing `keel.toml`.
-/// A missing file is an empty set (everything is "added").
-fn read_existing_targets(toml_path: &Path) -> Result<BTreeSet<String>, String> {
+/// The current `keel.toml` text; `None` when the file does not exist (which
+/// selects the `/dev/null` creation patch).
+fn read_existing(toml_path: &Path) -> Result<Option<String>, String> {
     if !toml_path.exists() {
-        return Ok(BTreeSet::new());
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(toml_path)
-        .map_err(|e| format!("could not read {}: {e}", toml_path.display()))?;
+    std::fs::read_to_string(toml_path)
+        .map(Some)
+        .map_err(|e| format!("could not read {}: {e}", toml_path.display()))
+}
+
+/// The set of `[target."…"]` keys declared in an existing `keel.toml`.
+fn existing_targets(text: &str, toml_path: &Path) -> Result<BTreeSet<String>, String> {
     let value: toml::Value = text
         .parse()
         .map_err(|e| format!("{} is not valid TOML: {e}", toml_path.display()))?;
@@ -562,7 +630,10 @@ fn update_gitignore(project: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn has_python_files(project: &Path) -> bool {
+/// Whether `project` contains any `.py` file — used to distinguish "python3
+/// was not found" from "there was nothing to scan" in both `init` and `flows
+/// suggest`'s warnings.
+pub(crate) fn has_python_files(project: &Path) -> bool {
     fn walk(dir: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -607,7 +678,8 @@ fn config_error(message: &str) -> Rendered {
     .with_exit(EXIT_USAGE)
 }
 
-fn plural(n: usize) -> &'static str {
+/// `"s"` unless `n == 1` — shared by every report that pluralizes a count noun.
+pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
@@ -671,6 +743,8 @@ mod tests {
             last_seen_ms,
             last_error_class: None,
             last_error_status: None,
+            not_retried: 0,
+            unwrapped_calls: 0,
         }
     }
 
@@ -756,6 +830,8 @@ mod tests {
             last_seen_ms: 120_000, // 2 minutes → 60/min
             last_error_class: None,
             last_error_status: None,
+            not_retried: 0,
+            unwrapped_calls: 0,
         };
         let out = render_keel_toml(&scan, std::slice::from_ref(&stats), None);
         assert!(out.contains("[target.\"api.dynamic.com\"]"));
@@ -774,7 +850,7 @@ mod tests {
     #[test]
     fn default_body_matches_the_frozen_pack() {
         // The hardcoded policy bodies must equal contracts/defaults.toml.
-        let defaults: toml::Value = include_str!("../../../contracts/defaults.toml")
+        let defaults: toml::Value = include_str!("../contract/defaults.toml")
             .parse()
             .expect("defaults.toml parses");
         let outbound = &defaults["defaults"]["outbound"];
@@ -955,6 +1031,113 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             "[target.\"api.gone.example\"]\ntimeout = \"30s\"\n"
+        );
+    }
+
+    /// dx-spec §5 (diffs as the lingua franca): `--diff` emits an applyable
+    /// patch. Applying it removes stale blocks and appends evidence-cited new
+    /// ones while user tuning outside the touched blocks survives byte-for-byte.
+    #[test]
+    fn diff_emits_an_applyable_patch_and_structured_changes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "// two targets, one already in keel.toml\nconst KEPT = await fetch(\"https://api.example.com/v1/x\");\nconst ADDED = await fetch(\"https://api.new.example/v2/y\");\n",
+        )
+        .unwrap();
+        let old = "\
+# hand-tuned: keep this comment
+
+[target.\"api.example.com\"]
+timeout = \"9s\"   # user tuning survives
+
+[target.\"api.gone.example\"]  # stale
+timeout = \"5s\"
+";
+        fs::write(dir.path().join("keel.toml"), old).unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let patch = r.json["patch"].as_str().unwrap();
+        assert!(
+            patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"),
+            "{patch}"
+        );
+        assert!(r.human.contains("apply with `git apply`"));
+        assert!(
+            r.human.contains(patch),
+            "the human output carries the patch verbatim"
+        );
+
+        let applied = crate::diff::apply_unified(old, patch).unwrap();
+        let value: toml::Value = applied.parse().expect("applied file parses");
+        assert!(value["target"].get("api.gone.example").is_none());
+        assert!(value["target"].get("api.new.example").is_some());
+        assert!(applied.contains("# hand-tuned: keep this comment"));
+        assert!(applied.contains("timeout = \"9s\"   # user tuning survives"));
+        // The added block is byte-identical to what a fresh init would write.
+        assert!(applied.contains("[target.\"api.new.example\"]"));
+        assert!(applied.contains("# seen in: app.mjs:3"));
+
+        // Structured hunks: one removal, one addition, sorted by path.
+        let changes = r.json["changes"].as_array().unwrap();
+        let paths: Vec<&str> = changes
+            .iter()
+            .map(|c| c["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            ["target.\"api.gone.example\"", "target.\"api.new.example\""]
+        );
+        assert!(changes[0]["after"].is_null());
+        assert!(changes[1]["before"].is_null());
+        // --diff never writes.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
+            old
+        );
+    }
+
+    /// With no keel.toml the patch creates the whole generated file from
+    /// `/dev/null`, byte-identical to what `keel init` would write.
+    #[test]
+    fn diff_without_existing_file_is_a_dev_null_creation_patch() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let patch = r.json["patch"].as_str().unwrap();
+        assert!(
+            patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"),
+            "{patch}"
+        );
+        let scanned = scan::scan(dir.path());
+        let expected = render_keel_toml(&scanned, &[], None);
+        assert_eq!(crate::diff::apply_unified("", patch).unwrap(), expected);
+        assert_eq!(
+            r.json["added"].as_array().unwrap(),
+            &vec![serde_json::json!("api.example.com")]
         );
     }
 

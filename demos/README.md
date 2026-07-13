@@ -25,3 +25,25 @@ Each demo is executed by a test (not just documented):
   `kill -9` + resume assertion)
 
 faultproxy itself is unit-tested in `tools/faultproxy/test_faultproxy.py`.
+
+## Framework packs: no ADK demo yet (noted, not built)
+
+`agent-demo` above is **not** an ADK agent — it models an LLM completion as a
+bare intercepted HTTP call (`demos/agent-demo/agent.py:18-21` is a plain
+`httpx.get`). The Google ADK pack itself
+(`python/keel/src/keel/packs/adk_pack.py`) is implemented and tested against a
+structural fake of the real `google-adk` API
+(`python/keel/tests/test_packs_adk.py`), proving zero-code-change plugin
+auto-registration and `tool:<name>` wrapping. A live end-to-end ADK demo is
+deliberately **not** built here: driving a real ADK agent turn needs either
+live Gemini credentials (breaks this directory's "no real network,
+deterministic" rule) or a scripted fake `google.adk.models.BaseLlm` backend
+(a real chunk of extra engineering, since ADK's own model responses carry
+typed `Content`/`Part`/`FunctionCall` payloads) — both out of scope for the
+pack task. What a future `demos/adk-agent` should do: an ADK `LlmAgent` with
+one `FunctionTool` whose body makes an `httpx.get` to a faultproxy endpoint
+serving `429, 429, 200` (i.e. reuse `agent-demo`'s scenario), driven either by
+a scripted fake `BaseLlm` or by invoking the registered `KeelPlugin`'s
+`before_tool_callback` directly against a real `Runner` (skipping the LLM
+turn) — the retry itself needs no new Keel code, since a `tool:` call's inner
+`httpx.get` is already idempotent and already covered.

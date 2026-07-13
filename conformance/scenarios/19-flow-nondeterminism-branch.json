@@ -1,0 +1,43 @@
+{
+  "name": "flow-nondeterminism-branch",
+  "tier": 2,
+  "description": "Tier 2: with on_nondeterminism=branch, the same divergence as flow-nondeterminism-warn instead abandons replay for a fresh attempt written in the high seq lane (BRANCH_SEQ_BASE = 1_000_000 + seq), preserving the abandoned run's original record for audit rather than overwriting it in place. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "branch" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-19",
+    "code_hash": "ch-19"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "v": 1 } },
+          "expect": { "result": "ok", "payload": { "v": 1 } }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.b.internal",
+          "args_hash": "q2",
+          "effect": { "status": "ok", "payload": { "v": 2 } },
+          "expect": { "result": "ok", "payload": { "v": 2 } }
+        }
+      ],
+      "expect_journal": [
+        { "seq": 1, "key": "api.a.internal#q1", "kind": "effect", "status": "ok" },
+        { "seq": 1000001, "key": "flow:branch:branch", "kind": "marker", "status": "ok" },
+        { "seq": 1000002, "key": "api.b.internal#q2", "kind": "effect", "status": "ok" }
+      ]
+    }
+  ]
+}

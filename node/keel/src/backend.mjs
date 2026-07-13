@@ -17,7 +17,8 @@ import { join } from "node:path";
 import { AsyncEngine, realClock, KeelError } from "./engine.mjs";
 
 const NATIVE_CANDIDATES = [
-  "keel-core-native", // published/installed addon
+  "@keel/core-native", // the addon's actual package name (node/keel-core-native)
+  "keel-core-native", // legacy unscoped probe, kept for locally-linked builds
   "../../keel-core-native/index.mjs", // in-repo sibling of node/keel (worktree), when built
 ];
 
@@ -46,14 +47,39 @@ class NativeBackend {
     this.#policy = isTable(policy) ? policy : {};
     this.#core.configure(policy);
   }
-  execute(request, effect) {
-    return this.#core.executeAsync(request, effect); // returns a Promise<Outcome>
+  execute(request, effect, idempotencyKey) {
+    // `idempotencyKey` (contracts/adapter-pack.md "Idempotency-key injection")
+    // matters only while a flow is open — the native `executeAsync` ignores it
+    // on the bare-engine branch, so it is always safe to forward.
+    return this.#core.executeAsync(request, effect, idempotencyKey); // returns a Promise<Outcome>
+  }
+  /** Peek the idempotency key recorded for the active flow's next step
+   *  (rule 3) — `null` outside a flow or when nothing is recorded, and also
+   *  on an addon build too old to expose the native method (optional
+   *  chaining, mirroring `flushEvents`). */
+  recordedIdempotencyKey(stepKey) {
+    return this.#core.recordedIdempotencyKey?.(stepKey) ?? null;
   }
   report() {
     return this.#core.report();
   }
   get persistent() {
     return this.#core.persistent === true;
+  }
+  // --- Tier 2: durable flows (native-only; absent on the stub) --------------
+  // Present only when the loaded addon exposes them (checked once at load
+  // time, below) — `_flow.mjs`'s `backendSupportsFlows` probes for these.
+  enterFlow(entrypoint, argsHash, { codeHash, explicitKey, leaseMs } = {}) {
+    return this.#core.enterFlow(entrypoint, argsHash, codeHash, explicitKey, leaseMs);
+  }
+  exitFlow(status) {
+    this.#core.exitFlow(status);
+  }
+  journalTime(key, nowMs) {
+    return this.#core.journalTime(key, nowMs);
+  }
+  journalRandom(key, data) {
+    return this.#core.journalRandom(key, data);
   }
   layer(target, key) {
     const t = this.#policy.target;
@@ -62,6 +88,12 @@ class NativeBackend {
     if (target.startsWith("llm:") && isTable(defaults.llm) && defaults.llm[key] !== undefined)
       return defaults.llm[key];
     return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
+  }
+  /** Flush the native engine's live NDJSON event feed (`.keel/events/`) —
+   * see `KeelCoreNative::flush_events`'s doc comment. A no-op on an addon
+   * build too old to expose it. */
+  flushEvents() {
+    this.#core.flushEvents?.();
   }
 }
 
@@ -104,7 +136,10 @@ async function tryLoadNative({ journalPath } = {}) {
 
 /**
  * Where the native core attaches its journal (persistent dev cache + Tier 2).
- * `KEEL_JOURNAL` overrides the path; an explicit empty value disables it.
+ * `KEEL_JOURNAL` overrides the path; an explicit empty value disables it. This
+ * is the *construction-time* default: keel.toml's `journal` key replaces it at
+ * configure time unless KEEL_JOURNAL is set, in which case the env wins (see
+ * `applyJournalEnvOverride` in bootstrap.mjs).
  */
 function resolveJournalPath(cwd, env) {
   const override = env.KEEL_JOURNAL;

@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import httpx
+import urllib3
 from requests.adapters import HTTPAdapter
 
 from keel import _runtime, bootstrap
@@ -28,6 +29,13 @@ from keel.adapters import (
 
 from . import CONTRACTS
 
+#: aiohttp/boto3/psycopg are NOT dev dependencies (never imported at module
+#: scope here — see their own test files, which use structural fakes offline);
+#: this file only exercises the three packs whose libraries are always
+#: installed in this environment (httpx/requests ship as dev deps, urllib3
+#: ships transitively with requests).
+_ALWAYS_PRESENT = {"httpx", "requests", "urllib3"}
+
 
 def _seam_attrs() -> dict[str, object]:
     return {
@@ -36,6 +44,7 @@ def _seam_attrs() -> dict[str, object]:
         "httpx.Client.__init__": httpx.Client.__init__,
         "httpx.AsyncClient.__init__": httpx.AsyncClient.__init__,
         "requests.send": HTTPAdapter.send,
+        "urllib3.urlopen": urllib3.HTTPConnectionPool.urlopen,
     }
 
 
@@ -95,10 +104,31 @@ class DetectTest(unittest.TestCase):
         self.assertEqual(d.name, "requests")
         self.assertEqual(d.confidence, "pinned")
 
-    def test_available_packs_reports_both(self) -> None:
+    def test_urllib3_detects_pinned(self) -> None:
+        from keel.adapters import urllib3_pack
+
+        detection = urllib3_pack.detect()
+        self.assertTrue(detection.matched)
+        self.assertEqual(detection.name, "urllib3")
+
+    def test_available_packs_reports_eleven_registered(self) -> None:
+        # 7 library adapters (aiohttp, boto3, httpx, langgraph, psycopg,
+        # requests, urllib3) + 4 framework packs (adk, crewai, openai-agents,
+        # pydantic-ai — adapters._all_packs). Only the always-installed
+        # libraries are actually present here; aiohttp/boto3/langgraph/
+        # psycopg are exercised (with structural fakes) in their own test
+        # files, and the framework packs are never installed in this repo's
+        # test environment (CLAUDE.md: framework deps never get added to a
+        # manifest), so all eight report unmatched — `available_packs` must
+        # still report each of them (never silently omit an absent
+        # library's pack), just unmatched.
         packs = available_packs()
-        self.assertEqual({d.name for d in packs}, {"httpx", "requests"})
-        self.assertTrue(all(d.matched for d in packs))
+        self.assertEqual(len(packs), 11, "7 library adapters + 4 framework packs")
+        present = {d.name for d in packs if d.matched}
+        self.assertEqual(present, _ALWAYS_PRESENT)
+        absent = [d for d in packs if not d.matched]
+        self.assertEqual(len(absent), 8)
+        self.assertTrue(all(d.name == "" for d in absent), "an unmatched pack reports no name")
 
 
 class ContractParityTest(unittest.TestCase):

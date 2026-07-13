@@ -17,18 +17,34 @@
 //! runs and its terminal outcome recorded *before* the result is released, so a
 //! crash between those points leaves a `running` step that resume re-executes.
 //!
-//! # Synchronous-only in v0.1 (front-end binding constraint)
+//! # The async `execute_step` bridge (front-end binding concern)
 //!
-//! [`FlowHandle::execute_step`] is `async` here, but the front-end *bindings*
-//! only route the **synchronous** intercepted-call path through it. The Python
-//! binding's `execute_async` runs on the bare [`Engine`], not the open handle —
-//! so an async effect inside a flow would be silently downgraded to Tier 1
-//! (never journaled, never replayed). Rather than let that happen quietly (a
-//! Level 0 surprise), the binding *refuses* an async intercepted call while a
-//! flow is open with a precise KEEL-E005 — unsupported-configuration, the policy
-//! is valid but this build cannot honor it (`keel-py`'s `execute_async` guard).
-//! v0.1 durable flows are therefore synchronous-only; lifting this is future
-//! work (an async `execute_step` bridge in each binding).
+//! [`FlowHandle::execute_step`] is `async`, and both the synchronous AND
+//! asynchronous intercepted-call paths in the front-end bindings route through
+//! it while a flow is open (an earlier v0.1 restriction refused an async
+//! intercepted call with KEEL-E005 rather than let it silently downgrade to
+//! Tier 1 on the bare [`Engine`]; that refusal is retired now that the bridge is
+//! real — see `contracts/error-codes.json`'s retired async-in-flow case and
+//! `docs/ccr/0002-async-steps-and-idempotency-injection.md`).
+//!
+//! `&mut self` is what makes a single call to `execute_step` exclusive, but a
+//! flow handle is reachable from *multiple* concurrent async tasks in a
+//! language runtime (Python's `asyncio.gather`, Node's `Promise.all`) — so each
+//! binding wraps its open handle in an **async** mutex (never a blocking one)
+//! that a call acquires with the moral equivalent of `.lock().await` before
+//! touching the handle, and holds for the *entire* step: `seq` is claimed the
+//! instant `execute_step_with_idempotency_key` is entered (its very first
+//! statement, before any `.await`), and the guard is not released until the
+//! terminal outcome is recorded. This is what makes concurrent awaited effects
+//! **serialize in await order** — normative for every binding, spelled out in
+//! conformance/README.md's "Async steps inside a flow" section: a step's
+//! position in the journal is fixed by the order its call *reaches* the handle,
+//! never by completion order, so replay reproduces the exact same `(seq,
+//! step_key)` sequence deterministically. See `crates/keel-py/src/lib.rs`'s
+//! `execute_async` (the reference implementation) for the binding-side half of
+//! this contract; `FlowHandle` itself contributes only the `&mut self` exclusion
+//! and the at-entry `seq` claim above — it holds no lock and knows nothing about
+//! any particular language runtime.
 //!
 //! Replay correctness is checked, not assumed (spec §4.4): the `(seq, step_key)`
 //! encountered on replay must match the journal. A `seq` recorded under a
@@ -62,7 +78,8 @@
 //! key per read.
 
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use keel_core_api::policy::NondeterminismResponse;
 use keel_core_api::{
@@ -85,6 +102,11 @@ const BRANCH_SEQ_BASE: u64 = 1_000_000;
 const ATTEMPT_SEQ: u64 = 0;
 /// The step key of the reserved resume-counter marker.
 const ATTEMPT_KEY: &str = "flow:attempt";
+/// The field carrying an adapter-injected idempotency key inside a `running`
+/// step record's schema-tagged payload (contracts/adapter-pack.md
+/// "Idempotency-key injection" rule 3: the minted key is journaled with the
+/// step, and a resume that re-executes a crashed step injects the SAME key).
+const IDEMPOTENCY_KEY_FIELD: &str = "idempotency_key";
 
 use crate::engine::Engine;
 
@@ -226,6 +248,39 @@ impl FlowManager {
         )
     }
 
+    /// Flow-level attempt cap (distinct from Tier 1 step attempts): each
+    /// resume of a not-yet-completed flow consumes one attempt from the
+    /// reserved seq-0 counter; exceeding the cap marks the flow dead. Returns
+    /// the new attempt number, or `Err` if the cap was exceeded.
+    fn bump_attempt_or_kill(&self, flow_id: &FlowId, entrypoint: &str) -> Result<u32, KeelError> {
+        let prior = self
+            .journal
+            .step_at(flow_id, ATTEMPT_SEQ)
+            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
+            .map_or(0, |(_, o)| o.attempt);
+        let attempt = prior.saturating_add(1);
+        // A second-or-later attempt is a *recovery*: the flow did not run to
+        // completion in one process lifetime (crash, lease loss, deliberate
+        // resume). First entries (attempt == 1) are ordinary starts, not
+        // recoveries — only re-entries count toward the §4.5 metric.
+        if attempt >= 2 {
+            crate::metrics::record_flow_resume(entrypoint);
+        }
+        if attempt > self.config.max_attempts {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Dead)
+                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
+            return Err(KeelError {
+                code: ErrorCode::FlowDead,
+                message: format!(
+                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
+                    self.config.max_attempts
+                ),
+            });
+        }
+        Ok(attempt)
+    }
+
     fn enter(
         &self,
         flow_id: &FlowId,
@@ -262,30 +317,17 @@ impl FlowManager {
         // here would fail (a completed flow is not `running`) and wrongly report
         // KEEL-E030; instead the rerun reconstructs its result from the journal.
         if status == FlowStatus::Completed {
-            return Ok(self.new_handle(flow_id.clone(), status, false, None, true));
+            return Ok(self.new_handle(
+                flow_id.clone(),
+                status,
+                false,
+                None,
+                LeaseHeartbeatMonitor::new(),
+                true,
+            ));
         }
 
-        // Flow-level attempt cap (distinct from Tier 1 step attempts): each
-        // resume of a not-yet-completed flow consumes one attempt from the
-        // reserved seq-0 counter; exceeding the cap marks the flow dead.
-        let prior = self
-            .journal
-            .step_at(flow_id, ATTEMPT_SEQ)
-            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
-            .map_or(0, |(_, o)| o.attempt);
-        let attempt = prior.saturating_add(1);
-        if attempt > self.config.max_attempts {
-            self.journal
-                .complete_flow(flow_id, FlowStatus::Dead)
-                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
-            return Err(KeelError {
-                code: ErrorCode::FlowDead,
-                message: format!(
-                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
-                    self.config.max_attempts
-                ),
-            });
-        }
+        let attempt = self.bump_attempt_or_kill(flow_id, entrypoint)?;
 
         // A cleanly-failed flow is put back to `running` before re-leasing so a
         // resume can proceed (and so a re-crash lands it in the recovery scan).
@@ -332,26 +374,42 @@ impl FlowManager {
             _ => false,
         };
 
+        // Seeded now, right after we confirmed via `acquire_lease` that we hold
+        // it: the monotonic reference point every subsequent `lease_lost` check
+        // measures elapsed real time against (architecture-spec §6).
+        let lease_monitor = LeaseHeartbeatMonitor::new();
         let heartbeat = spawn_heartbeat(
             Arc::clone(&self.journal),
             flow_id.clone(),
             self.holder.clone(),
             self.config.lease_ttl,
+            lease_monitor.clone(),
         );
 
-        Ok(self.new_handle(flow_id.clone(), status, code_hash_fenced, heartbeat, false))
+        Ok(self.new_handle(
+            flow_id.clone(),
+            status,
+            code_hash_fenced,
+            heartbeat,
+            lease_monitor,
+            false,
+        ))
     }
 
     /// Assemble a [`FlowHandle`] over this manager's shared engine/journal/clock.
     /// `replay_only` marks a completed-flow re-entry (pure replay: every step is
     /// substituted, no effect fires) — the handle is born already `completed` so
     /// dropping it is quiet and a front-end `exit_flow` is a harmless re-stamp.
+    /// `lease_monitor` is unused by a replay-only handle (it never runs a live
+    /// step, so `lease_lost` is never consulted), but every path constructs one
+    /// so the field is never `Option`.
     fn new_handle(
         &self,
         flow_id: FlowId,
         entry_status: FlowStatus,
         code_hash_fenced: bool,
         heartbeat: Option<HeartbeatHandle>,
+        lease_monitor: LeaseHeartbeatMonitor,
         replay_only: bool,
     ) -> FlowHandle {
         FlowHandle {
@@ -367,6 +425,8 @@ impl FlowManager {
             completed: replay_only,
             entry_status,
             heartbeat,
+            lease_ttl: self.config.lease_ttl,
+            lease_monitor,
         }
     }
 }
@@ -404,6 +464,12 @@ pub struct FlowHandle {
     /// The lease-renewal thread; stopped and joined when the handle drops so a
     /// completed or crashed flow stops heart-beating.
     heartbeat: Option<HeartbeatHandle>,
+    /// This handle's lease TTL, for [`FlowHandle::lease_lost`]'s monotonic
+    /// freshness check.
+    lease_ttl: Duration,
+    /// Monotonic view of our own last successful lease renewal, updated by the
+    /// heartbeat thread — see [`LeaseHeartbeatMonitor`].
+    lease_monitor: LeaseHeartbeatMonitor,
 }
 
 impl core::fmt::Debug for FlowHandle {
@@ -466,23 +532,33 @@ impl FlowHandle {
         self.clock.now_ms()
     }
 
-    /// Whether this handle has definitively lost its lease: the flow's recorded
-    /// holder is no longer us, or the lease has expired against our clock (so
-    /// another process may steal and resume it). A missing flow row or a journal
-    /// read error is *not* treated as loss (resilience-first: at-least-once still
-    /// holds via the `running` marker), so a transient hiccup does not stall a
-    /// legitimately-held flow.
+    /// Whether this handle has definitively lost its lease. Two independent
+    /// checks (architecture-spec §6: generous TTLs absorb cross-machine clock
+    /// skew; heartbeats judge freshness on a *monotonic* clock):
+    ///
+    /// - **Cross-process arbitration** (journal wall clock, read-only here): has
+    ///   another holder's `acquire_lease` overwritten `lease_holder`? That CAS
+    ///   already did the wall-clock expiry comparison against the journal's own
+    ///   record when it stole the row, so re-deriving it from *our* wall clock
+    ///   here would be redundant — and exactly the redundant read that lets a
+    ///   local NTP step spuriously flip the verdict.
+    /// - **Local freshness** (monotonic, never wall clock): has our own
+    ///   heartbeat actually renewed within `lease_ttl` of *real elapsed time*?
+    ///   [`LeaseHeartbeatMonitor`] tracks this with [`Instant`], which cannot
+    ///   jump backwards or forwards under an NTP correction the way comparing
+    ///   two `SystemTime` readings can — so a wall-clock step on this process
+    ///   can neither spuriously expire a healthy lease nor paper over a
+    ///   genuinely starved heartbeat.
+    ///
+    /// A missing flow row or a journal read error is *not* treated as loss
+    /// (resilience-first: at-least-once still holds via the `running` marker),
+    /// so a transient hiccup does not stall a legitimately-held flow.
     fn lease_lost(&self) -> bool {
-        match self.journal.get_flow(&self.flow_id) {
-            Ok(Some(flow)) => {
-                let held = flow.lease_holder.as_ref() == Some(&self.holder)
-                    && flow
-                        .lease_expires
-                        .is_some_and(|expires| expires >= self.now());
-                !held
-            }
-            Ok(None) | Err(_) => false,
-        }
+        let still_recorded_holder = match self.journal.get_flow(&self.flow_id) {
+            Ok(Some(flow)) => flow.lease_holder.as_ref() == Some(&self.holder),
+            Ok(None) | Err(_) => true,
+        };
+        !still_recorded_holder || self.lease_monitor.elapsed() >= self.lease_ttl
     }
 
     /// Decide how the step at `seq` (with `key`) resolves against the journal.
@@ -533,6 +609,27 @@ impl FlowHandle {
     where
         F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
     {
+        self.execute_step_with_idempotency_key(request, None, effect)
+            .await
+    }
+
+    /// [`execute_step`](Self::execute_step), carrying the idempotency key the
+    /// adapter minted and injected for this call (contracts/adapter-pack.md
+    /// "Idempotency-key injection", rule 3). The key is journaled in the step's
+    /// `running` record, so a resume that re-executes a crashed step can read it
+    /// back ([`recorded_idempotency_key`](Self::recorded_idempotency_key)) and
+    /// inject the SAME key — making the at-least-once re-execution deduplicable
+    /// on the provider side. The key never feeds the step key (`args_hash` is
+    /// unchanged by injection), so replay matching is unaffected.
+    pub async fn execute_step_with_idempotency_key<F>(
+        &mut self,
+        request: &Request,
+        idempotency_key: Option<&str>,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
         self.seq += 1;
         let seq = self.seq;
         let key = Self::step_key(request);
@@ -549,13 +646,54 @@ impl FlowHandle {
         match plan {
             StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
             StepPlan::Diverged { recorded } => {
-                self.on_divergence(seq, &recorded, &key, request, effect)
+                self.on_divergence(seq, &recorded, &key, request, idempotency_key, effect)
                     .await
             }
             StepPlan::Live => {
-                self.run_live(seq, &key, StepKind::Effect, request, effect)
-                    .await
+                self.run_live(
+                    seq,
+                    &key,
+                    StepKind::Effect,
+                    request,
+                    idempotency_key,
+                    effect,
+                )
+                .await
             }
+        }
+    }
+
+    /// The idempotency key recorded for the flow's NEXT step, when that record
+    /// is a crashed (`running`) step under the same `step_key` — the
+    /// resume-reuse read of contracts/adapter-pack.md "Idempotency-key
+    /// injection" rule 3. Adapters call this *before* executing an injectable
+    /// step: `Some(key)` means a previous run crashed mid-step after minting
+    /// `key`, and re-executing with the SAME key lets the provider deduplicate
+    /// the at-least-once re-execution. `None` — mint fresh — on a fresh step, a
+    /// terminal record (the step will be substituted, no key is sent), a
+    /// diverging key, an abandoned replay, a pure-replay handle, or a journal
+    /// read failure (resilience first).
+    #[must_use]
+    pub fn recorded_idempotency_key(&self, step_key: &str) -> Option<String> {
+        if self.replay_abandoned || self.replay_only {
+            return None;
+        }
+        let key = StepKey::new(step_key);
+        match self.journal.step_at(&self.flow_id, self.seq + 1) {
+            Ok(Some((recorded, outcome)))
+                if recorded == key && outcome.status == StepStatus::Running =>
+            {
+                outcome
+                    .payload
+                    .as_deref()
+                    .and_then(decode_payload)
+                    .and_then(|v| {
+                        v.get(IDEMPOTENCY_KEY_FIELD)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            }
+            _ => None,
         }
     }
 
@@ -578,6 +716,7 @@ impl FlowHandle {
         recorded: &StepKey,
         observed: &StepKey,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -600,7 +739,8 @@ impl FlowHandle {
             mode,
             preserve,
         };
-        self.branch_and_continue(div, request, effect).await
+        self.branch_and_continue(div, request, idempotency_key, effect)
+            .await
     }
 
     /// Journal a branch `marker` and re-execute the divergent step live, then
@@ -609,6 +749,7 @@ impl FlowHandle {
         &mut self,
         div: Divergence<'_>,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -616,8 +757,15 @@ impl FlowHandle {
     {
         self.journal_branch_marker(&div);
         let live_seq = self.seq;
-        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
-            .await
+        self.run_live(
+            live_seq,
+            div.observed,
+            StepKind::Effect,
+            request,
+            idempotency_key,
+            effect,
+        )
+        .await
     }
 
     /// Journal the branch marker, abandon replay, and advance the cursor to the
@@ -753,12 +901,18 @@ impl FlowHandle {
 
     /// Journal a `running` step, run the effect through the engine, and record
     /// the terminal outcome *before* returning it (at-least-once honesty).
+    /// An adapter-injected `idempotency_key` is journaled IN the `running`
+    /// record (payload `{"idempotency_key": …}`), so a resume that re-executes
+    /// this step after a crash reads the same key back
+    /// ([`recorded_idempotency_key`](Self::recorded_idempotency_key)); the
+    /// terminal record replaces the payload with the outcome as before.
     async fn run_live<F>(
         &mut self,
         seq: u64,
         key: &StepKey,
         kind: StepKind,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -783,7 +937,8 @@ impl FlowHandle {
                 kind,
                 attempt: 0,
                 status: StepStatus::Running,
-                payload: None,
+                payload: idempotency_key
+                    .and_then(|k| encode_payload(&json!({ (IDEMPOTENCY_KEY_FIELD): k }))),
                 error_class: None,
                 started_at,
                 ended_at: None,
@@ -866,6 +1021,45 @@ impl Drop for FlowHandle {
     }
 }
 
+/// The monotonic timestamp of this handle's last successful lease renewal,
+/// shared between the heartbeat thread (writer, [`Self::mark_renewed`]) and the
+/// owning [`FlowHandle`] (reader, [`Self::elapsed`]). Built on [`Instant`], the
+/// standard library's guaranteed-non-decreasing clock — unlike [`SystemTime`]
+/// (used for every *stored* journal timestamp), it cannot be stepped backwards
+/// by an NTP correction or a manual clock change, which is exactly the
+/// property architecture-spec §6 asks lease heartbeats to have.
+///
+/// [`SystemTime`]: std::time::SystemTime
+#[derive(Debug, Clone)]
+struct LeaseHeartbeatMonitor(Arc<Mutex<Instant>>);
+
+impl LeaseHeartbeatMonitor {
+    /// Starts "fresh" as of now — used both when a lease is first acquired
+    /// (before the heartbeat thread has ticked even once) and for the unused
+    /// monitor a replay-only handle is handed.
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    /// Record a successful renewal at the current instant.
+    fn mark_renewed(&self) {
+        let mut at = self
+            .0
+            .lock()
+            .expect("lease heartbeat monitor lock poisoned");
+        *at = Instant::now();
+    }
+
+    /// Real time elapsed since the last successful renewal (or since
+    /// construction, if none has happened yet).
+    fn elapsed(&self) -> Duration {
+        self.0
+            .lock()
+            .expect("lease heartbeat monitor lock poisoned")
+            .elapsed()
+    }
+}
+
 /// A running lease-renewal thread. Dropping this signals the thread to stop (by
 /// disconnecting the channel) and joins it.
 struct HeartbeatHandle {
@@ -891,13 +1085,17 @@ impl Drop for HeartbeatHandle {
 /// a long blocking step or pure-caller compute between steps — letting the lease
 /// lapse while the flow is still alive. A std thread renews on real wall-clock
 /// time regardless of whether any runtime is being polled. Renews every `ttl/2`
-/// against the journal's clock; a lost lease (`Ok(false)`) is logged loudly
-/// (the step-level fence is what actually prevents double execution).
+/// against the journal (which does its own wall-clock CAS — see
+/// [`FlowHandle::lease_lost`]); every successful renewal also marks `monitor`,
+/// the *monotonic* freshness signal the owning handle consults. A lost lease
+/// (`Ok(false)`) is logged loudly (the step-level fence is what actually
+/// prevents double execution).
 fn spawn_heartbeat(
     journal: Arc<dyn Journal>,
     flow: FlowId,
     holder: ProcessId,
     ttl: Duration,
+    monitor: LeaseHeartbeatMonitor,
 ) -> Option<HeartbeatHandle> {
     use std::sync::mpsc::{RecvTimeoutError, channel};
 
@@ -911,7 +1109,7 @@ fn spawn_heartbeat(
             // ends; a `Timeout` is a renewal tick.
             while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(period) {
                 match journal.acquire_lease(&flow, &holder, ttl) {
-                    Ok(true) => {}
+                    Ok(true) => monitor.mark_renewed(),
                     Ok(false) => {
                         warn!(flow = %flow, "lease heartbeat: lease lost to another holder");
                     }
@@ -1103,8 +1301,35 @@ fn base_outcome(trace_id: String) -> Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_payload, encode_payload};
+    use super::{LeaseHeartbeatMonitor, decode_payload, encode_payload};
+    use core::time::Duration;
     use serde_json::json;
+
+    /// `LeaseHeartbeatMonitor` measures real elapsed time (architecture-spec
+    /// §6's monotonic heartbeat), not a value anyone can inject — so this is
+    /// necessarily a real-clock test with small real sleeps, the same
+    /// precedent `the_heartbeat_renews_the_lease_on_a_real_clock` sets in
+    /// `crates/keel-core/tests/flows.rs`.
+    #[test]
+    fn lease_heartbeat_monitor_tracks_real_elapsed_time_since_the_last_renewal() {
+        let monitor = LeaseHeartbeatMonitor::new();
+        assert!(
+            monitor.elapsed() < Duration::from_millis(50),
+            "freshly constructed: elapsed should be ~0"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            monitor.elapsed() >= Duration::from_millis(60),
+            "elapsed grows with real time when nothing renews"
+        );
+
+        monitor.mark_renewed();
+        assert!(
+            monitor.elapsed() < Duration::from_millis(50),
+            "a renewal resets elapsed back to ~0"
+        );
+    }
 
     #[test]
     fn payload_round_trips_through_the_schema_tag() {

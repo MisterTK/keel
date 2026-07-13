@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Ships as the napi addon inside the npm package, not as a crate.
 publish = false
 
 [lib]
@@ -34,7 +35,10 @@ serde_json = { workspace = true }
 # Per-handle current-thread runtime + time driver (the engine needs the timer
 # wheel, never IO). `test-util` is always on: the paused clock + `advanceClock`
 # are exposed unconditionally as documented harness-only surface (per the brief).
-tokio = { version = "1.47", features = ["rt", "time", "test-util"] }
+# `sync` adds `tokio::sync::Mutex` — the Tier 2 flow-admission lock, which (unlike
+# every other lock in this crate) is deliberately held across an `.await` while a
+# journaled step runs (see the `active_flow` field docs on `KeelCore`).
+tokio = { version = "1.47", features = ["rt", "sync", "time", "test-util"] }
 
 [build-dependencies]
 # Emits the platform link args a Node addon needs — notably macOS

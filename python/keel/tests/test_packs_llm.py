@@ -28,11 +28,13 @@ from keel.adapters import _http, httpx_pack, requests_pack
 from keel.packs import (
     DEV_CACHE_TTL,
     anthropic_pack,
+    google_genai_pack,
     llm_pack,
     openai_pack,
     present_provider_defaults,
     resolve_dev_cache,
 )
+from keel.packs._provider import module_present
 from keel_core_stub import KeelCoreStub
 
 
@@ -90,7 +92,7 @@ class ApplyPackDefaultsTest(unittest.TestCase):
     def test_provider_fragments_fold_as_identity(self) -> None:
         # defaults < packs < user: the provider packs emit the generic llm layer,
         # so folding their fragments changes nothing over the embedded defaults.
-        fragments = [openai_pack.defaults(), anthropic_pack.defaults()]
+        fragments = [openai_pack.defaults(), anthropic_pack.defaults(), google_genai_pack.defaults()]
         self.assertEqual(apply_pack_defaults({}, fragments), apply_pack_defaults({}))
 
 
@@ -224,13 +226,49 @@ class ProviderPackTest(unittest.TestCase):
         self.assertEqual(targets[0].kind, "llm")
         self.assertEqual(anthropic_pack.defaults(), {"defaults": {"llm": llm_defaults()}})
 
+    def test_google_genai_pack(self) -> None:
+        present = module_present("google.genai")
+        self.assertEqual(google_genai_pack.detect().matched, present)
+        self.assertEqual(google_genai_pack.seams(), [])
+        targets = google_genai_pack.targets()
+        # Two TargetDecls (Gemini Developer API + Vertex AI), both llm:google-genai.
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(all(t.pattern == "llm:google-genai" and t.kind == "llm" for t in targets))
+        self.assertIn(google_genai_pack.HOST, targets[0].idempotency_rule)
+        self.assertIn(google_genai_pack.VERTEX_HOST, targets[1].idempotency_rule)
+        self.assertEqual(google_genai_pack.defaults(), {"defaults": {"llm": llm_defaults()}})
+
     def test_present_provider_defaults_only_lists_present(self) -> None:
         expected = [
             p.defaults()
-            for p in (openai_pack, anthropic_pack)
+            for p in (openai_pack, anthropic_pack, google_genai_pack)
             if p.detect().matched
         ]
         self.assertEqual(present_provider_defaults(), expected)
+
+
+class VertexHostResolutionTest(unittest.TestCase):
+    """Vertex AI's global + regional endpoints both route to llm:google-genai
+    (Node parity: node/keel/test/judge.test.mjs)."""
+
+    def test_global_endpoint_exact_match(self) -> None:
+        self.assertEqual(_http.resolve_target("aiplatform.googleapis.com"), "llm:google-genai")
+
+    def test_regional_endpoints_via_suffix_rule(self) -> None:
+        for host in (
+            "us-central1-aiplatform.googleapis.com",
+            "europe-west4-aiplatform.googleapis.com",
+            "asia-northeast1-aiplatform.googleapis.com",
+        ):
+            self.assertEqual(_http.resolve_target(host), "llm:google-genai", host)
+
+    def test_lookalike_host_without_hyphen_does_not_match(self) -> None:
+        # Guards the suffix rule's boundary: no hyphen before "aiplatform" means
+        # it is not a documented Vertex regional host.
+        self.assertEqual(_http.resolve_target("evilaiplatform.googleapis.com"), "evilaiplatform.googleapis.com")
+
+    def test_generativelanguage_still_resolves(self) -> None:
+        self.assertEqual(_http.resolve_target("generativelanguage.googleapis.com"), "llm:google-genai")
 
 
 class DevCacheArgsHashJudgeTest(unittest.TestCase):
@@ -245,7 +283,7 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
             "https://api.openai.com/v1/chat/completions",
             json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
         )
-        target, _op, idempotent, hash_ = httpx_pack._judge(req)
+        target, _op, idempotent, hash_, _injected = httpx_pack._judge(req)
         self.assertEqual(target, "llm:openai")
         self.assertFalse(idempotent, "an LLM POST stays non-idempotent (never retried)")
         self.assertIsNotNone(hash_)
@@ -254,12 +292,12 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
 
     def test_llm_get_hashes_method_and_url(self) -> None:
         url = "https://api.openai.com/v1/models"
-        _t, _op, _idem, hash_ = httpx_pack._judge(httpx.Request("GET", url))
+        _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
         self.assertEqual(hash_, _http.args_hash("GET", url))
 
     def test_non_llm_post_has_no_hash(self) -> None:
         req = httpx.Request("POST", "https://example.com/x", json={"a": 1})
-        target, _op, idempotent, hash_ = httpx_pack._judge(req)
+        target, _op, idempotent, hash_, _injected = httpx_pack._judge(req)
         self.assertEqual(target, "example.com")
         self.assertFalse(idempotent)
         self.assertIsNone(hash_, "the dev-cache exception is llm-only")

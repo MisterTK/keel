@@ -153,6 +153,15 @@ The real `ai` package is **not** a dependency; the middleware only implements th
 `LanguageModelV2` middleware shape (pinned in `fixtures/ai-sdk-model.d.ts`,
 mirroring `ai@5.0.0`).
 
+**All four core generation ops are covered by these two hooks.** `ai`'s
+`LanguageModelV2Middleware` exposes exactly `wrapGenerate`/`wrapStream` —
+`generateObject`/`streamObject` are built on the same `doGenerate`/`doStream`
+calls as `generateText`/`streamText` (object mode is a `responseFormat` value
+inside `params`, opaque to Keel except as a dev-cache key), so there is no
+third or fourth middleware hook to implement. The streaming rule above applies
+identically to `streamObject`: retried only before the first chunk/token,
+never mid-stream.
+
 ### MCP transports — `mcp:<server>`
 
 When the MCP client SDK (`@modelcontextprotocol/sdk`) is present, the bootstrap
@@ -179,6 +188,94 @@ one seam covers both. Each request routes through the backend as target
 - The patch is reversible (`uninstall = remove the package`). The real SDK is not
   a dependency; the wrapped shape is pinned in `fixtures/mcp-client.d.ts`
   (mirroring `@modelcontextprotocol/sdk@1.29.0`).
+
+### Database drivers — `pg`, `ioredis`, `mysql2`
+
+Resilience for the three database libraries `architecture-spec.md` §5.2 names,
+with the same conservative posture throughout: a target is `<db host>` (the
+connection's `host`/`path`, `kind: "host"` — the frozen `TargetDecl` enum has
+no `db` kind, so these inherit `[defaults.outbound]` exactly like a bare HTTP
+host), idempotency is judged explicitly (never guessed at a query's actual
+side effects), and calls are never cached (`args_hash` is always `null` — a
+result set is not safely replayable). None of the three libraries is a Keel
+dependency; each pack's wrapped shape is pinned in a `fixtures/*.d.ts` file
+(`pg-client.d.ts`, `ioredis-client.d.ts`, `mysql2-connection.d.ts`).
+
+- **`pg`** patches `Client.prototype.query` (`Pool.query` checks a real
+  `Client` out and calls this same method, so one seam covers both).
+  Idempotency is keyed off the SQL verb: a bare `SELECT` is retryable;
+  `INSERT`/`UPDATE`/`DELETE`, a `WITH` CTE (which may wrap a data-modifying
+  statement), DDL, and any unrecognized statement are observed, not retried
+  (KEEL-E014). A CALLBACK invocation (`client.query(text, cb)`) and a
+  SUBMITTABLE argument (`pg-cursor`, `pg-query-stream`, a raw `Query`) are
+  forwarded **untouched** — pg's own contract makes retrying either unsafe to
+  do transparently (documented gap, mirrors the fetch seam's treatment of
+  unbuffered stream bodies).
+- **`ioredis`** patches `Redis.prototype.sendCommand` — Commander's single
+  dispatch chokepoint. Idempotency comes from an **explicit** read-only
+  command table (`GET`/`MGET`/`EXISTS`/`TTL`/...); every mutating command,
+  pub/sub, transaction (`MULTI`/`EXEC`/`WATCH`), and any command absent from
+  the table is observed, not retried. A retried attempt dispatches a fresh
+  `Command` clone (a `Command`'s promise settles once); a callback attached to
+  the original call fires with the FIRST attempt's outcome, while the
+  returned/awaited promise — the dominant modern usage — always reflects the
+  final, retried result (documented limitation).
+- **`mysql2`** patches the BASE (callback) `Connection.prototype.query`/
+  `.execute` — `mysql2/promise`'s `PromiseConnection` calls these same methods
+  internally, so one seam covers the callback API and the promise API at
+  once. Idempotency uses the same SQL-verb rule as `pg`. A callback-less call
+  (mysql2's row-streaming mode) is forwarded untouched; a wrapped call
+  returns `undefined` rather than reconstructing the real `Query`/`Execute`
+  emitter (a documented, narrow deviation — the callback itself, which
+  `mysql2/promise` depends on exclusively, always fires with the correct
+  final outcome).
+- **Timeout is a SOFT race for all three.** Unlike fetch/mcp (which pass an
+  `AbortSignal` into the call), none of these libraries exposes a
+  cancellation hook through the wrapped seam, so a per-attempt deadline stops
+  Keel from *waiting* on an idempotent call without cancelling the underlying
+  I/O — an abandoned attempt keeps running until its own result/error
+  arrives, silently discarded (never an unhandled rejection). The database's
+  own server-side timeout (`statement_timeout`, `commandTimeout`, ...) is the
+  right tool for true cancellation.
+
+### Vercel eve — `tool:<name>`
+
+[eve](https://github.com/vercel/eve) is filesystem-first: an agent is a
+directory of `tools/`/`skills`/`channels`/`schedules`, and each tool is a
+module built with eve's own `defineTool()` helper:
+
+```ts
+// agent/tools/get_weather.ts
+import { defineTool } from "eve/tools";
+export default defineTool({
+  description: "…",
+  async execute({ city }) { /* … */ },
+});
+```
+
+eve reaches the world two ways, and Keel covers both, with zero eve-specific
+code needed for the first:
+
+- **MCP round-trips** — eve talks to MCP servers through the same
+  `@modelcontextprotocol/sdk` `Client` the `mcp:` pack above already patches,
+  so they're wrapped the moment that SDK is detected, eve or not.
+- **Tool modules** — when eve is detected, the bootstrap arms an ESM loader
+  rewrite (the same mechanism `ts:` function targets use) that intercepts the
+  canonical `import { defineTool } from "eve/tools"` line in a tool module and
+  wraps its `execute` function, so it routes through the backend as target
+  `tool:<name>` (`<name>` = the tool file's basename) before eve ever calls it.
+  Only that exact, unaliased import form is rewritten — anything else is left
+  untouched (a documented v0.1 simplification, like `ts:` targets).
+
+`tool:` calls are **non-idempotent by default** — unlike a `ts:` target (where
+listing it in `keel.toml` is itself the safety assertion), eve discovers tools
+automatically with no such opt-in, so a failure is observed, not retried
+(KEEL-E014), mirroring the `mcp:` pack's `tools/call` default; a target may
+still opt in via its own `retry.on`. Never dev-cached (tool calls can be
+side-effecting).
+
+Keel does **not** wrap eve's own conversation-level durability/checkpointing —
+it hardens the effects *inside* each step, which is a different layer.
 
 ## Errors and the `keelOutcome` attachment
 
