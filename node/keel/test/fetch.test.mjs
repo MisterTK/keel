@@ -8,6 +8,7 @@ import http from "node:http";
 import { AsyncEngine, virtualClock } from "../src/engine.mjs";
 import { installFetch } from "../src/fetch.mjs";
 import { level0Defaults } from "../src/defaults.mjs";
+import { resetLlmBudgets, recordSpend, spentCents } from "../src/llm-policy.mjs";
 
 /** Start a server whose handler is a scripted function of (req, hitCount). */
 async function startServer(handler) {
@@ -308,4 +309,186 @@ test("an idempotent request with an unbuffered stream body is observed, not retr
 
   assert.equal(captured[0].idempotent, false, "a stream body → observed, not retried (can't wrap safely)");
   assert.equal(captured[1].idempotent, true, "an in-memory body stays retryable");
+});
+
+// --- LLM budget caps + model fallback chains (llm-policy.mjs) ---------------
+
+test("LLM budget: usage-based spend accrues and blocks the NEXT call before dispatch", async () => {
+  resetLlmBudgets();
+  let hits = 0;
+  const globalObj = {
+    fetch: async () => {
+      hits++;
+      return new Response(
+        JSON.stringify({ reply: "hi", usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 } }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    },
+  };
+  const backend = new AsyncEngine(virtualClock());
+  // gpt-4o: $2.50 in + $10.00 out per 1M tokens → one call costs $12.50, well over a $1 cap.
+  backend.configure({ target: { "llm:openai": { budget: "$1.00/run", retry: { attempts: 1 } } } });
+  installFetch(backend, null, { globalObj });
+  const url = "https://api.openai.com/v1/chat/completions";
+  const post = () =>
+    globalObj.fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+    });
+
+  const r1 = await post();
+  assert.equal(r1.status, 200);
+  assert.equal(hits, 1, "the first call is always dispatched (nothing spent yet)");
+  assert.ok(spentCents("llm:openai") >= 100, "usage from the response was priced and recorded");
+
+  await assert.rejects(post(), (e) => {
+    assert.equal(e.code, "KEEL-E012");
+    assert.match(e.message, /budget cap/i);
+    assert.match(e.message, /llm:openai/);
+    return true;
+  });
+  assert.equal(hits, 1, "the second call was blocked before dispatch — no second API call");
+});
+
+test("LLM budget: a pre-exhausted budget blocks the very first call", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 5); // already over a 1-cent cap
+  let hits = 0;
+  const globalObj = { fetch: async () => { hits++; return new Response("{}", { status: 200 }); } };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run" } } });
+  installFetch(backend, null, { globalObj });
+  await assert.rejects(
+    () =>
+      globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o" }),
+      }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(hits, 0);
+});
+
+test("LLM budget: a target with no `budget` configured never reads the response body for accounting", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { retry: { attempts: 1 } } } }); // no budget
+  const globalObj = {
+    fetch: async () => new Response(JSON.stringify({ usage: { prompt_tokens: 999_999_999 } }), { status: 200 }),
+  };
+  installFetch(backend, null, { globalObj });
+  await globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o" }),
+  });
+  assert.equal(spentCents("llm:openai"), 0, "no budget configured → no accounting, ever");
+});
+
+test("LLM fallback: re-dispatches to the next model after a POST 503 (observed-not-retried, KEEL-E014)", async () => {
+  resetLlmBudgets();
+  const bodies = [];
+  let hits = 0;
+  const globalObj = {
+    fetch: async (_url, init) => {
+      hits++;
+      bodies.push(init.body);
+      const parsed = JSON.parse(init.body);
+      if (parsed.model === "gpt-4o") return new Response("overloaded", { status: 503 });
+      return new Response(JSON.stringify({ reply: "fallback-ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const backend = new AsyncEngine(virtualClock());
+  // attempts: 3 so a non-idempotent 503 fails as KEEL-E014 (observed, not
+  // retried) rather than KEEL-E010 (which fires immediately when no retry
+  // policy at all is configured, since the default attempt budget is then 1).
+  backend.configure({ target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["gpt-4o-mini"] } } });
+  installFetch(backend, null, { globalObj });
+  const resp = await globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+  });
+  assert.equal(resp.status, 200);
+  assert.equal(hits, 2, "primary model failed, the fallback model was dispatched");
+  assert.equal(JSON.parse(bodies[0]).model, "gpt-4o");
+  assert.equal(JSON.parse(bodies[1]).model, "gpt-4o-mini", "the fallback hop rewrote the model field");
+  assert.equal(resp.keelOutcome.result, "ok");
+});
+
+test("LLM fallback: chain exhausted delivers the LAST hop's failure", async () => {
+  resetLlmBudgets();
+  let hits = 0;
+  const globalObj = {
+    fetch: async () => {
+      hits++;
+      return new Response("still down", { status: 503 });
+    },
+  };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({
+    target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["gpt-4o-mini", "gpt-4.1-mini"] } },
+  });
+  installFetch(backend, null, { globalObj });
+  const resp = await globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o" }),
+  });
+  assert.equal(resp.status, 503, "the last hop's real response, unchanged");
+  assert.equal(hits, 3, "primary + both chain entries were tried");
+  assert.equal(resp.keelOutcome.error.code, "KEEL-E014");
+});
+
+test("LLM fallback: does NOT chase a budget-exceeded block (dx-spec: not on budget exhaustion)", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 10);
+  let hits = 0;
+  const globalObj = { fetch: async () => { hits++; return new Response("{}", { status: 200 }); } };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run", fallback: ["gpt-4o-mini"] } } });
+  installFetch(backend, null, { globalObj });
+  await assert.rejects(
+    () =>
+      globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o" }),
+      }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(hits, 0, "the budget block happens before any hop is dispatched");
+});
+
+test("LLM fallback: an unrecognized request shape stops the chain and delivers the original failure", async () => {
+  resetLlmBudgets();
+  let hits = 0;
+  const globalObj = {
+    fetch: async () => {
+      hits++;
+      return new Response("still down", { status: 503 });
+    },
+  };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { fallback: ["gpt-4o-mini"] } } });
+  installFetch(backend, null, { globalObj });
+  // A non-JSON body (no `model` field to rewrite) — rewriteModel returns null.
+  const resp = await globalObj.fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: "not json",
+  });
+  assert.equal(resp.status, 503);
+  assert.equal(hits, 1, "fallback could not rewrite the request, so it never re-dispatched");
 });

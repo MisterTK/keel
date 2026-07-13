@@ -9,6 +9,7 @@ import { AsyncEngine, virtualClock } from "../src/engine.mjs";
 import { applyPackDefaults } from "../src/defaults.mjs";
 import { resolveDevCache } from "../src/packs/llm.mjs";
 import { keelMiddleware, providerTarget, classifyModelError } from "../src/packs/ai-sdk.mjs";
+import { resetLlmBudgets, recordSpend, spentCents } from "../src/llm-policy.mjs";
 
 const llmBackend = (env = {}) => {
   const b = new AsyncEngine(virtualClock());
@@ -174,4 +175,126 @@ test("keelMiddleware is a transparent pass-through when no backend is active", a
   assert.equal(called, 1);
   assert.equal(r.text, "raw");
   assert.equal(r.keelOutcome, undefined, "no keelOutcome attached when disabled");
+});
+
+// --- LLM budget caps + model fallback chains (llm-policy.mjs) ---------------
+
+test("ai-sdk budget: usage on the doGenerate result is priced and blocks the next call", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$1.00/run" } } });
+  const mw = keelMiddleware({ backend });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    return { text: "hi", usage: { inputTokens: 1_000_000, outputTokens: 1_000_000 } };
+  };
+  const model = { provider: "openai", modelId: "gpt-4o" };
+  const r1 = await mw.wrapGenerate({ doGenerate, params: { prompt: "hi" }, model });
+  assert.equal(calls, 1);
+  assert.equal(r1.text, "hi");
+  assert.ok(spentCents("llm:openai") >= 100, "usage from the result was priced and recorded");
+
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: { prompt: "again" }, model }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      assert.match(e.message, /budget cap/i);
+      return true;
+    }
+  );
+  assert.equal(calls, 1, "the second call was blocked before doGenerate ran");
+});
+
+test("ai-sdk budget: a pre-exhausted budget blocks before any dispatch", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 5);
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run" } } });
+  const mw = keelMiddleware({ backend });
+  let calls = 0;
+  const doGenerate = async () => {
+    calls++;
+    return { text: "hi" };
+  };
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(calls, 0);
+});
+
+test("ai-sdk fallback: re-dispatches to an alternate LanguageModelV2 (cross-provider) on a qualifying failure", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({
+    target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["claude-fallback"] } },
+  });
+  let openaiCalls = 0;
+  let claudeCalls = 0;
+  const doGenerate = async () => {
+    openaiCalls++;
+    throw Object.assign(new Error("overloaded"), { statusCode: 503 });
+  };
+  const altModel = {
+    provider: "anthropic.messages",
+    modelId: "claude-haiku-4.5",
+    doGenerate: async () => {
+      claudeCalls++;
+      return { text: "from claude" };
+    },
+  };
+  const mw = keelMiddleware({ backend, models: { "claude-fallback": altModel } });
+  const result = await mw.wrapGenerate({
+    doGenerate,
+    params: { prompt: "hi" },
+    model: { provider: "openai.chat", modelId: "gpt-4o" },
+  });
+  // ai-sdk requests are always `idempotent: true` (LLM generate/stream calls
+  // are treated as retryable), so the primary hop exhausts its full 3-attempt
+  // budget (KEEL-E010) before the chain moves to the fallback model.
+  assert.equal(openaiCalls, 3);
+  assert.equal(claudeCalls, 1, "the fallback model was actually invoked, not just named");
+  assert.equal(result.text, "from claude");
+  assert.equal(result.keelOutcome.result, "ok");
+});
+
+test("ai-sdk fallback: an unresolved chain entry (no matching `models` map key) stops the chain honestly", async () => {
+  resetLlmBudgets();
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { retry: { attempts: 3 }, fallback: ["nobody-provided-this-one"] } } });
+  const mw = keelMiddleware({ backend }); // no `models` map at all
+  const boom = Object.assign(new Error("down"), { statusCode: 503 });
+  const doGenerate = async () => {
+    throw boom;
+  };
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e, boom, "the original (only) failure propagates unchanged");
+      return true;
+    }
+  );
+});
+
+test("ai-sdk fallback: does NOT chase a budget-exceeded block", async () => {
+  resetLlmBudgets();
+  recordSpend("llm:openai", 10);
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { budget: "$0.01/run", fallback: ["claude-fallback"] } } });
+  let claudeCalls = 0;
+  const altModel = { provider: "anthropic", doGenerate: async () => { claudeCalls++; return { text: "x" }; } };
+  const mw = keelMiddleware({ backend, models: { "claude-fallback": altModel } });
+  const doGenerate = async () => ({ text: "unreached" });
+  await assert.rejects(
+    () => mw.wrapGenerate({ doGenerate, params: {}, model: { provider: "openai" } }),
+    (e) => {
+      assert.equal(e.code, "KEEL-E012");
+      return true;
+    }
+  );
+  assert.equal(claudeCalls, 0, "budget block happens before any hop, fallback never engages");
 });

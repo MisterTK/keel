@@ -16,6 +16,12 @@ clearing the runtime makes every wrapper an instant, transparent passthrough
 (DX invariant 2). All judgment (target/idempotency/args_hash/error-class) lives
 in ``_http`` and is shared with the requests pack and the Node twin.
 
+LLM budget caps + model fallback chains (``_llm_policy``) ride this SAME seam
+for ``llm:*`` POST targets: a request may be re-dispatched through
+``call_with`` one or more times (a fresh ``httpx.Request`` per fallback hop),
+and a configured ``budget`` can block a call before ANY hop is dispatched. See
+``_llm_policy`` for the full design and its documented v0.1 limitations.
+
 Async note (v0.1): the core decision engine is synchronous (the stub; the
 native async core lands in Task 14). To drive the async seam through the same
 core — so retry/breaker/cache behavior and parity are identical, not
@@ -33,12 +39,14 @@ import base64
 import functools
 import importlib.metadata
 import importlib.util
+import json
 import time
 import weakref
 from typing import Any, Callable
 
 from .. import _runtime
-from . import _http
+from .._errors import KeelError
+from . import _http, _llm_policy
 from ._pack import Detection, Seam, TargetDecl
 
 MODULE = "httpx"
@@ -261,46 +269,132 @@ def _rebuild(payload: Any) -> Any:
     return httpx.Response(status_code=int(p.get("status", 200)), headers=p.get("headers", []), content=body)
 
 
+# --- LLM budget + fallback helpers (shared by the sync and async seams) -----
+
+def _llm_generate_gate(target: str, method: str) -> tuple[bool, int | None]:
+    """Whether `target`/`method` is an ``llm:*`` generate call, and its parsed
+    budget cap in cents (``None`` if unset/not an llm target)."""
+    is_llm = target.startswith("llm:") and method == "POST"
+    cap = _llm_policy.parse_budget_cents(_http.resolve_layer(target, "budget")) if is_llm else None
+    return is_llm, cap
+
+
+def _llm_fallback_chain(is_llm: bool, target: str) -> list[str]:
+    if not is_llm:
+        return []
+    cfg = _http.resolve_layer(target, "fallback")
+    return [m for m in cfg if isinstance(m, str) and m] if isinstance(cfg, list) else []
+
+
+def _budget_blocked_error(target: str, cap_cents: int, discovery: Any) -> KeelError:
+    spent = _llm_policy.spent_cents(target)
+    message = _llm_policy.budget_message(target, cap_cents, spent)
+    outcome = _llm_policy.budget_blocked_outcome(message)
+    if discovery is not None:
+        discovery.record(target, outcome, 0)
+    return KeelError("KEEL-E012", message)
+
+
+def _record_llm_spend(target: str, request: Any, payload: Any) -> None:
+    """Best-effort: price a live response's usage (from its buffered JSON body
+    — a deliberate, narrowly scoped exception, see `_llm_policy`) and record it
+    against `target`'s per-run ledger. Never raises."""
+    if not isinstance(payload, dict):
+        return
+    b64 = payload.get("body_b64")
+    if not isinstance(b64, str):
+        return
+    try:
+        parsed = json.loads(base64.b64decode(b64))
+    except Exception:
+        return
+    usage = _llm_policy.normalize_usage(parsed)
+    if usage is None:
+        return
+    model = _llm_policy.derive_request_model(str(request.url), _buffered_body(request))
+    _llm_policy.record_spend(target, _llm_policy.estimate_cost_usd(model, usage))
+
+
+def _next_hop_request(request: Any, next_model: str) -> Any | None:
+    """A fresh `httpx.Request` for the next fallback hop, or `None` when the
+    current request's shape can't be rewritten (see `_llm_policy`). Drops
+    `content-length` from the carried-over headers — the rewritten body is a
+    different length, and `httpx.Request` recomputes it correctly from
+    `content` when the header is absent."""
+    import httpx
+
+    rewritten = _llm_policy.rewrite_model(str(request.url), _buffered_body(request), next_model)
+    if rewritten is None:
+        return None
+    new_url, new_body = rewritten
+    headers = [(k, v) for k, v in request.headers.items() if k.lower() != "content-length"]
+    return httpx.Request(method=request.method, url=new_url, headers=headers, content=new_body)
+
+
 # --- sync seam ---------------------------------------------------------------
 
-def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
+def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
     backend = _runtime.get_backend()
     if backend is None:
-        return do_call()  # disabled / uninstalled: transparent
+        return call_with(request)  # disabled / uninstalled: transparent
     discovery = _runtime.get_discovery()
-    target, op, idempotent, hash_ = _judge(request)
-    env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl is actually configured for the target
-    # (mirrors Node's fetch gate): with no cache there is nothing to store, so a
-    # streaming/SSE GET must pass through unbuffered at Level 0.
-    cacheable = hash_ is not None and _http.cache_configured(target)
-    # Live objects kept side-band so the core payload stays JSON: the ok winner,
-    # the last superseded transient (closed on supersede), and a thrown error.
-    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
-    def effect(_attempt: int) -> dict[str, Any]:
-        try:
-            resp = do_call()
-        except Exception as err:  # not BaseException: let exit/interrupt fly
-            live["exc"] = err
-            return _http.thrown_error(err, _classify(err))
-        live["exc"] = None
-        if _http.is_transient_status(resp.status_code):
+    current = request
+    hop = 0
+    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
+    outcome: dict[str, Any] = {}
+
+    while True:
+        target, op, idempotent, hash_ = _judge(current)
+        env = _http.build_request(target, op, idempotent, hash_)
+        # Buffer the body ONLY when a cache ttl is actually configured for the
+        # target (mirrors Node's fetch gate), OR a budget is configured (usage
+        # accounting needs the response body — see `_llm_policy`).
+        is_llm, cap_cents = _llm_generate_gate(target, current.method)
+        if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
+            raise _budget_blocked_error(target, cap_cents, discovery)
+        track_usage = cap_cents is not None
+        cacheable = hash_ is not None and _http.cache_configured(target)
+        buffer_body = cacheable or track_usage
+        live = {"ok": None, "transient": None, "exc": None}
+
+        def effect(_attempt: int, _current: Any = current, _buffer: bool = buffer_body) -> dict[str, Any]:
+            try:
+                resp = call_with(_current)
+            except Exception as err:  # not BaseException: let exit/interrupt fly
+                live["exc"] = err
+                return _http.thrown_error(err, _classify(err))
+            live["exc"] = None
+            if _http.is_transient_status(resp.status_code):
+                if live["transient"] is not None and live["transient"] is not resp:
+                    _close_sync(live["transient"])
+                live["transient"] = resp
+                return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
             if live["transient"] is not None and live["transient"] is not resp:
                 _close_sync(live["transient"])
-            live["transient"] = resp
-            return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
-        if live["transient"] is not None and live["transient"] is not resp:
-            _close_sync(live["transient"])
-        live["transient"] = None
-        live["ok"] = resp
-        return {"status": "ok", "payload": _ok_payload(resp, cacheable)}
+            live["transient"] = None
+            live["ok"] = resp
+            return {"status": "ok", "payload": _ok_payload(resp, _buffer)}
 
-    started = time.perf_counter()
-    outcome = backend.execute(env, effect)
-    latency_ms = round((time.perf_counter() - started) * 1000)
-    if discovery is not None:
-        discovery.record(target, outcome, latency_ms)
+        started = time.perf_counter()
+        outcome = backend.execute(env, effect)
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        if discovery is not None:
+            discovery.record(target, outcome, latency_ms)
+
+        if outcome.get("result") == "ok":
+            if track_usage and not outcome.get("from_cache"):
+                _record_llm_spend(target, current, outcome.get("payload"))
+            break
+
+        chain = _llm_fallback_chain(is_llm, target)
+        if hop >= len(chain) or not _llm_policy.should_fallback(outcome.get("error")):
+            break
+        next_request = _next_hop_request(current, chain[hop])
+        if next_request is None:
+            break
+        current = next_request
+        hop += 1
 
     action, value = _http.deliver(
         outcome,
@@ -319,7 +413,7 @@ def _run_sync(do_call: Callable[[], Any], request: Any) -> Any:
 def _sync_class_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(orig)
     def handle_request(self: Any, request: Any) -> Any:
-        return _run_sync(lambda: orig(self, request), request)
+        return _run_sync(lambda req: orig(self, req), request)
 
     handle_request.__keel_wrapped__ = True  # type: ignore[attr-defined]
     return handle_request
@@ -327,7 +421,7 @@ def _sync_class_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
 
 def _sync_instance_wrapper(orig_bound: Callable[[Any], Any]) -> Callable[[Any], Any]:
     def handle_request(request: Any) -> Any:
-        return _run_sync(lambda: orig_bound(request), request)
+        return _run_sync(lambda req: orig_bound(req), request)
 
     handle_request.__keel_wrapped__ = True  # type: ignore[attr-defined]
     return handle_request
@@ -342,73 +436,96 @@ def _close_sync(resp: Any) -> None:
 
 # --- async seam --------------------------------------------------------------
 
-async def _run_async(make_coro: Callable[[], Any], request: Any) -> Any:
+async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
     backend = _runtime.get_backend()
     if backend is None:
-        return await make_coro()  # disabled / uninstalled: transparent
+        return await call_with(request)  # disabled / uninstalled: transparent
     discovery = _runtime.get_discovery()
-    target, op, idempotent, hash_ = _judge(request)
-    env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl is actually configured for the target
-    # (mirrors Node's fetch gate): with no cache there is nothing to store, so a
-    # streaming/SSE GET must pass through unbuffered at Level 0.
-    cacheable = hash_ is not None and _http.cache_configured(target)
-    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
     exec_async = getattr(backend, "execute_async", None)
 
-    started = time.perf_counter()
-    if callable(exec_async):
-        # NATIVE async path (Task 14 item 3): drive the effect directly on the
-        # caller's loop via keel_core.execute_async — no worker thread, no
-        # run_coroutine_threadsafe. The real async core awaits our coroutine.
-        async def aeffect(_attempt: int) -> dict[str, Any]:
-            try:
-                resp = await make_coro()
-            except Exception as err:
-                live["exc"] = err
-                return _http.thrown_error(err, _classify(err))
-            live["exc"] = None
-            if _http.is_transient_status(resp.status_code):
+    current = request
+    hop = 0
+    live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
+    outcome: dict[str, Any] = {}
+
+    while True:
+        target, op, idempotent, hash_ = _judge(current)
+        env = _http.build_request(target, op, idempotent, hash_)
+        is_llm, cap_cents = _llm_generate_gate(target, current.method)
+        if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
+            raise _budget_blocked_error(target, cap_cents, discovery)
+        track_usage = cap_cents is not None
+        cacheable = hash_ is not None and _http.cache_configured(target)
+        buffer_body = cacheable or track_usage
+        live = {"ok": None, "transient": None, "exc": None}
+
+        started = time.perf_counter()
+        if callable(exec_async):
+            # NATIVE async path (Task 14 item 3): drive the effect directly on the
+            # caller's loop via keel_core.execute_async — no worker thread, no
+            # run_coroutine_threadsafe. The real async core awaits our coroutine.
+            async def aeffect(_attempt: int, _current: Any = current, _buffer: bool = buffer_body) -> dict[str, Any]:
+                try:
+                    resp = await call_with(_current)
+                except Exception as err:
+                    live["exc"] = err
+                    return _http.thrown_error(err, _classify(err))
+                live["exc"] = None
+                if _http.is_transient_status(resp.status_code):
+                    if live["transient"] is not None and live["transient"] is not resp:
+                        await _aclose(live["transient"])
+                    live["transient"] = resp
+                    return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
                 if live["transient"] is not None and live["transient"] is not resp:
                     await _aclose(live["transient"])
-                live["transient"] = resp
-                return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
-            if live["transient"] is not None and live["transient"] is not resp:
-                await _aclose(live["transient"])
-            live["transient"] = None
-            live["ok"] = resp
-            return {"status": "ok", "payload": await _ok_payload_async(resp, cacheable)}
+                live["transient"] = None
+                live["ok"] = resp
+                return {"status": "ok", "payload": await _ok_payload_async(resp, _buffer)}
 
-        outcome = await exec_async(env, aeffect)
-    else:
-        # STUB async path: the synchronous stub cannot await, so each attempt is
-        # driven in a worker thread that marshals the await back onto this loop.
-        loop = asyncio.get_running_loop()
+            outcome = await exec_async(env, aeffect)
+        else:
+            # STUB async path: the synchronous stub cannot await, so each attempt is
+            # driven in a worker thread that marshals the await back onto this loop.
+            loop = asyncio.get_running_loop()
 
-        def effect(_attempt: int) -> dict[str, Any]:
-            future = asyncio.run_coroutine_threadsafe(make_coro(), loop)
-            try:
-                resp = future.result()
-            except Exception as err:
-                live["exc"] = err
-                return _http.thrown_error(err, _classify(err))
-            live["exc"] = None
-            if _http.is_transient_status(resp.status_code):
+            def effect(_attempt: int, _current: Any = current, _buffer: bool = buffer_body) -> dict[str, Any]:
+                future = asyncio.run_coroutine_threadsafe(call_with(_current), loop)
+                try:
+                    resp = future.result()
+                except Exception as err:
+                    live["exc"] = err
+                    return _http.thrown_error(err, _classify(err))
+                live["exc"] = None
+                if _http.is_transient_status(resp.status_code):
+                    if live["transient"] is not None and live["transient"] is not resp:
+                        _aclose_threadsafe(live["transient"], loop)
+                    live["transient"] = resp
+                    return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
                 if live["transient"] is not None and live["transient"] is not resp:
                     _aclose_threadsafe(live["transient"], loop)
-                live["transient"] = resp
-                return _http.transient_error(resp.status_code, resp.headers.get("retry-after"))
-            if live["transient"] is not None and live["transient"] is not resp:
-                _aclose_threadsafe(live["transient"], loop)
-            live["transient"] = None
-            live["ok"] = resp
-            payload = asyncio.run_coroutine_threadsafe(_ok_payload_async(resp, cacheable), loop).result()
-            return {"status": "ok", "payload": payload}
+                live["transient"] = None
+                live["ok"] = resp
+                payload = asyncio.run_coroutine_threadsafe(_ok_payload_async(resp, _buffer), loop).result()
+                return {"status": "ok", "payload": payload}
 
-        outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
-    latency_ms = round((time.perf_counter() - started) * 1000)
-    if discovery is not None:
-        discovery.record(target, outcome, latency_ms)
+            outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        if discovery is not None:
+            discovery.record(target, outcome, latency_ms)
+
+        if outcome.get("result") == "ok":
+            if track_usage and not outcome.get("from_cache"):
+                _record_llm_spend(target, current, outcome.get("payload"))
+            break
+
+        chain = _llm_fallback_chain(is_llm, target)
+        if hop >= len(chain) or not _llm_policy.should_fallback(outcome.get("error")):
+            break
+        next_request = _next_hop_request(current, chain[hop])
+        if next_request is None:
+            break
+        current = next_request
+        hop += 1
 
     action, value = _http.deliver(
         outcome,
@@ -427,7 +544,7 @@ async def _run_async(make_coro: Callable[[], Any], request: Any) -> Any:
 def _async_class_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(orig)
     async def handle_async_request(self: Any, request: Any) -> Any:
-        return await _run_async(lambda: orig(self, request), request)
+        return await _run_async(lambda req: orig(self, req), request)
 
     handle_async_request.__keel_wrapped__ = True  # type: ignore[attr-defined]
     return handle_async_request
@@ -435,7 +552,7 @@ def _async_class_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
 
 def _async_instance_wrapper(orig_bound: Callable[[Any], Any]) -> Callable[[Any], Any]:
     async def handle_async_request(request: Any) -> Any:
-        return await _run_async(lambda: orig_bound(request), request)
+        return await _run_async(lambda req: orig_bound(req), request)
 
     handle_async_request.__keel_wrapped__ = True  # type: ignore[attr-defined]
     return handle_async_request

@@ -25,6 +25,12 @@
  *   - an LLM POST (llm:* target) still derives an args_hash from its canonical
  *     JSON body (the documented dev-cache exception) so identical prompts replay
  *     from cache — without being made retryable.
+ *   - an LLM POST (llm:* target) additionally honors `budget` (per-run spend
+ *     cap, blocks the call before dispatch once exceeded) and `fallback`
+ *     (re-dispatch to the next model in the chain on a qualifying terminal
+ *     failure) — see `llm-policy.mjs` for the full design and its documented
+ *     v0.1 limitations. Both are no-ops (zero overhead, zero body reads) for
+ *     any target that does not configure them.
  */
 
 import {
@@ -40,6 +46,18 @@ import {
 } from "./judge.mjs";
 import { attachOutcome } from "./runtime.mjs";
 import { KeelError } from "./engine.mjs";
+import {
+  parseBudgetCents,
+  spentCents,
+  recordSpend,
+  estimateCostUsd,
+  normalizeUsage,
+  budgetMessage,
+  budgetBlockedOutcome,
+  deriveRequestModel,
+  rewriteModel,
+  shouldFallback,
+} from "./llm-policy.mjs";
 
 function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -76,7 +94,6 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     }
     const hostname = parsed.hostname;
     const target = resolveTarget(hostname);
-    const op = `${method} ${hostname}${parsed.pathname}`;
     const idemHeader = readIdempotencyHeader(backend, target);
     // A call is only retried if it is BOTH idempotent by method/header AND its
     // body can be re-sent on a retry: an unbuffered stream body is consumed once,
@@ -84,11 +101,6 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     // safely → observed, not retried). In-memory bodies (string/bytes) are
     // re-sent unchanged on each attempt (the same init.body is passed through).
     const idempotent = isIdempotent(method, headers, idemHeader) && isBodyRetrySafe(input, body);
-    // args_hash (cache/journal key material): idempotent GET, plus the documented
-    // LLM-POST dev-cache exception — cross-language parity with the Python twin's
-    // derive_args_hash (a cacheable POST is not thereby made retryable).
-    const hash = deriveArgsHash(target, method, parsed.href, body);
-    const request = { v: 1, target, op, idempotent, args_hash: hash };
 
     // Per-attempt timeout is enforced only for idempotent calls: a timeout we
     // impose becomes a new thrown error, and we must never inject one into a
@@ -99,47 +111,97 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     // payload envelope (for a cross-call / cross-run replay). Everything else
     // sends a cheap status/headers envelope and hands back the LIVE response.
     const cacheCfg = backend.layer(target, "cache");
-    const cacheable = hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined;
 
-    // Live objects kept side-band so the core payload can stay JSON: the winning
-    // ok response, the last superseded transient (5xx/429), and the last thrown
-    // transport error. The response we hand back keeps its body; superseded
-    // transients are cancelled so retries never leave an undrained body.
+    // --- LLM budget + fallback (llm-policy.mjs) — llm:* POST targets only ---
+    const isLlmGenerate = target.startsWith("llm:") && method === "POST";
+    const capCents = isLlmGenerate ? parseBudgetCents(backend.layer(target, "budget")) : null;
+    const fallbackCfgRaw = isLlmGenerate ? backend.layer(target, "fallback") : undefined;
+    const fallbackChain = Array.isArray(fallbackCfgRaw) ? fallbackCfgRaw.filter((m) => typeof m === "string" && m) : [];
+    const trackUsage = capCents !== null;
+
+    if (capCents !== null && spentCents(target) >= capCents) {
+      const message = budgetMessage(target, capCents, spentCents(target));
+      const blocked = budgetBlockedOutcome(message);
+      discovery?.observe(target, blocked, 0);
+      throw attachOutcome(new KeelError("KEEL-E012", message), blocked);
+    }
+
+    // Headers/init reused for any fallback hop beyond the first (a plain URL +
+    // init call — no library-specific Request-object surgery needed for fetch).
+    const initForHops = { ...(init ?? {}), method, headers };
+
+    let hopUrl = parsed.href;
+    let hopBody = body;
+    let hopIndex = 0; // 0 = the ORIGINAL request, as given; >0 = fallback[hopIndex - 1]
+    let outcome;
     let heldOk = null;
     let heldTransient = null;
     let heldErr = null;
 
-    const started = performance.now();
-    const outcome = await backend.execute(request, async () => {
-      const { signal, cancel } = withTimeout(init?.signal, timeoutMs);
-      const attemptInit = signal ? { ...init, signal } : init;
-      try {
-        const resp = await original.call(this, input, attemptInit);
-        heldErr = null;
-        if (isTransientStatus(resp.status)) {
-          if (heldTransient && heldTransient !== resp) cancelBody(heldTransient);
-          heldTransient = resp;
-          return {
-            status: "error",
-            class: "http",
-            http_status: resp.status,
-            retry_after_ms: parseRetryAfter(resp.headers.get("retry-after")),
-            message: `HTTP ${resp.status}`,
-          };
-        }
-        cancelBody(heldTransient); // a good response supersedes any held transient
-        heldTransient = null;
-        heldOk = resp;
-        return { status: "ok", payload: await responseEnvelope(resp, { withBody: cacheable }) };
-      } catch (err) {
-        heldErr = err;
-        return { status: "error", class: classifyThrow(err), message: err?.message ?? String(err) };
-      } finally {
-        cancel();
-      }
-    });
+    // Bounded by `fallbackChain.length` (checked before each extra hop below).
+    while (true) {
+      const hopParsed = new URL(hopUrl);
+      const op = `${method} ${hostname}${hopParsed.pathname}`;
+      const hash = deriveArgsHash(target, method, hopParsed.href, hopBody);
+      const request = { v: 1, target, op, idempotent, args_hash: hash };
+      const cacheable = hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined;
 
-    discovery?.observe(target, outcome, performance.now() - started);
+      heldOk = null;
+      heldTransient = null;
+      heldErr = null;
+      const started = performance.now();
+      outcome = await backend.execute(request, async () => {
+        const { signal, cancel } = withTimeout(init?.signal, timeoutMs);
+        const attemptInit =
+          hopIndex === 0
+            ? signal
+              ? { ...init, signal }
+              : init
+            : { ...initForHops, body: hopBody, ...(signal ? { signal } : {}) };
+        try {
+          const resp = await original.call(this, hopIndex === 0 ? input : hopUrl, attemptInit);
+          heldErr = null;
+          if (isTransientStatus(resp.status)) {
+            if (heldTransient && heldTransient !== resp) cancelBody(heldTransient);
+            heldTransient = resp;
+            return {
+              status: "error",
+              class: "http",
+              http_status: resp.status,
+              retry_after_ms: parseRetryAfter(resp.headers.get("retry-after")),
+              message: `HTTP ${resp.status}`,
+            };
+          }
+          cancelBody(heldTransient); // a good response supersedes any held transient
+          heldTransient = null;
+          heldOk = resp;
+          return { status: "ok", payload: await responseEnvelope(resp, { withBody: cacheable || trackUsage }) };
+        } catch (err) {
+          heldErr = err;
+          return { status: "error", class: classifyThrow(err), message: err?.message ?? String(err) };
+        } finally {
+          cancel();
+        }
+      });
+
+      discovery?.observe(target, outcome, performance.now() - started);
+
+      if (outcome.result === "ok") {
+        if (trackUsage && !outcome.from_cache) recordLlmSpend(target, hopUrl, hopBody, outcome.payload);
+        break;
+      }
+
+      // Terminal failure: chase the next model in the fallback chain when one
+      // is configured and the failure qualifies (see llm-policy.mjs). Rewriting
+      // may fail (unrecognized request shape) — then we stop and deliver THIS
+      // failure, honestly, rather than pretend a hop happened.
+      if (hopIndex >= fallbackChain.length || !shouldFallback(outcome.error)) break;
+      const rewritten = rewriteModel(hopUrl, hopBody, fallbackChain[hopIndex]);
+      if (!rewritten) break;
+      hopUrl = rewritten.url;
+      hopBody = rewritten.body;
+      hopIndex += 1;
+    }
 
     if (outcome.result === "ok") {
       // A cache hit (in-process or, under the persistent journal, across runs)
@@ -170,6 +232,26 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
   return function uninstall() {
     if (globalObj.fetch === keelFetch) globalObj.fetch = original;
   };
+}
+
+/** Extract usage from a live (non-cache) response envelope's buffered JSON body
+ *  (see llm-policy.mjs's documented body-reading exception) and record its
+ *  estimated cost against the target's per-run ledger. Best-effort: a
+ *  non-JSON or usage-less body silently records nothing (never breaks the
+ *  call over an accounting miss). */
+function recordLlmSpend(target, requestUrl, requestBody, payload) {
+  const b64 = payload?.body_b64;
+  if (typeof b64 !== "string") return;
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+  } catch {
+    return;
+  }
+  const usage = normalizeUsage(parsed);
+  if (!usage) return;
+  const model = deriveRequestModel(requestUrl, requestBody);
+  recordSpend(target, estimateCostUsd(model, usage));
 }
 
 function readIdempotencyHeader(backend, target) {
