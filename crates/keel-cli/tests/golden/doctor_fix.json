@@ -1,0 +1,114 @@
+{
+  "adapters": [
+    {
+      "detected": false,
+      "lib": "httpx",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "requests",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "aiohttp",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib3",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "openai",
+      "status": "pinned",
+      "target": "llm:openai"
+    },
+    {
+      "detected": false,
+      "lib": "anthropic",
+      "status": "pinned",
+      "target": "llm:anthropic"
+    },
+    {
+      "detected": false,
+      "lib": "fetch",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "undici",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "http",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "ai-sdk",
+      "status": "pinned",
+      "target": "llm:*"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "best-effort",
+      "target": "mcp:*"
+    }
+  ],
+  "coverage": {
+    "invisible": [],
+    "visible_unwrapped": [],
+    "wrapped": []
+  },
+  "findings": [
+    {
+      "action": "If a dependency makes calls Keel never reports, file an adapter request.",
+      "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
+      "level": "info",
+      "topic": "invisible"
+    },
+    {
+      "action": "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json. Or apply the attached patch (`git apply`) to remove the invalid entry — defaults cover it.",
+      "detail": "keel.toml failed validation at `target.api.example.com.retry.attempts`: invalid value: integer `0`, expected a nonzero u32",
+      "fix": {
+        "changes": [
+          {
+            "after": null,
+            "before": {
+              "attempts": 0
+            },
+            "path": "target.\"api.example.com\".retry"
+          }
+        ],
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,4 +1,3 @@\n # my tuning\n [target.\"api.example.com\"]\n timeout = \"30s\" # keep\n-retry = { attempts = 0 }\n"
+      },
+      "level": "error",
+      "topic": "policy"
+    }
+  ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
+  "ok": false,
+  "policy": {
+    "field": "target.api.example.com.retry.attempts",
+    "message": "invalid value: integer `0`, expected a nonzero u32",
+    "present": true,
+    "valid": false
+  }
+}

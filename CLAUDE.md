@@ -57,7 +57,7 @@ resume**. Done:
 published — build from source (README quickstart; `maturin develop -m
 crates/keel-py` for the native Python module). Postgres/fleet journal (Level 3),
 `keel mcp`, `keel record test`, and further adapter packs are future work.
-An approved CCR (branch `claude/ccr-defaults-e005`) resolved two contract
+An approved CCR (PR #5, `135580d`) resolved two contract
 questions: **KEEL-E005 unsupported-configuration** now carries the v0.1
 "valid policy, missing capability" cases (async-in-flow, flows-without-journal,
 `KEEL_BACKEND=native` with no native module), so KEEL-E001 is pure policy

@@ -66,10 +66,12 @@ pub fn run(project: &Path) -> Rendered {
         Err(e) => return soft_error(&e),
     };
     let discovery_present = evidence::discovery_db(project).exists();
-    let journal_present = evidence::journal_db(project).exists();
+    // Honor the policy's `journal` key (file: locations), like the engine does.
+    let journal_path = evidence::resolved_journal(project).path;
+    let journal_present = journal_path.exists();
 
     let flows = if journal_present {
-        match read_flows(&evidence::journal_db(project)) {
+        match read_flows(&journal_path) {
             Ok(f) => f,
             Err(e) => return soft_error(&e),
         }

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
+# Dev-only test harness shared by the stub and the real core; never published.
 publish = false
 
 [dependencies]

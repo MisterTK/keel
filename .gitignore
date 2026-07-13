@@ -27,3 +27,7 @@ conformance/fixtures/journal/.gen/
 
 # macOS Finder artifacts
 .DS_Store
+
+# session worktrees + python build tree
+.claude/worktrees/
+python/keel/build/

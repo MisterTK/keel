@@ -2,20 +2,26 @@
 //!
 //! Subcommands: [`run`] (dispatch a script into a language front end),
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
-//! report), [`status`] (the "what is Keel doing for me" screen),
+//! report; `--effective-policy` prints the composed `defaults < packs < user`
+//! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
 //! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
-//! [`flows`] (list durable flows) and [`flows::trace`] (`keel trace`).
+//! [`flows`] (list durable flows), [`flows::trace`] (`keel trace`), and
+//! [`replay`] (`keel replay` — a journal-driven dry run of what a re-entry
+//! would substitute vs. re-execute).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
 //! [`EXIT_OK`], [`EXIT_FAILURE`], [`EXIT_USAGE`]. The command modules are the
 //! testable core; [`main`](../keel/index.html) is a thin clap front.
 
+pub mod diff;
 pub mod doctor;
+pub mod effective;
 pub mod explain;
 pub mod flows;
 pub mod init;
 pub mod render;
+pub mod replay;
 pub mod run;
 pub mod scan;
 pub mod status;

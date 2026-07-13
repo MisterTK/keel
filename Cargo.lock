@@ -802,12 +802,14 @@ dependencies = [
  "clap",
  "keel-core-api",
  "keel-journal",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

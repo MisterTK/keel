@@ -6,7 +6,7 @@
 //!
 //! The deployed path is a current-thread `Runtime::block_on(Engine::execute)`,
 //! the same shape `keel-ffi`'s `keel_execute` drives, so what we measure is what
-//! ships. The four cases isolate Keel's overhead from the runtime floor:
+//! ships. The five cases isolate Keel's overhead from the runtime floor:
 //!
 //! - `0_baseline`  — `block_on` of a trivial future: the irreducible floor that
 //!   is *not* Keel overhead (subtract it from the others).
@@ -16,16 +16,21 @@
 //!   `args_hash`, on the cache-miss path (consult → miss → effect → write).
 //! - `c_cache_hit` — the same realistic policy, served from a warm cache entry
 //!   (attempts stays 0; the effect is never invoked).
+//! - `d_events`    — the `a_empty` call with a live event sink attached: the
+//!   emit path (call_start/attempt_start/call_end per call) stays on budget.
+//!   The sink drains to `io::sink()` so the OS filesystem is not what's timed —
+//!   file I/O runs on the background writer thread in production anyway.
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use keel_core::Engine;
+use keel_core::events::EventSink;
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 
-/// The four overhead cases, each pre-built so a measured iteration performs only
+/// The five overhead cases, each pre-built so a measured iteration performs only
 /// the deployed per-call path — never setup. Engines are separate per case so a
 /// miss-path write can never warm the hit-path cache (or vice versa).
 #[derive(Debug)]
@@ -34,9 +39,11 @@ pub struct Cases {
     empty_engine: Engine,
     miss_engine: Engine,
     hit_engine: Engine,
+    events_engine: Engine,
     empty_request: Request,
     miss_request: Request,
     hit_request: Request,
+    events_request: Request,
 }
 
 /// A realistic policy — retry + breaker + cache all configured with contract
@@ -100,9 +107,18 @@ impl Cases {
             .configure(&realistic_policy("bench.hit", "1h"))
             .expect("bench hit policy must configure");
 
+        // Events engine: the empty-policy call with a live sink, so the
+        // measured delta over `a_empty` is exactly the emit path.
+        let mut events_engine = Engine::new();
+        events_engine.attach_events(
+            EventSink::to_writer(Box::new(std::io::sink()), "bench")
+                .expect("bench event sink must start"),
+        );
+
         let empty_request = request("bench.empty", None);
         let miss_request = request("bench.miss", Some("args-0"));
         let hit_request = request("bench.hit", Some("args-0"));
+        let events_request = request("bench.events", None);
 
         runtime.block_on(async {
             black_box(hit_engine.execute(&hit_request, ok_effect).await);
@@ -113,9 +129,11 @@ impl Cases {
             empty_engine,
             miss_engine,
             hit_engine,
+            events_engine,
             empty_request,
             miss_request,
             hit_request,
+            events_request,
         }
     }
 
@@ -145,6 +163,14 @@ impl Cases {
         black_box(
             self.runtime
                 .block_on(self.hit_engine.execute(&self.hit_request, ok_effect)),
+        );
+    }
+
+    /// Case `d_events`: the empty-policy call with a live event sink attached.
+    pub fn events(&self) {
+        black_box(
+            self.runtime
+                .block_on(self.events_engine.execute(&self.events_request, ok_effect)),
         );
     }
 }
