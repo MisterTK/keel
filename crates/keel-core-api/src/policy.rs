@@ -450,9 +450,10 @@ pub struct FlowsPolicy {
 
 /// A journal location literal (`policy.journal`), validated against the frozen
 /// schema pattern `^(file:.+|postgres://.+)$` at parse time so a malformed value
-/// fails configuration (KEEL-E001) rather than being silently ignored. Parsed
-/// and carried; the concrete path is selected by the front end / core at
-/// construction (KEEL_JOURNAL or the `.keel/journal.db` default) in v0.1.
+/// fails configuration (KEEL-E001) rather than being silently ignored. The real
+/// core honors it at configure time: `file:` attaches a SQLite journal at that
+/// path (replacing the construction-time default), and `postgres://` fails
+/// loudly with KEEL-E005 until a Postgres backend ships.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct JournalLocation(pub String);
@@ -480,10 +481,14 @@ impl TryFrom<String> for JournalLocation {
     }
 }
 
-/// `[telemetry]` (`otlp_endpoint`, `console`). Parsed and carried, but inert in
-/// v0.1: OTel export is configured from the environment (see `keel-core`'s otel
-/// module), so setting this only validates — `Engine::configure` warns when it
-/// is present so the user is not silently surprised.
+/// `[telemetry]` (`otlp_endpoint`, `console`). Parsed and carried; `Engine`
+/// exposes `otlp_endpoint` back to native front ends (`telemetry_otlp_endpoint`)
+/// which feed it to `keel-core`'s `otel::init_otlp` when built with the `otel`
+/// feature — the standard `OTEL_*` environment variables take precedence over
+/// this table (see `keel-core`'s otel module for the exact precedence rules).
+/// `console` (the local pretty-console-summary switch) is validated and
+/// carried but has no consumer yet; `Engine::configure` warns on an explicit
+/// `false` so the user is not silently surprised.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryPolicy {
@@ -515,11 +520,12 @@ pub struct Policy {
     pub defaults: Defaults,
     pub target: BTreeMap<String, TargetPolicy>,
     pub flows: Option<FlowsPolicy>,
-    /// Journal location (schema-validated). Parsed and carried; path selection
-    /// is construction-time in v0.1 (see [`JournalLocation`]).
+    /// Journal location (schema-validated), honored by the real core at
+    /// configure time (see [`JournalLocation`]).
     pub journal: Option<JournalLocation>,
-    /// Telemetry config (schema-validated). Parsed and carried but inert in
-    /// v0.1 (env-driven export); see [`TelemetryPolicy`].
+    /// Telemetry config (schema-validated); `otlp_endpoint` is honored by
+    /// native front ends (env still wins), `console` is not yet wired — see
+    /// [`TelemetryPolicy`].
     pub telemetry: Option<TelemetryPolicy>,
 }
 

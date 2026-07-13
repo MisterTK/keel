@@ -13,11 +13,17 @@ members = [
 ]
 
 [workspace.package]
+# The single version source. Everything else derives from or is checked
+# against it: crates inherit it, the keel-core wheel reads it via maturin
+# (`dynamic = ["version"]`), and scripts/check-versions.py asserts the
+# remaining manifests (pyproject/package.json/front-end constants) agree.
+# Bump with scripts/bump-version.sh, never by hand.
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 repository = "https://github.com/MisterTK/keel"
 license = "Apache-2.0"
+readme = "README.md"
 
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

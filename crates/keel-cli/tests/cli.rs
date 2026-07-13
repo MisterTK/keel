@@ -9,11 +9,12 @@
 //! frozen `contracts/journal.sql` + the golden fixture inserts, the discovery
 //! store through `keel-journal`'s own API.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use keel_cli::render::json_string;
-use keel_cli::{doctor, explain, init, scan, status};
+use keel_cli::{doctor, effective, explain, flows, init, replay, scan, status};
 use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
@@ -58,6 +59,35 @@ fn python3_present() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+fn node_present() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Run `cmd`, feed `stdin_data`, and return stdout. Panics on failure — the
+/// caller has already checked the interpreter is present.
+fn run_with_stdin(mut cmd: Command, stdin_data: &str) -> String {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn subprocess");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(stdin_data.as_bytes())
+        .expect("write child stdin");
+    let out = child.wait_with_output().expect("wait for subprocess");
+    assert!(
+        out.status.success(),
+        "subprocess failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("subprocess stdout is UTF-8")
 }
 
 /// Build a `.keel/journal.db` at `project` with the three golden flows.
@@ -188,6 +218,138 @@ fn init_agents_snippet_matches_golden() {
     check_golden("init_agents.md", &init::agents_block());
 }
 
+// ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
+
+/// Two-target project for the `--diff` fixtures: `api.example.com` is already
+/// in keel.toml (kept, untouched), `api.new.example` is new (added block).
+const DIFF_APP_MJS: &str = "\
+// two targets, one already in keel.toml
+const KEPT = await fetch(\"https://api.example.com/v1/x\");
+const ADDED = await fetch(\"https://api.new.example/v2/y\");
+";
+
+/// The pre-existing keel.toml: one kept target with user tuning + comments,
+/// one stale target the scan no longer finds (removed block).
+const DIFF_KEEL_TOML: &str = "\
+# hand-tuned: keep this comment
+
+[target.\"api.example.com\"]
+timeout = \"9s\"   # user tuning survives
+
+[target.\"api.gone.example\"]  # stale
+timeout = \"5s\"
+";
+
+fn diff_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.mjs"), DIFF_APP_MJS).unwrap();
+    std::fs::write(dir.path().join("keel.toml"), DIFF_KEEL_TOML).unwrap();
+    dir
+}
+
+fn init_diff(project: &Path) -> keel_cli::Rendered {
+    let r = init::run(
+        project,
+        init::InitOptions {
+            diff: true,
+            stamp: false,
+            agents: false,
+        },
+    );
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    r
+}
+
+/// The whole `--json` twin of `keel init --diff` — summary, structured
+/// `changes`, and the unified `patch` — is byte-golden (dx-spec §5).
+#[test]
+fn init_diff_json_matches_golden() {
+    let dir = diff_project();
+    let r = init_diff(dir.path());
+    check_golden("init_diff.json", &json_string(&r.json));
+}
+
+fn git_present() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// The lingua-franca property, checked against the real tool: `git apply`
+/// applies the emitted patch cleanly, the result parses to the proposed
+/// policy, and every byte outside the touched blocks survives.
+#[test]
+fn init_diff_patch_applies_cleanly_with_git_apply() {
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let dir = diff_project();
+    let r = init_diff(dir.path());
+    let patch = r.json["patch"].as_str().unwrap();
+    assert!(
+        patch.starts_with("--- a/keel.toml\n+++ b/keel.toml\n"),
+        "{patch}"
+    );
+
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    let value: toml::Value = applied.parse().expect("applied file parses");
+    let targets = value["target"].as_table().unwrap();
+    assert!(targets.contains_key("api.example.com"));
+    assert!(targets.contains_key("api.new.example"));
+    assert!(!targets.contains_key("api.gone.example"));
+    // Untouched regions byte-preserved: header comment + user tuning.
+    assert!(applied.contains("# hand-tuned: keep this comment"));
+    assert!(applied.contains("timeout = \"9s\"   # user tuning survives"));
+}
+
+/// With no keel.toml, the patch is a `/dev/null` creation diff; `git apply`
+/// creates a file byte-identical to what `keel init` itself would write.
+#[test]
+fn init_diff_creation_patch_matches_a_real_init_write() {
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.mjs"), DIFF_APP_MJS).unwrap();
+    let r = init_diff(dir.path());
+    let patch = r.json["patch"].as_str().unwrap();
+    assert!(
+        patch.starts_with("--- /dev/null\n+++ b/keel.toml\n@@ -0,0 +1,"),
+        "{patch}"
+    );
+
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let created = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    let expected = init::render_keel_toml(&scan::scan(dir.path()), &[], None);
+    assert_eq!(created, expected, "creation patch reproduces init's write");
+}
+
 // ---- status / doctor / explain: --json golden-tested ----
 
 #[test]
@@ -220,6 +382,149 @@ fn doctor_json_matches_golden() {
     check_golden("doctor_node.json", &json_string(&r.json));
 }
 
+/// An invalid keel.toml turns the doctor policy finding into an applyable fix
+/// (dx-spec §5): the whole `--json` twin — findings, `fix.patch`,
+/// `fix.changes` — is byte-golden, and the patch applies cleanly with the real
+/// `git apply`, preserving every byte outside the removed entry.
+#[test]
+fn doctor_fix_json_matches_golden_and_applies() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "# my tuning\n[target.\"api.example.com\"]\ntimeout = \"30s\" # keep\nretry = { attempts = 0 }\n",
+    )
+    .unwrap();
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_USAGE, "invalid policy exits 2");
+    assert!(r.human.contains("patch (apply with `git apply`)"));
+    check_golden("doctor_fix.json", &json_string(&r.json));
+
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let findings = r.json["findings"].as_array().unwrap();
+    let fix = findings
+        .iter()
+        .find(|f| f["topic"] == "policy")
+        .map(|f| &f["fix"])
+        .expect("policy finding carries a fix");
+    let patch = fix["patch"].as_str().unwrap();
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    assert!(applied.contains("# my tuning"));
+    assert!(applied.contains("timeout = \"30s\" # keep"));
+    assert!(!applied.contains("retry"), "invalid entry removed");
+    // The fixed file passes a re-run: doctor is now ok.
+    let again = doctor::run(dir.path());
+    assert_eq!(
+        again.exit,
+        keel_cli::EXIT_OK,
+        "removal fix heals the policy"
+    );
+}
+
+/// The evidence readers honor `keel.toml`'s `journal` key: a journal at a
+/// custom `file:` location (relative to the project) is found by `flows`,
+/// `trace`, and `status` even though `.keel/journal.db` does not exist.
+#[test]
+fn flows_and_status_honor_the_policy_journal_location() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "journal = \"file:state/custom.db\"\n",
+    )
+    .unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let conn = rusqlite::Connection::open(state.join("custom.db")).unwrap();
+    conn.execute_batch(JOURNAL_SCHEMA).unwrap();
+    conn.execute_batch(COMPLETED_FLOW).unwrap();
+    drop(conn);
+
+    let f = flows::flows(dir.path(), false, T0);
+    assert_eq!(f.json["journal_present"], true, "custom journal found");
+    assert_eq!(f.json["count"], 1, "the completed fixture flow is listed");
+
+    let s = status::run(dir.path());
+    assert_eq!(
+        s.json["flows"]["total"], 1,
+        "status reads the custom journal"
+    );
+}
+
+// ---- replay: the journal-driven dry run, --json golden over all three ----
+// ---- golden flow shapes (completed / interrupted / dead)              ----
+
+/// A completed flow re-enters as a pure replay: every step substitutes and the
+/// whole `--json` plan is byte-golden.
+#[test]
+fn replay_completed_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000001", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_completed.json", &json_string(&r.json));
+}
+
+/// An interrupted flow resumes: steps 1–3 substitute, the crashed step 4
+/// re-executes, and the cursor (`live_from_seq`) stands at 4.
+#[test]
+fn replay_interrupted_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_interrupted.json", &json_string(&r.json));
+}
+
+/// A dead flow is refused (KEEL-E032): the plan renders for inspection but no
+/// step carries an action.
+#[test]
+fn replay_dead_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000003", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_dead.json", &json_string(&r.json));
+}
+
+/// `--step N` details one record, decoding its MessagePack payload; the
+/// enrich step (seq 3, 2 attempts, `{"ok": true}`) is byte-golden.
+#[test]
+fn replay_step_detail_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000001", Some(3));
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_step3.json", &json_string(&r.json));
+}
+
+/// The human plan is deterministic too (no wall-clock anywhere), so it can be
+/// asserted directly: verdict, per-step actions, cursor.
+#[test]
+fn replay_human_plan_is_deterministic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    let again = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    assert_eq!(r.human, again.human);
+    assert!(r.human.contains("dry run"));
+    assert!(r.human.contains("\u{2192} substitute"));
+    assert!(r.human.contains("\u{2192} re-execute"));
+    assert!(r.human.contains("live execution resumes at seq 4"));
+}
+
 #[test]
 fn explain_e014_json_matches_golden() {
     let r = explain::run("KEEL-E014");
@@ -234,6 +539,153 @@ fn explain_e005_json_matches_golden() {
     let r = explain::run("KEEL-E005");
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("explain_e005.json", &json_string(&r.json));
+}
+
+// ---- doctor --effective-policy: golden + cross-language merge parity ----
+
+/// The shared user policy the merge parity legs all consume: a wholesale llm
+/// retry override, an outbound timeout override, and a pass-through target.
+/// Matches `EFFECTIVE_KEEL_TOML` parsed to JSON.
+const MERGE_FIXTURE: &str = r#"{
+  "defaults": {
+    "llm": { "retry": { "attempts": 2 } },
+    "outbound": { "timeout": "10s" }
+  },
+  "target": {
+    "api.example.com": { "retry": { "attempts": 5 } }
+  }
+}"#;
+
+/// The same policy as the keel.toml the CLI-level golden test reads.
+const EFFECTIVE_KEEL_TOML: &str = concat!(
+    "[defaults.outbound]\n",
+    "timeout = \"10s\"\n",
+    "\n",
+    "[defaults.llm]\n",
+    "retry = { attempts = 2 }\n",
+    "\n",
+    "[target.\"api.example.com\"]\n",
+    "retry = { attempts = 5 }\n",
+);
+
+/// The Rust merge of the shared fixture, as the canonical sorted-pretty JSON
+/// bytes every implementation must reproduce.
+fn rust_merge_json() -> String {
+    let user: serde_json::Value = serde_json::from_str(MERGE_FIXTURE).unwrap();
+    let merged = effective::effective_policy(&user, &[effective::llm_pack_fragment()]);
+    json_string(&merged)
+}
+
+/// A fixture project whose JS scan detects the `openai` pack (pure Rust, no
+/// python3) plus the shared keel.toml.
+fn effective_fixture_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("node_openai").join("app.mjs"),
+        dir.path().join("app.mjs"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("keel.toml"), EFFECTIVE_KEEL_TOML).unwrap();
+    dir
+}
+
+#[test]
+fn doctor_effective_json_matches_golden() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("doctor_effective.json", &json_string(&r.json));
+}
+
+#[test]
+fn doctor_effective_human_matches_golden() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    check_golden("doctor_effective.txt", &r.human);
+}
+
+#[test]
+fn doctor_effective_level0_json_matches_golden() {
+    // No keel.toml, no packs: the pure Level 0 composition.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("node_fetch").join("app.mjs"),
+        dir.path().join("app.mjs"),
+    )
+    .unwrap();
+    let r = effective::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert_eq!(r.json["user_policy_present"], serde_json::json!(false));
+    check_golden("doctor_effective_level0.json", &json_string(&r.json));
+}
+
+/// The report's `policy` object IS the merge — byte-identical to the shared
+/// merge golden the other two languages also reproduce.
+#[test]
+fn doctor_effective_policy_field_is_the_shared_merge() {
+    let dir = effective_fixture_project();
+    let r = effective::run(dir.path());
+    assert_eq!(json_string(&r.json["policy"]), rust_merge_json());
+}
+
+#[test]
+fn effective_merge_rust_matches_golden() {
+    check_golden("effective_policy_merge.json", &rust_merge_json());
+}
+
+/// Python's `apply_pack_defaults` over the same fixture (with the provider
+/// fragment its bootstrap would fold) must produce the same bytes.
+#[test]
+fn effective_merge_parity_python() {
+    const SCRIPT: &str = r#"
+import importlib.util, json, sys
+
+spec = importlib.util.spec_from_file_location("keel_defaults", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+user = json.loads(sys.stdin.read())
+merged = mod.apply_pack_defaults(user, [{"defaults": {"llm": mod.llm_defaults()}}])
+print(json.dumps(merged, sort_keys=True, indent=2))
+"#;
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let defaults_py = manifest_dir().join("../../python/keel/src/keel/_defaults.py");
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(SCRIPT).arg(defaults_py);
+    let out = run_with_stdin(cmd, MERGE_FIXTURE);
+    assert_eq!(out, rust_merge_json(), "Python merge diverges from Rust");
+}
+
+/// Node's `applyPackDefaults` over the same fixture must produce the same
+/// bytes (it takes no fragments; the pack fold is identity by contract).
+#[test]
+fn effective_merge_parity_node() {
+    const SCRIPT: &str = r#"
+const { pathToFileURL } = require("node:url");
+const sort = (v) =>
+  Array.isArray(v)
+    ? v.map(sort)
+    : v && typeof v === "object"
+      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])]))
+      : v;
+let s = "";
+process.stdin.on("data", (d) => (s += d));
+process.stdin.on("end", async () => {
+  const { applyPackDefaults } = await import(pathToFileURL(process.argv[1]).href);
+  console.log(JSON.stringify(sort(applyPackDefaults(JSON.parse(s))), null, 2));
+});
+"#;
+    if !node_present() {
+        eprintln!("skip: node not available");
+        return;
+    }
+    let defaults_mjs = manifest_dir().join("../../node/keel/src/defaults.mjs");
+    let mut cmd = Command::new("node");
+    cmd.arg("-e").arg(SCRIPT).arg(defaults_mjs);
+    let out = run_with_stdin(cmd, MERGE_FIXTURE);
+    assert_eq!(out, rust_merge_json(), "Node merge diverges from Rust");
 }
 
 // ---- --json parity: every human-visible fact has a JSON counterpart ----

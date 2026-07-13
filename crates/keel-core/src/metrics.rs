@@ -146,7 +146,8 @@ mod enabled {
     /// One attempt executed for `target` (including the first try of a call).
     pub fn record_attempt(target: &str) {
         if let Some(i) = get() {
-            i.attempts.add(1, &[KeyValue::new(TARGET_KEY, target.to_owned())]);
+            i.attempts
+                .add(1, &[KeyValue::new(TARGET_KEY, target.to_owned())]);
         }
     }
 
@@ -204,10 +205,135 @@ mod enabled {
             );
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::metrics::Temporality;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+        use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        /// A minimal `PushMetricExporter` that folds every exported batch into a
+        /// `name -> datapoint-count` map instead of buffering raw
+        /// `ResourceMetrics` (which isn't `Clone`). Avoids depending on
+        /// `opentelemetry_sdk`'s `testing` feature, which would leak into
+        /// `cargo tree`'s default (non-otel) view of this crate's dependency
+        /// graph since Cargo unifies dev- and normal-dependency features.
+        #[derive(Clone, Default)]
+        struct DatapointCounts(std::sync::Arc<Mutex<BTreeMap<String, usize>>>);
+
+        impl fmt::Debug for DatapointCounts {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("DatapointCounts").finish_non_exhaustive()
+            }
+        }
+
+        impl PushMetricExporter for DatapointCounts {
+            async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+                let mut counts = self.0.lock().expect("mutex poisoned");
+                for scope_metrics in metrics.scope_metrics() {
+                    for metric in scope_metrics.metrics() {
+                        let n = match metric.data() {
+                            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                                sum.data_points().count()
+                            }
+                            AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                                h.data_points().count()
+                            }
+                            _ => 0,
+                        };
+                        *counts.entry(metric.name().to_owned()).or_default() += n;
+                    }
+                }
+                Ok(())
+            }
+
+            fn force_flush(&self) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn temporality(&self) -> Temporality {
+                Temporality::Cumulative
+            }
+        }
+
+        /// Exercises every `record_*` hook against a real OTel metrics
+        /// pipeline and asserts each instrument produced the expected
+        /// datapoint.
+        ///
+        /// `INSTRUMENTS` is a process-wide `OnceLock` — first bind wins,
+        /// mirroring production (a process installs telemetry once). This is
+        /// deliberately the **only** test in the crate that calls
+        /// [`bind_global_meter`]; splitting the hooks across several `#[test]`
+        /// functions would race unpredictably on which one's `MeterProvider`
+        /// actually ends up bound, since `cargo test` runs them concurrently in
+        /// one process.
+        #[test]
+        fn every_hook_emits_its_documented_datapoint() {
+            use opentelemetry::global;
+            use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+
+            let exporter = DatapointCounts::default();
+            // A long interval means only an explicit `force_flush` ever
+            // exports — no background timer races the assertions below.
+            let reader = PeriodicReader::builder(exporter.clone())
+                .with_interval(Duration::from_hours(1))
+                .build();
+            let provider = SdkMeterProvider::builder().with_reader(reader).build();
+            global::set_meter_provider(provider.clone());
+            bind_global_meter();
+
+            record_attempt("host:api.example.com");
+            record_retry("host:api.example.com", 250);
+            record_cache_request("llm:gpt", true);
+            record_cache_request("llm:gpt", false);
+            record_throttled("host:api.example.com", 40);
+            record_breaker_transition("host:api.example.com", "opened");
+            record_flow_resume("orders.checkout");
+
+            provider.force_flush().expect("force_flush");
+            let counts = exporter.0.lock().expect("mutex poisoned").clone();
+
+            for name in [
+                "keel.attempts",
+                "keel.retries",
+                "keel.retry.backoff",
+                "keel.cache.requests",
+                "keel.rate.throttled",
+                "keel.rate.wait",
+                "keel.breaker.transitions",
+                "keel.flow.resumes",
+            ] {
+                assert!(
+                    counts.get(name).is_some_and(|&n| n > 0),
+                    "expected at least one {name} datapoint, got {counts:?}"
+                );
+            }
+            // Two `record_cache_request` calls (hit=true, hit=false) are
+            // distinct attribute sets on the SAME counter, so they aggregate
+            // into two points.
+            assert_eq!(counts["keel.cache.requests"], 2);
+        }
+    }
 }
 
 #[cfg(feature = "otel")]
-pub(crate) use enabled::*;
+pub(crate) use enabled::{
+    record_attempt, record_breaker_transition, record_cache_request, record_flow_resume,
+    record_retry, record_throttled,
+};
+// `bind_global_meter` alone is crate-external `pub`: `otel::init_otlp` needs
+// it, and `otel` is a `pub mod` embedders/tests reach from outside the crate.
+#[cfg(feature = "otel")]
+pub use enabled::bind_global_meter;
 
 /// No-op twins: without the `otel` feature the hooks compile to nothing, so
 /// call sites in the engine/flow manager stay clean of `cfg` noise.
