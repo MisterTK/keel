@@ -82,8 +82,9 @@ journal layers sit inside this order in the real core; scenarios inject
    - attempt budget exhausted → terminal `KEEL-E010`;
    - request not idempotent → terminal `KEEL-E014` (observed, not retried —
      Level 0 hard rule);
-   - otherwise wait `min(base·factor^(n−1), cap)` per the schedule
-     (default `exp(200ms, x2, max 30s)`), overridden upward by the error's
+   - otherwise wait per the schedule (default `exp(200ms, x2, max 30s)`; a
+     single `exp` waits `min(base·factor^(n−1), cap)`, composition per
+     "Schedule algebra" below), overridden upward by the error's
      `retry_after_ms` (`wait = max(schedule, retry_after)`), and try again.
 6. **Outcome.** Terminal errors carry the original error (class,
    http_status, `original` token) so front ends re-raise it unchanged.
@@ -93,6 +94,50 @@ journal layers sit inside this order in the real core; scenarios inject
    `attempts, breaker_opens, breaker_state, cache_hits, calls, failures,
    retries, successes, throttled` (sorted target keys). `successes` includes
    cache hits; `failures` includes breaker rejections.
+
+## Schedule algebra: `upTo` / `andThen` (normative)
+
+The full frozen grammar (contracts/schedule-grammar.ebnf) is implemented: a
+schedule is one or more `andThen`-separated **segments**, each a primary
+(`exp(…)` or `fixed(…)`) with an optional cumulative-wait bound
+(`upTo <duration>`). Scenarios 21–22 pin these semantics.
+
+1. **Shape rule (configure time, KEEL-E001).** `upTo` must appear on every
+   segment except the last, and never on the last. The grammar defines a
+   schedule as a total mapping attempt → wait: a bounded final segment could
+   not supply waits past its bound, and an unbounded non-final segment would
+   never hand off (unreachable dead config) — both shapes are grammatical but
+   invalid, and are rejected loudly at configure time. A single-segment
+   schedule (every v0.1 form) therefore never carries `upTo` and behaves
+   exactly as before.
+2. **Wait computation.** `wait(n)` is a pure function of the retry attempt
+   number `n` (1-based; the wait happens after attempt `n` fails). Walk the
+   segments left to right with per-segment state — local attempt `a`
+   (starting at 1) and emitted total `e` (starting at 0 ms):
+   - candidate `w` = the active segment's natural wait at `a`
+     (`exp`: `min(base·factor^(a−1), cap)`; `fixed`: the period);
+   - while the active segment is bounded and `e + w` exceeds its bound, hand
+     off: advance to the next segment (reset `a = 1`, `e = 0`) and recompute
+     `w` — a segment whose bound is smaller than its first natural wait
+     contributes zero waits, and the handoff cascades;
+   - otherwise emit `w`, then `a += 1`, `e += w`.
+   An exact fit (`e + w` equals the bound) stays in the segment. Each
+   segment's primary restarts at local attempt 1 on entry (an `exp` after
+   `andThen` restarts from its base).
+3. **What the bound measures.** `upTo` bounds the segment's own cumulative
+   **natural** wait: the pre-jitter, pre-`Retry-After` integer waits the walk
+   emits. Jitter (real core only) applies to an emitted wait when the segment
+   that emitted it says `jitter`; a server override
+   (`wait = max(schedule, retry_after)`) applies after the walk. Neither
+   feeds back into the walk, so the segment handoff points are identical in
+   every implementation and on replay.
+
+Example: `exp(1s, x2) upTo 4s andThen fixed(500ms)` waits 1000, 2000
+(cumulative 3000; the natural 4000 would overshoot the 4s bound), then 500,
+500, … And in `fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen
+fixed(250ms)`: three 1000 waits fill the 3s bound exactly, `fixed(10s) upTo
+5s` contributes nothing (10000 > 5000 — cascade), and the tail emits 250 ms
+waits from the fourth retry on.
 
 ## Determinism rules for scenarios
 

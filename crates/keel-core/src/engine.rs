@@ -1292,8 +1292,11 @@ impl Engine {
                             original,
                         });
                     }
-                    let mut wait = retry.schedule.wait_ms(attempt);
-                    if retry.schedule.has_jitter() && wait > 0 {
+                    // Jitter is the emitting segment's flag (schedules can
+                    // compose via `upTo`/`andThen`; the walk is pure in the
+                    // attempt number, so jitter never shifts handoff points).
+                    let (mut wait, jitter) = retry.schedule.wait_and_jitter(attempt);
+                    if jitter && wait > 0 {
                         wait = fastrand::u64(wait / 2..=wait);
                     }
                     if let Some(server_says) = retry_after_ms {

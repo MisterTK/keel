@@ -19,6 +19,10 @@ use serde::Deserialize;
 pub struct ParseError {
     what: &'static str,
     input: String,
+    /// For literals that are grammatical but invalid (e.g. a schedule
+    /// composition whose segments can never all be reached): the reason,
+    /// appended so the KEEL-E001 first line says what to fix.
+    note: Option<&'static str>,
 }
 
 impl ParseError {
@@ -26,13 +30,29 @@ impl ParseError {
         Self {
             what,
             input: input.to_owned(),
+            note: None,
+        }
+    }
+
+    fn with_note(what: &'static str, input: &str, note: &'static str) -> Self {
+        Self {
+            what,
+            input: input.to_owned(),
+            note: Some(note),
         }
     }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unparseable {} literal: {:?}", self.what, self.input)
+        match self.note {
+            None => write!(f, "unparseable {} literal: {:?}", self.what, self.input),
+            Some(note) => write!(
+                f,
+                "invalid {} literal: {:?} — {note}",
+                self.what, self.input
+            ),
+        }
     }
 }
 
@@ -104,13 +124,33 @@ impl TryFrom<String> for Rate {
     }
 }
 
-/// A retry schedule per contracts/schedule-grammar.ebnf. The stub implements
-/// the v0.1 primaries (`exp`, `fixed`); composition (`upTo`/`andThen`) is in
-/// the frozen grammar but rejected here, so using it is a configure-time
-/// `KEEL-E001` rather than a silent misbehavior.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+/// A retry schedule per contracts/schedule-grammar.ebnf — the full algebra:
+/// one or more `andThen`-separated segments, each an `exp`/`fixed` primary
+/// with an optional cumulative-wait bound (`upTo`). Semantics are pinned
+/// normatively in conformance/README.md ("Schedule algebra"): `upTo` bounds
+/// the segment's cumulative *natural* wait and hands off to the next segment;
+/// every segment except the last must be bounded and the last never is (both
+/// degenerate shapes are configure-time `KEEL-E001`), so a schedule is always
+/// a total mapping attempt → wait.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "String")]
-pub enum Schedule {
+pub struct Schedule {
+    /// Non-empty; the parser enforces `up_to_ms.is_some()` on every segment
+    /// except the last and `None` on the last.
+    pub segments: Vec<ScheduleSegment>,
+}
+
+/// One `andThen` segment: a primary plus its optional `upTo` bound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScheduleSegment {
+    pub primary: SchedulePrimary,
+    /// `upTo` bound on this segment's cumulative natural wait, in ms.
+    pub up_to_ms: Option<u64>,
+}
+
+/// A schedule primary (`exp` / `fixed`) from the frozen grammar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SchedulePrimary {
     Exp {
         base_ms: u64,
         factor: f64,
@@ -122,25 +162,9 @@ pub enum Schedule {
     },
 }
 
-impl Schedule {
-    /// The contract default: `exp(200ms, x2, max 30s, jitter)`.
-    pub const DEFAULT: Self = Self::Exp {
-        base_ms: 200,
-        factor: 2.0,
-        cap_ms: 30_000,
-        jitter: true,
-    };
-
-    /// True when the schedule requests jitter. The stub ignores it (its
-    /// clock is virtual and deterministic); the real core samples equal
-    /// jitter, uniform in `[w/2, w]`, per contracts/schedule-grammar.ebnf.
-    #[must_use]
-    pub fn has_jitter(self) -> bool {
-        matches!(self, Self::Exp { jitter: true, .. })
-    }
-
-    /// Deterministic wait after failed attempt `n` (1-based):
-    /// `min(base * factor^(n-1), cap)`, before any jitter.
+impl SchedulePrimary {
+    /// Deterministic natural wait at local attempt `a` (1-based):
+    /// `min(base * factor^(a-1), cap)`, before any jitter.
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -148,7 +172,7 @@ impl Schedule {
         clippy::cast_possible_wrap,
         reason = "backoff arithmetic: values are small and non-negative by construction"
     )]
-    pub fn wait_ms(self, attempt: u32) -> u64 {
+    fn wait_ms(self, attempt: u32) -> u64 {
         match self {
             Self::Exp {
                 base_ms,
@@ -162,9 +186,77 @@ impl Schedule {
             Self::Fixed { period_ms } => period_ms,
         }
     }
+
+    fn jitter(self) -> bool {
+        matches!(self, Self::Exp { jitter: true, .. })
+    }
 }
 
-impl FromStr for Schedule {
+impl Default for Schedule {
+    /// The contract default: `exp(200ms, x2, max 30s, jitter)`.
+    fn default() -> Self {
+        Self {
+            segments: vec![ScheduleSegment {
+                primary: SchedulePrimary::Exp {
+                    base_ms: 200,
+                    factor: 2.0,
+                    cap_ms: 30_000,
+                    jitter: true,
+                },
+                up_to_ms: None,
+            }],
+        }
+    }
+}
+
+impl Schedule {
+    /// Deterministic wait after failed attempt `n` (1-based), before any
+    /// jitter or `Retry-After` override.
+    #[must_use]
+    pub fn wait_ms(&self, attempt: u32) -> u64 {
+        self.wait_and_jitter(attempt).0
+    }
+
+    /// `(wait, jitter?)` for retry attempt `n` — a pure function of `n`, per
+    /// the normative walk in conformance/README.md ("Schedule algebra"):
+    /// segments hand off when the next natural wait would push the segment's
+    /// cumulative emitted total past its `upTo` bound (an exact fit stays;
+    /// handoffs cascade past segments whose bound is below their first wait),
+    /// and each segment restarts at local attempt 1 on entry. The jitter flag
+    /// is the emitting segment's — the stubs ignore it (virtual clocks); the
+    /// real core samples equal jitter, uniform in `[w/2, w]`.
+    ///
+    /// # Panics
+    /// If `segments` is empty (unrepresentable via the parser).
+    #[must_use]
+    pub fn wait_and_jitter(&self, attempt: u32) -> (u64, bool) {
+        let attempt = attempt.max(1);
+        let last = self.segments.len() - 1;
+        let (mut i, mut a, mut e) = (0_usize, 1_u32, 0_u64);
+        let mut emitted = 0_u32;
+        loop {
+            let segment = self.segments[i];
+            let wait = segment.primary.wait_ms(a);
+            // A bound on the final segment is unrepresentable via the parser;
+            // `i < last` keeps hand-constructed values total anyway.
+            if i < last
+                && let Some(bound) = segment.up_to_ms
+                && e.saturating_add(wait) > bound
+            {
+                (i, a, e) = (i + 1, 1, 0);
+                continue;
+            }
+            emitted += 1;
+            if emitted == attempt {
+                return (wait, segment.primary.jitter());
+            }
+            a += 1;
+            e = e.saturating_add(wait);
+        }
+    }
+}
+
+impl FromStr for SchedulePrimary {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -204,6 +296,62 @@ impl FromStr for Schedule {
         } else {
             Err(err())
         }
+    }
+}
+
+impl FromStr for Schedule {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::new("schedule", s);
+        // The grammar's `ws` makes `upTo` / `andThen` space-separated tokens;
+        // tokenizing on whitespace runs and rejoining a primary's tokens with
+        // single spaces is lossless for the primary parsers (they trim around
+        // commas). Keywords never occur inside `exp(…)`/`fixed(…)` in a valid
+        // literal, so no paren tracking is needed — misplaced keywords make
+        // the primary unparseable, which is the same KEEL-E001.
+        let tokens: Vec<&str> = s.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Err(err());
+        }
+        let mut segments = Vec::new();
+        for segment_tokens in tokens.split(|t| *t == "andThen") {
+            let (primary_tokens, up_to_ms) =
+                match segment_tokens.iter().position(|t| *t == "upTo") {
+                    None => (segment_tokens, None),
+                    Some(pos) => {
+                        // exactly `upTo <duration>`, at the segment's tail
+                        let [duration] = &segment_tokens[pos + 1..] else {
+                            return Err(err());
+                        };
+                        let bound = duration.parse::<DurationMs>().map_err(|_| err())?.0;
+                        (&segment_tokens[..pos], Some(bound))
+                    }
+                };
+            if primary_tokens.is_empty() {
+                return Err(err());
+            }
+            let primary: SchedulePrimary = primary_tokens.join(" ").parse().map_err(|_| err())?;
+            segments.push(ScheduleSegment { primary, up_to_ms });
+        }
+        // Shape rule (normative, conformance/README.md "Schedule algebra"):
+        // bounded exactly on the non-final segments, so every segment is
+        // reachable and every attempt has a wait.
+        let last = segments.len() - 1;
+        if segments
+            .iter()
+            .enumerate()
+            .any(|(i, segment)| (i < last) != segment.up_to_ms.is_some())
+        {
+            return Err(ParseError::with_note(
+                "schedule",
+                s,
+                "`upTo` must bound every segment except the last, and never the last \
+                 (an unbounded segment never hands off; a bounded tail would leave \
+                 attempts without a wait — cap total retrying with `attempts`)",
+            ));
+        }
+        Ok(Self { segments })
     }
 }
 
@@ -316,7 +464,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             attempts: Self::DEFAULT_ATTEMPTS,
-            schedule: Schedule::DEFAULT,
+            schedule: Schedule::default(),
             on: Self::default_on(),
         }
     }
@@ -603,11 +751,112 @@ mod tests {
     fn schedule_fixed_and_rejections() {
         assert_eq!(
             "fixed(1s)".parse::<Schedule>(),
-            Ok(Schedule::Fixed { period_ms: 1_000 })
+            Ok(Schedule {
+                segments: vec![ScheduleSegment {
+                    primary: SchedulePrimary::Fixed { period_ms: 1_000 },
+                    up_to_ms: None,
+                }],
+            })
         );
-        // frozen grammar, unimplemented primary composition -> configure error
-        assert!("exp(1s, x2) andThen fixed(1m)".parse::<Schedule>().is_err());
         assert!("linear(1s)".parse::<Schedule>().is_err());
+    }
+
+    #[test]
+    fn schedule_composition_parses_the_spec_example() {
+        // architecture-spec §4.1 / the frozen grammar's own example
+        let schedule: Schedule = "exp(1s, x2, max 5m) upTo 10m andThen fixed(1m)"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            schedule.segments,
+            vec![
+                ScheduleSegment {
+                    primary: SchedulePrimary::Exp {
+                        base_ms: 1_000,
+                        factor: 2.0,
+                        cap_ms: 300_000,
+                        jitter: false,
+                    },
+                    up_to_ms: Some(600_000),
+                },
+                ScheduleSegment {
+                    primary: SchedulePrimary::Fixed { period_ms: 60_000 },
+                    up_to_ms: None,
+                },
+            ]
+        );
+        // The grammar's ws is "one or more spaces": extra spacing still parses.
+        assert_eq!(
+            "exp(1s, x2, max 5m)  upTo  10m  andThen  fixed(1m)".parse::<Schedule>(),
+            Ok(schedule)
+        );
+    }
+
+    #[test]
+    fn schedule_composition_hands_off_when_the_bound_would_be_overshot() {
+        let schedule: Schedule = "exp(1s, x2) upTo 4s andThen fixed(500ms)".parse().unwrap();
+        let waits: Vec<u64> = (1..=5).map(|n| schedule.wait_ms(n)).collect();
+        // 1s + 2s = 3s fits; the natural 4s would overshoot the 4s bound.
+        assert_eq!(waits, [1_000, 2_000, 500, 500, 500]);
+    }
+
+    #[test]
+    fn schedule_composition_exact_fit_stays_and_cascade_skips() {
+        let schedule: Schedule = "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms)"
+            .parse()
+            .unwrap();
+        let waits: Vec<u64> = (1..=6).map(|n| schedule.wait_ms(n)).collect();
+        // Three 1s waits fill upTo 3s exactly (e + w == bound stays); the 10s
+        // segment's first wait exceeds its own 5s bound, so it contributes
+        // zero waits and the handoff cascades to the 250ms tail.
+        assert_eq!(waits, [1_000, 1_000, 1_000, 250, 250, 250]);
+    }
+
+    #[test]
+    fn schedule_composition_restarts_exp_and_tracks_jitter_per_segment() {
+        let schedule: Schedule = "fixed(1s) upTo 2s andThen exp(100ms, x3, jitter)"
+            .parse()
+            .unwrap();
+        // exp restarts at local attempt 1 after the handoff.
+        let waits: Vec<u64> = (1..=5).map(|n| schedule.wait_ms(n)).collect();
+        assert_eq!(waits, [1_000, 1_000, 100, 300, 900]);
+        // jitter is the emitting segment's flag, not schedule-global.
+        assert_eq!(schedule.wait_and_jitter(1), (1_000, false));
+        assert_eq!(schedule.wait_and_jitter(3), (100, true));
+    }
+
+    #[test]
+    fn schedule_composition_shape_rule_rejections() {
+        // Grammatical but invalid shapes fail configure-time (KEEL-E001), per
+        // conformance/README.md "Schedule algebra": a non-final segment
+        // without upTo never hands off; a bounded final segment would leave
+        // attempts without a wait.
+        for degenerate in [
+            "fixed(1s) andThen fixed(2s)",
+            "exp(1s, x2, max 5m) upTo 10m",
+            "fixed(1s) upTo 3s andThen fixed(2s) andThen fixed(4s)",
+            "fixed(1s) upTo 3s andThen fixed(2s) upTo 5s",
+        ] {
+            let error = degenerate.parse::<Schedule>().unwrap_err();
+            assert!(
+                error.to_string().contains("upTo"),
+                "{degenerate}: expected the shape-rule note, got {error}"
+            );
+        }
+        // Broken composition syntax stays a plain parse rejection.
+        for broken in [
+            "fixed(1s) upTo",
+            "upTo 3s andThen fixed(1s)",
+            "fixed(1s) upTo 1s upTo 2s andThen fixed(1s)",
+            "fixed(1s) andThen",
+            "andThen fixed(1s)",
+            "fixed(1s) upTo 3s fixed(2s)",
+        ] {
+            assert!(
+                broken.parse::<Schedule>().is_err(),
+                "{broken} must be rejected"
+            );
+        }
     }
 
     #[test]
