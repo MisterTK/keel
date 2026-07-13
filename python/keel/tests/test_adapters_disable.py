@@ -96,9 +96,14 @@ class DetectTest(unittest.TestCase):
         self.assertEqual(d.confidence, "pinned")
 
     def test_available_packs_reports_both(self) -> None:
+        # httpx/requests are the dev-installed library adapters (always
+        # matched here); the framework packs (pydantic-ai/openai-agents/
+        # crewai) are registered too (adapters._all_packs), but never
+        # installed in this repo's test environment (CLAUDE.md: framework
+        # deps never get added to a manifest), so they report unmatched.
         packs = available_packs()
-        self.assertEqual({d.name for d in packs}, {"httpx", "requests"})
-        self.assertTrue(all(d.matched for d in packs))
+        self.assertEqual(len(packs), 5, "2 library adapters + 3 framework packs")
+        self.assertEqual({d.name for d in packs if d.matched}, {"httpx", "requests"})
 
 
 class ContractParityTest(unittest.TestCase):

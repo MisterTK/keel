@@ -26,6 +26,12 @@ from . import httpx_pack, requests_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
+#: Library adapters only (physically-patched, seam-owning packs that live in
+#: this package). Framework packs (pydantic-ai / openai-agents / crewai / …,
+#: `keel.packs`) own a seam the same way but are registered via
+#: :func:`_framework_packs` — a lazily-imported cross-package reference, so
+#: `keel.packs` (which already imports `keel.adapters._pack`) never has to be
+#: imported at `keel.adapters` MODULE-import time (no init-order cycle).
 PACKS = (httpx_pack, requests_pack)
 
 
@@ -36,10 +42,24 @@ class _State:
 _STATE = _State()
 
 
+def _framework_packs() -> tuple[Any, ...]:
+    """The framework packs, imported lazily (function-call time, never module-
+    import time) to avoid a cycle: `keel.packs` submodules already import
+    `keel.adapters._pack`, so importing `keel.packs` at the top of THIS module
+    would make the two packages import each other mid-initialization."""
+    from ..packs import crewai_pack, openai_agents_pack, pydantic_ai_pack
+
+    return (pydantic_ai_pack, openai_agents_pack, crewai_pack)
+
+
+def _all_packs() -> tuple[Any, ...]:
+    return (*PACKS, *_framework_packs())
+
+
 def available_packs() -> list[Detection]:
     """Detections for every registered pack, present or not (never imports an
     absent library). Feeds `keel doctor` and the startup banner."""
-    return [pack.detect() for pack in PACKS]
+    return [pack.detect() for pack in _all_packs()]
 
 
 def install_adapters() -> list[Detection]:
@@ -48,7 +68,7 @@ def install_adapters() -> list[Detection]:
     Returns the detections of the present packs (for the banner)."""
     index: dict[str, Any] = {}
     present: list[Detection] = []
-    for pack in PACKS:
+    for pack in _all_packs():
         detection = pack.detect()
         if not detection.matched:
             continue
@@ -72,7 +92,7 @@ def uninstall_adapters() -> None:
         except ValueError:
             pass
         _STATE.finder = None
-    for pack in PACKS:
+    for pack in _all_packs():
         pack.uninstall()
 
 
