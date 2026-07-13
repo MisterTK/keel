@@ -135,7 +135,7 @@ crates/
   keel-ffi/           C-ABI facade (MessagePack) + async bridge
   keel-py/            PyO3 native module (keel_core)
   keel-node/          napi native addon
-  keel-cli/           the `keel` binary (run|init|doctor|status|explain|flows|trace)
+  keel-cli/           the `keel` binary (run|init|doctor|status|explain|flows|trace|mcp)
   keel-core-stub/     in-memory reference stub (Rust); keel-conformance/ shared harness
 python/keel/          Python front end (import hook, adapters, llm packs, flows)
 python/keel-core-stub/  the same stub, pure Python
@@ -156,3 +156,7 @@ at every step. The full Sprint 0–2 plan and what shipped against it are in
 [docs/sprint-plan.md](docs/sprint-plan.md). Session context for coding agents
 lives in [CLAUDE.md](CLAUDE.md); the agent-facing docs are `llms.txt` /
 `llms-full.txt`, and `keel init --agents` drops a Keel section into `AGENTS.md`.
+MCP-native agents can run `keel mcp`: the CLI doubles as an MCP server over
+stdio (no daemon — it exits on EOF), exposing `get_status`, `get_doctor_report`,
+`propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, and
+`explain_error`, each byte-identical to the matching `--json` command.

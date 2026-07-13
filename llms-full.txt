@@ -129,6 +129,7 @@ timestamps) instead of prose. Same command, two audiences.
 - `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
 - `keel flows [--dead]` — list durable flows (id, entrypoint, status, steps, age).
 - `keel trace <flow>` — one flow's steps (outcomes, attempts, timings).
+- `keel mcp` — serve this project over MCP on stdio (JSON-RPC 2.0; no daemon, exits on EOF). Six tools: `get_status`, `get_doctor_report`, `propose_policy` (returns a keel.toml diff), `get_trace`, `list_flows`, `explain_error`. Each tool's text result is byte-identical to the matching command's `--json` output.
 
 ## Error codes (frozen taxonomy)
 

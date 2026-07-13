@@ -9,7 +9,7 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, effective, explain, flows, init, run, status};
+use keel_cli::{doctor, effective, explain, flows, init, mcp, run, status};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -68,6 +68,10 @@ enum Command {
         #[arg(long)]
         dead: bool,
     },
+    /// Serve this project over MCP on stdio (JSON-RPC 2.0). Six tools —
+    /// get_status, get_doctor_report, propose_policy, get_trace, list_flows,
+    /// explain_error — each byte-identical to the matching `--json` command.
+    Mcp,
     /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
     Trace {
         /// A flow_id, or a substring of an id/entrypoint that names one flow.
@@ -122,6 +126,12 @@ fn main() {
         }
         Command::Status => emit(&status::run(&project), json),
         Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Mcp => {
+            // The server speaks JSON-RPC regardless of --json; it exits on EOF.
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
+        }
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };

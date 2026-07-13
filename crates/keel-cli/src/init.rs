@@ -60,6 +60,8 @@ Useful commands (all support `--json`):
 - `keel status` — coverage, retries saved, breaker events, resumable flows.
 - `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
 - `keel flows` / `keel trace <flow>` — durable (Tier 2) flow state and step ledger.
+- `keel mcp` — the same surfaces as MCP tools over stdio (get_status,
+  get_doctor_report, propose_policy, get_trace, list_flows, explain_error).
 
 Do not hand-write retry loops or backoff around calls Keel already wraps; edit
 `keel.toml` instead. Uninstalling Keel removes the behavior and nothing else —
