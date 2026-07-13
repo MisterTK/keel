@@ -191,7 +191,7 @@ impl Server {
         match name {
             "explain_error" => Ok(explain::run(require_str(args, "code", name)?)),
             "get_doctor_report" => Ok(doctor::run(&self.project)),
-            "get_status" => Ok(status::run(&self.project)),
+            "get_status" => Ok(status::run(&self.project, (self.now_ms)())),
             "get_trace" => Ok(flows::trace(
                 &self.project,
                 require_str(args, "flow", name)?,

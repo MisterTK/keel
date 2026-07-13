@@ -53,6 +53,43 @@ pub struct TargetEvidence {
     pub sightings: BTreeSet<Sighting>,
 }
 
+/// Per-function effect attribution — the evidence behind `keel flows suggest`.
+///
+/// Each language pass attributes what it finds *inside* a function definition
+/// to that function: intercepted-effect call sites, calls that read time or
+/// randomness (virtualized under Tier 2 replay), and constructs that defeat
+/// replay outright (threads, subprocesses, raw sockets). Precision is the
+/// language pass's business: the Python walker attributes by real AST
+/// containment; the JS pass is a documented line-heuristic (see [`js`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionFacts {
+    /// The full flow-entrypoint ref this function would be designated as —
+    /// `py:pipeline.ingest:main` or `ts:jobs/nightly.ts#run` (the `ts:`
+    /// namespace covers all JS/TS files).
+    pub entrypoint: String,
+    /// Project-relative path of the defining file.
+    pub file: String,
+    /// 1-based line of the `def`/`function`.
+    pub line: u32,
+    /// Intercepted-effect call sites (HTTP / LLM / DSN-bearing libraries).
+    pub effects: u32,
+    /// Effect calls that are not idempotent-safe to re-send (POST/PATCH-shaped)
+    /// and carry no idempotency evidence.
+    pub idempotent_unsafe: u32,
+    /// Wall-clock reads (`time.time`, `datetime.now`, `Date.now`, …) — these
+    /// are virtualized (journaled + replayed) under Tier 2.
+    pub time_reads: u32,
+    /// Randomness reads (`random.*`, `uuid4`, `Math.random`, …) — also
+    /// virtualized under Tier 2.
+    pub random_reads: u32,
+    /// Why replay would be unsafe (empty = the replay-safe estimate holds).
+    /// Each reason cites `what at file:line`; sorted, deterministic.
+    pub unsafe_reasons: Vec<String>,
+    /// Targets referenced inside the function (hosts from URL literals,
+    /// `llm:<provider>` from SDK calls) — the join key into `.keel/discovery.db`.
+    pub targets: BTreeSet<String>,
+}
+
 /// The merged output of both scanners.
 #[derive(Debug, Clone, Default)]
 pub struct ScanResult {
@@ -69,6 +106,9 @@ pub struct ScanResult {
     /// `openai`, `boto3`, `fetch`). `keel doctor` cross-references these against
     /// its adapter registry to classify coverage.
     pub libs: BTreeSet<String>,
+    /// Per-function attribution (see [`FunctionFacts`]), sorted by
+    /// `(file, line)` — deterministic across runs.
+    pub functions: Vec<FunctionFacts>,
 }
 
 impl ScanResult {
@@ -95,11 +135,16 @@ pub fn scan(project: &Path) -> ScanResult {
     result.python_available = py.available;
     result.files_scanned += py.files_scanned;
     merge_lang(&mut result, &py.findings);
+    result.functions.extend(py.functions);
 
     let js = js::scan(project);
     result.files_scanned += js.files_scanned;
     merge_lang(&mut result, &js.findings);
+    result.functions.extend(js.functions);
 
+    result
+        .functions
+        .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
     result
 }
 

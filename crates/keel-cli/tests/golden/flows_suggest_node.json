@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "already_designated": false,
+      "calls_observed": 0,
+      "display": "app.mjs#fetchData",
+      "effects": 1,
+      "entrypoint": "ts:app.mjs#fetchData",
+      "file": "app.mjs",
+      "idempotent_unsafe": 0,
+      "line": 4,
+      "random_reads": 0,
+      "replay_safe": true,
+      "time_reads": 0,
+      "unsafe_reasons": []
+    }
+  ],
+  "count": 1,
+  "js_attribution_note": "JS/TS attribution is a line-oriented heuristic: it cannot see class methods, object-literal methods, or a function whose opening `{` sits on its own line. Python attribution is exact (real `ast` containment).",
+  "python_available": true,
+  "replay_safe_count": 1
+}

@@ -116,6 +116,8 @@ fn fixture_project() -> tempfile::TempDir {
                 last_seen_ms: T0 + 120_000,
                 last_error_class: Some(keel_journal::ErrorClass::Http),
                 last_error_status: Some(503),
+                not_retried: 1,
+                unwrapped_calls: 0,
             },
             TargetStats {
                 target: "llm:openai".to_owned(),
@@ -133,6 +135,8 @@ fn fixture_project() -> tempfile::TempDir {
                 last_seen_ms: T0 + 60_000,
                 last_error_class: None,
                 last_error_status: None,
+                not_retried: 0,
+                unwrapped_calls: 5,
             },
         ])
         .unwrap();
@@ -199,7 +203,7 @@ fn mcp_tool_outputs_are_byte_identical_to_the_json_twins() {
     let lines = run_session(p, SESSION_SCRIPT);
 
     // get_status ↔ `keel status --json`
-    assert_eq!(tool_text(&lines, 3), json_string(&status::run(p).json));
+    assert_eq!(tool_text(&lines, 3), json_string(&status::run(p, T0).json));
     // get_doctor_report ↔ `keel doctor --json`
     assert_eq!(tool_text(&lines, 4), json_string(&doctor::run(p).json));
     // propose_policy ↔ `keel init --diff --json`

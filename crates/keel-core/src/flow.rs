@@ -232,6 +232,39 @@ impl FlowManager {
         )
     }
 
+    /// Flow-level attempt cap (distinct from Tier 1 step attempts): each
+    /// resume of a not-yet-completed flow consumes one attempt from the
+    /// reserved seq-0 counter; exceeding the cap marks the flow dead. Returns
+    /// the new attempt number, or `Err` if the cap was exceeded.
+    fn bump_attempt_or_kill(&self, flow_id: &FlowId, entrypoint: &str) -> Result<u32, KeelError> {
+        let prior = self
+            .journal
+            .step_at(flow_id, ATTEMPT_SEQ)
+            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
+            .map_or(0, |(_, o)| o.attempt);
+        let attempt = prior.saturating_add(1);
+        // A second-or-later attempt is a *recovery*: the flow did not run to
+        // completion in one process lifetime (crash, lease loss, deliberate
+        // resume). First entries (attempt == 1) are ordinary starts, not
+        // recoveries — only re-entries count toward the §4.5 metric.
+        if attempt >= 2 {
+            crate::metrics::record_flow_resume(entrypoint);
+        }
+        if attempt > self.config.max_attempts {
+            self.journal
+                .complete_flow(flow_id, FlowStatus::Dead)
+                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
+            return Err(KeelError {
+                code: ErrorCode::FlowDead,
+                message: format!(
+                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
+                    self.config.max_attempts
+                ),
+            });
+        }
+        Ok(attempt)
+    }
+
     fn enter(
         &self,
         flow_id: &FlowId,
@@ -278,34 +311,7 @@ impl FlowManager {
             ));
         }
 
-        // Flow-level attempt cap (distinct from Tier 1 step attempts): each
-        // resume of a not-yet-completed flow consumes one attempt from the
-        // reserved seq-0 counter; exceeding the cap marks the flow dead.
-        let prior = self
-            .journal
-            .step_at(flow_id, ATTEMPT_SEQ)
-            .map_err(|e| internal(format!("attempt lookup failed: {e}")))?
-            .map_or(0, |(_, o)| o.attempt);
-        let attempt = prior.saturating_add(1);
-        // A second-or-later attempt is a *recovery*: the flow did not run to
-        // completion in one process lifetime (crash, lease loss, deliberate
-        // resume). First entries (attempt == 1) are ordinary starts, not
-        // recoveries — only re-entries count toward the §4.5 metric.
-        if attempt >= 2 {
-            crate::metrics::record_flow_resume(entrypoint);
-        }
-        if attempt > self.config.max_attempts {
-            self.journal
-                .complete_flow(flow_id, FlowStatus::Dead)
-                .map_err(|e| internal(format!("mark-dead failed: {e}")))?;
-            return Err(KeelError {
-                code: ErrorCode::FlowDead,
-                message: format!(
-                    "flow {flow_id} exceeded its {} attempt cap; marked dead (KEEL-E032)",
-                    self.config.max_attempts
-                ),
-            });
-        }
+        let attempt = self.bump_attempt_or_kill(flow_id, entrypoint)?;
 
         // A cleanly-failed flow is put back to `running` before re-leasing so a
         // resume can proceed (and so a re-crash lands it in the recovery scan).
