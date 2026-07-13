@@ -155,6 +155,57 @@ class SyncHardRulesTest(HttpxBase):
             self.assertEqual(srv.served, 1)
 
 
+class SyncIdempotencyInjectionTest(HttpxBase):
+    """contracts/adapter-pack.md "Idempotency-key injection", exercised through
+    the real httpx client + a local server (no external network)."""
+
+    def _configure_injection(self) -> None:
+        policy = level0_defaults()
+        policy["target"] = {"127.0.0.1": {"idempotency": {"header": "Idempotency-Key"}}}
+        self.backend.configure(policy)
+
+    def test_post_without_a_caller_key_is_injected_and_retried(self) -> None:
+        self._configure_injection()
+        with FaultServer([fail(503), ok(b"posted")]) as srv:
+            with httpx.Client() as c:
+                r = c.post(srv.url(), content=b"body")
+            self.assertEqual(r.status_code, 200)  # judgment flip: retried to success
+            self.assertEqual(r.keel_outcome["attempts"], 2)
+            self.assertEqual(srv.served, 2)
+            # Rule 2: the SAME minted key on every attempt.
+            keys = [h.get("idempotency-key") for h in srv.headers]
+            self.assertEqual(len(keys), 2)
+            self.assertIsNotNone(keys[0])
+            self.assertEqual(keys[0], keys[1])
+
+    def test_caller_supplied_key_is_never_overwritten(self) -> None:
+        self._configure_injection()
+        with FaultServer([fail(503), ok(b"posted")]) as srv:
+            with httpx.Client() as c:
+                r = c.post(srv.url(), content=b"body", headers={"Idempotency-Key": "caller-key"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(srv.headers[0]["idempotency-key"], "caller-key")
+            self.assertEqual(srv.headers[1]["idempotency-key"], "caller-key")
+
+    def test_two_logical_calls_mint_distinct_keys(self) -> None:
+        self._configure_injection()
+        with FaultServer([ok(b"one"), ok(b"two")]) as srv:
+            with httpx.Client() as c:
+                c.post(srv.url(), content=b"a")
+                c.post(srv.url(), content=b"b")
+        self.assertNotEqual(srv.headers[0]["idempotency-key"], srv.headers[1]["idempotency-key"])
+
+    def test_no_configured_header_means_no_injection_post_still_not_retried(self) -> None:
+        # No `_configure_injection()`: Level 0 defaults carry no idempotency
+        # knob, so the Level 0 hard rule is unchanged for a bare POST.
+        with FaultServer([fail(503), ok(b"unreached")]) as srv:
+            with httpx.Client() as c:
+                r = c.post(srv.url(), content=b"body")
+            self.assertEqual(r.keel_outcome["error"]["code"], "KEEL-E014")
+            self.assertEqual(srv.served, 1)
+            self.assertNotIn("idempotency-key", srv.headers[0])
+
+
 class AsyncTest(HttpxBase):
     def test_async_success_is_byte_identical_to_unwrapped(self) -> None:
         body = b"async-\x00\xff-body"

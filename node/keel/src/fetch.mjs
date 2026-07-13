@@ -31,6 +31,8 @@ import {
   normalizeRequest,
   resolveTarget,
   isIdempotent,
+  resolveIdempotencyInjection,
+  defaultMintIdempotencyKey,
   deriveArgsHash,
   parseRetryAfter,
   classifyThrow,
@@ -60,7 +62,11 @@ function cancelBody(resp) {
  * Install the wrapping fetch. Returns an uninstall function that restores the
  * exact original. Idempotent: a second install is a no-op.
  */
-export function installFetch(backend, discovery, { globalObj = globalThis } = {}) {
+export function installFetch(
+  backend,
+  discovery,
+  { globalObj = globalThis, mintIdempotencyKey = defaultMintIdempotencyKey } = {},
+) {
   const original = globalObj.fetch;
   if (typeof original !== "function") return () => {};
   if (original.__keelWrapped) return () => {}; // already installed
@@ -78,12 +84,19 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     const target = resolveTarget(hostname);
     const op = `${method} ${hostname}${parsed.pathname}`;
     const idemHeader = readIdempotencyHeader(backend, target);
-    // A call is only retried if it is BOTH idempotent by method/header AND its
-    // body can be re-sent on a retry: an unbuffered stream body is consumed once,
-    // so a call carrying one is downgraded to non-idempotent (Level 0: can't wrap
-    // safely → observed, not retried). In-memory bodies (string/bytes) are
-    // re-sent unchanged on each attempt (the same init.body is passed through).
-    const idempotent = isIdempotent(method, headers, idemHeader) && isBodyRetrySafe(input, body);
+    // Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
+    // once, before the first attempt, and set it on the normalized `headers`
+    // — the same object every retry attempt below forwards as `attemptInit`,
+    // so the SAME key rides every attempt (rule 2).
+    const injectedKey = resolveIdempotencyInjection(method, headers, idemHeader, mintIdempotencyKey);
+    if (injectedKey !== null) headers.set(idemHeader, injectedKey);
+    // A call is only retried if it is BOTH idempotent by method/header/injection
+    // AND its body can be re-sent on a retry: an unbuffered stream body is
+    // consumed once, so a call carrying one is downgraded to non-idempotent
+    // (Level 0: can't wrap safely → observed, not retried). In-memory bodies
+    // (string/bytes) are re-sent unchanged on each attempt.
+    const idempotent =
+      (injectedKey !== null || isIdempotent(method, headers, idemHeader)) && isBodyRetrySafe(input, body);
     // args_hash (cache/journal key material): idempotent GET, plus the documented
     // LLM-POST dev-cache exception — cross-language parity with the Python twin's
     // derive_args_hash (a cacheable POST is not thereby made retryable).
@@ -112,7 +125,11 @@ export function installFetch(backend, discovery, { globalObj = globalThis } = {}
     const started = performance.now();
     const outcome = await backend.execute(request, async () => {
       const { signal, cancel } = withTimeout(init?.signal, timeoutMs);
-      const attemptInit = signal ? { ...init, signal } : init;
+      // An injected key must actually reach the wire: forward the normalized
+      // `headers` (which carries it) as the attempt's headers. Every other
+      // call is untouched — `init` (or the caller's Request) flows through
+      // exactly as before, preserving byte-for-byte transparency.
+      const attemptInit = { ...init, ...(injectedKey !== null ? { headers } : {}), ...(signal ? { signal } : {}) };
       try {
         const resp = await original.call(this, input, attemptInit);
         heldErr = null;

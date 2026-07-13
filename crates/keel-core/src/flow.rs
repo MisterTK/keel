@@ -579,8 +579,15 @@ impl FlowHandle {
                     .await
             }
             StepPlan::Live => {
-                self.run_live(seq, &key, StepKind::Effect, request, idempotency_key, effect)
-                    .await
+                self.run_live(
+                    seq,
+                    &key,
+                    StepKind::Effect,
+                    request,
+                    idempotency_key,
+                    effect,
+                )
+                .await
             }
         }
     }

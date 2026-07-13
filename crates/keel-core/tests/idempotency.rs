@@ -113,48 +113,49 @@ fn payload_value(bytes: &[u8]) -> Value {
     envelope["payload"].clone()
 }
 
+/// Run 1: step 1 completes with key ik-1; step 2 is interrupted mid-effect
+/// (kill -9 shape) after its `running` record — carrying ik-2 — is journaled.
+/// Split out of the test below to stay under `clippy::too_many_lines`.
+async fn run1_completes_then_crashes_mid_step(fx: &Fixture) {
+    let mut handle = fx.manager.enter_flow(&fx.desc).expect("enter");
+    assert_eq!(
+        handle.recorded_idempotency_key("api.pay.example#c1"),
+        None,
+        "a fresh step has no recorded key"
+    );
+    let out = handle
+        .execute_step_with_idempotency_key(
+            &request("api.pay.example", "c1"),
+            Some("ik-1"),
+            |_attempt: u32| async {
+                AttemptResult::Ok {
+                    payload: json!({ "charge": "ch_1" }),
+                }
+            },
+        )
+        .await;
+    assert_eq!(out.result, "ok");
+
+    {
+        let req = request("api.pay.example", "c2");
+        let fut = handle.execute_step_with_idempotency_key(&req, Some("ik-2"), |_attempt: u32| {
+            std::future::pending::<AttemptResult>()
+        });
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "the hung step must be in flight, not resolved"
+        );
+        // Dropping the in-flight future models the crash mid-step.
+    }
+    drop(handle); // crash: flow stays running with its lease
+}
+
 #[tokio::test(start_paused = true)]
 async fn crashed_running_step_journals_and_resurfaces_its_key() {
     let fx = fixture();
-
-    // Run 1: step 1 completes with key ik-1; step 2 is interrupted mid-effect
-    // (kill -9 shape) after its `running` record — carrying ik-2 — is journaled.
-    {
-        let mut handle = fx.manager.enter_flow(&fx.desc).expect("enter");
-        assert_eq!(
-            handle.recorded_idempotency_key("api.pay.example#c1"),
-            None,
-            "a fresh step has no recorded key"
-        );
-        let out = handle
-            .execute_step_with_idempotency_key(
-                &request("api.pay.example", "c1"),
-                Some("ik-1"),
-                |_attempt: u32| async {
-                    AttemptResult::Ok {
-                        payload: json!({ "charge": "ch_1" }),
-                    }
-                },
-            )
-            .await;
-        assert_eq!(out.result, "ok");
-
-        {
-            let fut = handle.execute_step_with_idempotency_key(
-                &request("api.pay.example", "c2"),
-                Some("ik-2"),
-                |_attempt: u32| std::future::pending::<AttemptResult>(),
-            );
-            let mut fut = pin!(fut);
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(
-                matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
-                "the hung step must be in flight, not resolved"
-            );
-            // Dropping the in-flight future models the crash mid-step.
-        }
-        drop(handle); // crash: flow stays running with its lease
-    }
+    run1_completes_then_crashes_mid_step(&fx).await;
     fx.clock.advance(31_000); // past the default 30s lease
 
     // The `running` record carries the key in its schema-tagged payload.
@@ -198,9 +199,14 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
 
     // The peek: same step key + `running` record => the recorded key. A
     // different step key must NOT surface it (the key belongs to that step).
-    assert_eq!(handle.recorded_idempotency_key("api.pay.example#other"), None);
     assert_eq!(
-        handle.recorded_idempotency_key("api.pay.example#c2").as_deref(),
+        handle.recorded_idempotency_key("api.pay.example#other"),
+        None
+    );
+    assert_eq!(
+        handle
+            .recorded_idempotency_key("api.pay.example#c2")
+            .as_deref(),
         Some("ik-2")
     );
 
@@ -240,11 +246,14 @@ async fn steps_without_a_key_journal_no_payload_while_running() {
 
     // `execute_step` (no key) delegates with None: behavior unchanged.
     let out = handle
-        .execute_step(&request("api.pay.example", "plain"), |_attempt: u32| async {
-            AttemptResult::Ok {
-                payload: json!({ "ok": true }),
-            }
-        })
+        .execute_step(
+            &request("api.pay.example", "plain"),
+            |_attempt: u32| async {
+                AttemptResult::Ok {
+                    payload: json!({ "ok": true }),
+                }
+            },
+        )
         .await;
     assert_eq!(out.result, "ok");
     handle.complete_success();
@@ -252,5 +261,8 @@ async fn steps_without_a_key_journal_no_payload_while_running() {
     // Re-entering a completed flow is pure replay: the peek always misses.
     let replay = fx.manager.enter_flow(&fx.desc).expect("pure replay");
     assert!(replay.is_replay_only());
-    assert_eq!(replay.recorded_idempotency_key("api.pay.example#plain"), None);
+    assert_eq!(
+        replay.recorded_idempotency_key("api.pay.example#plain"),
+        None
+    );
 }

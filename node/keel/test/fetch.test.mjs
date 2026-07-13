@@ -110,6 +110,110 @@ test("POST with an idempotency key is retried", async () => {
   });
 });
 
+// --- idempotency-key injection (contracts/adapter-pack.md "Idempotency-key
+// injection") -----------------------------------------------------------
+
+async function withInjection(server, fn, { mintIdempotencyKey } = {}) {
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({
+    ...level0Defaults(),
+    target: { "127.0.0.1": { idempotency: { header: "Idempotency-Key" } } },
+  });
+  const uninstall = installFetch(backend, null, mintIdempotencyKey ? { mintIdempotencyKey } : {});
+  try {
+    return await fn(backend);
+  } finally {
+    uninstall();
+    await server.close();
+  }
+}
+
+test("POST with no caller key is injected one and retried (judgment flip)", async () => {
+  const seen = [];
+  const server = await startServer((req, res, hit) => {
+    seen.push(req.headers["idempotency-key"]);
+    if (hit === 1) {
+      res.writeHead(503);
+      res.end("down");
+    } else {
+      res.writeHead(200);
+      res.end("done");
+    }
+  });
+  await withInjection(server, async () => {
+    const resp = await fetch(server.url(), { method: "POST", body: "payload" });
+    assert.equal(resp.status, 200);
+    assert.equal(server.hits(), 2);
+    assert.equal(resp.keelOutcome.attempts, 2);
+    assert.equal(seen.length, 2);
+    assert.ok(seen[0], "a key was injected");
+    assert.equal(seen[0], seen[1], "rule 2: the same minted key on every attempt");
+  });
+});
+
+test("a caller-supplied key is never overwritten by injection", async () => {
+  const seen = [];
+  const server = await startServer((req, res, hit) => {
+    seen.push(req.headers["idempotency-key"]);
+    res.writeHead(hit === 1 ? 503 : 200);
+    res.end(hit === 1 ? "down" : "done");
+  });
+  await withInjection(server, async () => {
+    const resp = await fetch(server.url(), {
+      method: "POST",
+      headers: { "Idempotency-Key": "caller-key" },
+      body: "payload",
+    });
+    assert.equal(resp.status, 200);
+    assert.deepEqual(seen, ["caller-key", "caller-key"]);
+  });
+});
+
+test("two logical calls mint distinct keys", async () => {
+  const seen = [];
+  const server = await startServer((req, res) => {
+    seen.push(req.headers["idempotency-key"]);
+    res.writeHead(200);
+    res.end("ok");
+  });
+  await withInjection(server, async () => {
+    await fetch(server.url(), { method: "POST", body: "a" });
+    await fetch(server.url(), { method: "POST", body: "b" });
+    assert.equal(seen.length, 2);
+    assert.notEqual(seen[0], seen[1]);
+  });
+});
+
+test("the mint source is injectable for deterministic tests", async () => {
+  const seen = [];
+  const server = await startServer((req, res) => {
+    seen.push(req.headers["idempotency-key"]);
+    res.writeHead(200);
+    res.end("ok");
+  });
+  let n = 0;
+  await withInjection(
+    server,
+    async () => {
+      await fetch(server.url(), { method: "POST", body: "a" });
+      assert.deepEqual(seen, ["fixed-1"]);
+    },
+    { mintIdempotencyKey: () => `fixed-${++n}` },
+  );
+});
+
+test("no configured header means no injection: a bare POST is still not retried", async () => {
+  const server = await startServer((_req, res) => {
+    res.writeHead(503);
+    res.end("still-down");
+  });
+  await withKeel(server, async () => {
+    const resp = await fetch(server.url(), { method: "POST", body: "payload" });
+    assert.equal(resp.keelOutcome.error.code, "KEEL-E014");
+    assert.equal(server.hits(), 1);
+  });
+});
+
 test("args_hash is derived only for idempotent GET requests", async () => {
   const captured = [];
   const backend = {

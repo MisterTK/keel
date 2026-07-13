@@ -1,0 +1,53 @@
+{
+  "name": "flow-idempotency-key-survives-resume",
+  "tier": 2,
+  "description": "contracts/adapter-pack.md 'Idempotency-key injection' rules 3 and 5, at the flow level: an adapter-injected key rides a step's `running` record (this scenario drives `execute_step_with_idempotency_key` directly, the JSON-conformance twin of the hand-written crash-mid-effect unit test in crates/keel-core/tests/idempotency.rs), but it never feeds the step key. Run 1's step 1 completes with key ik-1, then the flow crashes. On resume, step 1 is substituted from the journal — its live effect (which would return a different payload) never fires, EVEN THOUGH the resumed call injects a different key (ik-should-be-ignored): the injected key is not part of args_hash, so it cannot fence replay. `expect_recorded_key: null` before each step pins that the peek only ever surfaces a key for a crashed (still-`running`) record, never a fresh or a terminal one. Step 2 then runs live for the first time, carrying its own key (ik-2), and the flow completes. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": {
+    "flows": { "on_nondeterminism": "fail" },
+    "target": { "api.pay.example": { "idempotency": { "header": "Idempotency-Key" } } }
+  },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:billing.charge:main",
+    "args_hash": "ah-24",
+    "code_hash": "ch-24"
+  },
+  "runs": [
+    {
+      "end": "crash",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.pay.example",
+          "args_hash": "c1",
+          "idempotency_key": "ik-1",
+          "expect_recorded_key": null,
+          "effect": { "status": "ok", "payload": { "charge": "ch_1" } },
+          "expect": { "result": "ok", "payload": { "charge": "ch_1" }, "attempts": 1 }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.pay.example",
+          "args_hash": "c1",
+          "idempotency_key": "ik-should-be-ignored",
+          "expect_recorded_key": null,
+          "effect": { "status": "ok", "payload": { "charge": "never" } },
+          "expect": { "result": "ok", "payload": { "charge": "ch_1" }, "attempts": 1 }
+        },
+        {
+          "target": "api.pay.example",
+          "args_hash": "c2",
+          "idempotency_key": "ik-2",
+          "expect_recorded_key": null,
+          "effect": { "status": "ok", "payload": { "charge": "ch_2" } },
+          "expect": { "result": "ok", "payload": { "charge": "ch_2" }, "attempts": 1 }
+        }
+      ]
+    }
+  ]
+}

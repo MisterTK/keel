@@ -3,7 +3,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveTarget, LLM_HOST_PROVIDERS, classifyThrow, parseRetryAfter } from "../src/judge.mjs";
+import {
+  resolveTarget,
+  LLM_HOST_PROVIDERS,
+  classifyThrow,
+  parseRetryAfter,
+  resolveIdempotencyInjection,
+  defaultMintIdempotencyKey,
+} from "../src/judge.mjs";
 
 test("llm: host map resolves to the exact contracted targets", () => {
   assert.equal(resolveTarget("api.openai.com"), "llm:openai");
@@ -47,4 +54,41 @@ test("classifyThrow: caller AbortError → cancelled; Keel TimeoutError → time
   assert.equal(classifyThrow(new DOMException("Keel timeout", "TimeoutError")), "timeout");
   assert.equal(classifyThrow(new TypeError("fetch failed")), "conn");
   assert.equal(classifyThrow(new Error("weird")), "other");
+});
+
+// --- idempotency-key injection (contracts/adapter-pack.md "Idempotency-key
+// injection"), pinned independently of fetch/HTTP plumbing --------------
+
+test("no configured header means no injection", () => {
+  assert.equal(resolveIdempotencyInjection("POST", new Headers(), undefined), null);
+});
+
+test("idempotent methods are never injected", () => {
+  for (const m of ["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"]) {
+    assert.equal(resolveIdempotencyInjection(m, new Headers(), "Idempotency-Key"), null, m);
+  }
+});
+
+test("a caller-supplied key always wins, never overwritten", () => {
+  assert.equal(
+    resolveIdempotencyInjection("POST", new Headers({ "idempotency-key": "x" }), "Idempotency-Key"),
+    null,
+  );
+  // Case-insensitive match (Headers is already case-insensitive).
+  assert.equal(
+    resolveIdempotencyInjection("POST", new Headers({ "IDEMPOTENCY-KEY": "x" }), "Idempotency-Key"),
+    null,
+  );
+});
+
+test("an unsafe method with a configured header mints a key via the injectable source", () => {
+  const key = resolveIdempotencyInjection("POST", new Headers(), "Idempotency-Key", () => "fixed-key");
+  assert.equal(key, "fixed-key");
+});
+
+test("defaultMintIdempotencyKey mints distinct opaque values", () => {
+  const a = defaultMintIdempotencyKey();
+  const b = defaultMintIdempotencyKey();
+  assert.notEqual(a, b);
+  assert.ok(a);
 });

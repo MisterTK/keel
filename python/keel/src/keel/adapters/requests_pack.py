@@ -129,7 +129,16 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     target = _http.resolve_target(host)
     op = f"{method} {host}{parts.path}"
     idem_header = _http.idempotency_header(target)
-    idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
+    # Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
+    # once, before the first attempt, and set it on the PreparedRequest so
+    # every retry attempt resends the SAME header (`do_call` re-sends this
+    # exact request object on each attempt — see `_run_send` below).
+    injected = _http.resolve_idempotency_injection(method, request.headers.keys(), idem_header)
+    if injected is not None:
+        request.headers[idem_header] = injected  # type: ignore[index]
+    idempotent = injected is not None or _http.is_idempotent(
+        method, request.headers.keys(), idem_header
+    )
     # A prepared body is bytes/str (buffered) or None; derive_args_hash ignores a
     # streaming (generator/file) body, so this never consumes an upload stream.
     # LLM POSTs get a canonicalized-JSON-body cache key (dev-cache exception).

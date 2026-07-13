@@ -48,6 +48,72 @@ class IdempotencyTest(unittest.TestCase):
         self.assertFalse(_http.is_idempotent("POST", ["Idempotency-Key"], idempotency_header="My-Key"))
 
 
+class IdempotencyInjectionTest(unittest.TestCase):
+    """contracts/adapter-pack.md "Idempotency-key injection" — the mint+inject
+    decision, pinned independently of any HTTP library."""
+
+    def test_no_configured_header_means_no_injection(self) -> None:
+        self.assertIsNone(_http.resolve_idempotency_injection("POST", [], None))
+
+    def test_idempotent_methods_are_never_injected(self) -> None:
+        for m in ("GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"):
+            self.assertIsNone(
+                _http.resolve_idempotency_injection(m, [], "Idempotency-Key"), m
+            )
+
+    def test_caller_supplied_key_always_wins_never_overwritten(self) -> None:
+        self.assertIsNone(
+            _http.resolve_idempotency_injection(
+                "POST", ["idempotency-key"], "Idempotency-Key"
+            )
+        )
+        # Case-insensitive match.
+        self.assertIsNone(
+            _http.resolve_idempotency_injection(
+                "POST", ["IDEMPOTENCY-KEY"], "Idempotency-Key"
+            )
+        )
+
+    def test_unsafe_method_with_configured_header_mints_a_key(self) -> None:
+        key = _http.resolve_idempotency_injection("POST", [], "Idempotency-Key")
+        self.assertIsInstance(key, str)
+        self.assertTrue(key)
+
+    def test_mint_is_deterministic_under_test(self) -> None:
+        # rule 2 requires a fresh mint per logical call; the source is
+        # injectable (a plain module attribute) so tests never depend on real
+        # randomness.
+        orig = _http.new_idempotency_key
+        try:
+            calls = iter(["fixed-key-1", "fixed-key-2"])
+            _http.new_idempotency_key = lambda: next(calls)  # type: ignore[assignment]
+            self.assertEqual(
+                _http.resolve_idempotency_injection("POST", [], "Idempotency-Key"),
+                "fixed-key-1",
+            )
+            self.assertEqual(
+                _http.resolve_idempotency_injection("PATCH", [], "Idempotency-Key"),
+                "fixed-key-2",
+            )
+        finally:
+            _http.new_idempotency_key = orig
+
+    def test_a_tier2_recorded_key_is_reused_verbatim_rule_3(self) -> None:
+        # A resume that re-executes a crashed step injects the SAME key the
+        # journal recorded — never a fresh mint — so the provider can dedup.
+        self.assertEqual(
+            _http.resolve_idempotency_injection(
+                "POST", [], "Idempotency-Key", recorded_key="ik-recorded"
+            ),
+            "ik-recorded",
+        )
+
+    def test_new_idempotency_key_mints_distinct_opaque_values(self) -> None:
+        a, b = _http.new_idempotency_key(), _http.new_idempotency_key()
+        self.assertNotEqual(a, b)
+        self.assertTrue(a)
+
+
 class ArgsHashTest(unittest.TestCase):
     def test_stable_and_url_sensitive(self) -> None:
         a = _http.args_hash("GET", "https://h/x")

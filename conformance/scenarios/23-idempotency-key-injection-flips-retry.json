@@ -1,0 +1,38 @@
+{
+  "name": "idempotency-key-injection-flips-retry",
+  "description": "contracts/adapter-pack.md 'Idempotency-key injection': a target configuring idempotency.header does not change the core's judgment by itself — injection happens in the adapter, which flips Request.idempotent to true before the call ever reaches the core. This is the mirror of scenario 04 (non-idempotent-not-retried): the SAME POST, to a target that additionally carries idempotency.header, submitted with idempotent: true (as an adapter would after injecting a key) retries through a 5xx to success instead of terminating with KEEL-E014. The resolved idempotency.header config itself is inert at this layer (contracts/core_api.rs carries no key material) — pinning that the policy parses and resolves without perturbing Tier 1 behavior.",
+  "policy": {
+    "defaults": {
+      "outbound": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] }
+      }
+    },
+    "target": {
+      "api.example.com": { "idempotency": { "header": "Idempotency-Key" } }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "POST api.example.com/orders", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 503, "message": "service unavailable" },
+          { "status": "ok", "payload": { "order_id": "ord_1" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "attempts": 2,
+          "payload": { "order_id": "ord_1" }
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.example.com": { "calls": 1, "attempts": 2, "retries": 1, "successes": 1, "failures": 0 }
+        }
+      }
+    }
+  ]
+}
