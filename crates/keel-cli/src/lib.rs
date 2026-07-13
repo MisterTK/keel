@@ -32,6 +32,7 @@ pub mod flows_suggest;
 pub mod fsck;
 pub mod init;
 pub mod mcp;
+pub mod record;
 pub mod render;
 pub mod replay;
 pub mod resume;

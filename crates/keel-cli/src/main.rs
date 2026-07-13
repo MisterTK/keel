@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
 use keel_cli::{
-    doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, replay, resume,
-    run, status, tail,
+    doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record, replay,
+    resume, run, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -93,6 +93,12 @@ enum Command {
     /// get_status, get_doctor_report, propose_policy, get_trace, list_flows,
     /// explain_error — each byte-identical to the matching `--json` command.
     Mcp,
+    /// Capture effects during a run, then turn the capture into a replayable
+    /// offline test fixture (`docs/recording-format.md`).
+    Record {
+        #[command(subcommand)]
+        action: RecordCommand,
+    },
     /// Inspect what re-entering a flow would do — a journal-driven dry run:
     /// which steps substitute, which re-execute, where replay resumes.
     Replay {
@@ -158,6 +164,33 @@ enum FlowsCommand {
         /// different ones).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+/// `keel record <action>` (`docs/recording-format.md`).
+#[derive(Debug, Subcommand)]
+enum RecordCommand {
+    /// List recordings under `.keel/recordings/`.
+    List,
+    /// Run a script under Keel, teeing every intercepted effect's
+    /// request/outcome envelope into a fresh recording.
+    Run {
+        /// The script to run — same targets `keel run` accepts.
+        target: String,
+        /// Arguments passed through to the program unchanged.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Generate a replayable offline test fixture (a pytest fixture for a
+    /// Python recording, a `node:test` file for a Node recording) from a
+    /// completed recording.
+    Test {
+        /// A recording id, path, or unambiguous id substring.
+        recording: String,
+        /// Write the generated file under this directory instead of next to
+        /// the recording.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
     },
 }
 
@@ -227,6 +260,20 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
+        Command::Record { action } => match action {
+            RecordCommand::List => emit(&record::list(&project), json),
+            RecordCommand::Run { target, args } => {
+                let (rendered, code) = record::run(&project, &target, &args);
+                if let Some(r) = rendered {
+                    emit(&r, json);
+                }
+                code
+            }
+            RecordCommand::Test { recording, out } => emit(
+                &record::test_gen(&project, &recording, out.as_deref()),
+                json,
+            ),
+        },
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Tail { no_follow, run } => {
             let opts = tail::TailOptions {
