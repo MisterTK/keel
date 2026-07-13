@@ -122,6 +122,26 @@ export declare function resolveDevCache(
   env?: Record<string, string | undefined>
 ): Record<string, unknown>;
 
+/** The `tool:` semantic pack (adapter-pack contract). */
+export declare const toolPack: AdapterPack;
+/**
+ * Wrap a tool callable as a `tool:<name>` target — the API framework packs
+ * build on. A tool call is NON-idempotent by default (observed, never retried
+ * — KEEL-E014); `idempotent: true` is the wrap site's opt-in for tools that
+ * are safe to re-invoke. The wrapper is always async.
+ */
+export declare function wrapTool<A extends unknown[], R>(
+  name: string,
+  fn: (...args: A) => R | PromiseLike<R>,
+  options?: { idempotent?: boolean; backend?: Backend; discovery?: Discovery }
+): (...args: A) => Promise<R>;
+/** Classify a thrown tool error into a core error class. */
+export declare function classifyToolError(err: unknown): "timeout" | "cancelled" | "conn" | "other";
+/** True iff `name` is a valid `tool:` name per the frozen target grammar. */
+export declare function isValidToolName(name: unknown): boolean;
+/** `tool:<name>`, validated against the frozen target grammar (throws KEEL-E001). */
+export declare function toolTarget(name: string): string;
+
 /** Build the `mcp:` transport pack bound to a project directory. */
 export declare function mcpPack(options?: { cwd?: string }): AdapterPack;
 /** Auto-detect the MCP client SDK and wrap its transports (best-effort). */

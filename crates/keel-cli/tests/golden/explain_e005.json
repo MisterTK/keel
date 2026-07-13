@@ -2,7 +2,7 @@
   "code": "KEEL-E005",
   "docs": "https://keel.dev/errors/KEEL-E005",
   "name": "unsupported-configuration",
-  "next": "For the async case, run the flow body synchronously or remove its entrypoint from [flows]. For the journal case, build/install the native module (`maturin develop -m crates/keel-py/Cargo.toml`) and make sure `.keel/` is writable. `keel doctor` reports which backend and journal are in play.",
+  "next": "Build/install the native module (`maturin develop -m crates/keel-py/Cargo.toml`) and make sure `.keel/` is writable. `keel doctor` reports which backend and journal are in play.",
   "what": "The policy is valid, but it requests a capability this build or runtime configuration does not provide.",
-  "why": "Two things trigger this in v0.1: an async effect inside a durable flow (flows are synchronous-only — an async call would bypass the journal), and a durable flow with no journal to record to (Tier 2 needs the native backend with a journal attached)."
+  "why": "Two things trigger this in v0.1: a durable flow with no journal to record to (Tier 2 needs the native backend with a journal attached), and KEEL_BACKEND=native with no native module installed. (Async effects inside a flow are supported — serialized in await order per conformance/README.md — and no longer trigger this code.)"
 }

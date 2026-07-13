@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use keel_core::Engine;
+use keel_core::FlowDescriptor as FlowIdentity;
+use keel_core::{Engine, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, ErrorClass, Request};
 use keel_journal::{
-    CacheKey, DiscoveryStore, FlowDescriptor, FlowId, FlowStatus, Journal, ManualClock, NewFlow,
-    ProcessId, SqliteJournal, StepKey, StepOutcome,
+    CacheKey, Clock, DiscoveryStore, FlowDescriptor, FlowId, FlowStatus, Journal, ManualClock,
+    NewFlow, ProcessId, SqliteJournal, StepKey, StepOutcome,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -231,6 +232,199 @@ async fn unwritable_journal_degrades_persistent_cache_to_live_calls() {
         warns.load(Ordering::SeqCst) >= 2,
         "expected read + write degradation warnings, saw {}",
         warns.load(Ordering::SeqCst)
+    );
+}
+
+// ---- policy `journal` backend selection (architecture spec §4.2) ----
+
+/// `journal = "file:<path>"` is honored at configure time: the SQLite store is
+/// attached at the custom path (parent directories created), and persistent
+/// cache entries land there — provable by a second engine configured with the
+/// same policy serving the first engine's write.
+#[tokio::test(start_paused = true)]
+async fn policy_file_journal_is_attached_at_the_custom_path() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("custom").join("nested").join("j.db");
+    let mut policy = persistent_policy("api.catalog.internal", "5m");
+    policy["journal"] = json!(format!("file:{}", path.display()));
+
+    let a = Engine::new();
+    a.configure(&policy).expect("file: journal is honored");
+    assert!(a.journal().is_some(), "configure attached the journal");
+    assert!(
+        path.exists(),
+        "store created at the policy path, directories included"
+    );
+
+    let out_a = a
+        .execute(&cache_request("api.catalog.internal"), async |_| {
+            AttemptResult::Ok {
+                payload: json!("v1"),
+            }
+        })
+        .await;
+    assert!(!out_a.from_cache, "cold cache on the fresh custom store");
+
+    let b = Engine::new();
+    b.configure(&policy)
+        .expect("same policy on a second engine");
+    let out_b = b
+        .execute(&cache_request("api.catalog.internal"), async |_| {
+            AttemptResult::Ok {
+                payload: json!("SENTINEL-NOT-SERVED"),
+            }
+        })
+        .await;
+    assert!(
+        out_b.from_cache,
+        "the entry round-trips through the custom path"
+    );
+    assert_eq!(out_b.payload, Some(json!("v1")));
+}
+
+/// Tier 2 flows land in the policy-selected journal: a manager built over
+/// `engine.journal()` *after* configure (the bindings' pattern) writes its flow
+/// rows into the custom file.
+#[tokio::test(start_paused = true)]
+async fn flows_land_in_the_policy_selected_journal() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("flows").join("j.db");
+    let engine = Arc::new(Engine::new());
+    engine
+        .configure(&json!({ "journal": format!("file:{}", path.display()) }))
+        .unwrap();
+
+    let journal = engine.journal().expect("policy attached a journal");
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(T0));
+    let manager = FlowManager::new(
+        Arc::clone(&engine),
+        Arc::clone(&journal),
+        clock,
+        ProcessId::new("host-a:pid-1"),
+    );
+    let mut handle = manager
+        .enter_flow(&FlowIdentity {
+            entrypoint: "py:pipeline.ingest:main".to_owned(),
+            args_hash: "a1".to_owned(),
+            explicit_key: None,
+            code_hash: Some("ch-1".to_owned()),
+        })
+        .unwrap();
+    let fid = handle.flow_id().clone();
+    let out = handle
+        .execute_step(&cache_request("api.step.internal"), |_attempt: u32| async {
+            AttemptResult::Ok {
+                payload: json!({ "rows": 1 }),
+            }
+        })
+        .await;
+    assert_eq!(out.result, "ok");
+    handle.complete_success();
+    drop(handle);
+
+    // The flow row lives in the CUSTOM file, read through a fresh handle.
+    let reader = SqliteJournal::open(&path, ManualClock::new(T0)).unwrap();
+    let flow = reader
+        .get_flow(&fid)
+        .unwrap()
+        .expect("flow journaled at the policy path");
+    assert_eq!(flow.status, FlowStatus::Completed);
+}
+
+/// `journal = "postgres://…"` is a valid policy this build cannot honor: the
+/// configure fails loudly with KEEL-E005 (exact message contract), the URL
+/// (which can carry credentials) never enters the diagnostic, and the previous
+/// configuration stays fully in force.
+#[tokio::test(start_paused = true)]
+async fn postgres_journal_fails_configure_with_e005() {
+    let engine = Engine::new();
+    engine
+        .configure(&persistent_policy("api.catalog.internal", "5m"))
+        .unwrap();
+
+    let err = engine
+        .configure(&json!({ "journal": "postgres://keel:sekrit@db.internal/keel" }))
+        .expect_err("no postgres backend in this build");
+    assert_eq!(err.code.as_str(), "KEEL-E005");
+    assert_eq!(
+        err.message,
+        "Postgres journal not yet available in this build; use file: — see docs"
+    );
+    assert!(
+        !err.message.contains("sekrit"),
+        "credentials never enter the diagnostic"
+    );
+    assert!(
+        engine.journal().is_none(),
+        "the rejected location attaches nothing"
+    );
+
+    // The previous policy still governs: its cache layer still serves.
+    let out1 = engine
+        .execute(&cache_request("api.catalog.internal"), async |_| {
+            AttemptResult::Ok { payload: json!(1) }
+        })
+        .await;
+    let out2 = engine
+        .execute(&cache_request("api.catalog.internal"), async |_| {
+            AttemptResult::Ok { payload: json!(2) }
+        })
+        .await;
+    assert!(!out1.from_cache);
+    assert!(
+        out2.from_cache,
+        "previous policy still in force after the rejected configure"
+    );
+}
+
+/// No `journal` key: the construction-time attachment is untouched — the
+/// default behavior is unchanged by the policy wiring.
+#[tokio::test(start_paused = true)]
+async fn absent_journal_key_keeps_the_construction_attachment() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = Engine::new();
+    engine.attach_journal(
+        SqliteJournal::open(dir.path().join("journal.db"), ManualClock::new(T0)).unwrap(),
+    );
+    let before = engine.journal().expect("attached at construction");
+    engine
+        .configure(&persistent_policy("api.catalog.internal", "5m"))
+        .unwrap();
+    let after = engine.journal().expect("still attached");
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "no journal key leaves the attachment untouched"
+    );
+}
+
+/// A policy `file:` location replaces the construction-time attachment (the
+/// effective policy is authoritative), and reapplying the same location is a
+/// no-op — the open store is kept, not re-opened.
+#[tokio::test(start_paused = true)]
+async fn policy_journal_replaces_construction_attachment_and_reapplies_idempotently() {
+    let dir = TempDir::new().unwrap();
+    let mut engine = Engine::new();
+    engine.attach_journal(
+        SqliteJournal::open(dir.path().join("default.db"), ManualClock::new(T0)).unwrap(),
+    );
+    let constructed = engine.journal().unwrap();
+
+    let custom = dir.path().join("custom.db");
+    let mut policy = persistent_policy("api.catalog.internal", "5m");
+    policy["journal"] = json!(format!("file:{}", custom.display()));
+    engine.configure(&policy).unwrap();
+    let selected = engine.journal().unwrap();
+    assert!(
+        !Arc::ptr_eq(&constructed, &selected),
+        "policy file: replaces the construction journal"
+    );
+    assert!(custom.exists());
+
+    engine.configure(&policy).unwrap();
+    let reapplied = engine.journal().unwrap();
+    assert!(
+        Arc::ptr_eq(&selected, &reapplied),
+        "an unchanged location keeps the open store"
     );
 }
 
