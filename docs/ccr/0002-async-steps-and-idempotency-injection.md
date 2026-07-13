@@ -1,8 +1,8 @@
 # CCR-2 — async steps in flows (retire the KEEL-E005 async case) + idempotency-key injection
 
-- **Status:** submitted 2026-07-12. Per the change process in
-  `contracts/README.md`, the PR carrying these `contracts/` edits **must have
-  the `contract-change-approved` label** or CI's `contract-freeze` job fails.
+- **Status:** submitted 2026-07-12, approved and merged 2026-07-13 via PR #6
+  (`76cb94b`), which carried the required `contract-change-approved` label
+  per `contracts/README.md`.
 - **Precedent:** CCR-1 (PR #5, commit `135580d`), which created
   KEEL-E005 unsupported-configuration and settled the effective-policy
   contract for `keel_configure`. This CCR follows its shape: the contract
@@ -35,16 +35,15 @@ KEEL-E005 itself remains frozen and still covers the genuine
 capability-missing cases: a durable flow with no journal to record to, and
 `KEEL_BACKEND=native` with no native module installed.
 
-**Migration / ripple (not in this CCR's commits).** The async `execute_step`
-bridge in `crates/keel-py` and `crates/keel-node`, removal of the
-`execute_async` KEEL-E005 guard, the `flow.rs` module-doc rewrite, front-end
-README limitation sections, and `llms-full.txt`'s "flows are
-synchronous-only" line are the async-bridge task's territory and land on the
-same integration branch. Until it lands, the bindings still refuse
-async-in-flow with KEEL-E005 — a transitional over-refusal, not a contract
-violation (E005's copy no longer promises that trigger, and no test asserts
-the old prose). Teams affected: bindings (keel-py/keel-node), both language
-front ends, docs. The stubs are unaffected (they never implemented Tier 2).
+**Migration / ripple (landed, PR #6).** The async `execute_step` bridge in
+`crates/keel-py/src/lib.rs` (`execute_async`) and
+`crates/keel-node/src/lib.rs` (`execute_async`) now routes an open flow's
+intercepted effects through `FlowHandle` via an async mutex instead of
+refusing with KEEL-E005; the `flow.rs` module doc, front-end README
+limitation sections, and `llms-full.txt`'s old "flows are synchronous-only"
+line were all updated accordingly. Teams affected: bindings
+(keel-py/keel-node), both language front ends, docs. The stubs are
+unaffected (they never implemented Tier 2).
 
 ## Change 2 — idempotency-key injection semantics (adapter-pack contract)
 
@@ -81,13 +80,14 @@ effective policy (CCR-1), and `core_api.rs` anticipated exactly this —
 key was injected**". Consequently **no envelope or FFI change is needed**;
 the existing `Request` carries everything the core must know.
 
-**Migration / ripple (not in this CCR's commits).** Surfacing `idempotency`
-through `ResolvedPolicy`/`resolve()`, the minting + injection code in the
-httpx/requests/fetch adapters, the step-record journaling of the key, and
-conformance/stub parity for the flipped judgment are the
-idempotency-injection task's territory. `TargetDecl` (stubs in
-`contracts/stubs/`) is unchanged — `idempotency_rule` already describes "how
-`idempotent` is derived at the seam", which now includes injection.
+**Migration / ripple (landed, PR #6, Wave 1 / R4).** `idempotency` now
+surfaces through `ResolvedPolicy`/`resolve()`, the httpx/requests/fetch
+adapters mint+inject keys, `FlowHandle` journals the key on the running step
+record and exposes it via `recorded_idempotency_key` for resume-reuse, and
+conformance scenario 24 exercises the flipped judgment end to end.
+`TargetDecl` (stubs in `contracts/stubs/`) is unchanged — `idempotency_rule`
+already describes "how `idempotent` is derived at the seam", which now
+includes injection.
 
 ## Verification carried with this CCR
 

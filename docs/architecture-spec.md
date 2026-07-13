@@ -120,13 +120,13 @@ entrypoints = ["py:pipeline.ingest:main", "ts:jobs/nightly.ts#run"]
 on_nondeterminism = "fail"              # fail | warn | branch
 ```
 
-Fixed layer order (cache outermost, journal innermost) keeps composition predictable; policies configure layers, never reorder them. The schedule grammar is the Effect-style algebra — schedules compose (`exp(...) upTo 10m andThen fixed(1m)`) — but lives in config, not code. Retry *conditions* are structured error classes (timeout, connection, HTTP status classes, custom regex on error text) because the core sees typed errors from adapters, not language exceptions.
+Fixed layer order (cache outermost, journal innermost) keeps composition predictable; policies configure layers, never reorder them. The schedule grammar is the Effect-style algebra — schedules compose (`exp(...) upTo 10m andThen fixed(1m)`) — but lives in config, not code. Retry *conditions* are structured error classes (timeout, connection, HTTP status classes/exact codes) because the core sees typed errors from adapters, not language exceptions.
 
-Rust building blocks: `tower` (layer model), `moka` (in-memory cache), `governor` (rate limiting), a small custom breaker and schedule evaluator (both are ~hundreds of lines and semantically owned — do not outsource the semantics you're selling).
+Rust building blocks: the layer chain, in-memory cache, token-bucket rate limiter, breaker, and schedule evaluator are all hand-rolled in `keel-core` directly on `tokio` (no `tower`/`moka`/`governor` dependency) — semantically owned, not outsourced.
 
 ### 4.2 Journal
 
-A `Journal` trait with three planned backends; only SQLite ships in v1.
+A `Journal` trait with three planned backends; SQLite (default) and a real Postgres backend (`crates/keel-journal/src/postgres_journal.rs`) both ship — only the object-store-backed segmented log (§6, massive scale) remains unbuilt.
 
 ```rust
 trait Journal: Send + Sync {
@@ -176,7 +176,7 @@ The front ends are the product's UX; the core is its soul. Each front end transl
 
 ### 5.1 Python (`keel-py`, PyO3)
 
-`keel run app.py` (or `python -m keel app.py`) installs, before user code loads: (1) a `sys.meta_path` import hook that wraps functions matching `py:` targets at module import time — the wrapper is generated, user source untouched; (2) **library adapters** that patch known effect libraries at their narrowest stable seam: `httpx`/`requests`/`aiohttp`/`urllib3` (transport/adapter layer, so `host` targets work regardless of which HTTP sugar the app uses), `boto3` (botocore event hooks — official extension points), `psycopg`/`asyncpg` (connection factory). Async is bridged natively (PyO3 + pyo3-async runtime integration); sync calls run the core on a blocking path with GIL released during waits. Adapter fragility is managed with per-library-version contract tests in CI and a `keel doctor` warning when an unknown library version is detected — this is the maintenance tax of the no-code-changes promise, budgeted for, not wished away.
+`keel run app.py` (or `python -m keel app.py`) installs, before user code loads: (1) a `sys.meta_path` import hook that wraps functions matching `py:` targets at module import time — the wrapper is generated, user source untouched; (2) **library adapters** that patch known effect libraries at their narrowest stable seam: `httpx`/`requests`/`aiohttp`/`urllib3` (transport/adapter layer, so `host` targets work regardless of which HTTP sugar the app uses), `boto3` (botocore event hooks — official extension points), `psycopg` (connection factory). Async is bridged natively (PyO3 + pyo3-async runtime integration); sync calls run the core on a blocking path with GIL released during waits. Adapter fragility is managed with per-library-version contract tests in CI and a `keel doctor` warning when an unknown library version is detected — this is the maintenance tax of the no-code-changes promise, budgeted for, not wished away.
 
 ### 5.2 TypeScript/Node (`keel-node`, napi-rs)
 
@@ -184,7 +184,7 @@ Same shape: `keel run app.ts` injects `--import keel/hook` (ESM loader; `--requi
 
 ### 5.3 Rust (`keel` crate)
 
-Rust has no runtime interception seam — no import hooks, no monkeypatching — so it is the honest exception to "zero code marks," held to a one-line ceiling: `#[keel::wrap]` on a function (proc macro reads the *same* `keel.toml` at compile time and generates the chain call), plus drop-in middleware for the usual seams (`reqwest-middleware` client builder, a `tower::Layer` for axum/tonic, a sqlx wrapper) that `keel doctor` can suggest and, for the reqwest case, `keel init --rust` can wire in a two-line diff. Rust developers tolerate an attribute; they riot at a framework. This satisfies NFR1's spirit: no Keel *semantics* in code — the attribute is a marker, all behavior stays in config.
+Rust has no runtime interception seam — no import hooks, no monkeypatching — so it is the honest exception to "zero code marks," held to a one-line ceiling: `#[keel::wrap]` on a function (proc macro reads the *same* `keel.toml` at compile time and generates the chain call), plus a `reqwest-middleware` client builder (`crates/keel/src/middleware.rs`) for outbound HTTP — the only drop-in middleware seam that actually ships. A `tower::Layer` for axum/tonic and a sqlx wrapper are not built, and `keel doctor`/`keel init` do not yet detect Rust projects at all (no `keel init --rust`); this is documented, tracked debt (see `crates/keel/src/lib.rs` module docs), not a silent gap. Rust developers tolerate an attribute; they riot at a framework. This satisfies NFR1's spirit: no Keel *semantics* in code — the attribute is a marker, all behavior stays in config.
 
 ### 5.4 What interception cannot see
 

@@ -46,10 +46,15 @@ deterministic, which happens at this one seam.
 }
 ```
 
-- `target` / `args` — the script `keel sim run` dispatches, exactly as `keel run
+- `target` / `args` — the script `keel sim` dispatches, exactly as `keel run
   <target> [args…]` would (same interpreter dispatch via `keel-cli::run::plan`).
-- `max_restarts` (default 8) — how many times `keel sim run` will re-invoke
+- `max_restarts` (default 8) — how many times `keel sim` will re-invoke
   `target` after a `crash` directive kills the child, before giving up.
+- `flow_lease_ms` (optional) — when `target` is a Tier 2 flow entrypoint,
+  forwarded to the child as `KEEL_FLOW_LEASE_MS`; a crash-restart sleeps
+  `flow_lease_ms + 200ms` before respawning so the crashed process's flow
+  lease has genuinely expired before the new process tries to re-acquire it
+  (otherwise KEEL-E030). Omit for a non-flow target.
 - `faults` — one **ordered directive queue per target** (the exact target string
   a policy `[target."…"]` key would match). Consumption is **per Tier 1 attempt**,
   not per logical call: the Nth attempt (across every call to that target, in
@@ -73,7 +78,7 @@ deterministic, which happens at this one seam.
 
 Directives are injected by the language front end (`python/keel/src/keel/_sim.py`'s
 `SimBackend`, `node/keel/src/sim.mjs`'s `SimBackend`), gated on the
-`KEEL_SIM_PLAN=<path to this file>` environment variable `keel sim run` sets on
+`KEEL_SIM_PLAN=<path to this file>` environment variable `keel sim` sets on
 the child — never `contracts/`, and never active unless that variable is set.
 
 ## Where the injection seam is
@@ -88,11 +93,15 @@ once per Tier 1 attempt, so a scripted `timeout` on attempt 1 followed by `ok` o
 attempt 2 genuinely exercises one real backoff wait, one real retry, and (if
 configured) one real breaker observation — nothing about resilience is
 bypassed or faked at a higher layer. `SimBackend` never touches `enter_flow`/
-`exit_flow`/`journal_time`/`journal_random`/`report`/`layer` — every non-`execute`
-member delegates straight through (`__getattr__`, mirroring `_backend._NativeBackend`
+`exit_flow`/`journal_time`/`journal_random`/`report`/`layer` in the Python
+front end (`__getattr__`-based delegation, mirroring `_backend._NativeBackend`
 and `RecordingBackend`), so Tier 2 flow control and journal semantics are
-completely untouched by fault injection; only the effect a step's attempt would
-have performed is ever replaced.
+completely untouched by fault injection there. The Node `SimBackend`
+(`node/keel/src/sim.mjs`) has no equivalent passthrough for `enterFlow`/
+`exitFlow`/`journalTime`/`journalRandom` yet, so `keel sim` against a Node
+Tier 2 flow entrypoint currently fails with a KEEL-E005 "needs the native
+core" error instead of fault-injecting transparently — documented debt, not
+yet supported.
 
 ## Crash-restart
 
@@ -108,7 +117,7 @@ at-least-once guarantee), so the mechanical shape is identical to a real `kill
 The crash is a real, uncatchable `SIGKILL` sent to the process's own pid
 (`os.kill(os.getpid(), signal.SIGKILL)` / `process.kill(process.pid, "SIGKILL")`)
 — not a `sys.exit`/`process.exit`, which would run cleanup the simulation is
-specifically trying to skip. `keel sim run` detects a child that died to a
+specifically trying to skip. `keel sim` detects a child that died to a
 signal (vs. a normal exit) and re-invokes the SAME plan against the SAME script,
 up to `max_restarts` times.
 
@@ -117,7 +126,7 @@ persisted to a sidecar file (`<plan path>.cursor.json`, created and updated by
 `SimBackend`/`_Cursor` next to the plan — fsynced immediately after every
 directive is consumed, including the one that triggers the crash) so a freshly
 started process picks the fault sequence up where the crashed one left off,
-rather than restarting it from directive 0 forever. `keel sim run` deletes any
+rather than restarting it from directive 0 forever. `keel sim` deletes any
 stale cursor file before the *first* spawn of a run, so re-running the same
 plan from a clean slate is always deterministic.
 
@@ -125,7 +134,7 @@ plan from a clean slate is always deterministic.
 
 Checked after the restart loop settles (a clean exit, or `max_restarts`
 exhausted), against every event file `.keel/events/*.ndjson` written during the
-sim (`keel sim run` sets `KEEL_EVENTS=1` on the child so the sink is always on,
+sim (`keel sim` sets `KEEL_EVENTS=1` on the child so the sink is always on,
 and diffs the directory before/after so events from every restart's process are
 aggregated, oldest first) and, when `flow_status` is set, the newest row's
 status in `.keel/journal.db`:
@@ -153,10 +162,11 @@ non-native run anyway, since Tier 2 durable flows are themselves native-only.
 opened" is trivially true when there is no event feed at all, so asserting it
 over a stub run is a legitimate (if weak) no-op.
 
-## `keel sim run <plan>`
+## `keel sim <plan>`
 
 Runs the plan (see above), producing a doctor-style pass/fail report — a `ok`
 boolean, the settled `exit_code`, `restarts` used, and a `findings` list (each
-`{ level, topic, detail }`, matching `keel doctor`'s finding shape) — with a
-`--json` twin. Exit code mirrors `keel doctor`: `0` when `findings` is empty,
-`2` otherwise.
+`{ level, topic, detail }` — the same three core fields as `keel doctor`'s
+findings, though `keel sim` never emits doctor's additional `action`/`fix`
+fields) — with a `--json` twin. Exit code mirrors `keel doctor`: `0` when
+`findings` is empty, `2` otherwise.

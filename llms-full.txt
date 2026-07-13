@@ -195,8 +195,9 @@ cargo build -p keel-cli                         # the `keel` binary
 
 ## Conformance
 
-27 scenarios in `conformance/scenarios/` (01–15 plus 18/19/20/21–22/23 Tier 1,
-16–27 Tier 2), run by the real Rust core (all of them — Tier 2 additionally
-against a real Postgres journal backend), the Rust/Python/Node stubs (every
-Tier 1 scenario; Tier 2 skipped by design — no journal), and the native front
-ends. `conformance/README.md` is the normative semantics.
+34 scenarios in `conformance/scenarios/` (21 Tier 1: 01–15 plus
+18/19/20/21–22/23; 13 Tier 2: 16–27, with two Tier-2 scenarios sharing number
+24), run by the real Rust core (all of them — Tier 2 additionally against a
+real Postgres journal backend), the Rust/Python/Node stubs (every Tier 1
+scenario; Tier 2 skipped by design — no journal), and the native front ends.
+`conformance/README.md` is the normative semantics.

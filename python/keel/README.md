@@ -1,16 +1,19 @@
 # keel (Python front end)
 
 Production-grade resilience for any Python program, with **zero code changes**.
-`keel run app.py` intercepts your outbound calls (httpx, requests, LLM SDKs, and
-`py:` function targets) and applies retries, backoff, timeouts, circuit
-breakers, rate limits, and an optional dev-mode response cache — all declared in
-one `keel.toml`, enforced by the native Rust core inside your process. No daemon,
-no port, no login.
+`keel run app.py` intercepts your outbound calls (httpx, requests, aiohttp,
+urllib3, boto3, psycopg, LLM SDKs via `llm:` packs, `tool:`/`mcp:` targets,
+agent-framework packs, and `py:` function targets) and applies retries, backoff,
+timeouts, circuit breakers, rate limits, and an optional dev-mode response
+cache — all declared in one `keel.toml`, enforced by the native Rust core
+inside your process. No daemon, no port, no login.
 
 ```
-$ uvx keel run app.py
+$ cd python/keel && pip install -e . && keel-py-run app.py
 keel ▸ wrapped 14 call sites (httpx ×9, openai ×4) with production defaults — `keel init` to customize
 ```
+
+(Not yet published to any registry; run from source — see `docs/naming-decision.md` for registry status.)
 
 Uninstalling Keel removes the behavior and nothing else: your code runs
 identically (minus resilience). No imports, no context objects, no base classes.

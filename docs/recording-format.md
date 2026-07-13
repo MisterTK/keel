@@ -1,7 +1,8 @@
 # Recording format (`keel record`)
 
-Non-contract. `keel record` (dx-spec §6 standing structure item 5, "record
-test") captures every effect a program made under `keel record run` and lets
+Non-contract. `keel record` (docs/sprint-plan.md's "Standing structure after
+the weekend" item 5, "record test" (also dx-spec §6's third experience-detail
+bullet)) captures every effect a program made under `keel record run` and lets
 `keel record test` turn that capture into an offline, deterministic test
 fixture. Everything on this page lives entirely in the front ends
 (`python/keel/src/keel/_record.py`, `python/keel/src/keel/testing.py`,
@@ -28,9 +29,10 @@ This implementation uses newline-delimited JSON instead:
 
 ## File layout
 
-`.keel/recordings/<id>.ndjson`, one recording per file. `<id>` is a
-zero-padded-hex epoch-millisecond string (same convention as the event sink's
-run ids — lexically sortable, newest last).
+`.keel/recordings/<id>.ndjson`, one recording per file. `<id>` is
+`<11-hex-digit-epoch-ms>-<4-hex-digit-suffix>` (the same two-segment shape as
+the event sink's run ids, though the suffix is derived from the process id
+rather than random) — lexically sortable, newest last.
 
 ### Line 1: the `meta` header (always first, always present)
 
@@ -82,8 +84,8 @@ running program instead of performing real effects. The matching rule is
 identical in both languages and deliberately simple:
 
 1. Group every recorded `call` by a match key:
-   - `(target, args_hash)` when the call's `args_hash` is not `null`.
-   - `(target, "op:" + op)` when `args_hash` is `null` (a non-idempotent call,
+   - `(target, "h:" + args_hash)` when the call's `args_hash` is not `null`.
+   - `(target, "o:" + op)` when `args_hash` is `null` (a non-idempotent call,
      e.g. a plain `POST`, never gets an `args_hash` — see
      `python/keel/src/keel/adapters/_http.py`'s `derive_args_hash`).
 2. Each group is a **FIFO queue**: a live call computes the same key from its

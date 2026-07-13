@@ -60,6 +60,8 @@ Saturday midday sync (orchestrator): B/C seams stabilize → E integrates; any c
 
 Subsequent weekend sprints, in order of leverage: (1) Tier 2 durable flows complete + `keel flows` UX; (2) adapter-pack expansion sprint — the §4.3 contract makes each framework (Pydantic AI, OpenAI Agents SDK, CrewAI, eve deep-integration, LangGraph checkpointer) a one-team task; (3) `keel mcp` server + agent-docs surface (DX §5); (4) Postgres journal + fleet recovery; (5) `keel record test` + sim mode.
 
+(Status update, 2026-07-13: all five items above have since shipped, via the follow-on multi-wave completion program on branch claude/complete-keel merged into main as PR #6 — see CLAUDE.md.)
+
 Permanent roles: contract steward (guards `contracts/` — the compatibility promises), adapter CI farm (contract tests against pinned framework/library versions, the maintenance tax made visible), and a weekly "cold-machine run" as the recurring quality ritual.
 
 ## Risk register (weekend-specific)
@@ -72,13 +74,13 @@ Top three ways this weekend fails, and the countermeasure baked in: **(1) contra
 
 The weekend's plan was executed as 17 tasks; all landed. What shipped against the plan:
 
-- **Sprint 0 (contracts + stubs + conformance):** shipped as planned — `contracts-v1` frozen, three-language stubs, conformance corpus (grown from 15 to **17** scenarios with the two Tier 2 additions).
+- **Sprint 0 (contracts + stubs + conformance):** shipped as planned — `contracts-v1` frozen, three-language stubs, conformance corpus (grown from 15 to **17** scenarios with the two Tier 2 additions) (superseded: the follow-on wave program grew the corpus further; conformance/scenarios/ currently holds 34 scenario files spanning numbers 01-27 — see conformance/README.md).
 - **Sprint 1 (the real core + both front ends + CLI):** shipped. `crates/keel-core` (engine + `keel-journal` discovery/flow journal + OTel), `crates/keel-ffi` (C ABI + MessagePack) with **PyO3 and napi async bridges** (risk #2 retired with a bridge conformance test, as planned). Python + Node front ends with httpx/requests/fetch adapters and `llm:`/`mcp:`/AI-SDK packs. CLI `run·init·doctor·status·explain` — plus `flows·trace` (below).
 - **Sprint 2 midday gate — Tier 2: GO.** Durable flows shipped beyond the "Python demo only" floor: flow journaling, resume-on-rerun with step substitution, `fail`/`warn`/`branch` nondeterminism responses, leases + attempt cap, and time/random virtualization, all in the real core; the Python front end designates flows from `[flows]`; `keel flows`/`keel trace` expose them. The `kill -9` → resume demo is a real subprocess test.
-- **Overhead:** measured **~0.56 µs** worst-case wrapped call vs the 10 µs budget (DX invariant 8), emitted as a CI artifact.
+- **Overhead:** measured ~0.56 µs worst-case wrapped call at weekend's end (2026-07-12); after the follow-on wave program added the event sink and idempotency-key injection, the current measured worst case is ~0.8 µs (target/bench-overhead.json), still well inside the 10 µs budget (DX invariant 8), emitted as a CI artifact.
 
 Delivered beyond / deferred from the RC-1 evening list:
 - **Delivered:** four runnable demos + `tools/faultproxy` (deterministic, no network), the 40-second storyboard as a script, `llms.txt`/`llms-full.txt`, and `keel init --agents`.
-- **Deferred (honest gaps):** wheels/npm/brew are **not published** — everything builds from source; the asciinema is a shooting script, not a recording; Postgres/fleet journal (Level 3), `keel mcp`, `keel record test`, and further adapter packs remain future work per the standing structure above.
+- **Deferred (honest gaps):** wheels/npm/brew are **not published** — everything builds from source; the asciinema is a shooting script, not a recording; Postgres/fleet journal (Level 3), `keel mcp`, `keel record test`, and further adapter packs (LLM + agent-framework: pydantic-ai, openai-agents, crewai, ADK, LangGraph checkpointer, AI-SDK) were deferred as of this 2026-07-12 annotation but have since shipped in the follow-on multi-wave completion program (branch `claude/complete-keel`, merged into `main` as PR #6) — see CLAUDE.md for current status. Still not done: package-registry publishing (wheels/npm/brew) and a recorded (vs. scripted) asciinema.
 
 The referee held throughout: conformance green in every harness at each step, `contracts/` unchanged since freeze.
