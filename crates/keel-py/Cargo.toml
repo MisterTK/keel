@@ -42,7 +42,10 @@ serde_json = { workspace = true }
 # Current-thread runtime + time driver (the engine needs the timer wheel, never
 # IO). `test-util` is always on: the paused clock + `advance_clock` are exposed
 # unconditionally as documented harness-only surface (per the task brief).
-tokio = { version = "1.47", features = ["rt", "time", "test-util"] }
+# `sync` adds `tokio::sync::Mutex`, the async admission lock the `execute_async`
+# flow bridge uses to serialize concurrent awaited effects without blocking an
+# OS thread (see `active_flow` below).
+tokio = { version = "1.47", features = ["rt", "time", "test-util", "sync"] }
 
 [features]
 # Enabled by maturin for the wheel build (see pyproject.toml): tells pyo3 not to

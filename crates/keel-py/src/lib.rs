@@ -11,7 +11,10 @@
 //!   which returns an attempt-result dict.
 //! - `KeelCore.execute_async(request, effect)` — returns an awaitable (via
 //!   `pyo3-async-runtimes`); `effect(attempt)` is an `async def` awaited on the
-//!   caller's asyncio loop.
+//!   caller's asyncio loop. While a flow is open this routes through the same
+//!   `FlowHandle` the synchronous path uses (see "The async flow bridge" below)
+//!   instead of the bare `Engine`, so async intercepted effects inside a flow
+//!   are journaled and replayable exactly like synchronous ones.
 //! - `KeelCore.report()` — the deterministic report dict.
 //! - `KeelCore.advance_clock(ms)` and the `KeelCore(paused=True)` flag —
 //!   **harness-only** virtual-clock controls, always present but not part of the
@@ -28,9 +31,33 @@
 //! `block_on` is synchronous from our side).
 //!
 //! The async path instead runs the engine future on the `pyo3-async-runtimes`
-//! tokio runtime (real, non-paused time) so it can await Python coroutines on the
+//! tokio runtime (real, non-paused time, and — unless configured otherwise —
+//! multi-threaded, so concurrent `execute_async` calls genuinely run on separate
+//! OS threads until they need the GIL) so it can await Python coroutines on the
 //! event loop; the shared [`Engine`] is `&self`-concurrent, held as an `Arc`, so
-//! no lock is taken across an `.await`.
+//! no lock is taken across an `.await` when no flow is open.
+//!
+//! # The async flow bridge (concurrent admission ordering)
+//!
+//! `active_flow` is an `Arc<tokio::sync::Mutex<Option<FlowHandle>>>` — an
+//! *async* mutex, never a blocking one, across the `execute_async` path. This is
+//! the serialization point conformance/README.md's "Async steps inside a flow"
+//! section specifies: `execute_async` acquires it with `.lock().await` (queuing
+//! FIFO, without parking an OS thread) before touching the handle, and holds the
+//! guard for the *entire* step — from `seq` admission (the first line of
+//! `FlowHandle::execute_step`) through the terminal record — so two effects
+//! `asyncio.gather`ed inside one flow are admitted, and therefore journaled, in
+//! the order their `execute_async` calls reach the handle, never in completion
+//! order. Outside a flow (`active_flow` is `None`) the lock is only held long
+//! enough to observe that, so unrelated Tier 1 `execute_async` calls still run
+//! fully concurrently — the serialization is a *flow* property, not a handle-wide
+//! one. The **synchronous** `execute`/`enter_flow`/`exit_flow`/`journal_time`/
+//! `journal_random` paths take the same lock via `blocking_lock()`, always
+//! wrapped in [`Python::detach`] first: a synchronous method that blocked on this
+//! mutex *while holding the GIL* could deadlock against an in-flight
+//! `execute_async` step that itself needs the GIL to invoke its Python effect
+//! callback (`invoke_async_effect`'s `Python::attach`) before it can release the
+//! mutex.
 //!
 //! # Envelope translation
 //!
@@ -58,6 +85,7 @@ use pyo3::types::PyBytes;
 use pythonize::{depythonize, pythonize};
 use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Mutex as AsyncMutex;
 
 pyo3::create_exception!(
     keel_core,
@@ -132,11 +160,12 @@ fn in_effect() -> bool {
     IN_EFFECT.with(Cell::get)
 }
 
-/// Lock a per-handle mutex, recovering the guard even if a previous holder
-/// panicked while holding it. The guarded state (the tokio runtime, or the
-/// active flow handle) remains valid after an unrelated panic, so one panic must
-/// not permanently brick the handle with an opaque `PanicException` on every
-/// later call (poisoned-mutex lock-out).
+/// Lock the per-handle `runtime` mutex, recovering the guard even if a previous
+/// holder panicked while holding it. The guarded runtime remains valid after an
+/// unrelated panic, so one panic must not permanently brick the handle with an
+/// opaque `PanicException` on every later call (poisoned-mutex lock-out).
+/// `active_flow` uses a `tokio::sync::Mutex` instead (never poisoned; see the
+/// module docs' "async flow bridge" section), so this only ever guards `runtime`.
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -335,10 +364,13 @@ fn status_str(status: FlowStatus) -> &'static str {
 /// over is read *live* from `engine.journal()` (the same store the engine
 /// caches through — a `configure` whose policy carries a `journal` location
 /// replaces it), and `active_flow` holds the [`FlowHandle`] between
-/// `enter_flow` and `exit_flow`. While a flow is active, `execute` routes each
-/// intercepted call through the handle's `execute_step` (journaled, replayable)
-/// instead of the bare engine — the front end drives the *same* `execute` API
-/// either way.
+/// `enter_flow` and `exit_flow`. While a flow is active, `execute`/`execute_async`
+/// route each intercepted call through the handle's `execute_step` (journaled,
+/// replayable) instead of the bare engine — the front end drives the *same*
+/// `execute`/`execute_async` API either way. `active_flow` is an async mutex
+/// (not `std::sync::Mutex`) specifically so `execute_async` can serialize
+/// concurrent awaited effects into a deterministic admission order without
+/// blocking an OS thread — see the module docs' "async flow bridge" section.
 #[pyclass(module = "keel_core")]
 struct KeelCore {
     engine: Arc<Engine>,
@@ -347,8 +379,10 @@ struct KeelCore {
     /// `advance_clock` is valid only on such a handle — advancing a real-time
     /// runtime panics tokio, so we refuse it precisely instead.
     paused: bool,
-    /// The flow currently open (between `enter_flow`/`exit_flow`), if any.
-    active_flow: Mutex<Option<FlowHandle>>,
+    /// The flow currently open (between `enter_flow`/`exit_flow`), if any. An
+    /// `Arc` so `execute_async`'s `'static` future can hold its own clone across
+    /// the `.await`.
+    active_flow: Arc<AsyncMutex<Option<FlowHandle>>>,
 }
 
 impl core::fmt::Debug for KeelCore {
@@ -387,7 +421,7 @@ impl KeelCore {
             engine: Arc::new(engine),
             runtime: Mutex::new(runtime),
             paused,
-            active_flow: Mutex::new(None),
+            active_flow: Arc::new(AsyncMutex::new(None)),
         })
     }
 
@@ -451,7 +485,12 @@ impl KeelCore {
         // or time/random read it triggers passes through instead of deadlocking.
         let outcome = py.detach(move || {
             let guard = lock_recover(runtime);
-            let mut flow = lock_recover(active);
+            // `blocking_lock` (never the async `.lock().await`, which would need
+            // an executor polling us) — safe here because we already released
+            // the GIL above, so we cannot deadlock an `execute_async` step that
+            // needs the GIL to invoke its Python effect before releasing this
+            // same lock (see the module docs' "async flow bridge" section).
+            let mut flow = active.blocking_lock();
             let effect_fn = async |attempt: u32| {
                 Python::attach(|py| {
                     let _in_effect = InEffectGuard::enter();
@@ -470,47 +509,53 @@ impl KeelCore {
     /// resolves to the outcome dict. `effect(attempt)` is awaited on the caller's
     /// asyncio loop, so it may be an `async def` performing real async IO.
     ///
-    /// Refuses (KEEL-E005, unsupported-configuration) if a durable flow is open:
-    /// async effects inside a flow are unsupported in v0.1 and would bypass the
-    /// journal (Tier 1 downgrade).
+    /// **The async flow bridge.** While a flow is open, this routes through the
+    /// active `FlowHandle` — journaled and replayable, exactly like the
+    /// synchronous `execute` — instead of silently downgrading to the bare
+    /// `Engine` (a Level 0 surprise the v0.1 KEEL-E005 refusal used to guard
+    /// against; that refusal is retired now that the bridge is real). The
+    /// admission rule (normative: conformance/README.md "Async steps inside a
+    /// flow") is enforced by `active_flow`'s async mutex: a call claims the
+    /// handle — and therefore its `seq` — the instant it acquires the lock, and
+    /// holds it until the step's terminal outcome is recorded, so two effects an
+    /// `asyncio.gather` awaits concurrently are admitted, and journaled, in the
+    /// order their calls *reach* the handle (FIFO on the lock), never in
+    /// completion order. Outside a flow the lock is only held long enough to see
+    /// `None`, so concurrent Tier 1 `execute_async` calls are unaffected.
     fn execute_async<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'py, PyAny>,
         effect: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Carried review (Task 16 → 17): an async intercepted call while a flow
-        // is open would run on the bare engine below — it does NOT route through
-        // the active `FlowHandle`, so it would be silently downgraded to Tier 1
-        // (never journaled, never replayed) inside a "durable" flow. That is a
-        // Level 0 surprise. Refuse precisely instead. v0.1 durable flows are
-        // synchronous-only; the async-in-flow seam is deliberately unsupported
-        // (see `keel_engine::flow` module docs). Checked (and dropped) before the
-        // awaitable is built, so the error is raised synchronously at call time.
-        if lock_recover(&self.active_flow).is_some() {
-            return Err(keel_error(
-                py,
-                "KEEL-E005",
-                "async effects inside durable flows are not supported in v0.1; this call would \
-                 bypass the flow journal and silently run as Tier 1. Run the flow synchronously \
-                 (no async def / await for intercepted calls inside the flow), or remove this \
-                 entrypoint from [flows]. trace: keel trace <flow-id>",
-            ));
-        }
         let request = decode_request(py, request)?;
         let engine = Arc::clone(&self.engine);
+        let active_flow = Arc::clone(&self.active_flow);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // A plain `FnMut` returning an OWNED-capture `async move` future
             // (each attempt gets its own `Py` clone). This keeps the per-attempt
             // future `'static` + `Send`, sidestepping the HRTB "Send is not
             // general enough" that an `async` closure borrowing state triggers
-            // inside `future_into_py`'s `Send` future.
-            let outcome = engine
-                .execute(&request, move |attempt: u32| {
-                    let effect = Python::attach(|py| effect.clone_ref(py));
-                    async move { invoke_async_effect(&effect, attempt).await }
-                })
-                .await;
+            // inside `future_into_py`'s `Send` future. Passed to whichever of
+            // `execute_step`/`engine.execute` below actually runs — the other
+            // branch never touches it.
+            let effect_fn = move |attempt: u32| {
+                let effect = Python::attach(|py| effect.clone_ref(py));
+                async move { invoke_async_effect(&effect, attempt).await }
+            };
+            // Admission: acquire the flow lock ASYNCHRONOUSLY — `.lock().await`
+            // queues fairly without parking an OS thread, so a second concurrent
+            // call waits on the executor, not by blocking a worker. Only the
+            // `Some` arm holds the guard across the step; the `None` arm drops it
+            // immediately so unrelated concurrent calls are never serialized by a
+            // flow that isn't theirs.
+            let mut guard = active_flow.lock().await;
+            let outcome = if let Some(handle) = guard.as_mut() {
+                handle.execute_step(&request, effect_fn).await
+            } else {
+                drop(guard);
+                engine.execute(&request, effect_fn).await
+            };
             Python::attach(|py| outcome_to_py(py, &outcome))
         })
     }
@@ -611,7 +656,10 @@ impl KeelCore {
             "status": status_str(handle.entry_status()),
             "replay": handle.is_replay_only(),
         });
-        *lock_recover(&self.active_flow) = Some(handle);
+        // Detached: `blocking_lock` while holding the GIL could deadlock an
+        // in-flight `execute_async` step that needs the GIL to invoke its
+        // Python effect before it can release this same lock (module docs).
+        py.detach(|| *self.active_flow.blocking_lock() = Some(handle));
         pythonize(py, &info)
             .map(Bound::unbind)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("flow info not encodable: {e}")))
@@ -632,7 +680,8 @@ impl KeelCore {
                 ));
             }
         };
-        let handle = lock_recover(&self.active_flow).take();
+        // Detached for the same deadlock-avoidance reason as `enter_flow`.
+        let handle = py.detach(|| self.active_flow.blocking_lock().take());
         if let Some(mut handle) = handle {
             handle.complete(final_status);
             // `handle` drops here, aborting the heartbeat task.
@@ -654,13 +703,24 @@ impl KeelCore {
         if in_effect() {
             return Ok(now_ms);
         }
-        let mut guard = lock_recover(&self.active_flow);
-        let handle = guard
-            .as_mut()
-            .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_time called outside a flow"))?;
-        handle
-            .journal_time(key, now_ms)
-            .map_err(|e| keel_error_from(py, &e))
+        // Detached: see the module docs' "async flow bridge" section — a
+        // synchronous method that blocked on this lock while holding the GIL
+        // could deadlock an in-flight `execute_async` step that needs the GIL to
+        // invoke its Python effect before it can release this same lock.
+        let result = py.detach(|| {
+            let mut guard = self.active_flow.blocking_lock();
+            guard
+                .as_mut()
+                .map(|handle| handle.journal_time(key, now_ms))
+        });
+        match result {
+            Some(inner) => inner.map_err(|e| keel_error_from(py, &e)),
+            None => Err(keel_error(
+                py,
+                "KEEL-E040",
+                "journal_time called outside a flow",
+            )),
+        }
     }
 
     /// Journal (or substitute) a virtualized random draw under `key` (e.g.
@@ -675,14 +735,23 @@ impl KeelCore {
         if in_effect() {
             return Ok(PyBytes::new(py, &data));
         }
-        let mut guard = lock_recover(&self.active_flow);
-        let handle = guard
-            .as_mut()
-            .ok_or_else(|| keel_error(py, "KEEL-E040", "journal_random called outside a flow"))?;
-        let out = handle
-            .journal_random(key, data)
-            .map_err(|e| keel_error_from(py, &e))?;
-        Ok(PyBytes::new(py, &out))
+        // Detached: same deadlock-avoidance reason as `journal_time`.
+        let result = py.detach(|| {
+            let mut guard = self.active_flow.blocking_lock();
+            guard
+                .as_mut()
+                .map(|handle| handle.journal_random(key, data))
+        });
+        match result {
+            Some(inner) => inner
+                .map(|out| PyBytes::new(py, &out))
+                .map_err(|e| keel_error_from(py, &e)),
+            None => Err(keel_error(
+                py,
+                "KEEL-E040",
+                "journal_random called outside a flow",
+            )),
+        }
     }
 }
 

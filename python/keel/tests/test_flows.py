@@ -1,19 +1,29 @@
 """Tier 2 flow designation and the durable-flow run path (dx-spec §1 Level 2).
 
-Three layers:
+Four layers:
   * pure parsing/matching (`extract_flow_entrypoints`, `match_flow`),
   * the `run_as_flow` orchestration + time/random virtualization against a fake
-    backend (no native module needed — CI's no-wheel path),
-  * the native binding replay round-trip (skips without the built `keel_core`).
+    backend (no native module needed — CI's no-wheel path), including an
+    `async def` flow body run via `asyncio.run`,
+  * the native binding replay round-trip (skips without the built `keel_core`),
+  * the async `execute_step` bridge: concurrent `asyncio.gather`ed effects
+    inside one flow serialize in admission order and a crash (dropped handle,
+    no `exit_flow`) resumes correctly on a fresh `KeelCore` over the same
+    journal — the kill-9 shape, mirroring
+    `crash_after_step_three_resumes_substituting_completed_steps` in
+    `crates/keel-core/tests/flows.rs`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from typing import Any
 
 from keel import _flow
 from keel._policy import FlowEntrypoint, extract_flow_entrypoints
@@ -290,6 +300,41 @@ class RunAsFlowTest(unittest.TestCase):
         self.assertIs(time.time, orig_time, "time.time restored on flow exit")
         self.assertIs(random.random, orig_random, "random.random restored on flow exit")
 
+    def test_async_flow_body_runs_via_asyncio_run(self) -> None:
+        # An `async def` entrypoint is driven by `asyncio.run`, not called
+        # bare (which would just build a coroutine object and never run it).
+        entry = self._module(
+            "flowmod_async_ok",
+            """
+            import asyncio
+
+            async def main():
+                await asyncio.sleep(0)
+                globals()["RAN"] = True
+            """,
+        )
+        backend = _FakeFlowBackend()
+        _flow.run_as_flow(
+            str(self.dir / "flowmod_async_ok.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+        )
+        self.assertEqual(backend.exited, ["completed"])
+        self.assertTrue(sys.modules["flowmod_async_ok"].RAN, "the coroutine actually ran")
+
+    def test_async_flow_body_failure_marks_flow_failed_and_reraises(self) -> None:
+        entry = self._module(
+            "flowmod_async_boom",
+            """
+            async def main():
+                raise ValueError("async boom")
+            """,
+        )
+        backend = _FakeFlowBackend()
+        with self.assertRaises(ValueError):
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_async_boom.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
+            )
+        self.assertEqual(backend.exited, ["failed"])
+
     def test_stub_backend_is_precise_unsupported_error(self) -> None:
         entry = FlowEntrypoint("py:pipeline:main", "pipeline", "main")
 
@@ -371,25 +416,185 @@ class NativeFlowReplayTest(unittest.TestCase):
             core.enter_flow("py:pipeline:main", "ah-1")
         self.assertEqual(ctx.exception.code, "KEEL-E040")
 
-    def test_async_effect_in_flow_is_refused(self) -> None:
-        """Carried fix #1: an async intercepted call while a flow is open must be
-        refused (KEEL-E005), synchronously, rather than silently downgraded to
-        Tier 1 by running on the bare engine outside the FlowHandle."""
+    def test_async_effect_in_flow_is_journaled_and_replays(self) -> None:
+        """The async execute_step bridge: an awaited intercepted call while a
+        flow is open routes through the SAME FlowHandle a synchronous call
+        would, so it is journaled and — on a rerun of a completed flow —
+        replayed without re-firing (mirrors
+        test_completed_flow_replays_without_refiring_effects, async leg)."""
         core = self._core()
+        fires = {"n": 0}
 
-        async def eff(_attempt):  # pragma: no cover - never awaited (guard fires first)
-            return {"status": "ok"}
+        async def eff(_attempt):
+            fires["n"] += 1
+            return {"status": "ok", "payload": {"i": fires["n"]}}
 
-        core.enter_flow("py:pipeline:main", "ah-async", code_hash="ch-1")
-        try:
-            with self.assertRaises(keel_core.KeelCoreError) as ctx:
-                core.execute_async(
-                    {"v": 1, "target": "api.x", "op": "api.x", "idempotent": True}, eff
+        async def run_once() -> None:
+            core.enter_flow("py:pipeline:main", "ah-async-ok", code_hash="ch-1")
+            for i in range(3):
+                out = await core.execute_async(
+                    {
+                        "v": 1,
+                        "target": "api.x",
+                        "op": "api.x",
+                        "args_hash": f"h{i}",
+                        "idempotent": True,
+                    },
+                    eff,
                 )
-            self.assertEqual(ctx.exception.code, "KEEL-E005")
-            self.assertIn("durable flow", str(ctx.exception).lower())
-        finally:
+                self.assertEqual(out["result"], "ok")
             core.exit_flow("completed")
+
+        asyncio.run(run_once())
+        self.assertEqual(fires["n"], 3)
+
+        async def replay_once() -> list[object]:
+            info = core.enter_flow("py:pipeline:main", "ah-async-ok", code_hash="ch-1")
+            self.assertTrue(info["replay"])
+            payloads = []
+            for i in range(3):
+                out = await core.execute_async(
+                    {
+                        "v": 1,
+                        "target": "api.x",
+                        "op": "api.x",
+                        "args_hash": f"h{i}",
+                        "idempotent": True,
+                    },
+                    eff,
+                )
+                payloads.append(out["payload"])
+            core.exit_flow("completed")
+            return payloads
+
+        payloads = asyncio.run(replay_once())
+        self.assertEqual(payloads, [{"i": 1}, {"i": 2}, {"i": 3}])
+        self.assertEqual(fires["n"], 3, "replay fired no async effects")
+
+    def test_concurrent_async_effects_serialize_in_admission_order(self) -> None:
+        """Normative (conformance/README.md "Async steps inside a flow"): the
+        open flow handle admits one step at a time, so `asyncio.gather`ed
+        effects never run concurrently and are journaled in the order their
+        calls reach the handle. Creation is staggered with small real sleeps
+        so each call is already admitted (or queued behind an admitted call)
+        before the next is even created — this is a genuinely real-time async
+        bridge (no virtual clock on this path), so a real sleep is required to
+        pin admission order deterministically rather than racing three tasks
+        onto a multi-threaded tokio runtime."""
+        core = self._core()
+        active = {"n": 0}
+        max_active = {"n": 0}
+        finished: list[int] = []
+
+        def make_eff(i: int, sleep_s: float):
+            async def eff(_attempt):
+                active["n"] += 1
+                max_active["n"] = max(max_active["n"], active["n"])
+                await asyncio.sleep(sleep_s)
+                active["n"] -= 1
+                finished.append(i)
+                return {"status": "ok", "payload": {"i": i}}
+
+            return eff
+
+        async def call(i: int, sleep_s: float):
+            return await core.execute_async(
+                {
+                    "v": 1,
+                    "target": "api.x",
+                    "op": "api.x",
+                    "args_hash": f"h{i}",
+                    "idempotent": True,
+                },
+                make_eff(i, sleep_s),
+            )
+
+        async def run_once():
+            core.enter_flow("py:pipeline:main", "ah-async-concurrent", code_hash="ch-1")
+            # Sleep durations DECREASE with index: if effects ran unserialized
+            # they would FINISH out of admission order (2, 1, 0); serialization
+            # instead forces each to finish before the next is even admitted.
+            t0 = asyncio.ensure_future(call(0, 0.03))
+            await asyncio.sleep(0.01)
+            t1 = asyncio.ensure_future(call(1, 0.02))
+            await asyncio.sleep(0.01)
+            t2 = asyncio.ensure_future(call(2, 0.01))
+            results = await asyncio.gather(t0, t1, t2)
+            core.exit_flow("completed")
+            return results
+
+        results = asyncio.run(run_once())
+        self.assertEqual(max_active["n"], 1, "no two admitted effects ever run concurrently")
+        self.assertEqual(finished, [0, 1, 2], "each effect finishes before the next is admitted")
+        self.assertEqual([r["payload"] for r in results], [{"i": 0}, {"i": 1}, {"i": 2}])
+
+    def test_async_flow_crash_and_resume_substitutes_completed_steps(self) -> None:
+        """The kill-9 shape for the async bridge: two concurrent async steps
+        complete and are journaled, the handle is dropped WITHOUT `exit_flow`
+        (the crash `FlowHandle::drop` documents — left `running` with its
+        lease), and a FRESH `KeelCore` opened over the same on-disk journal
+        resumes the flow: the two completed steps substitute (their effects
+        never re-fire) and a third, new step runs live. Mirrors
+        `crash_after_step_three_resumes_substituting_completed_steps` in
+        crates/keel-core/tests/flows.rs, adapted to the async bridge."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        journal_path = str(Path(tmp.name) / "journal.db")
+        fires = {"n": 0}
+
+        def make_eff(payload_i: int):
+            async def eff(_attempt):
+                fires["n"] += 1
+                return {"status": "ok", "payload": {"i": payload_i}}
+
+            return eff
+
+        async def call(core: Any, i: int):
+            return await core.execute_async(
+                {
+                    "v": 1,
+                    "target": "api.x",
+                    "op": "api.x",
+                    "args_hash": f"h{i}",
+                    "idempotent": True,
+                },
+                make_eff(i),
+            )
+
+        async def run1() -> list[object]:
+            core1 = keel_core.KeelCore(journal_path=journal_path)
+            core1.configure({})
+            core1.enter_flow("py:pipeline:main", "ah-async-crash", code_hash="ch-1")
+            t0 = asyncio.ensure_future(call(core1, 0))
+            await asyncio.sleep(0.01)
+            t1 = asyncio.ensure_future(call(core1, 1))
+            results = await asyncio.gather(t0, t1)
+            return results
+            # core1 (and its FlowHandle) fall out of scope here uncompleted —
+            # no exit_flow — modeling a `kill -9`: the flow stays `running`.
+
+        first = asyncio.run(run1())
+        gc.collect()  # deterministically drop core1's FlowHandle/journal now
+        self.assertEqual(fires["n"], 2, "two live steps before the crash")
+        self.assertEqual([r["payload"] for r in first], [{"i": 0}, {"i": 1}])
+
+        async def run2() -> list[object]:
+            core2 = keel_core.KeelCore(journal_path=journal_path)
+            core2.configure({})
+            info = core2.enter_flow("py:pipeline:main", "ah-async-crash", code_hash="ch-1")
+            self.assertFalse(info["replay"], "an uncompleted flow resumes live, not a pure replay")
+            t0 = asyncio.ensure_future(call(core2, 0))
+            await asyncio.sleep(0.01)
+            t1 = asyncio.ensure_future(call(core2, 1))
+            await asyncio.sleep(0.01)
+            t2 = asyncio.ensure_future(call(core2, 2))
+            results = await asyncio.gather(t0, t1, t2)
+            core2.exit_flow("completed")
+            return results
+
+        second = asyncio.run(run2())
+        self.assertEqual(fires["n"], 3, "steps 1-2 substituted from the journal; only step 3 ran live")
+        self.assertEqual([r["payload"] for r in second], [{"i": 0}, {"i": 1}, {"i": 2}])
 
 
 if __name__ == "__main__":

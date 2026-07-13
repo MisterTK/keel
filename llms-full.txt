@@ -68,9 +68,12 @@ re-fire); the rest run live. `keel flows` lists resumable/completed flows;
 `random.random` reads inside a flow are virtualized so a resumed run sees the
 same values.
 
-v0.1 limits (precise, never silent): a flow needs a journal (native core), and
-flow bodies are synchronous-only — an async intercepted call inside a flow is
-refused (KEEL-E005) rather than silently downgraded to Tier 1.
+v0.1 limits (precise, never silent): a flow needs a journal (native core).
+Async flow bodies are supported: an `async def` entrypoint's awaited
+intercepted calls route through the same open flow handle as a synchronous
+flow's, journaled identically; concurrent awaited effects (`asyncio.gather`)
+are admitted — and journaled — in the order their calls reach the handle,
+never in completion order.
 
 ### Level 3 — fleet
 
