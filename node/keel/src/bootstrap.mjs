@@ -20,6 +20,8 @@ import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
 import { resolveDevCache } from "./packs/llm.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
+import { evePack } from "./packs/eve.mjs";
+import { aiSdkPack } from "./packs/ai-sdk.mjs";
 
 export function isDisabled(env = process.env) {
   return isTruthy(env.KEEL_DISABLE);
@@ -49,22 +51,50 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   // Framework packs: auto-detect and wrap MCP client transports if present.
   // Best-effort — an absent SDK is a silent no-op; never fatal.
   const mcp = await installMcpPack({ cwd });
+  // eve and ai-sdk are detection-only at this seam: neither patches anything
+  // (eve's `tool:` targets are wrapped by the loader below, from source; the
+  // ai-sdk seam is the user's own explicit `wrapLanguageModel` call — nothing
+  // for the bootstrap to install). `detect()` never throws by construction,
+  // but every pack surface stays best-effort here too — a detection bug must
+  // never be fatal to `keel run`.
+  let eveDetection = { matched: false };
+  let aiSdkDetection = { matched: false };
+  try {
+    eveDetection = evePack({ cwd }).detect();
+  } catch {
+    /* best-effort — an eve-detection bug must never break the run */
+  }
+  try {
+    aiSdkDetection = aiSdkPack({ cwd }).detect();
+  } catch {
+    /* best-effort — an ai-sdk-detection bug must never break the run */
+  }
 
   const functionTargets = extractFunctionTargets(policy);
   const wrappable = functionTargets.filter((t) => t.fn);
-  if (wrappable.length > 0) {
+  if (wrappable.length > 0 || eveDetection.matched) {
     register("./loader.mjs", import.meta.url, {
       data: {
         functionTargets: wrappable,
         cwd,
         runtimeUrl: new URL("./loader-runtime.mjs", import.meta.url).href,
+        eveEnabled: eveDetection.matched,
       },
     });
   }
 
   installExitFlush(discovery);
-  banner(env, source, wrappable.length, mcp);
-  return { enabled: true, backend, discovery, functionTargets, uninstallFetch, mcp };
+  banner(env, source, wrappable.length, mcp, eveDetection, aiSdkDetection);
+  return {
+    enabled: true,
+    backend,
+    discovery,
+    functionTargets,
+    uninstallFetch,
+    mcp,
+    eve: eveDetection,
+    aiSdk: aiSdkDetection,
+  };
 }
 
 /**
@@ -111,11 +141,13 @@ export function installExitFlush(discovery, { proc = process } = {}) {
   return flush;
 }
 
-function banner(env, source, fnCount, mcp) {
+function banner(env, source, fnCount, mcp, eve, aiSdk) {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
   if (mcp?.active) seams.push("mcp: transports");
+  if (eve?.matched) seams.push("eve tool modules");
+  if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
   const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
   process.stderr.write(
     `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`

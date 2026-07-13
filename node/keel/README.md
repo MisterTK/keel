@@ -153,6 +153,15 @@ The real `ai` package is **not** a dependency; the middleware only implements th
 `LanguageModelV2` middleware shape (pinned in `fixtures/ai-sdk-model.d.ts`,
 mirroring `ai@5.0.0`).
 
+**All four core generation ops are covered by these two hooks.** `ai`'s
+`LanguageModelV2Middleware` exposes exactly `wrapGenerate`/`wrapStream` —
+`generateObject`/`streamObject` are built on the same `doGenerate`/`doStream`
+calls as `generateText`/`streamText` (object mode is a `responseFormat` value
+inside `params`, opaque to Keel except as a dev-cache key), so there is no
+third or fourth middleware hook to implement. The streaming rule above applies
+identically to `streamObject`: retried only before the first chunk/token,
+never mid-stream.
+
 ### MCP transports — `mcp:<server>`
 
 When the MCP client SDK (`@modelcontextprotocol/sdk`) is present, the bootstrap
@@ -179,6 +188,45 @@ one seam covers both. Each request routes through the backend as target
 - The patch is reversible (`uninstall = remove the package`). The real SDK is not
   a dependency; the wrapped shape is pinned in `fixtures/mcp-client.d.ts`
   (mirroring `@modelcontextprotocol/sdk@1.29.0`).
+
+### Vercel eve — `tool:<name>`
+
+[eve](https://github.com/vercel/eve) is filesystem-first: an agent is a
+directory of `tools/`/`skills`/`channels`/`schedules`, and each tool is a
+module built with eve's own `defineTool()` helper:
+
+```ts
+// agent/tools/get_weather.ts
+import { defineTool } from "eve/tools";
+export default defineTool({
+  description: "…",
+  async execute({ city }) { /* … */ },
+});
+```
+
+eve reaches the world two ways, and Keel covers both, with zero eve-specific
+code needed for the first:
+
+- **MCP round-trips** — eve talks to MCP servers through the same
+  `@modelcontextprotocol/sdk` `Client` the `mcp:` pack above already patches,
+  so they're wrapped the moment that SDK is detected, eve or not.
+- **Tool modules** — when eve is detected, the bootstrap arms an ESM loader
+  rewrite (the same mechanism `ts:` function targets use) that intercepts the
+  canonical `import { defineTool } from "eve/tools"` line in a tool module and
+  wraps its `execute` function, so it routes through the backend as target
+  `tool:<name>` (`<name>` = the tool file's basename) before eve ever calls it.
+  Only that exact, unaliased import form is rewritten — anything else is left
+  untouched (a documented v0.1 simplification, like `ts:` targets).
+
+`tool:` calls are **non-idempotent by default** — unlike a `ts:` target (where
+listing it in `keel.toml` is itself the safety assertion), eve discovers tools
+automatically with no such opt-in, so a failure is observed, not retried
+(KEEL-E014), mirroring the `mcp:` pack's `tools/call` default; a target may
+still opt in via its own `retry.on`. Never dev-cached (tool calls can be
+side-effecting).
+
+Keel does **not** wrap eve's own conversation-level durability/checkpointing —
+it hardens the effects *inside* each step, which is a different layer.
 
 ## Errors and the `keelOutcome` attachment
 
