@@ -28,7 +28,8 @@ the CLI and **Tier 2 durable flows with crash resume**:
   requests adapters, `llm:openai`/`llm:anthropic` packs with the dev cache, and
   durable-flow designation from `[flows]`.
 - **Node front end** (`node/keel`): loader + `fetch`/undici interception,
-  AI-SDK middleware, `mcp:`/`llm:` packs, discovery.
+  AI-SDK middleware, `mcp:`/`llm:` packs, `pg`/`ioredis`/`mysql2` database
+  adapters, discovery.
 - **CLI** (`crates/keel-cli`): `run · init · doctor · status · explain · flows ·
   trace`, every command with a deterministic `--json` twin.
 - **Tier 2**: durable flows in the core + Python front end; `kill -9` a flow
