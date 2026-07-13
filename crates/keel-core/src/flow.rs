@@ -85,6 +85,11 @@ const BRANCH_SEQ_BASE: u64 = 1_000_000;
 const ATTEMPT_SEQ: u64 = 0;
 /// The step key of the reserved resume-counter marker.
 const ATTEMPT_KEY: &str = "flow:attempt";
+/// The field carrying an adapter-injected idempotency key inside a `running`
+/// step record's schema-tagged payload (contracts/adapter-pack.md
+/// "Idempotency-key injection" rule 3: the minted key is journaled with the
+/// step, and a resume that re-executes a crashed step injects the SAME key).
+const IDEMPOTENCY_KEY_FIELD: &str = "idempotency_key";
 
 use crate::engine::Engine;
 
@@ -533,6 +538,27 @@ impl FlowHandle {
     where
         F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
     {
+        self.execute_step_with_idempotency_key(request, None, effect)
+            .await
+    }
+
+    /// [`execute_step`](Self::execute_step), carrying the idempotency key the
+    /// adapter minted and injected for this call (contracts/adapter-pack.md
+    /// "Idempotency-key injection", rule 3). The key is journaled in the step's
+    /// `running` record, so a resume that re-executes a crashed step can read it
+    /// back ([`recorded_idempotency_key`](Self::recorded_idempotency_key)) and
+    /// inject the SAME key — making the at-least-once re-execution deduplicable
+    /// on the provider side. The key never feeds the step key (`args_hash` is
+    /// unchanged by injection), so replay matching is unaffected.
+    pub async fn execute_step_with_idempotency_key<F>(
+        &mut self,
+        request: &Request,
+        idempotency_key: Option<&str>,
+        effect: F,
+    ) -> Outcome
+    where
+        F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
+    {
         self.seq += 1;
         let seq = self.seq;
         let key = Self::step_key(request);
@@ -549,13 +575,47 @@ impl FlowHandle {
         match plan {
             StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
             StepPlan::Diverged { recorded } => {
-                self.on_divergence(seq, &recorded, &key, request, effect)
+                self.on_divergence(seq, &recorded, &key, request, idempotency_key, effect)
                     .await
             }
             StepPlan::Live => {
-                self.run_live(seq, &key, StepKind::Effect, request, effect)
+                self.run_live(seq, &key, StepKind::Effect, request, idempotency_key, effect)
                     .await
             }
+        }
+    }
+
+    /// The idempotency key recorded for the flow's NEXT step, when that record
+    /// is a crashed (`running`) step under the same `step_key` — the
+    /// resume-reuse read of contracts/adapter-pack.md "Idempotency-key
+    /// injection" rule 3. Adapters call this *before* executing an injectable
+    /// step: `Some(key)` means a previous run crashed mid-step after minting
+    /// `key`, and re-executing with the SAME key lets the provider deduplicate
+    /// the at-least-once re-execution. `None` — mint fresh — on a fresh step, a
+    /// terminal record (the step will be substituted, no key is sent), a
+    /// diverging key, an abandoned replay, a pure-replay handle, or a journal
+    /// read failure (resilience first).
+    #[must_use]
+    pub fn recorded_idempotency_key(&self, step_key: &str) -> Option<String> {
+        if self.replay_abandoned || self.replay_only {
+            return None;
+        }
+        let key = StepKey::new(step_key);
+        match self.journal.step_at(&self.flow_id, self.seq + 1) {
+            Ok(Some((recorded, outcome)))
+                if recorded == key && outcome.status == StepStatus::Running =>
+            {
+                outcome
+                    .payload
+                    .as_deref()
+                    .and_then(decode_payload)
+                    .and_then(|v| {
+                        v.get(IDEMPOTENCY_KEY_FIELD)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            }
+            _ => None,
         }
     }
 
@@ -578,6 +638,7 @@ impl FlowHandle {
         recorded: &StepKey,
         observed: &StepKey,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -600,7 +661,8 @@ impl FlowHandle {
             mode,
             preserve,
         };
-        self.branch_and_continue(div, request, effect).await
+        self.branch_and_continue(div, request, idempotency_key, effect)
+            .await
     }
 
     /// Journal a branch `marker` and re-execute the divergent step live, then
@@ -609,6 +671,7 @@ impl FlowHandle {
         &mut self,
         div: Divergence<'_>,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -616,8 +679,15 @@ impl FlowHandle {
     {
         self.journal_branch_marker(&div);
         let live_seq = self.seq;
-        self.run_live(live_seq, div.observed, StepKind::Effect, request, effect)
-            .await
+        self.run_live(
+            live_seq,
+            div.observed,
+            StepKind::Effect,
+            request,
+            idempotency_key,
+            effect,
+        )
+        .await
     }
 
     /// Journal the branch marker, abandon replay, and advance the cursor to the
@@ -753,12 +823,18 @@ impl FlowHandle {
 
     /// Journal a `running` step, run the effect through the engine, and record
     /// the terminal outcome *before* returning it (at-least-once honesty).
+    /// An adapter-injected `idempotency_key` is journaled IN the `running`
+    /// record (payload `{"idempotency_key": …}`), so a resume that re-executes
+    /// this step after a crash reads the same key back
+    /// ([`recorded_idempotency_key`](Self::recorded_idempotency_key)); the
+    /// terminal record replaces the payload with the outcome as before.
     async fn run_live<F>(
         &mut self,
         seq: u64,
         key: &StepKey,
         kind: StepKind,
         request: &Request,
+        idempotency_key: Option<&str>,
         effect: F,
     ) -> Outcome
     where
@@ -783,7 +859,8 @@ impl FlowHandle {
                 kind,
                 attempt: 0,
                 status: StepStatus::Running,
-                payload: None,
+                payload: idempotency_key
+                    .and_then(|k| encode_payload(&json!({ (IDEMPOTENCY_KEY_FIELD): k }))),
                 error_class: None,
                 started_at,
                 ended_at: None,

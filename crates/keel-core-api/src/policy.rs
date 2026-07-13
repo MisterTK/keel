@@ -533,6 +533,11 @@ pub struct ResolvedPolicy {
     pub breaker: Option<BreakerPolicy>,
     pub rate: Option<Rate>,
     pub cache: Option<CachePolicy>,
+    /// `idempotency = { header }` — the knob adapters consult to *inject* a
+    /// minted idempotency key on unsafe-method calls (and to recognize a
+    /// caller-supplied one). The core itself never injects; injection lives in
+    /// the adapter per contracts/adapter-pack.md ("Idempotency-key injection").
+    pub idempotency: Option<IdempotencyPolicy>,
 }
 
 impl Policy {
@@ -543,6 +548,7 @@ impl Policy {
             breaker: self.layer(target, |t| t.breaker.as_ref()).cloned(),
             rate: self.layer(target, |t| t.rate.as_ref()).copied(),
             cache: self.layer(target, |t| t.cache.as_ref()).cloned(),
+            idempotency: self.layer(target, |t| t.idempotency.as_ref()).cloned(),
         }
     }
 
@@ -710,6 +716,45 @@ mod tests {
         // A journal string that matches neither `file:` nor `postgres://` fails.
         let bad = json!({ "journal": "sqlite:/tmp/x.db" });
         assert!(serde_path_to_error::deserialize::<_, Policy>(&bad).is_err());
+    }
+
+    #[test]
+    fn idempotency_resolves_like_any_other_layer() {
+        // The `idempotency` layer must surface through `resolve()` so adapters
+        // (via the front ends) and the engine can honor the injection contract
+        // (contracts/adapter-pack.md "Idempotency-key injection").
+        let doc = json!({
+            "defaults": {
+                "outbound": { "idempotency": { "header": "X-Idem" } },
+                "llm": { "idempotency": { "header": "X-Llm-Idem" } }
+            },
+            "target": {
+                "api.stripe.com": { "idempotency": { "header": "Idempotency-Key" } },
+                "api.plain.example": { "timeout": "1s" }
+            }
+        });
+        let policy: Policy = serde_path_to_error::deserialize(&doc).unwrap();
+
+        // Exact target entry wins.
+        let stripe = policy.resolve("api.stripe.com");
+        assert_eq!(
+            stripe.idempotency.as_ref().map(|i| i.header.as_str()),
+            Some("Idempotency-Key")
+        );
+        // llm:* falls to defaults.llm, then anything else to defaults.outbound.
+        let llm = policy.resolve("llm:openai");
+        assert_eq!(
+            llm.idempotency.as_ref().map(|i| i.header.as_str()),
+            Some("X-Llm-Idem")
+        );
+        let plain = policy.resolve("api.plain.example");
+        assert_eq!(
+            plain.idempotency.as_ref().map(|i| i.header.as_str()),
+            Some("X-Idem")
+        );
+        // No idempotency anywhere: resolves to None.
+        let empty: Policy = serde_path_to_error::deserialize(&json!({})).unwrap();
+        assert!(empty.resolve("api.stripe.com").idempotency.is_none());
     }
 
     #[test]
