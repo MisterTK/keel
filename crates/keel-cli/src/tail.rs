@@ -129,7 +129,7 @@ pub fn run(
         if cursor.is_none() {
             match select_run(&dir, opts.run.as_deref())? {
                 Some(path) => {
-                    cursor = Some(Cursor::open(&path).map_err(|e| unreadable(&path, &e))?)
+                    cursor = Some(Cursor::open(&path).map_err(|e| unreadable(&path, &e))?);
                 }
                 None if !opts.follow => return Err(no_runs()),
                 None => {
@@ -314,7 +314,7 @@ fn fmt_clock(ms: u64) -> String {
 fn fmt_wait(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
-    } else if ms % 1000 == 0 {
+    } else if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
         format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
@@ -335,10 +335,6 @@ fn fmt_attempts(n: u64) -> String {
 /// (green ok / yellow degradation / red failure). Unknown event kinds render
 /// generically (dim verb, no detail) — the vocabulary may grow. Returns
 /// `None` only when the line has no `ms`/`event` envelope at all.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per event kind; splitting it would hide the vocabulary"
-)]
 fn human_line(event: &Value, color: bool) -> Option<String> {
     let ms = event.get("ms").and_then(Value::as_u64)?;
     let kind = event.get("event").and_then(Value::as_str)?;
