@@ -65,6 +65,38 @@ def run_target(
     # sees the same argv[0] and byte-identical behavior.
     sys.argv = [target, *args]
 
+    # `keel sim <plan>`: adapter-level fault injection driven by a declarative
+    # plan (docs/sim-format.md). Wired BEFORE the recording tee below so that,
+    # if a run is somehow both simulated and recorded, the recording captures
+    # what actually happened (including any injected faults) rather than the
+    # pristine outcome underneath.
+    if state is not None and state.get("enabled") and env.get("KEEL_SIM_PLAN"):
+        from . import _runtime
+        from ._sim import install_sim
+
+        state["backend"] = install_sim(state["backend"], plan_path=env["KEEL_SIM_PLAN"], env=env)
+        _runtime.set_runtime(state["backend"], state.get("discovery"))
+
+    # `keel record run`: tee every intercepted effect into a recording file
+    # (docs/recording-format.md). A pure observer — never changes what a
+    # wrapped call sees — so installing it this late (right before the target
+    # actually runs) is safe.
+    if state is not None and state.get("enabled") and env.get("KEEL_RECORD"):
+        from . import _runtime
+        from ._record import install_recording
+
+        state["backend"] = install_recording(
+            state["backend"],
+            path=env["KEEL_RECORD"],
+            target=target,
+            args=list(args),
+            env=env,
+        )
+        # Actually make the tee the live runtime backend — every wrapper
+        # (`py:`/`ts:` functions, httpx/requests/…) reads `_runtime.get_backend()`
+        # dynamically, not the `state` dict `install_keel` returned.
+        _runtime.set_runtime(state["backend"], state.get("discovery"))
+
     # Tier 2: if this script is a designated flow entrypoint, run it as a durable
     # flow (enter/replay/complete via the native backend) rather than a plain
     # script. Otherwise fall through to normal `python <target>` execution.

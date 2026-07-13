@@ -1,0 +1,47 @@
+# Build config for a pip-installable `keel` CLI distribution — maturin's `bin`
+# bindings (auto-detected: this crate has a [[bin]] target and neither a pyo3
+# dependency nor a cdylib target — see crates/keel-cli/Cargo.toml) compile the
+# `keel` binary and place it under the wheel's `<pkg>.data/scripts/` directory,
+# where pip/uv/uvx put it on PATH. No Python glue, no libpython link: one
+# prebuilt binary per platform — NFR5's "static Rust binary" promise, shipped
+# through pip as well as `cargo install`.
+#
+# This is a SEPARATE distribution from crates/keel-py (which ships the
+# `keel_core` native extension module via pyo3): the CLI needs no pyo3
+# bindings, and maturin does not support mixing `bin` and cdylib/pyo3 targets
+# in one project. Naming follows docs/naming-decision.md's crates.io
+# recommendation: `keel-cli` ships the `keel` binary, mirroring
+# `cargo install keel-cli` giving `keel` on PATH.
+#
+# Local verification (one distribution short of the literal
+# docs/sprint-plan.md release-gate command `uvx keel run` — that spelling
+# needs the PyPI name `keel` itself, blocked on docs/naming-decision.md):
+#
+#   python3 -m venv /tmp/keel-cli-build && . /tmp/keel-cli-build/bin/activate
+#   pip install 'maturin>=1.7,<2'
+#   maturin build --release -m crates/keel-cli/Cargo.toml -o dist
+#   uvx --from ./dist/keel_cli-*.whl keel --help
+#   uvx --from ./dist/keel_cli-*.whl keel explain KEEL-E011 --json
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+# Distribution name; the installed EXECUTABLE name is `keel` (the [[bin]] name
+# in Cargo.toml). Version is read from the crate (workspace version) —
+# scripts/check-versions.py asserts this file stays `dynamic`, same rule as
+# crates/keel-py/pyproject.toml.
+name = "keel-cli"
+license = "Apache-2.0"
+dynamic = ["version"]
+description = "The keel CLI (run | init | doctor | status | explain | flows | trace) as a prebuilt binary — no Rust toolchain required to install it."
+requires-python = ">=3.8"
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Rust",
+    "Environment :: Console",
+]
+
+[tool.maturin]
+bindings = "bin"
+strip = true

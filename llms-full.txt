@@ -68,14 +68,19 @@ re-fire); the rest run live. `keel flows` lists resumable/completed flows;
 `random.random` reads inside a flow are virtualized so a resumed run sees the
 same values.
 
-v0.1 limits (precise, never silent): a flow needs a journal (native core), and
-flow bodies are synchronous-only — an async intercepted call inside a flow is
-refused (KEEL-E005) rather than silently downgraded to Tier 1.
+v0.1 limits (precise, never silent): a flow needs a journal (native core).
+Async flow bodies are supported: an `async def` entrypoint's awaited
+intercepted calls route through the same open flow handle as a synchronous
+flow's, journaled identically; concurrent awaited effects (`asyncio.gather`)
+are admitted — and journaled — in the order their calls reach the handle,
+never in completion order.
 
 ### Level 3 — fleet
 
 One line (`journal = "postgres://…"`) moves the journal to Postgres for
-multi-process recovery; nothing else changes. (Not in v0.1.)
+multi-process, cross-host fleet recovery; nothing else changes. Lease
+arbitration reads the DATABASE's clock, not any one process's, so it stays
+correct under host clock drift.
 
 ## Targets
 
@@ -124,11 +129,20 @@ timestamps) instead of prose. Same command, two audiences.
 
 - `keel run <target> [args...]` — run a script/package/dir under Keel. `--disable` runs it byte-identically with Keel off.
 - `keel init [--diff] [--stamp] [--agents]` — generate `keel.toml` from evidence; `--diff` previews; `--stamp` dates the header; `--agents` writes the Keel section into `AGENTS.md` instead.
-- `keel doctor` — the honesty report: what's wrapped, what's visible-but-unwrapped and why, adapter version pins, detected framework.
-- `keel status` — coverage %, retries saved, breaker events, cache hit rate, resumable flows.
+- `keel doctor [--effective-policy]` — the honesty report: what's wrapped, what's visible-but-unwrapped and why, adapter version pins, policy validity, journal backend. `--effective-policy` prints the composed `defaults < packs < user` policy `keel_configure` actually receives.
+- `keel status` — coverage %, retries saved this week, breaker events, cache hit rate, resumable flows.
 - `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
 - `keel flows [--dead]` — list durable flows (id, entrypoint, status, steps, age).
+- `keel flows suggest` — analyze candidate flow entrypoints for replay-safety (effect counts, idempotent-unsafe effects, time/random reads, an estimated replay-safe verdict).
+- `keel flows add <entrypoint> [--diff]` — designate an entrypoint as a durable flow: appends it to `[flows] entrypoints`, idempotent re-run.
+- `keel flows resume [<flow> | --all]` — re-invoke a resumable flow's recorded entrypoint through `keel run`.
 - `keel trace <flow>` — one flow's steps (outcomes, attempts, timings).
+- `keel replay <flow> [--step N]` — a journal-driven dry run of what re-entering the flow would do: which steps substitute, which re-execute, where replay resumes.
+- `keel tail [--run ID] [--no-follow]` — live view of attempts/backoffs/breaker transitions while a program runs, reading `.keel/events/`; no daemon.
+- `keel fsck [--fix] [--prune AGE]` — journal integrity check (orphan steps, dangling leases, expired cache), safe repairs, and retention pruning.
+- `keel mcp` — serve this project over MCP on stdio (JSON-RPC 2.0; no daemon, exits on EOF). Six tools: `get_status`, `get_doctor_report`, `propose_policy` (returns a keel.toml diff), `get_trace`, `list_flows`, `explain_error`. Each tool's text result is byte-identical to the matching command's `--json` output.
+- `keel record run <target> [args...]` / `keel record list` / `keel record test <recording>` — capture every intercepted effect during a run into `.keel/recordings/`, then turn a recording into a replayable offline test fixture (a pytest fixture or `node:test` file) that fails loudly on any unmatched effect.
+- `keel sim <plan>` — replay a declarative fault plan (injected errors, latency, crash-restart points) against a script or a recording, asserting the policy holds (retries within budget, breaker opens as configured, flows resume). Adapter-level fault injection, not hermetic simulation.
 
 ## Error codes (frozen taxonomy)
 
@@ -139,7 +153,7 @@ a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
 - KEEL-E002 policy-target-unknown — strict mode only; unknown target with no entry.
 - KEEL-E003 envelope-decode — a request/attempt-result envelope could not be decoded at the FFI boundary (version mismatch / corruption).
 - KEEL-E004 envelope-version-unsupported — language package and core binary are incompatible releases.
-- KEEL-E005 unsupported-configuration — the policy is valid but asks for a capability this build/configuration cannot provide: an async effect inside a durable flow (flows are synchronous-only in v0.1), or a `[flows]` designation with no journal / no native backend. Next: run the flow synchronously or drop it from `[flows]`; build the native module and make `.keel/` writable; `keel doctor`.
+- KEEL-E005 unsupported-configuration — the policy is valid but asks for a capability this build/configuration cannot provide: a `[flows]` designation with no journal / no native backend, or `KEEL_BACKEND=native` with no native module. (Async effects inside a flow are supported — serialized in await order, per conformance/README.md's Tier 2 ordering rule — and no longer trigger this code.) Next: build the native module and make `.keel/` writable; `keel doctor`.
 - KEEL-E010 attempts-exhausted — failed on the final permitted attempt; original error re-raised unchanged.
 - KEEL-E011 timeout — exceeded the policy timeout.
 - KEEL-E012 breaker-open — the breaker is open; the call failed fast, unattempted.
@@ -161,7 +175,7 @@ a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
 5. Never swallow errors — the original propagates unchanged, with a `keel` attachment.
 6. Everything has `--json` and stable exit codes.
 7. Works offline — no telemetry, no phone-home.
-8. Fast — `keel run` adds <100 ms startup; wrapping overhead ≤10 µs/call (measured ~0.56 µs), published in the README.
+8. Fast — `keel run` adds <100 ms startup; wrapping overhead ≤10 µs/call (measured ~0.8 µs, worst case, including the event sink and idempotency injection), published in the README.
 
 ## Determinism (for agents)
 
@@ -181,7 +195,8 @@ cargo build -p keel-cli                         # the `keel` binary
 
 ## Conformance
 
-17 scenarios in `conformance/scenarios/` (01–15 Tier 1, 16–17 Tier 2), run by the
-real Rust core (17/17), the Rust/Python/Node stubs (15/15 Tier 1; Tier 2 skipped
-— no journal), and the native front ends. `conformance/README.md` is the
-normative semantics.
+27 scenarios in `conformance/scenarios/` (01–15 plus 18/19/20/21–22/23 Tier 1,
+16–27 Tier 2), run by the real Rust core (all of them — Tier 2 additionally
+against a real Postgres journal backend), the Rust/Python/Node stubs (every
+Tier 1 scenario; Tier 2 skipped by design — no journal), and the native front
+ends. `conformance/README.md` is the normative semantics.

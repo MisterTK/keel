@@ -1,0 +1,38 @@
+{
+  "name": "schedule-composition-exact-fit-and-cascade",
+  "description": "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms): three 1s waits fill the first bound exactly (an exact fit stays in the segment); the second segment's own first natural wait (10s) already exceeds its own 5s bound, so it contributes zero waits and the handoff cascades straight through to the fixed(250ms) tail. See conformance/README.md 'Schedule algebra'.",
+  "policy": {
+    "target": {
+      "api.example.com": {
+        "retry": {
+          "attempts": 7,
+          "schedule": "fixed(1s) upTo 3s andThen fixed(10s) upTo 5s andThen fixed(250ms)",
+          "on": ["timeout"]
+        }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.example.com",
+        "request": { "op": "GET api.example.com/slow", "idempotent": true },
+        "effect": [
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" },
+          { "status": "error", "class": "timeout" }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 7,
+          "waits_ms": [1000, 1000, 1000, 250, 250, 250],
+          "error": { "code": "KEEL-E010", "class": "timeout" }
+        }
+      }
+    }
+  ]
+}

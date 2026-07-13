@@ -42,20 +42,13 @@
 
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { join } from "node:path";
 import { getBackend, getDiscovery, attachOutcome } from "../runtime.mjs";
 import { KeelError } from "../engine.mjs";
+import { resolveFrom, durationMs } from "./_shared.mjs";
 
 const CLIENT_SPECIFIER = "@modelcontextprotocol/sdk/client/index.js";
 const PKG_SPECIFIER = "@modelcontextprotocol/sdk/package.json";
 const PINNED_VERSION = "1.29.0"; // the SDK version these seam tests certify
-
-function durationMs(v) {
-  const m = /^(\d+)(ms|s|m|h)$/.exec(String(v ?? "").trim());
-  if (!m) return null;
-  const mult = { ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]];
-  return Number(m[1]) * mult;
-}
 
 /**
  * Read-ish MCP request methods that are safe to auto-retry. Everything else —
@@ -208,19 +201,6 @@ export function patchClientRequest(ClientClass, deps = {}) {
   return function uninstall() {
     if (proto.request === wrapped) proto.request = original;
   };
-}
-
-function resolveFrom(cwd, specifier) {
-  // Resolve first from the user's project, then from Keel's own deps.
-  try {
-    return createRequire(join(cwd, "package.json")).resolve(specifier);
-  } catch {
-    try {
-      return createRequire(import.meta.url).resolve(specifier);
-    } catch {
-      return null;
-    }
-  }
 }
 
 /** The `mcp:` adapter pack — the four uniform operations (adapter-pack.md). */

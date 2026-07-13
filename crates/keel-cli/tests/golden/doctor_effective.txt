@@ -1,0 +1,23 @@
+keel ▸ doctor --effective-policy
+
+The composed policy `keel_configure` receives — defaults < packs < user,
+merged per key; the core layers no pack underneath.
+  defaults  embedded contracts/defaults.toml (Level 0)
+  packs     openai
+  user      keel.toml
+
+[defaults.outbound]
+timeout = "10s"  # user
+retry   = { attempts = 3, on = ["conn", "timeout", "429", "5xx"], schedule = "exp(200ms, x2, max 30s, jitter)" }  # defaults
+breaker = { cooldown = "15s", failures = 5 }  # defaults
+
+[defaults.llm]
+timeout = "120s"  # pack
+retry   = { attempts = 2 }  # user
+breaker = { cooldown = "30s", failures = 5 }  # pack
+cache   = { mode = "dev" }  # pack
+
+[target."api.example.com"]  # user — pass-through (engine resolves target → defaults per key)
+retry = { attempts = 5 }
+
+note: cache mode "dev" is resolved by the front end at run time (a concrete ttl off-prod; dropped when KEEL_ENV=prod) — the policy shown is the pre-resolution merge.

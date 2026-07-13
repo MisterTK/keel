@@ -1,0 +1,149 @@
+# The "adapter CI farm" permanent role (sprint-plan.md §"Permanent roles":
+# "adapter CI farm (contract tests against pinned framework/library versions,
+# the maintenance tax made visible)", plus "a weekly cold-machine run as the
+# recurring quality ritual"). architecture-spec.md §5.1 wants "per-library-
+# version contract tests in CI"; dx-spec.md §4.2 wants "version-pinned
+# contract tests".
+#
+# This workflow installs the REAL third-party libraries each adapter pack
+# certifies — not the offline structural fakes ci.yml's `python-frontend` /
+# `node-frontend` jobs use for the fast path — at pinned versions, into
+# isolated environments (a throwaway venv per Python leg; an ephemeral,
+# never-committed `node/keel/node_modules` per Node leg — `npm install
+# --no-save`, so no package.json is ever touched and node_modules stays
+# .gitignore'd). It runs the SAME test files as the fast path (or, where the
+# fast path is a structural fake, a `*-farm.test.mjs` twin gated on
+# KEEL_ADAPTER_FARM=1 — see node/keel/test/mcp-farm.test.mjs and
+# ai-sdk-farm.test.mjs), so passing here means the pack's seam assumptions
+# hold against the real API, not just Keel's own model of it.
+#
+# Scheduled weekly (the "cold-machine run" quality ritual) + manual dispatch.
+# Intentionally NOT run on every push/PR: installing N pinned versions per
+# library is the "maintenance tax made visible", not a per-PR gate — a version
+# going stale here is a scheduled finding, not a blocked PR.
+#
+# ==============================================================================
+# PINNED VERSION MATRIX — bump by editing the `matrix:` blocks below AND this
+# table (kept in sync manually; this is the "trivially bump-able" table the
+# task asked for). A row with no job below it is a FUTURE adapter (no pack
+# exists yet in this repo) — added here as a placeholder so the maintenance
+# tax is visible before the pack lands, per the sprint-plan's tracking intent.
+#
+#   language | library                       | pinned versions run here | pack
+#   ---------|-------------------------------|---------------------------|------------------------------------------
+#   python   | httpx                         | 0.27.2, 0.28.1            | python/keel/src/keel/adapters/httpx_pack.py
+#   python   | requests                      | 2.33.1, 2.34.2            | python/keel/src/keel/adapters/requests_pack.py
+#   python   | aiohttp                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
+#   python   | urllib3                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
+#   python   | boto3                         | (planned — no pack yet)   | not yet in the doctor REGISTRY either
+#   python   | psycopg                       | (planned — no pack yet)   | not yet in the doctor REGISTRY either
+#   node     | ai (Vercel AI SDK)            | 5.0.0                     | node/keel/src/packs/ai-sdk.mjs
+#   node     | @modelcontextprotocol/sdk     | 1.29.0                    | node/keel/src/packs/mcp.mjs
+#   node     | undici                        | (planned — no pack yet;   | best-effort in doctor REGISTRY; the
+#            |                               |  fetch.mjs deliberately   | fetch: pack covers global fetch instead,
+#            |                               |  has no undici dependency)| see fetch.mjs's design note
+#   node     | pg / ioredis / mysql2         | (planned — no pack yet)   | not yet in the doctor REGISTRY either
+# ==============================================================================
+
+name: adapter-farm
+
+on:
+  schedule:
+    # Weekly cold-machine run (sprint-plan.md's recurring quality ritual).
+    # Tuesday 09:17 UTC — an off-the-hour slot so this doesn't stack with
+    # other scheduled jobs across the fleet at :00/:30.
+    - cron: "17 9 * * 2"
+  workflow_dispatch: {}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python: real httpx / requests at each pinned minor, contract-tested against
+  # the SAME test files the fast path CI leg would use (test_adapters_httpx.py
+  # / test_adapters_requests.py), which already run their assertions against
+  # whatever httpx/requests version is actually importable — these are real
+  # HTTP round trips over a loopback FaultServer (python/keel/tests/faultserver.py),
+  # never a structural fake, so pinning the version here is the whole point.
+  # ---------------------------------------------------------------------------
+  python-pinned:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lib: httpx
+            version: "0.27.2"
+            test_module: tests.test_adapters_httpx
+          - lib: httpx
+            version: "0.28.1"
+            test_module: tests.test_adapters_httpx
+          - lib: requests
+            version: "2.33.1"
+            test_module: tests.test_adapters_requests
+          - lib: requests
+            version: "2.34.2"
+            test_module: tests.test_adapters_requests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ${{ matrix.lib }}==${{ matrix.version }} (pinned, isolated)
+        run: python3 -m pip install --upgrade pip "${{ matrix.lib }}==${{ matrix.version }}"
+      - name: Grading sanity — detect() must report 'pinned' at this version
+        run: python3 scripts/check-adapter-grading.py ${{ matrix.lib }} pinned
+      - name: Contract tests (${{ matrix.test_module }}) against the real, pinned ${{ matrix.lib }}
+        working-directory: python/keel
+        run: python3 -m unittest ${{ matrix.test_module }} -v
+
+  # ---------------------------------------------------------------------------
+  # Python: an OUT-OF-RANGE install, asserting the pinned->best_effort grading
+  # actually flips on a real install (not just a monkeypatched version string
+  # in a unit test) — the gap this workflow exists to close.
+  # ---------------------------------------------------------------------------
+  python-out-of-range:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install httpx + requests BELOW their pinned ranges
+        run: python3 -m pip install --upgrade pip "httpx==0.26.0" "requests==2.30.0"
+      - name: Grading must flip to best_effort outside the pinned range
+        run: |
+          python3 scripts/check-adapter-grading.py httpx best_effort
+          python3 scripts/check-adapter-grading.py requests best_effort
+      - name: Contract tests still pass on a best-effort version (the seam itself hasn't moved)
+        working-directory: python/keel
+        run: |
+          python3 -m unittest tests.test_adapters_httpx -v
+          python3 -m unittest tests.test_adapters_requests -v
+
+  # ---------------------------------------------------------------------------
+  # Node: real `ai` + `@modelcontextprotocol/sdk` at their pinned versions,
+  # installed with --no-save into node/keel (node_modules is .gitignore'd —
+  # package.json is never touched, preserving the zero-runtime-deps invariant).
+  # Runs the *-farm.test.mjs twins (KEEL_ADAPTER_FARM=1) which exercise the
+  # packs against the real SDK classes end-to-end (real InMemoryTransport +
+  # McpServer for mcp; real wrapLanguageModel for ai-sdk) — the fast path
+  # (mcp.test.mjs / ai-sdk.test.mjs) covers the same seams against a fixture.
+  # ---------------------------------------------------------------------------
+  node-pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install ai@5.0.0 + @modelcontextprotocol/sdk@1.29.0 (pinned, --no-save)
+        working-directory: node/keel
+        run: npm install --no-save --no-audit --no-fund ai@5.0.0 @modelcontextprotocol/sdk@1.29.0
+      - name: Farm contract tests against the real, pinned packages
+        working-directory: node/keel
+        env:
+          KEEL_ADAPTER_FARM: "1"
+        run: node --test test/mcp-farm.test.mjs test/ai-sdk-farm.test.mjs
+      - name: Clean up (never leave the real deps for a later step/job to trip over)
+        if: always()
+        working-directory: node/keel
+        run: rm -rf node_modules package-lock.json

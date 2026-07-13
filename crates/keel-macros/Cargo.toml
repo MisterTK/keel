@@ -1,0 +1,29 @@
+[package]
+name = "keel-macros"
+description = "proc-macro crate for the `keel` Rust front end: #[keel::wrap] reads keel.toml at compile time (walking up from CARGO_MANIFEST_DIR) and generates code that routes an async function's body through the keel-core Engine chain for a resolved target."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Not meant to be depended on directly — re-exported by `keel` as `keel::wrap`.
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+# Parse the user's keel.toml at compile time for a best-effort static check
+# (syntax validity + a typo hint against the `[target]` table). The *runtime*
+# policy is still (re)loaded and applied by `keel::init` — this is a
+# compile-time lint, not a substitute for runtime configuration.
+toml = "0.8"
+
+[dev-dependencies]
+trybuild = "1.0"
+
+[lints]
+workspace = true

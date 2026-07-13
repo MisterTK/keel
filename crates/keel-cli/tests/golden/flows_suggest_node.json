@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "already_designated": false,
+      "calls_observed": 0,
+      "display": "app.mjs#fetchData",
+      "effects": 1,
+      "entrypoint": "ts:app.mjs#fetchData",
+      "file": "app.mjs",
+      "idempotent_unsafe": 0,
+      "line": 4,
+      "random_reads": 0,
+      "replay_safe": true,
+      "time_reads": 0,
+      "unsafe_reasons": []
+    }
+  ],
+  "count": 1,
+  "js_attribution_note": "JS/TS attribution is a real AST parse (oxc): effects, time/random reads, and unsafe constructs are attributed by real scope containment, not a line heuristic. Only top-level named functions are tracked as flow candidates — effects inside class methods, object-literal methods, or nested functions/callbacks roll up to the enclosing top-level function (or are not tracked, for methods). Python attribution is the same real containment, over Python's own AST.",
+  "python_available": true,
+  "replay_safe_count": 1
+}

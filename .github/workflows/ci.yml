@@ -30,6 +30,35 @@ jobs:
           fi
           echo "contracts/ unchanged or change approved."
 
+  # NFR6 (architecture-spec.md §1.2): no copyleft/BSL contamination from
+  # dependencies in the core path. cargo-deny enforces the Rust license/bans/
+  # advisories/sources graph (deny.toml); the two check-licenses scripts cover
+  # the front ends' "zero runtime dependencies" invariant (engineering-manifesto
+  # rule 12) and allowlist their test-only dev dependencies.
+  license-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Pinned exactly (not `--locked` against a floating latest) so this job's
+      # pass/fail is reproducible independent of when cargo-deny last released.
+      - name: Install cargo-deny 0.20.2 (pinned)
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: cargo deny check (licenses, bans, advisories, sources)
+        run: cargo deny check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python front end + stub — zero-dep / dev-dependency license check
+        run: python3 scripts/check-licenses.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Node front end + stub/native — zero-dep / dev-dependency license check
+        run: node scripts/check-licenses.mjs
+
   # Real core + stub conformance + FFI + CLI + Tier 2 all ride `cargo test --all`.
   rust:
     runs-on: ubuntu-latest
@@ -212,6 +241,35 @@ jobs:
           cat budget.log
           {
             echo "### \`keel run\` startup budget (DX invariant 8)"
+            echo ""
+            echo '```'
+            grep -F "[startup budget]" budget.log || echo "(no measurement line captured)"
+            echo '```'
+            echo ""
+            echo "_Target <100ms at p50; publishing this number in the README is a manual step._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+  # DX invariant 8 (Node half): `node --import keel/hook` adds <100ms to
+  # process startup at p50. Mirrors the Python `startup-budget` job above
+  # exactly: run the guard test, echo the measured deltas into the job
+  # summary, same generous 250ms budget / NON-REQUIRED reasoning (shared
+  # runners are noisy; the printed number is the signal).
+  node-startup-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Measure `node --import keel/hook` startup overhead (no addon → native leg skips)
+        working-directory: node/keel
+        run: |
+          status=0
+          node --test test/startup-budget.test.mjs > budget.log 2>&1 || status=$?
+          cat budget.log
+          {
+            echo "### \`node --import keel/hook\` startup budget (DX invariant 8)"
             echo ""
             echo '```'
             grep -F "[startup budget]" budget.log || echo "(no measurement line captured)"

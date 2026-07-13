@@ -24,9 +24,10 @@ from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_flow_entrypoints, extract_function_targets, load_policy
-from ._runtime import clear_runtime, set_runtime
+from ._runtime import clear_runtime, get_backend, set_runtime
+from ._targets import clear_outbound_targets, install_outbound_targets
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import present_provider_defaults, resolve_dev_cache
+from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -41,6 +42,7 @@ class _State:
     finder: KeelFinder | None = None
     discovery: Discovery | None = None
     exit_registered: bool = False
+    mcp_uninstall: Any = None
 
 
 _STATE = _State()
@@ -70,11 +72,21 @@ def install_keel(
     policy = resolve_dev_cache(
         apply_pack_defaults(raw, present_provider_defaults()), env, persistent=persistent
     )
-    backend.configure(policy)  # raises KEEL-E001 on invalid policy (field paths)
+    policy = apply_journal_env_override(policy, env)
+    backend.configure(policy)  # raises KEEL-E001/KEEL-E005 on invalid/unsupported policy
 
-    discovery = Discovery(cwd)
+    # The explicit `[target."…"]` keys of the SAME effective policy the core
+    # just configured — discovery's "wrapped" classification (dx-spec §2's
+    # coverage gap) must agree with what actually applied.
+    known_targets = frozenset(policy.get("target") or {})
+    discovery = Discovery(cwd, known_targets)
     _STATE.discovery = discovery
     set_runtime(backend, discovery)
+    # Outbound host/URL-pattern matchers (docs/targeting.md), compiled from the
+    # same effective policy the backend was configured with: the HTTP packs'
+    # target judgment consults these so `[target."*.internal.corp"]`-style keys
+    # actually select requests. The core still sees one exact key per call.
+    install_outbound_targets(policy)
 
     targets = extract_function_targets(policy)
     _STATE.finder = install_import_hook(targets)
@@ -84,13 +96,21 @@ def install_keel(
     # flow. Parsing only; running one requires the native backend.
     flow_entrypoints = extract_flow_entrypoints(policy)
 
-    # Library adapters (httpx/requests/…): armed lazily — each patches its
-    # library only when the program imports it. Present-but-unused libraries
-    # cost nothing, so `keel run` startup stays cheap.
+    # Library adapters (httpx/requests/…) plus framework packs with a real
+    # seam of their own (adk_pack, pydantic-ai, …): all armed lazily — each
+    # patches its library/framework only when the program imports it.
+    # Present-but-unused libraries cost nothing, so `keel run` startup stays
+    # cheap.
     adapters = install_adapters()
 
+    # Framework packs: auto-detect and patch the MCP client SDK if present.
+    # Best-effort — an absent SDK is a silent no-op; never fatal (mirrors the
+    # Node front end's installMcpPack, called right after its fetch install).
+    mcp = install_mcp_pack()
+    _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
+
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets], adapters)
+    _banner(env, source, [t.key for t in targets], adapters, mcp)
 
     return {
         "enabled": True,
@@ -100,7 +120,24 @@ def install_keel(
         "function_targets": targets,
         "flow_entrypoints": flow_entrypoints,
         "adapters": adapters,
+        "mcp": mcp,
     }
+
+
+def apply_journal_env_override(
+    policy: dict[str, Any], env: Mapping[str, str]
+) -> dict[str, Any]:
+    """`KEEL_JOURNAL` is the journal escape hatch: when it is set in the
+    environment (even to the empty string, which *disables* the journal), the
+    construction-time selection made from it wins over keel.toml's `journal`
+    key. The core honors the effective policy's `journal` at configure time, so
+    the override is composed here — the key is dropped before `configure`,
+    leaving the env-selected (or disabled) construction attachment in force.
+    Precedence: KEEL_JOURNAL (when set) > policy `journal` > `.keel/journal.db`.
+    Mirrors the Node front end exactly (parity)."""
+    if "KEEL_JOURNAL" not in env or "journal" not in policy:
+        return policy
+    return {k: v for k, v in policy.items() if k != "journal"}
 
 
 def uninstall_keel() -> None:
@@ -112,9 +149,13 @@ def uninstall_keel() -> None:
     remove_import_hook(_STATE.finder)
     _STATE.finder = None
     uninstall_adapters()
+    if _STATE.mcp_uninstall is not None:
+        _STATE.mcp_uninstall()
+        _STATE.mcp_uninstall = None
     if _STATE.discovery is not None:
         _STATE.discovery.close()
         _STATE.discovery = None
+    clear_outbound_targets()
     clear_runtime()
     _STATE.installed = False
 
@@ -127,6 +168,18 @@ def _register_exit_flush() -> None:
     def _flush() -> None:
         if _STATE.discovery is not None:
             _STATE.discovery.close()
+        # The native engine's live NDJSON event feed (`.keel/events/`,
+        # `KEEL_EVENTS`) flushes its writer thread whenever the queue drains,
+        # which a long-lived `keel tail`'d process never needs help with —
+        # but a short-lived `keel run`/`keel sim` script can exit before its
+        # last few events land on disk. Read the CURRENT runtime backend
+        # (`_runtime.get_backend()`, not a snapshot taken at registration
+        # time) since `keel run`/`keel sim` may have since wrapped it in a
+        # RecordingBackend/SimBackend that delegates `flush_events` through.
+        # Best-effort: the stub backend has no such method.
+        flush_events = getattr(get_backend(), "flush_events", None)
+        if callable(flush_events):
+            flush_events()
 
     atexit.register(_flush)
 
@@ -136,6 +189,7 @@ def _banner(
     source: str,
     target_keys: list[str],
     adapters: list[Detection],
+    mcp: dict[str, Any] | None = None,
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
@@ -150,5 +204,7 @@ def _banner(
         pieces.append(f"{n} {noun} ({', '.join(sorted(target_keys))})")
     if adapters:
         pieces.append(", ".join(f"{d.name} {d.version}".strip() for d in adapters))
+    if mcp and mcp.get("active"):
+        pieces.append("mcp: transports")
     wrapped = " + ".join(pieces) if pieces else "nothing yet"
     sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")

@@ -4,13 +4,13 @@
 //! `contracts/core_api.rs`.
 
 use core::fmt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerPolicy, CacheScope, DurationMs, NondeterminismResponse, Policy, Rate, ResolvedPolicy,
-    RetryPolicy,
+    BreakerMode, BreakerPolicy, CacheScope, DurationMs, JournalLocation, NondeterminismResponse,
+    Policy, Rate, ResolvedPolicy, RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -25,11 +25,21 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, warn};
 
-/// Count-mode circuit breaker (consecutive terminal failures). Observes
-/// post-retry call outcomes — layer order puts it outside the retry loop.
+use crate::events::{CacheStore, EventKind, EventSink, TraceRef};
+use crate::journal_backend::{self, JournalBackend};
+
+/// Circuit breaker in count mode (consecutive terminal failures) or rate mode
+/// (failure rate over a sliding window; `BreakerPolicy::mode` selects).
+/// Observes post-retry call outcomes — layer order puts it outside the retry
+/// loop. Normative semantics: conformance/README.md §4.
 #[derive(Debug, Default)]
 struct Breaker {
+    /// Count mode: consecutive terminal failures.
     consecutive: u64,
+    /// Rate mode: post-retry outcomes `(completed_at, failed)` inside the
+    /// trailing window, oldest first. Pruned on every observation; cleared
+    /// when the breaker opens or a probe closes it.
+    outcomes: VecDeque<(Instant, bool)>,
     open_until: Option<Instant>,
     opens: u64,
 }
@@ -73,7 +83,7 @@ impl Breaker {
         }
     }
 
-    fn on_success(&mut self) -> BreakerTransition {
+    fn on_success(&mut self, now: Instant, config: &BreakerPolicy) -> BreakerTransition {
         // A live success is only reached while closed or half-open; an open
         // breaker fails fast (never runs the effect). So `open_until.is_some()`
         // here means a probe just closed the breaker.
@@ -81,10 +91,15 @@ impl Breaker {
         self.consecutive = 0;
         self.open_until = None;
         if closed_a_probe {
-            BreakerTransition::Closed
-        } else {
-            BreakerTransition::None
+            // A closing probe resets the window: the pre-open failure history
+            // must not instantly re-trip a freshly-recovered target.
+            self.outcomes.clear();
+            return BreakerTransition::Closed;
         }
+        if let BreakerMode::Rate { window, .. } = config.mode() {
+            self.observe(now, window, false);
+        }
+        BreakerTransition::None
     }
 
     fn on_terminal_failure(
@@ -96,46 +111,118 @@ impl Breaker {
         let should_trip = if admission == Admission::HalfOpen {
             true // failed probe: re-open for another full cooldown
         } else {
-            self.consecutive += 1;
-            self.consecutive >= config.failures.get()
+            match config.mode() {
+                BreakerMode::Count { failures } => {
+                    self.consecutive += 1;
+                    self.consecutive >= failures.get()
+                }
+                BreakerMode::Rate {
+                    window,
+                    failure_rate,
+                    min_calls,
+                } => {
+                    self.observe(now, window, true);
+                    self.window_rate_reached(failure_rate, min_calls)
+                }
+            }
         };
         if should_trip {
             self.open_until = Some(now + Duration::from_millis(config.cooldown.0));
             self.opens += 1;
             self.consecutive = 0;
+            self.outcomes.clear();
             BreakerTransition::Opened
         } else {
             BreakerTransition::None
         }
     }
+
+    /// Rate mode: prune outcomes that aged out of the window (strictly: an
+    /// outcome exactly `window` old is evicted, per conformance/README.md §4),
+    /// then record this one.
+    fn observe(&mut self, now: Instant, window: DurationMs, failed: bool) {
+        let window = Duration::from_millis(window.0);
+        while let Some(&(at, _)) = self.outcomes.front() {
+            if now.duration_since(at) >= window {
+                self.outcomes.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.outcomes.push_back((now, failed));
+    }
+
+    /// Rate mode's trip condition over the (already-pruned) window.
+    fn window_rate_reached(&self, failure_rate: f64, min_calls: core::num::NonZeroU32) -> bool {
+        let total = self.outcomes.len();
+        if (total as u64) < u64::from(min_calls.get()) {
+            return false;
+        }
+        let failed = self.outcomes.iter().filter(|&&(_, f)| f).count();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "window counts are bounded by the calls observed within one \
+                      breaker window — far below f64's 2^53 exact-integer range"
+        )]
+        let rate = failed as f64 / total as f64;
+        rate >= failure_rate
+    }
 }
 
-/// Fixed-window rate limiter over engine-elapsed milliseconds. Exceeding the
-/// limit delays the call to the next window (`throttled`), never fails it.
+/// Token-bucket rate limiter over engine-elapsed milliseconds (dx-spec §4.1
+/// promises token-bucket rate limiting), bit-identical to every stub (parity
+/// rule — `crates/keel-core-stub`, `python/keel-core-stub`,
+/// `node/keel-core-stub`). Burst capacity is the rate's `limit`; refill is
+/// continuous at `limit` per `window`. Exceeding the rate delays the call
+/// (`throttled`), never fails it.
+///
+/// All arithmetic is integer fixed-point — token amounts are scaled by
+/// `window_ms`, so one token is `window_ms` scaled units and refill is exactly
+/// `limit` scaled units per elapsed millisecond. No float drift: identical
+/// call timings plan identical waits, so conformance scenarios may assert the
+/// exact `throttle_wait_ms` (conformance/README.md §3).
 #[derive(Debug, Default)]
-struct RateWindow {
-    window: u64,
-    count: u64,
+struct TokenBucket {
+    /// Tokens in scaled units (1 token = `window_ms` units). Negative means
+    /// admissions were already booked ahead of refill — queued waiters, each
+    /// spaced `window/limit` apart.
+    scaled_tokens: i128,
+    /// Engine-elapsed ms of the last refill.
+    last_refill_ms: u64,
+    /// Whether the bucket has been filled to burst on first use (a `Default`
+    /// bucket cannot know the rate yet).
+    primed: bool,
 }
 
-impl RateWindow {
-    /// Plans one admission at `elapsed_ms`, pre-booking the slot the call
-    /// will occupy after sleeping. Returns the wait (0 = immediate).
+impl TokenBucket {
+    /// Plans one admission at `elapsed_ms`, pre-booking the token the call
+    /// will consume after sleeping. Returns the wait (0 = immediate): the time
+    /// until continuous refill covers this booking's deficit.
     fn plan_admit(&mut self, elapsed_ms: u64, rate: Rate) -> u64 {
-        let current = elapsed_ms / rate.window_ms;
-        if self.window != current {
-            self.window = current;
-            self.count = 0;
+        let limit = i128::from(rate.limit.get());
+        let window = i128::from(rate.window_ms);
+        let capacity = limit * window; // burst = `limit` whole tokens
+        if !self.primed {
+            self.primed = true;
+            self.scaled_tokens = capacity;
+            self.last_refill_ms = elapsed_ms;
         }
-        let mut wait = 0;
-        if self.count >= rate.limit.get() {
-            let next_window_start = (self.window + 1) * rate.window_ms;
-            wait = next_window_start - elapsed_ms;
-            self.window += 1;
-            self.count = 0;
+        // Concurrent planners may observe `elapsed_ms` before taking the state
+        // lock, so a reading older than the last refill credits nothing.
+        let elapsed = i128::from(elapsed_ms.saturating_sub(self.last_refill_ms));
+        self.last_refill_ms = self.last_refill_ms.max(elapsed_ms);
+        self.scaled_tokens = capacity.min(
+            self.scaled_tokens
+                .saturating_add(elapsed.saturating_mul(limit)),
+        );
+        self.scaled_tokens -= window;
+        if self.scaled_tokens >= 0 {
+            0
+        } else {
+            // ceil(deficit / refill-per-ms)
+            let deficit = -self.scaled_tokens;
+            u64::try_from((deficit + limit - 1) / limit).unwrap_or(u64::MAX)
         }
-        self.count += 1;
-        wait
     }
 }
 
@@ -262,7 +349,7 @@ struct Report<'a> {
 struct State {
     trace_seq: u64,
     breakers: HashMap<String, Breaker>,
-    rate_windows: HashMap<String, RateWindow>,
+    rate_buckets: HashMap<String, TokenBucket>,
     cache: HashMap<CacheKey, CacheEntry>,
     metrics: BTreeMap<String, TargetMetrics>,
 }
@@ -343,17 +430,71 @@ fn record_call_fields(span: &tracing::Span, out: &Outcome) {
     span.record("breaker", breaker_str(out.breaker));
 }
 
-/// Emits a breaker state change at debug level (architecture spec §4.5).
-/// Called off the state lock; a no-op when nothing changed.
+/// Emits a breaker state change at debug level and as a
+/// `keel.breaker.transitions` metric (architecture spec §4.5). Called off the
+/// state lock; a no-op when nothing changed.
 fn emit_breaker_transition(target: &str, transition: BreakerTransition) {
     match transition {
         BreakerTransition::Opened => {
             debug!(target = %target, transition = "opened", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "opened");
         }
         BreakerTransition::Closed => {
             debug!(target = %target, transition = "closed", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "closed");
         }
         BreakerTransition::None => {}
+    }
+}
+
+/// Warn (once per offending table) when a breaker sets `failures` alongside
+/// rate-mode knobs: the frozen schema's "setting `failures` selects count
+/// mode" makes window/failure_rate/min_calls inert, and inert config must be
+/// loud (the same rule `configure` applies to `journal`/`telemetry`).
+fn warn_inert_breaker_knobs(policy: &Policy) {
+    let defaults = &policy.defaults;
+    let tables = defaults
+        .outbound
+        .iter()
+        .map(|t| (String::from("defaults.outbound"), t))
+        .chain(
+            defaults
+                .llm
+                .iter()
+                .map(|t| (String::from("defaults.llm"), t)),
+        )
+        .chain(
+            policy
+                .target
+                .iter()
+                .map(|(name, t)| (format!("target.\"{name}\""), t)),
+        );
+    for (path, table) in tables {
+        if table
+            .breaker
+            .as_ref()
+            .is_some_and(BreakerPolicy::has_inert_rate_knobs)
+        {
+            warn!(
+                "policy {path}.breaker sets `failures` (count mode) alongside rate-mode knobs \
+                 (window/failure_rate/min_calls), which are inert in count mode. Remove \
+                 `failures` to select rate mode."
+            );
+        }
+    }
+}
+
+/// Append the dx-invariant-4 trace reference (`… trace: keel trace <ref>`) to
+/// a terminal failure message. `trace` is `Some` only while a live event sink
+/// minted a ref for this call, so without a sink — the conformance condition —
+/// every implementation stays message-identical (parity rule).
+fn with_trace_ref(message: String, trace: Option<&TraceRef>) -> String {
+    match trace {
+        Some(t) => {
+            let sep = if message.ends_with('.') { "" } else { "." };
+            format!("{message}{sep} trace: keel trace {t}")
+        }
+        None => message,
     }
 }
 
@@ -391,6 +532,58 @@ fn terminal_message(
     text.trim_end().to_owned()
 }
 
+/// Per-attempt context [`terminal_attempt_error`] needs but that never
+/// changes across the retry loop's calls to it — bundled so the helper stays
+/// under clippy's argument-count ceiling.
+struct TerminalAttemptCtx<'a> {
+    request: &'a Request,
+    attempt: u32,
+    max_attempts: u32,
+    trace: Option<&'a TraceRef>,
+    /// Whether THIS attempt was cut off by the policy timeout layer (distinct
+    /// from the retryable-class check): a policy-layer timeout is the more
+    /// precise diagnosis than "exhausted"/"non-retryable" — except the Level 0
+    /// non-idempotent rule, which callers must always see verbatim.
+    timed_out_by_layer: bool,
+}
+
+/// Builds the terminal `OutcomeError` once `run_attempts` has decided this
+/// failed attempt is not retried — folds the timeout-diagnosis override and
+/// the dx-invariant-4 trace ref into one place so the retry loop itself stays
+/// under clippy's line-count ceiling.
+fn terminal_attempt_error(
+    ctx: &TerminalAttemptCtx<'_>,
+    code: ErrorCode,
+    class: ErrorClass,
+    http_status: Option<u16>,
+    message: &str,
+    original: Option<Value>,
+) -> OutcomeError {
+    let code = if ctx.timed_out_by_layer && code != ErrorCode::NonIdempotentNotRetried {
+        ErrorCode::Timeout
+    } else {
+        code
+    };
+    OutcomeError {
+        code,
+        class,
+        http_status,
+        message: with_trace_ref(
+            terminal_message(
+                code,
+                ctx.request,
+                ctx.attempt,
+                ctx.max_attempts,
+                class,
+                http_status,
+                message,
+            ),
+            ctx.trace,
+        ),
+        original,
+    }
+}
+
 /// The Keel kernel, Tier 1 scope. One per process; `&self`-concurrent.
 ///
 /// A journal and/or discovery store are optional attachments: the engine is
@@ -400,10 +593,29 @@ pub struct Engine {
     started: Instant,
     policy: RwLock<Policy>,
     state: Mutex<State>,
-    /// Persistence for the `scope = persistent` cache (and, later, Tier 2 flows).
-    journal: Option<Arc<dyn Journal>>,
+    /// Persistence for the `scope = persistent` cache and Tier 2 flows. Behind
+    /// a lock because `configure` honors `policy.journal` by (re)attaching the
+    /// selected backend; readers clone the `Arc` out, so the lock is never held
+    /// across journal I/O (let alone an await).
+    journal: RwLock<JournalSlot>,
     /// Traffic ledger fed one observation per `execute`, for `keel init`/`status`.
     discovery: Option<Arc<dyn DiscoveryRecorder>>,
+    /// Live NDJSON event feed for `keel tail`/`keel trace` ([`crate::events`]).
+    /// `None` (the zero-cost path) unless the environment activates it or a
+    /// sink is attached; like journal/discovery it can never change an outcome.
+    events: Option<EventSink>,
+}
+
+/// The engine's journal attachment plus, when policy selected it, the resolved
+/// backend it was opened from — so reapplying an unchanged policy (whether a
+/// `file:` path or the same `postgres://` location) is a no-op instead of a
+/// re-open/re-connect.
+#[derive(Default)]
+struct JournalSlot {
+    journal: Option<Arc<dyn Journal>>,
+    /// `Some` only for a policy-selected attachment; construction-time
+    /// attachments have no location the engine could compare against.
+    backend: Option<JournalBackend>,
 }
 
 impl fmt::Debug for Engine {
@@ -412,8 +624,9 @@ impl fmt::Debug for Engine {
         f.debug_struct("Engine")
             .field("policy", &self.policy)
             .field("state", &self.state)
-            .field("journal_attached", &self.journal.is_some())
+            .field("journal_attached", &self.current_journal().is_some())
             .field("discovery_attached", &self.discovery.is_some())
+            .field("events_attached", &self.events.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -431,24 +644,47 @@ impl Engine {
             started: Instant::now(),
             policy: RwLock::new(Policy::default()),
             state: Mutex::new(State::default()),
-            journal: None,
+            journal: RwLock::new(JournalSlot::default()),
             discovery: None,
+            // Live events activate from the environment (KEEL_EVENTS / an
+            // existing ./.keel dir — see `crate::events`), so every embedding
+            // — FFI, PyO3, napi, CLI — inherits the feed with no plumbing.
+            events: EventSink::from_env(),
         }
     }
 
-    /// Attach a journal, enabling the persistent cache scope. Optional; set once
-    /// at setup, before the engine is shared for concurrent `execute`.
+    /// Attach a journal at construction time, enabling the persistent cache
+    /// scope. Optional; set at setup, before the engine is shared for
+    /// concurrent `execute`. A later [`configure`](Self::configure) whose
+    /// policy carries a `journal` key replaces this attachment — the effective
+    /// policy is authoritative (spec §4.2).
     pub fn attach_journal(&mut self, journal: impl Journal + 'static) -> &mut Self {
-        self.journal = Some(Arc::new(journal));
+        let slot = self.journal.get_mut().expect("journal lock poisoned");
+        slot.journal = Some(Arc::new(journal));
+        slot.backend = None;
         self
     }
 
     /// The attached journal, if any — shared (`Arc`) so a [`FlowManager`] can run
     /// its Tier 2 steps over the *same* store the engine caches through. `None`
-    /// for an in-memory engine (Tier 2 requires a durable journal).
+    /// for an in-memory engine (Tier 2 requires a durable journal). Live: a
+    /// `configure` whose policy selects a `journal` location changes what this
+    /// returns, so Tier 2 wiring should read it after the engine is configured.
+    ///
+    /// [`FlowManager`]: crate::FlowManager
     #[must_use]
     pub fn journal(&self) -> Option<Arc<dyn Journal>> {
-        self.journal.clone()
+        self.current_journal()
+    }
+
+    /// Clone the current journal out of its slot (the lock never outlives the
+    /// statement, so it is never held across journal I/O or an await).
+    fn current_journal(&self) -> Option<Arc<dyn Journal>> {
+        self.journal
+            .read()
+            .expect("journal lock poisoned")
+            .journal
+            .clone()
     }
 
     /// Attach a discovery store; each `execute` then records one observation.
@@ -458,38 +694,154 @@ impl Engine {
         self
     }
 
+    /// Attach (or replace) a live event sink. [`Engine::new`] already resolves
+    /// one from the environment (see [`crate::events`]); this override exists
+    /// for tests and embedders that place the feed elsewhere.
+    pub fn attach_events(&mut self, sink: EventSink) -> &mut Self {
+        self.events = Some(sink);
+        self
+    }
+
+    /// The active event sink, if any — its run id anchors this engine's trace
+    /// refs, and `flush()` makes the feed current for a same-process reader.
+    #[must_use]
+    pub fn events(&self) -> Option<&EventSink> {
+        self.events.as_ref()
+    }
+
+    /// Emit one live event, stamped with engine-elapsed (virtual-clock-safe)
+    /// milliseconds. The closure defers construction — and its string clones —
+    /// to the active-sink case, so the disabled path costs one branch.
+    fn emit_event(&self, kind: impl FnOnce() -> EventKind) {
+        if let Some(sink) = self.events.as_ref() {
+            sink.emit(self.elapsed_ms(), kind());
+        }
+    }
+
+    /// Feed event for a consulted cache: hit (the call is served) or miss
+    /// (the call proceeds live). Not emitted when no cache plan exists.
+    fn emit_cache(&self, out: &Outcome, target: &str, scope: CacheStore, hit: bool) {
+        self.emit_event(|| {
+            let call = out.trace_id.clone();
+            let target = target.to_owned();
+            if hit {
+                EventKind::CacheHit {
+                    call,
+                    target,
+                    scope,
+                }
+            } else {
+                EventKind::CacheMiss {
+                    call,
+                    target,
+                    scope,
+                }
+            }
+        });
+    }
+
     /// Apply a policy document (keel.toml as JSON, per
     /// contracts/policy.schema.json), replacing the previous one atomically.
-    /// Rejections are `KEEL-E001` with the exact offending field path.
+    /// Rejections are `KEEL-E001` with the exact offending field path;
+    /// a valid policy naming a journal backend this build cannot provide is
+    /// `KEEL-E005` (and the previous policy stays in force).
     pub fn configure(&self, policy_json: &Value) -> Result<(), KeelError> {
         let policy: Policy =
             serde_path_to_error::deserialize(policy_json).map_err(|e| KeelError {
                 code: ErrorCode::PolicyInvalid,
                 message: format!("policy invalid at {}: {}", e.path(), e.inner()),
             })?;
-        // The `journal` and `telemetry` keys are schema-legal and now typed +
-        // validated, but v0.1 selects the journal path at construction
-        // (KEEL_JOURNAL / .keel/journal.db) and drives OTel export from the
-        // environment. Warn loudly rather than silently ignoring a set value, so
-        // a user pointing `journal` at a migration target — or setting an OTLP
-        // endpoint — is not surprised when it has no effect (finding: frozen keys
-        // accepted and silently ignored).
-        if policy.journal.is_some() {
-            // Note the value is intentionally NOT logged: a `postgres://` journal
-            // location can carry credentials, and this is a diagnostic log line.
+        // `journal` selects the backing store (spec §4.2 — "that override is
+        // the entire laptop→enterprise migration"), so it must take effect or
+        // fail loudly, never warn-and-ignore. Applied before the policy swap so
+        // a rejected location leaves the previous configuration fully in force.
+        if let Some(location) = &policy.journal {
+            self.apply_journal_location(location)?;
+        }
+        // `telemetry.otlp_endpoint` IS honored: native front ends built with the
+        // `otel` feature read it back via `telemetry_otlp_endpoint` (below) and
+        // pass it to `otel::init_otlp` (env still wins — see `otel::export_enabled`
+        // / `otel::resolve_endpoint`). `telemetry.console` (the local
+        // pretty-console-summary switch, architecture spec §4.5) is validated and
+        // carried but has no consumer yet; warn on an explicit non-default value
+        // rather than silently ignoring the user's intent.
+        if let Some(telemetry) = &policy.telemetry
+            && !telemetry.console
+        {
             warn!(
-                "policy `journal` is validated but not yet wired: v0.1 selects the journal path at \
-                 startup (KEEL_JOURNAL env or .keel/journal.db). This value has no effect."
+                "policy `telemetry.console = false` is validated but not yet wired: v0.1 always \
+                 uses the default local summary. `telemetry.otlp_endpoint` IS honored by front \
+                 ends built with the `otel` feature."
             );
         }
-        if policy.telemetry.is_some() {
-            warn!(
-                "policy `telemetry` is validated but inert in v0.1: OTel export is configured from \
-                 the environment (KEEL_OTEL_*). This table has no effect."
-            );
-        }
+        warn_inert_breaker_knobs(&policy);
         *self.policy.write().expect("policy lock poisoned") = policy;
         Ok(())
+    }
+
+    /// The effective `telemetry.otlp_endpoint` (`None` if `[telemetry]` is
+    /// absent or the key unset), read live so a reconfigure is honored. Native
+    /// front ends built with the `otel` feature read this after `configure` and
+    /// pass it to [`crate::otel::export_enabled`] / [`crate::otel::resolve_endpoint`]
+    /// to decide whether/where to export (env vars still take precedence).
+    #[must_use]
+    pub fn telemetry_otlp_endpoint(&self) -> Option<String> {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .telemetry
+            .as_ref()
+            .and_then(|t| t.otlp_endpoint.clone())
+    }
+
+    /// Honor `policy.journal`: open and attach the backend it names, replacing
+    /// any construction-time attachment — the effective policy is
+    /// authoritative. (Front ends that want an environment escape hatch such as
+    /// `KEEL_JOURNAL` compose it into the effective policy *before* calling
+    /// `configure`, per the effective-policy contract.) Reapplying an unchanged
+    /// location — the same `file:` path, or the same `postgres://` URL — is a
+    /// no-op, so reconfigure loops never re-open the store, re-open a fresh
+    /// Postgres connection pool, or drop either's connection state.
+    ///
+    /// # Errors
+    /// - `KEEL-E040` when the selected SQLite file, or the selected Postgres
+    ///   database, cannot be opened/connected to.
+    fn apply_journal_location(&self, location: &JournalLocation) -> Result<(), KeelError> {
+        let backend = JournalBackend::select(location);
+        {
+            let slot = self.journal.read().expect("journal lock poisoned");
+            if slot.backend.as_ref() == Some(&backend) {
+                return Ok(()); // unchanged location: keep the open store
+            }
+        }
+        // Open OFF the lock (filesystem/network I/O); the brief write below
+        // only swaps pointers. Two racing configures both open, last writer
+        // wins — the loser's store (and, for Postgres, its connection pool)
+        // is just dropped.
+        let journal = journal_backend::open(&backend)?;
+        if let JournalBackend::File(path) = &backend {
+            debug!(path = %path.display(), "journal selected by policy");
+        }
+        let mut slot = self.journal.write().expect("journal lock poisoned");
+        slot.journal = Some(journal);
+        slot.backend = Some(backend);
+        Ok(())
+    }
+
+    /// The target's resolved `idempotency = { header }` knob, read live so a
+    /// reconfigure is honored. This is the engine surface of the injection
+    /// contract (contracts/adapter-pack.md "Idempotency-key injection"):
+    /// adapters/bindings consult it to mint and inject an idempotency key on
+    /// unsafe-method calls — the engine itself never injects, and the flipped
+    /// judgment reaches it as `Request.idempotent = true`.
+    #[must_use]
+    pub fn idempotency_header(&self, target: &str) -> Option<String> {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .resolve(target)
+            .idempotency
+            .map(|i| i.header)
     }
 
     /// The configured Tier 2 `flows.on_nondeterminism` response (default
@@ -545,6 +897,15 @@ impl Engine {
             .await;
         record_call_fields(&span, &out);
         self.observe(request, &out, started);
+        // Every call's last feed event, on all paths (cache hit, breaker
+        // reject, envelope error, live attempt).
+        self.emit_event(|| EventKind::CallEnd {
+            call: out.trace_id.clone(),
+            target: request.target.clone(),
+            result: out.result.clone(),
+            code: out.error.as_ref().map(|e| e.code),
+            attempts: out.attempts,
+        });
         out
     }
 
@@ -558,6 +919,23 @@ impl Engine {
     {
         let target = request.target.as_str();
         let mut out = self.begin_call(target);
+
+        // Every call's first feed event; its seq anchors the trace ref that
+        // failure messages carry (`None` without a sink — the parity path).
+        let trace = self.events.as_ref().map(|sink| {
+            let seq = sink.emit(
+                self.elapsed_ms(),
+                EventKind::CallStart {
+                    call: out.trace_id.clone(),
+                    target: target.to_owned(),
+                    op: request.op.clone(),
+                },
+            );
+            TraceRef {
+                run: sink.run_id().to_owned(),
+                seq,
+            }
+        });
 
         if request.v != ENVELOPE_VERSION {
             out.error = Some(OutcomeError {
@@ -577,18 +955,27 @@ impl Engine {
             .expect("policy lock poisoned")
             .resolve(target);
 
-        // cache (outermost layer)
+        // cache (outermost layer); every planned lookup is one
+        // `keel.cache.requests` datapoint (hit ratio, spec §4.5)
         let cache_plan = self.plan_cache(target, &resolved, request);
         match &cache_plan {
             CachePlan::Memory { key } => {
                 if self.serve_from_cache(key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
+                    self.emit_cache(&out, target, CacheStore::Memory, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
+                self.emit_cache(&out, target, CacheStore::Memory, false);
             }
             CachePlan::Persistent { key, .. } => {
                 if self.serve_from_persistent(target, key, &mut out) {
+                    crate::metrics::record_cache_request(target, true);
+                    self.emit_cache(&out, target, CacheStore::Persistent, true);
                     return out;
                 }
+                crate::metrics::record_cache_request(target, false);
+                self.emit_cache(&out, target, CacheStore::Persistent, false);
             }
             CachePlan::None => {}
         }
@@ -599,7 +986,7 @@ impl Engine {
         }
 
         // breaker admission (observes post-retry call outcomes)
-        let admission = self.admit(target, &resolved, &mut out);
+        let admission = self.admit(target, &resolved, &mut out, trace.as_ref());
         if admission == Admission::Rejected {
             return out;
         }
@@ -610,7 +997,7 @@ impl Engine {
             ..RetryPolicy::default()
         });
         let result = self
-            .run_attempts(request, &resolved, &retry, effect, &mut out)
+            .run_attempts(request, &resolved, &retry, effect, &mut out, trace.as_ref())
             .await;
         // Only the memory scope writes through under the state lock; the
         // persistent scope writes after the lock drops (journal I/O off-lock).
@@ -641,7 +1028,7 @@ impl Engine {
             return CachePlan::None;
         };
         match cache.scope {
-            CacheScope::Persistent if self.journal.is_some() => CachePlan::Persistent {
+            CacheScope::Persistent if self.current_journal().is_some() => CachePlan::Persistent {
                 key: JournalCacheKey::new(format!("{target}#{hash}")),
                 ttl,
             },
@@ -714,7 +1101,7 @@ impl Engine {
         key: &JournalCacheKey,
         out: &mut Outcome,
     ) -> bool {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return false;
         };
         let bytes = match journal.get_cache(key) {
@@ -750,20 +1137,33 @@ impl Engine {
         let wait_ms = {
             let elapsed = self.elapsed_ms();
             let mut state = self.state();
-            let window = state.rate_windows.entry(target.to_owned()).or_default();
-            window.plan_admit(elapsed, rate)
+            let bucket = state.rate_buckets.entry(target.to_owned()).or_default();
+            bucket.plan_admit(elapsed, rate)
         };
         if wait_ms > 0 {
             out.throttled = true;
             out.throttle_wait_ms = wait_ms;
             self.state().metrics_for(target).throttled += 1;
+            crate::metrics::record_throttled(target, wait_ms);
+            // Emitted before the wait so a live tail shows the queueing now.
+            self.emit_event(|| EventKind::Throttle {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                wait_ms,
+            });
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
     }
 
     /// Consults the target's breaker; on rejection, fills the fail-fast
     /// KEEL-E012 outcome (the effect is never invoked).
-    fn admit(&self, target: &str, resolved: &ResolvedPolicy, out: &mut Outcome) -> Admission {
+    fn admit(
+        &self,
+        target: &str,
+        resolved: &ResolvedPolicy,
+        out: &mut Outcome,
+        trace: Option<&TraceRef>,
+    ) -> Admission {
         if resolved.breaker.is_none() {
             return Admission::Closed;
         }
@@ -780,7 +1180,10 @@ impl Engine {
                     code: ErrorCode::BreakerOpen,
                     class: ErrorClass::Other,
                     http_status: None,
-                    message: format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                    message: with_trace_ref(
+                        format!("breaker OPEN for {target}: failed fast, call not attempted"),
+                        trace,
+                    ),
                     original: None,
                 });
                 out.breaker = BreakerState::Open;
@@ -788,9 +1191,21 @@ impl Engine {
             }
             admission
         };
+        // Both feed events run off the state lock, like the debug! below.
+        if admission == Admission::Rejected {
+            self.emit_event(|| EventKind::BreakerReject {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
+        }
         // Admitting a probe is an OPEN → HALF-OPEN transition (spec §4.5).
         if admission == Admission::HalfOpen {
             debug!(target = %target, transition = "half_open", "breaker transition");
+            crate::metrics::record_breaker_transition(target, "half_open");
+            self.emit_event(|| EventKind::BreakerHalfOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            });
         }
         admission
     }
@@ -813,10 +1228,10 @@ impl Engine {
                 Ok(payload) => {
                     state.metrics_for(target).successes += 1;
                     let mut transition = BreakerTransition::None;
-                    if resolved.breaker.is_some()
+                    if let Some(config) = &resolved.breaker
                         && let Some(breaker) = state.breakers.get_mut(target)
                     {
-                        transition = breaker.on_success();
+                        transition = breaker.on_success(now, config);
                     }
                     if let (Some(key), Some(cache)) = (cache_key, &resolved.cache)
                         && let Some(ttl) = cache.ttl
@@ -857,6 +1272,18 @@ impl Engine {
             transition
         };
         emit_breaker_transition(target, transition);
+        match transition {
+            BreakerTransition::Opened => self.emit_event(|| EventKind::BreakerOpen {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                cooldown_ms: resolved.breaker.as_ref().map_or(0, |b| b.cooldown.0),
+            }),
+            BreakerTransition::Closed => self.emit_event(|| EventKind::BreakerClose {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+            }),
+            BreakerTransition::None => {}
+        }
     }
 
     /// Writes a live success into the journal's persistent cache (called after
@@ -870,7 +1297,7 @@ impl Engine {
         payload: &Value,
         ttl: DurationMs,
     ) {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.current_journal() else {
             return;
         };
         let bytes = match encode_cache_payload(payload) {
@@ -909,6 +1336,21 @@ impl Engine {
             .error
             .as_ref()
             .is_some_and(|e| e.code == ErrorCode::BreakerOpen);
+        // "Observed, not retried" (dx-spec §1 Level 0 hard rule): the call
+        // failed and the retry layer refused to re-send it (KEEL-E014).
+        let not_retried = out
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::NonIdempotentNotRetried);
+        // Coverage: the front end resolves globs to the exact policy-table key
+        // before `execute`, so an exact lookup answers "did an explicit
+        // [target."…"] entry apply?" — defaults-only calls count as unwrapped.
+        let wrapped = self
+            .policy
+            .read()
+            .expect("policy lock poisoned")
+            .target
+            .contains_key(&request.target);
         let observation = CallObservation {
             target: request.target.clone(),
             result,
@@ -916,6 +1358,8 @@ impl Engine {
             latency_ms,
             throttled: out.throttled,
             breaker_opened,
+            not_retried,
+            wrapped,
             error,
         };
         if let Err(error) = discovery.record(&observation) {
@@ -979,7 +1423,8 @@ impl Engine {
         }
     }
 
-    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error.
+    /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error
+    /// (whose message carries the call's trace ref when a sink is live).
     async fn run_attempts<F>(
         &self,
         request: &Request,
@@ -987,6 +1432,7 @@ impl Engine {
         retry: &RetryPolicy,
         effect: &mut F,
         out: &mut Outcome,
+        trace: Option<&TraceRef>,
     ) -> Result<Value, OutcomeError>
     where
         F: AsyncFnMut(u32) -> AttemptResult,
@@ -1003,6 +1449,12 @@ impl Engine {
         for attempt in 1..=max_attempts {
             out.attempts = attempt;
             self.state().metrics_for(target).attempts += 1;
+            crate::metrics::record_attempt(target);
+            self.emit_event(|| EventKind::AttemptStart {
+                call: out.trace_id.clone(),
+                target: target.to_owned(),
+                attempt,
+            });
 
             // Child span per attempt (spec §4.5): `class`/`http_status`/`wait_ms`
             // are filled in below once the attempt resolves. The effect future
@@ -1037,38 +1489,38 @@ impl Engine {
                     if let Some(status) = http_status {
                         attempt_span.record("http_status", status);
                     }
+                    self.emit_event(|| EventKind::AttemptError {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        class,
+                        http_status,
+                    });
                     let retryable = retry.is_retryable(class, http_status);
                     if let Some(code) =
                         terminal_code(retryable, attempt, max_attempts, request.idempotent)
                     {
-                        // A policy-layer timeout is the more precise diagnosis
-                        // than "exhausted"/"non-retryable" — except for the
-                        // Level 0 non-idempotent rule, which callers must see.
-                        let code = if attempt_outcome.timed_out_by_layer
-                            && code != ErrorCode::NonIdempotentNotRetried
-                        {
-                            ErrorCode::Timeout
-                        } else {
-                            code
+                        let ctx = TerminalAttemptCtx {
+                            request,
+                            attempt,
+                            max_attempts,
+                            trace,
+                            timed_out_by_layer: attempt_outcome.timed_out_by_layer,
                         };
-                        return Err(OutcomeError {
+                        return Err(terminal_attempt_error(
+                            &ctx,
                             code,
                             class,
                             http_status,
-                            message: terminal_message(
-                                code,
-                                request,
-                                attempt,
-                                max_attempts,
-                                class,
-                                http_status,
-                                &message,
-                            ),
+                            &message,
                             original,
-                        });
+                        ));
                     }
-                    let mut wait = retry.schedule.wait_ms(attempt);
-                    if retry.schedule.has_jitter() && wait > 0 {
+                    // Jitter is the emitting segment's flag (schedules can
+                    // compose via `upTo`/`andThen`; the walk is pure in the
+                    // attempt number, so jitter never shifts handoff points).
+                    let (mut wait, jitter) = retry.schedule.wait_and_jitter(attempt);
+                    if jitter && wait > 0 {
                         wait = fastrand::u64(wait / 2..=wait);
                     }
                     if let Some(server_says) = retry_after_ms {
@@ -1077,6 +1529,14 @@ impl Engine {
                     attempt_span.record("wait_ms", wait);
                     out.waits_ms.push(wait);
                     self.state().metrics_for(target).retries += 1;
+                    crate::metrics::record_retry(target, wait);
+                    // Emitted before the wait so a live tail shows it now.
+                    self.emit_event(|| EventKind::Backoff {
+                        call: out.trace_id.clone(),
+                        target: target.to_owned(),
+                        attempt,
+                        wait_ms: wait,
+                    });
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
             }
@@ -1119,9 +1579,86 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttemptResult, ENVELOPE_VERSION, Engine, Request};
+    use super::{
+        Admission, AttemptResult, Breaker, BreakerTransition, ENVELOPE_VERSION, Engine, Instant,
+        Request, TokenBucket,
+    };
+    use core::num::NonZeroU32;
     use core::time::Duration;
+    use keel_core_api::policy::{BreakerPolicy, DurationMs, Rate};
     use serde_json::json;
+
+    /// A failure recorded far enough in the past to have aged out of the
+    /// window must not count towards a later trip decision: without eviction,
+    /// this exact two-failure sequence (11s apart, `window: 10s`) would trip
+    /// at `min_calls: 2` (rate 1.0); with eviction the first failure is gone
+    /// by the time the second arrives, so the window only ever holds one.
+    #[test]
+    fn breaker_rate_mode_evicts_outcomes_older_than_the_window() {
+        let config = BreakerPolicy {
+            failures: None,
+            cooldown: DurationMs(15_000),
+            window: Some(DurationMs(10_000)),
+            failure_rate: Some(0.5),
+            min_calls: Some(NonZeroU32::new(2).unwrap()),
+        };
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+
+        assert_eq!(
+            breaker.on_terminal_failure(t0, &config, Admission::Closed),
+            BreakerTransition::None,
+            "one failure is below min_calls"
+        );
+        let t_11s = t0 + Duration::from_secs(11);
+        assert_eq!(
+            breaker.on_terminal_failure(t_11s, &config, Admission::Closed),
+            BreakerTransition::None,
+            "the stale failure must have aged out of the 10s window"
+        );
+    }
+
+    /// Burst capacity is `limit` tokens, never more — an idle gap refills the
+    /// bucket but is clamped at capacity, so it cannot bank unlimited tokens
+    /// for a future burst larger than the configured `limit`.
+    #[test]
+    fn token_bucket_caps_refill_at_burst_capacity() {
+        let rate = Rate {
+            limit: core::num::NonZeroU64::new(2).unwrap(),
+            window_ms: 1000,
+        };
+        let mut bucket = TokenBucket::default();
+
+        assert_eq!(bucket.plan_admit(0, rate), 0, "burst covers the first call");
+        assert_eq!(
+            bucket.plan_admit(0, rate),
+            0,
+            "burst covers the second call"
+        );
+        assert_eq!(
+            bucket.plan_admit(0, rate),
+            500,
+            "burst drained: paced at window/limit = 500ms"
+        );
+
+        // A long idle gap (50s, enough to "earn" 100 tokens at this rate) must
+        // not accrue more than the 2-token burst cap.
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            0,
+            "capacity refilled to burst"
+        );
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            0,
+            "both burst tokens available"
+        );
+        assert_eq!(
+            bucket.plan_admit(50_000, rate),
+            500,
+            "capacity clamp: idle time cannot bank more than `limit` tokens"
+        );
+    }
 
     fn req(target: &str, args_hash: &str) -> Request {
         Request {

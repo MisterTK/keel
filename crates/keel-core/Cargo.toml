@@ -6,15 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-publish = false
+readme.workspace = true
+# Publishable. Note the crates.io name collision (docs/naming-decision.md):
+# publishing is a release-workflow step, blocked on the naming decision.
 # Only the explicitly declared `overhead` bench is a target; `benches/support.rs`
 # is a module of it (and of tests/overhead_guard.rs), not a bench of its own.
 autobenches = false
 
 [dependencies]
 fastrand = "2.3"
-keel-core-api = { path = "../keel-core-api" }
-keel-journal = { path = "../keel-journal" }
+keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
+keel-journal = { path = "../keel-journal", version = "0.1.0" }
 # OTLP export, gated behind the `otel` feature so the default core stays lean
 # and dependency-free (see src/otel.rs). Versions form a compatible 0.32 set.
 opentelemetry = { version = "0.32", optional = true }

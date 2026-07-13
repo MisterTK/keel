@@ -49,7 +49,7 @@ pub enum RunError {
 }
 
 impl RunError {
-    fn render(&self) -> Rendered {
+    pub(crate) fn render(&self) -> Rendered {
         let (what, why, next, kind) = match self {
             Self::NotFound { target } => (
                 format!("Cannot run `{target}`: no such file or directory."),
@@ -199,11 +199,22 @@ fn node_package(manifest: &Path, args: &[String], disable: bool) -> Result<RunPl
 /// Execute a [`RunPlan`], inheriting the environment (so `KEEL_*` passes
 /// through). Returns the child's exit code, or a rendered spawn error.
 pub fn exec(plan: &RunPlan) -> Result<i32, Rendered> {
+    exec_with(plan, |_cmd| {})
+}
+
+/// Like [`exec`], but lets the caller layer extra environment onto the child
+/// before it spawns (`keel record run` sets `KEEL_RECORD` this way — see
+/// `crate::record`). `exec` is exactly `exec_with(plan, |_| {})`.
+pub(crate) fn exec_with(
+    plan: &RunPlan,
+    configure: impl FnOnce(&mut Command),
+) -> Result<i32, Rendered> {
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.argv);
     if plan.disable {
         cmd.env("KEEL_DISABLE", "1");
     }
+    configure(&mut cmd);
     match cmd.status() {
         Ok(status) => Ok(status.code().unwrap_or(EXIT_FAILURE)),
         Err(err) => {
@@ -370,6 +381,26 @@ mod tests {
             disable: false,
         };
         assert_eq!(exec(&plan).expect("sh should spawn"), 7);
+    }
+
+    #[test]
+    fn exec_with_layers_extra_env_onto_the_child() {
+        // `keel record run` (crate::record) relies on this to thread
+        // `KEEL_RECORD` into the child without duplicating `exec`'s spawn
+        // logic — prove the closure actually reaches the child's environment.
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![
+                "-c".to_owned(),
+                "[ \"$KEEL_RECORD_TEST\" = \"marker\" ] && exit 0 || exit 9".to_owned(),
+            ],
+            disable: false,
+        };
+        let code = exec_with(&plan, |cmd| {
+            cmd.env("KEEL_RECORD_TEST", "marker");
+        })
+        .expect("sh should spawn");
+        assert_eq!(code, 0);
     }
 
     #[test]

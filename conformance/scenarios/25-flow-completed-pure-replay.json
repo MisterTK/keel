@@ -1,0 +1,50 @@
+{
+  "name": "flow-completed-pure-replay",
+  "tier": 2,
+  "description": "Tier 2: re-entering an already-completed flow is pure replay — no lease is taken, no attempt is consumed, and every step substitutes from the journal with ZERO live effect calls, even though the front end scripts different (should-not-run) effects the second time around. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-25",
+    "code_hash": "ch-25"
+  },
+  "runs": [
+    {
+      "end": "success",
+      "expect_effect_calls": 2,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "t": "a" } },
+          "expect": { "result": "ok", "payload": { "t": "a" } }
+        },
+        {
+          "target": "api.b.internal",
+          "args_hash": "2",
+          "effect": { "status": "ok", "payload": { "t": "b" } },
+          "expect": { "result": "ok", "payload": { "t": "b" } }
+        }
+      ]
+    },
+    {
+      "end": "success",
+      "expect_effect_calls": 0,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "1",
+          "effect": { "status": "ok", "payload": { "SHOULD_NOT_RUN": true } },
+          "expect": { "result": "ok", "payload": { "t": "a" } }
+        },
+        {
+          "target": "api.b.internal",
+          "args_hash": "2",
+          "effect": { "status": "ok", "payload": { "SHOULD_NOT_RUN": true } },
+          "expect": { "result": "ok", "payload": { "t": "b" } }
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,9 @@
       "import": "./hook.mjs",
       "require": "./hook.cjs"
     },
+    "./testing": {
+      "import": "./testing.mjs"
+    },
     "./package.json": "./package.json"
   },
   "bin": {
@@ -33,6 +36,7 @@
     "ai-sdk.d.ts",
     "hook.mjs",
     "hook.cjs",
+    "testing.mjs",
     "bin/",
     "src/",
     "README.md"

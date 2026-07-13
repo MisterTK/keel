@@ -10,8 +10,10 @@
 //! `!Sync` connection.
 //!
 //! Deliberate v1 simplifications, recorded here per the manifesto:
-//! - Expired cache/step rows are filtered on read, not swept; a `keel fsck`
-//!   GC pass is the eventual reaper.
+//! - Expired cache rows are filtered on read; each [`open`](SqliteJournal::open)
+//!   sweeps the ones already expired (a bounded, startup-time reap so a
+//!   dev-cache-heavy project's journal does not grow without bound between
+//!   runs), and `keel fsck --fix` sweeps on demand ([`crate::admin`]).
 //! - `incomplete_flows` treats only `running` as resumable; `failed`/`dead`
 //!   are terminal for recovery (the flow manager owns the failed→retry policy
 //!   if one is ever added).
@@ -23,27 +25,33 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::clock::Clock;
+use crate::convert::{
+    FLOW_COLUMNS, FlowRowData, StepRowData, duration_ms, flow_from_row, step_from_row, to_i64,
+};
 use crate::error::{Error, Result};
 use crate::journal::Journal;
 use crate::types::{
-    CacheKey, FlowDescriptor, FlowId, FlowStatus, NewFlow, ProcessId, StepKey, StepKind,
-    StepOutcome, StepStatus, error_class_from_db, error_class_str,
+    CacheKey, FlowDescriptor, FlowId, FlowStatus, NewFlow, ProcessId, StepKey, StepOutcome,
+    error_class_str,
 };
 
 /// The frozen schema, embedded so the compiled backend and the contract can
 /// never drift.
-const SCHEMA: &str = include_str!("../../../contracts/journal.sql");
+const SCHEMA: &str = include_str!("../contract/journal.sql");
 
-/// Per-connection pragmas set on every open. WAL is also persisted in the file
-/// by the schema, but re-asserting it makes opening a foreign-created DB safe.
+/// Per-connection pragmas set on every open. `busy_timeout` MUST come first:
+/// switching a brand-new file into WAL mode briefly needs an exclusive lock,
+/// and when several processes race to open the same fresh path (the exact
+/// scenario `concurrent_first_open_is_race_safe` exercises), that first WAL
+/// switch is the statement that contends — with `busy_timeout` unset at that
+/// point, a loser gets an immediate `SQLITE_BUSY` ("database is locked")
+/// instead of waiting out the timeout. WAL is also persisted in the file by
+/// the schema, but re-asserting it makes opening a foreign-created DB safe.
 const CONNECTION_PRAGMAS: &str = "\
+PRAGMA busy_timeout = 5000;
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = NORMAL;";
-
-const FLOW_COLUMNS: &str = "flow_id, entrypoint, args_hash, code_hash, status, lease_holder, lease_expires, \
-     created_at, updated_at";
 
 /// A crash-durable [`Journal`] over a single WAL-mode SQLite file, generic over
 /// the [`Clock`] that stamps the timestamps the store originates.
@@ -74,9 +82,15 @@ impl<C: Clock> SqliteJournal<C> {
     /// back on next open rather than leaving a half-created schema that every
     /// future open mistakes for complete and then silently fails to journal to.
     pub fn open(path: impl AsRef<Path>, clock: C) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(CONNECTION_PRAGMAS)?;
-        init_schema(&conn)?;
+        let conn = open_and_init_with_retry(path.as_ref())?;
+        // Opportunistic reap: expired cache rows are invisible to reads but
+        // still grow the file; sweeping the backlog once per open bounds a
+        // dev-cache-heavy project's journal without touching the hot path.
+        // Best-effort — a locked or read-only file must not fail the open.
+        let _ = conn.execute(
+            "DELETE FROM cache WHERE expires_at <= ?1",
+            params![clock.now_ms()],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
@@ -272,30 +286,6 @@ impl<C: Clock> Journal for SqliteJournal<C> {
     }
 }
 
-/// A flow row exactly as the columns arrive from SQLite, before typing.
-struct FlowRowData {
-    flow_id: String,
-    entrypoint: String,
-    args_hash: String,
-    code_hash: Option<String>,
-    status: String,
-    lease_holder: Option<String>,
-    lease_expires: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-/// A step row as the columns arrive from SQLite, before typing.
-struct StepRowData {
-    kind: String,
-    attempt: i64,
-    outcome: String,
-    payload: Option<Vec<u8>>,
-    error_class: Option<String>,
-    started_at: i64,
-    ended_at: Option<i64>,
-}
-
 /// Extracts the raw flow columns inside the query closure (which must return a
 /// `rusqlite::Result`); typing happens afterwards in [`flow_from_row`].
 fn flow_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FlowRowData> {
@@ -331,38 +321,6 @@ fn step_row_from(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<StepR
     })
 }
 
-fn flow_from_row(raw: FlowRowData) -> Result<FlowDescriptor> {
-    Ok(FlowDescriptor {
-        flow_id: FlowId::new(raw.flow_id),
-        entrypoint: raw.entrypoint,
-        args_hash: raw.args_hash,
-        code_hash: raw.code_hash,
-        status: FlowStatus::from_db(&raw.status)?,
-        lease_holder: raw.lease_holder.map(ProcessId::new),
-        lease_expires: raw.lease_expires,
-        created_at: raw.created_at,
-        updated_at: raw.updated_at,
-    })
-}
-
-fn step_from_row(raw: StepRowData) -> Result<StepOutcome> {
-    let error_class = raw
-        .error_class
-        .as_deref()
-        .map(|value| error_class_from_db("steps.error_class", value))
-        .transpose()?;
-    Ok(StepOutcome {
-        kind: StepKind::from_db(&raw.kind)?,
-        attempt: u32::try_from(raw.attempt)
-            .map_err(|_| Error::corrupt("steps.attempt", raw.attempt))?,
-        status: StepStatus::from_db(&raw.outcome)?,
-        payload: raw.payload,
-        error_class,
-        started_at: raw.started_at,
-        ended_at: raw.ended_at,
-    })
-}
-
 /// Apply the frozen schema exactly once, race-safely and crash-atomically.
 ///
 /// `BEGIN IMMEDIATE` takes the database write lock up front, so concurrent
@@ -371,6 +329,49 @@ fn step_from_row(raw: StepRowData) -> Result<StepOutcome> {
 /// skips the batch. The whole `CREATE TABLE` batch commits atomically, so a
 /// crash mid-batch rolls back (leaving no `flows` table) and the next open
 /// re-applies the full schema — never a partially-initialized journal.
+/// Open a fresh connection, apply pragmas, and initialize the schema — the
+/// whole critical section retried as one unit on a transient `SQLITE_BUSY`.
+/// `busy_timeout` (the first pragma applied) covers most lock contention, but
+/// empirically `PRAGMA journal_mode = WAL` itself can surface `SQLITE_BUSY`
+/// immediately rather than through the C-level busy handler when several
+/// threads race to WAL-ize the SAME brand-new file (the exact scenario
+/// `concurrent_first_open_is_race_safe` exercises) — a SQLite behavior this
+/// crate does not control, so a handful of short, jittered retries on a FRESH
+/// connection (never reusing one that hit a mid-setup error) closes the gap
+/// without slowing the uncontended, overwhelming-majority case, which never
+/// retries at all.
+fn open_and_init_with_retry(path: &Path) -> Result<Connection> {
+    const ATTEMPTS: u32 = 8;
+    for attempt in 1..=ATTEMPTS {
+        let attempted = (|| {
+            let conn = Connection::open(path)?;
+            conn.execute_batch(CONNECTION_PRAGMAS)?;
+            init_schema(&conn)?;
+            Ok(conn)
+        })();
+        match attempted {
+            Ok(conn) => return Ok(conn),
+            Err(e) if attempt < ATTEMPTS && is_sqlite_busy(&e) => {
+                std::thread::sleep(Duration::from_millis(5 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt's Ok or Err")
+}
+
+/// Is this a transient `SQLITE_BUSY`/`SQLITE_LOCKED`, safe to retry?
+fn is_sqlite_busy(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
@@ -404,21 +405,11 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-/// Clamp a `Duration` to whole milliseconds as an `i64` (saturating; a TTL past
-/// the epoch's `i64` range is not a real configuration).
-fn duration_ms(ttl: Duration) -> i64 {
-    i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)
-}
-
-/// Narrow a `u64` sequence number to the schema's `INTEGER` (`i64`) domain.
-fn to_i64(column: &'static str, seq: u64) -> Result<i64> {
-    i64::try_from(seq).map_err(|_| Error::corrupt(column, seq))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::types::{StepKind, StepStatus};
     use keel_core_api::ErrorClass;
     use tempfile::TempDir;
 
@@ -727,6 +718,33 @@ mod tests {
         j.put_cache(&key, b"v2", Duration::from_secs(10)).unwrap();
         clock.advance(6_000); // past v1's expiry, within v2's
         assert_eq!(j.get_cache(&key).unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    #[test]
+    fn open_sweeps_the_expired_cache_backlog() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("journal.db");
+        {
+            let j = SqliteJournal::open(&path, ManualClock::new(T0)).unwrap();
+            j.put_cache(&CacheKey::new("stale"), b"v", Duration::from_secs(1))
+                .unwrap();
+            j.put_cache(&CacheKey::new("fresh"), b"v", Duration::from_hours(1))
+                .unwrap();
+        }
+        // Reopen well past the short TTL: the expired row is physically gone,
+        // the live one is untouched.
+        let reopened = SqliteJournal::open(&path, ManualClock::new(T0 + 10_000)).unwrap();
+        assert!(
+            reopened
+                .get_cache(&CacheKey::new("fresh"))
+                .unwrap()
+                .is_some()
+        );
+        let remaining: i64 = reopened
+            .lock()
+            .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "expired backlog swept on open");
     }
 
     #[test]

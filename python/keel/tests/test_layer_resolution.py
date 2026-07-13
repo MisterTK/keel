@@ -5,6 +5,11 @@ public ``layer()``) are now honored on BOTH backends:
 
   * ``idempotency.header`` — a POST carrying the configured header is retryable
     (was silently ignored under native → divergent retry decisions vs Node);
+    a POST carrying NO recognized key is now INJECTED one and retried too
+    (contracts/adapter-pack.md "Idempotency-key injection" — see
+    ``test_adapters_httpx.py``/``test_adapters_requests.py`` for the fuller
+    injection matrix: stable-across-retries, caller-key-wins, distinct
+    per-logical-call keys);
   * the cache-body buffering gate — a response body is buffered ONLY when a cache
     ttl is actually configured, so a streaming/SSE GET passes through unbuffered
     at Level 0 (Python used to force-read every GET body).
@@ -112,14 +117,22 @@ class _IdempotencyHeaderE2E:
         self.assertEqual(r.status_code, 200, f"[{self.KIND}] configured-header POST retried to success")
         self.assertEqual(r.keel_outcome["attempts"], 2)
 
-    def test_post_without_configured_header_not_retried(self) -> None:
+    def test_post_without_a_caller_header_is_injected_and_retried(self) -> None:
+        # contracts/adapter-pack.md "Idempotency-key injection": a configured
+        # `idempotency.header` with no caller-supplied key means the adapter
+        # MINTS one and injects it — the judgment flip makes this retryable,
+        # superseding the old recognition-only behavior (a bare POST used to
+        # be observed, not retried, here).
         self._install({**level0_defaults(), "target": {"127.0.0.1": {**_RETRY_5XX, **_IDEM}}})
         with FaultServer([fail(503), ok(b"ok")]) as srv:
             with httpx.Client() as c:
-                r = c.post(srv.url("/p"))  # no idempotency header → not retryable
-        self.assertEqual(r.status_code, 503, f"[{self.KIND}] bare POST observed, not retried")
-        self.assertEqual(r.keel_outcome["attempts"], 1)
-        self.assertEqual(r.keel_outcome["error"]["code"], "KEEL-E014")
+                r = c.post(srv.url("/p"))
+        self.assertEqual(r.status_code, 200, f"[{self.KIND}] injected-key POST retried to success")
+        self.assertEqual(r.keel_outcome["attempts"], 2)
+        keys = [h.get("x-request-token") for h in srv.headers]
+        self.assertEqual(len(keys), 2)
+        self.assertIsNotNone(keys[0])
+        self.assertEqual(keys[0], keys[1])  # same minted key on every attempt
 
 
 class IdempotencyHeaderStub(_IdempotencyHeaderE2E, unittest.TestCase):

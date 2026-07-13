@@ -81,21 +81,37 @@ def extract_function_targets(policy: dict[str, Any]) -> list[FunctionTarget]:
 class FlowEntrypoint(NamedTuple):
     """A Tier 2 durable-flow entrypoint from `[flows] entrypoints`, parsed from
     the `py:<module>:<function>` grammar into the module to import and the
-    function to run as the flow body."""
+    function to run as the flow body. The module portion may be a `*` glob
+    over the dotted module path (`py:pipeline.*:main`); `match_flow` resolves
+    a glob to a CONCRETE entry (so flow identity never contains a glob), with
+    `via` recording the designating pattern."""
 
-    raw: str  # the declared entrypoint, e.g. "py:pipeline:main"
-    module: str  # the module to import, e.g. "pipeline"
+    raw: str  # the entrypoint, e.g. "py:pipeline:main" (concrete after a glob match)
+    module: str  # the module to import — or a `*` glob before matching
     function: str  # the function to run as the flow, e.g. "main"
+    via: str | None = None  # the declared glob that designated this entry, if any
 
 
 def extract_flow_entrypoints(policy: dict[str, Any]) -> list[FlowEntrypoint]:
-    """The `py:<module>:<function>` flow entrypoints declared in
-    `[flows] entrypoints`.
+    """The `py:` flow entrypoints declared in `[flows] entrypoints`.
 
-    v0.1 rule (documented): the module portion is a concrete importable module
-    (single component in v0.1, e.g. `pipeline`); a colon separates it from the
-    function name. Malformed or non-`py:` entries are skipped, not guessed —
-    designating a flow is an explicit, load-bearing assertion.
+    Admitted forms (docs/targeting.md; the frozen `entrypointRef` grammar
+    `^(py|ts|rs):\\S+$` already covers all of them — no schema change):
+
+      * `py:<module>:<function>` — concrete designation, as before. The module
+        is a concrete importable dotted path; the function is its flow body.
+      * `py:<module-glob>:<function>` — the module portion may contain `*`
+        (matching any run of characters, dots included, over the dotted module
+        path of the script `keel run` executes). The function must stay
+        CONCRETE — a `*` in the function position is skipped (we must know
+        exactly what to call).
+      * `py:<module-glob>` — glob shorthand with no `:function`: the function
+        defaults to `main` (the spec's own convention — `keel flows add
+        pipeline.ingest:main`). A colon-less entry WITHOUT a glob stays
+        skipped, exactly as before.
+
+    Malformed and non-`py:` entries are skipped, not guessed — designating a
+    flow is an explicit, load-bearing assertion.
     """
     flows = policy.get("flows")
     if not isinstance(flows, dict):
@@ -108,10 +124,13 @@ def extract_flow_entrypoints(policy: dict[str, Any]) -> list[FlowEntrypoint]:
         if not isinstance(raw, str) or not raw.startswith("py:"):
             continue
         body = raw[3:]
-        if ":" not in body:
-            continue  # need module:function
-        module, function = body.rsplit(":", 1)
-        if not module or not function:
-            continue
+        if ":" in body:
+            module, function = body.rsplit(":", 1)
+            if not module or not function or "*" in function:
+                continue  # the flow body must be a concrete, named function
+        elif "*" in body:
+            module, function = body, "main"  # glob shorthand: py:pipeline.* ≡ py:pipeline.*:main
+        else:
+            continue  # a concrete module still needs its :function
         out.append(FlowEntrypoint(raw=raw, module=module, function=function))
     return out

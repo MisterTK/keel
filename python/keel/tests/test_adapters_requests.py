@@ -148,6 +148,55 @@ class HardRulesTest(RequestsBase):
             self.assertEqual(srv.served, 1)
 
 
+class IdempotencyInjectionTest(RequestsBase):
+    """contracts/adapter-pack.md "Idempotency-key injection", exercised through
+    a real ``requests.Session`` + a local server (no external network)."""
+
+    def _configure_injection(self) -> None:
+        policy = level0_defaults()
+        policy["target"] = {"127.0.0.1": {"idempotency": {"header": "Idempotency-Key"}}}
+        self.backend.configure(policy)
+
+    def test_post_without_a_caller_key_is_injected_and_retried(self) -> None:
+        self._configure_injection()
+        with FaultServer([fail(503), ok(b"posted")]) as srv:
+            with requests.Session() as s:
+                r = s.post(srv.url(), data=b"body")
+            self.assertEqual(r.status_code, 200)  # judgment flip: retried to success
+            self.assertEqual(r.keel_outcome["attempts"], 2)
+            self.assertEqual(srv.served, 2)
+            keys = [h.get("idempotency-key") for h in srv.headers]
+            self.assertEqual(len(keys), 2)
+            self.assertIsNotNone(keys[0])
+            self.assertEqual(keys[0], keys[1])  # rule 2: stable across retries
+
+    def test_caller_supplied_key_is_never_overwritten(self) -> None:
+        self._configure_injection()
+        with FaultServer([fail(503), ok(b"posted")]) as srv:
+            with requests.Session() as s:
+                r = s.post(srv.url(), data=b"body", headers={"Idempotency-Key": "caller-key"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(srv.headers[0]["idempotency-key"], "caller-key")
+            self.assertEqual(srv.headers[1]["idempotency-key"], "caller-key")
+
+    def test_two_logical_calls_mint_distinct_keys(self) -> None:
+        self._configure_injection()
+        with FaultServer([ok(b"one"), ok(b"two")]) as srv:
+            with requests.Session() as s:
+                s.post(srv.url(), data=b"a")
+                s.post(srv.url(), data=b"b")
+        self.assertNotEqual(srv.headers[0]["idempotency-key"], srv.headers[1]["idempotency-key"])
+
+    def test_no_configured_header_means_no_injection_post_still_not_retried(self) -> None:
+        with FaultServer([fail(503), ok(b"unreached")]) as srv:
+            with requests.Session() as s:
+                r = s.post(srv.url(), data=b"body")
+            self.assertEqual(r.keel_outcome["error"]["code"], "KEEL-E014")
+            self.assertEqual(srv.served, 1)
+            self.assertNotIn("idempotency-key", srv.headers[0])
+            self.assertEqual(srv.served, 1)
+
+
 class DiscoveryTest(RequestsBase):
     def test_canonical_row_written_for_http_target(self) -> None:
         with FaultServer([fail(503), ok(b"ok")]) as srv:

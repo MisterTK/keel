@@ -1,0 +1,37 @@
+{
+  "name": "flow-lease-held-and-takeover",
+  "tier": 2,
+  "description": "Tier 2: host-a enters and holds a flow open (no complete/crash). A second holder, host-b, tries to enter the SAME flow identity while host-a's lease is still fresh and is refused with KEEL-E030. Once the clock advances past the 30s lease TTL, host-b's next entry succeeds (the lease is stealable once expired) and it runs the flow to completion. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-21",
+    "code_hash": "ch-21"
+  },
+  "runs": [
+    {
+      "holder": "host-a:pid-1",
+      "hold": true,
+      "steps": []
+    },
+    {
+      "holder": "host-b:pid-2",
+      "expect_enter_error": { "code": "KEEL-E030" }
+    },
+    {
+      "holder": "host-b:pid-2",
+      "advance_before_ms": 31000,
+      "end": "success",
+      "expect_effect_calls": 1,
+      "steps": [
+        {
+          "target": "api.a.internal",
+          "args_hash": "q1",
+          "effect": { "status": "ok", "payload": { "v": 1 } },
+          "expect": { "result": "ok", "payload": { "v": 1 } }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "breaker-failures-set-selects-count-mode-over-rate-knobs",
+  "description": "Frozen schema precedence (`$defs/breaker`: \"Setting `failures` selects count mode\"): when `failures` is set alongside rate-mode knobs, count mode wins and the rate knobs are inert. Here `failure_rate: 0.01` would trip on the very first failure in rate mode, but `failures: 2` means it takes two consecutive failures instead.",
+  "policy": {
+    "target": {
+      "api.flaky.internal": {
+        "retry": { "attempts": 1 },
+        "breaker": { "failures": 2, "window": "1m", "failure_rate": 0.01, "cooldown": "15s" }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": {
+          "result": "error",
+          "breaker": "closed"
+        }
+      }
+    },
+    {
+      "call": {
+        "target": "api.flaky.internal",
+        "request": { "op": "GET api.flaky.internal/x", "idempotent": true },
+        "effect": [{ "status": "error", "class": "http", "http_status": 503 }],
+        "expect": {
+          "result": "error",
+          "error": { "code": "KEEL-E010" },
+          "breaker": "open"
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "targets": {
+          "api.flaky.internal": { "calls": 2, "breaker_opens": 1, "breaker_state": "open" }
+        }
+      }
+    }
+  ]
+}

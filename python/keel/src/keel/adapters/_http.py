@@ -29,14 +29,16 @@ written once.
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
-from .. import _runtime
+from .. import _runtime, _targets
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
@@ -48,13 +50,23 @@ RESPONSE_MARK = "__keel_http__"
 #: Host → LLM provider. A cross-language parity contract with the Node front
 #: end (``LLM_HOST_PROVIDERS`` in judge.mjs); extend in lockstep across
 #: languages, since adding a host here changes which default pack applies.
+#: ``aiplatform.googleapis.com`` is Vertex AI's GLOBAL endpoint; Vertex's
+#: REGIONAL endpoints (``<location>-aiplatform.googleapis.com``, one per
+#: ``--location``) vary by location and so cannot be listed exactly — they are
+#: matched by the suffix rule in :func:`resolve_target` instead.
 LLM_HOST_PROVIDERS: MappingProxyType[str, str] = MappingProxyType(
     {
         "api.openai.com": "openai",
         "api.anthropic.com": "anthropic",
         "generativelanguage.googleapis.com": "google-genai",
+        "aiplatform.googleapis.com": "google-genai",
     }
 )
+
+#: Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
+#: ``us-central1-aiplatform.googleapis.com``. Parity contract with the Node
+#: twin's identical suffix check in ``judge.mjs``.
+VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
 
 #: Methods whose semantics make a retry safe (RFC 9110 §9.2.2). Matches the
 #: Node twin's ``IDEMPOTENT_METHODS`` exactly — TRACE is included for parity of
@@ -65,6 +77,36 @@ IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRAC
 #: Header names that mark an otherwise-unsafe request (POST/PATCH) as safe to
 #: retry. Parity with the Node twin's ``DEFAULT_IDEMPOTENCY_HEADERS``.
 DEFAULT_IDEMPOTENCY_HEADERS = ("idempotency-key", "x-idempotency-key")
+
+
+#: True while a higher-level Keel seam (requests' ``HTTPAdapter.send``,
+#: botocore's ``BaseClient._make_api_call``) is driving the underlying
+#: transport for one attempt. Lower-level adapters (urllib3) check this and
+#: pass through untouched, so one intercepted call is exactly one core
+#: ``execute`` — never a Keel retry loop nested inside another.
+_SEAM_OWNED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "keel_http_seam_owned", default=False
+)
+
+
+def run_owned(fn: Callable[[], Any]) -> Any:
+    """Run one attempt's underlying library call with the seam-ownership flag
+    set. A ``ContextVar`` set and reset around the call is correct in every
+    execution shape the packs use: the flag is scoped to whichever thread (or
+    async task) actually runs the effect, so a stub worker-thread attempt and a
+    native in-loop attempt both mark exactly their own downstream calls."""
+    token = _SEAM_OWNED.set(True)
+    try:
+        return fn()
+    finally:
+        _SEAM_OWNED.reset(token)
+
+
+def seam_owned() -> bool:
+    """True when a higher-level Keel seam already owns the in-flight call (the
+    double-wrap guard for adapters whose library is also used *by* a wrapped
+    library — urllib3 under requests/botocore)."""
+    return _SEAM_OWNED.get()
 
 
 def resolve_layer(target: str, key: str) -> Any:
@@ -102,9 +144,44 @@ def cache_configured(target: str) -> bool:
 
 def resolve_target(host: str) -> str:
     """The policy target for a host: ``llm:<provider>`` for a known provider
-    host, else the bare host string."""
+    host (exact match, or a Vertex AI regional endpoint via the suffix rule),
+    else the bare host string."""
     provider = LLM_HOST_PROVIDERS.get(host)
+    if provider is None and host.endswith(VERTEX_REGIONAL_SUFFIX):
+        provider = "google-genai"
     return f"llm:{provider}" if provider else host
+
+
+def resolve_policy_target(
+    method: str,
+    host: str,
+    *,
+    scheme: str | None = None,
+    port: int | None = None,
+    path: str | None = None,
+) -> str:
+    """The policy target for one outbound request, honoring URL-pattern keys.
+
+    Precedence (``docs/targeting.md``; parity contract with the Node twin's
+    ``resolvePolicyTarget``): the LLM host map first (a provider host is the
+    semantic target ``llm:<provider>``, exactly as before), then an exact
+    bare-host ``[target]`` key, then the most specific matching host/URL
+    *pattern* key (``*.internal.corp``, ``GET api.catalog.internal/*``, …) —
+    returned verbatim so the core's exact lookup lands on it — and finally the
+    bare host, whose layers fall through to ``[defaults.outbound]``. With no
+    matchers installed (bootstrap not run) this is exactly ``resolve_target``.
+    """
+    provider = LLM_HOST_PROVIDERS.get(host)
+    if provider:
+        return f"llm:{provider}"
+    return _targets.resolve_outbound(
+        _targets.current_outbound_targets(),
+        method,
+        host,
+        scheme=scheme,
+        port=port,
+        path=path,
+    )
 
 
 def is_idempotent(
@@ -125,6 +202,85 @@ def is_idempotent(
         else DEFAULT_IDEMPOTENCY_HEADERS
     )
     return any(h in present for h in candidates)
+
+
+def new_idempotency_key() -> str:
+    """Mint one opaque idempotency key (contracts/adapter-pack.md
+    "Idempotency-key injection" rule 2: ONE per logical call, minted before the
+    first attempt). A plain module-level function — not a class/closure — so
+    tests get a deterministic source via ``monkeypatch.setattr(_http,
+    "new_idempotency_key", lambda: "fixed")``; production mints a fresh UUID4."""
+    return uuid.uuid4().hex
+
+
+def step_key(target: str, args_hash: str | None) -> str:
+    """The `(target)#(args_hash)` key identifying a Tier 2 effect step —
+    matches `FlowHandle::step_key` in crates/keel-core/src/flow.rs exactly
+    (`"-"` for a missing `args_hash`), so a peek here lands on the journal row
+    a resumed step would occupy."""
+    return f"{target}#{args_hash if args_hash is not None else '-'}"
+
+
+def peek_recorded_idempotency_key(target: str, args_hash: str | None) -> str | None:
+    """The idempotency key recorded for this step's NEXT execution, when a
+    Tier 2 flow is open and that record is a crashed (`running`) step under
+    this step's key (contracts/adapter-pack.md "Idempotency-key injection"
+    rule 3) — `None` outside a flow, on a backend with no peek surface (the
+    stub; a bare Tier 1 core), or when nothing is recorded. Call this BEFORE
+    building the outgoing request, so a resumed call injects the SAME key its
+    crashed predecessor did instead of minting a fresh one."""
+    if not _runtime.in_active_flow():
+        return None
+    backend = _runtime.get_backend()
+    peek = getattr(backend, "recorded_idempotency_key", None)
+    return peek(step_key(target, args_hash)) if callable(peek) else None
+
+
+def call_execute(
+    backend: Any,
+    request: dict[str, Any],
+    effect: Callable[[int], dict[str, Any]],
+    idempotency_key: str | None,
+) -> dict[str, Any]:
+    """`backend.execute(request, effect)`, threading `idempotency_key` through
+    ONLY while a Tier 2 flow is open (contracts/adapter-pack.md rule 3): the
+    parameter is native/flow-only, so passing it outside a flow — where the
+    backend may be the stub, which does not accept it — would break the plain
+    (non-flow) Tier 1 path this must never touch."""
+    if _runtime.in_active_flow():
+        return backend.execute(request, effect, idempotency_key=idempotency_key)  # type: ignore[no-any-return]
+    return backend.execute(request, effect)  # type: ignore[no-any-return]
+
+
+def resolve_idempotency_injection(
+    method: str,
+    header_names: Iterable[str],
+    configured_header: str | None,
+    *,
+    recorded_key: str | None = None,
+) -> str | None:
+    """The idempotency key to INJECT for this call, or ``None`` to inject
+    nothing (contracts/adapter-pack.md "Idempotency-key injection"):
+
+      * ``None`` when the method is already idempotent (injection only ever
+        targets an unsafe method — rule 1), no ``idempotency.header`` is
+        configured for the target, or the caller already supplied the
+        configured header — a caller-supplied key always wins; adapters never
+        overwrite one.
+      * otherwise ``recorded_key`` when given (a Tier 2 resume's key,
+        journaled with the crashed step — rule 3 — reused verbatim so the
+        re-execution is deduplicable on the provider side), else a freshly
+        minted one (:func:`new_idempotency_key`; stable across Tier 1 retries
+        because the caller mints/injects it once, before the first attempt).
+
+    The returned key is not folded into ``args_hash`` by any caller of this
+    function — rule 5 (it would otherwise fence Tier 2 replay)."""
+    if configured_header is None or method in IDEMPOTENT_METHODS:
+        return None
+    present = {h.lower() for h in header_names}
+    if configured_header.lower() in present:
+        return None
+    return recorded_key if recorded_key is not None else new_idempotency_key()
 
 
 def args_hash(method: str, url: str, body: bytes | str | None = None) -> str:
@@ -344,13 +500,20 @@ __all__ = [
     "ENVELOPE_VERSION",
     "RESPONSE_MARK",
     "LLM_HOST_PROVIDERS",
+    "VERTEX_REGIONAL_SUFFIX",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
     "resolve_layer",
     "idempotency_header",
     "cache_configured",
+    "resolve_policy_target",
     "resolve_target",
     "is_idempotent",
+    "new_idempotency_key",
+    "step_key",
+    "peek_recorded_idempotency_key",
+    "call_execute",
+    "resolve_idempotency_injection",
     "args_hash",
     "derive_args_hash",
     "parse_retry_after",

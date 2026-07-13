@@ -2,23 +2,45 @@
 //!
 //! Subcommands: [`run`] (dispatch a script into a language front end),
 //! [`init`] (evidence-merged policy generation), [`doctor`] (the honesty
-//! report), [`status`] (the "what is Keel doing for me" screen),
-//! [`explain`] (the frozen error taxonomy), and the Tier 2 flow inspectors
-//! [`flows`] (list durable flows) and [`flows::trace`] (`keel trace`).
+//! report; `--effective-policy` prints the composed `defaults < packs < user`
+//! policy via [`effective`]), [`status`] (the "what is Keel doing for me" screen),
+//! [`explain`] (the frozen error taxonomy), [`tail`] (the live Tier 1 event
+//! view), [`fsck`] (journal integrity check/repair and retention pruning),
+//! the Tier 2 flow inspectors [`flows`] (list durable flows), [`flows::trace`]
+//! (`keel trace`), and [`replay`] (`keel replay` — a journal-driven dry run of
+//! what a re-entry would substitute vs. re-execute), [`mcp`] (`keel mcp`: the
+//! CLI doubles as an MCP server over stdio whose six tools return the same
+//! bytes as the corresponding `--json` twins), and the Level 2 on-ramp
+//! [`flows_suggest`] (`keel flows suggest`, a replay-safety analysis over
+//! candidate entrypoints), [`flows_add`] (`keel flows add <entrypoint>`,
+//! one-command durability designation), and [`resume`] (`keel flows resume` —
+//! actually re-invoke a resumable flow's recorded entrypoint through
+//! `keel run`).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
 //! [`EXIT_OK`], [`EXIT_FAILURE`], [`EXIT_USAGE`]. The command modules are the
 //! testable core; [`main`](../keel/index.html) is a thin clap front.
 
+pub mod diff;
 pub mod doctor;
+pub mod effective;
 pub mod explain;
 pub mod flows;
+pub mod flows_add;
+pub mod flows_suggest;
+pub mod fsck;
 pub mod init;
+pub mod mcp;
+pub mod record;
 pub mod render;
+pub mod replay;
+pub mod resume;
 pub mod run;
 pub mod scan;
+pub mod sim;
 pub mod status;
+pub mod tail;
 
 mod evidence;
 

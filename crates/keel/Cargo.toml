@@ -1,0 +1,36 @@
+[package]
+name = "keel"
+description = "Keel as a Rust front end: #[keel::wrap] plus a reqwest-middleware adapter, routing calls through the keel-core Engine chain (cache/rate/breaker/timeout/retry) from one `keel.toml`. No import hook (Rust has none to hang off of) — call `keel::init()` once from your own `main`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+keel-core = { path = "../keel-core" }
+keel-core-api = { path = "../keel-core-api" }
+keel-macros = { path = "../keel-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Parse keel.toml at runtime (mirrors python/keel's `tomllib.loads` /
+# node/keel's toml read — `keel::init` loads the SAME kind of file the macro
+# peeked at compile time).
+toml = "0.8"
+# The `middleware` module: a `reqwest_middleware::Middleware` mapping to
+# `host:`-shaped targets (module docs for the exact resolution it implements
+# and what it deliberately does not).
+reqwest = { version = "0.13", default-features = false }
+reqwest-middleware = "0.5"
+async-trait = "0.1"
+http = "1"
+
+[dev-dependencies]
+tempfile = "3.23"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+trybuild = "1.0"
+
+[lints]
+workspace = true

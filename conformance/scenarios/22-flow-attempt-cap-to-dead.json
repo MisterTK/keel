@@ -1,0 +1,19 @@
+{
+  "name": "flow-attempt-cap-to-dead",
+  "tier": 2,
+  "description": "Tier 2: with max_attempts=2, two clean failed entries stay within the cap (complete_failed clears the lease so the next entry can proceed immediately). The third entry exceeds the cap: the flow is marked dead and refused with KEEL-E032. A dead flow is never auto-resumed, so a fourth entry stays refused with KEEL-E032 too. Stubs skip tier-2 scenarios; the real core runs this in crates/keel-core/tests/flows_conformance.rs.",
+  "policy": { "flows": { "on_nondeterminism": "fail" } },
+  "max_attempts": 2,
+  "steps": [],
+  "flow": {
+    "entrypoint": "py:pipeline.ingest:main",
+    "args_hash": "ah-22",
+    "code_hash": "ch-22"
+  },
+  "runs": [
+    { "end": "failed", "steps": [] },
+    { "end": "failed", "steps": [] },
+    { "expect_enter_error": { "code": "KEEL-E032" } },
+    { "expect_enter_error": { "code": "KEEL-E032" } }
+  ]
+}

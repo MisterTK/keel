@@ -674,6 +674,50 @@ fn the_heartbeat_renews_the_lease_on_a_real_clock() {
     drop(handle);
 }
 
+/// A local wall-clock jump forward past the lease TTL must NOT, by itself,
+/// make a still-legitimate holder believe it lost the lease. `lease_lost`
+/// judges local freshness on a monotonic clock (architecture-spec §6), never
+/// by re-deriving expiry from the injected wall clock — otherwise an NTP
+/// correction on this very process could make it fence its own live steps for
+/// no reason, even though nobody else has touched the lease
+/// (`journal.get_flow(&fid).lease_holder` is still us).
+#[tokio::test(start_paused = true)]
+async fn a_forward_wall_clock_jump_alone_does_not_fence_a_live_step() {
+    let r = rig("host-a:pid-1");
+    let mut handle = r.manager.enter_flow(&descriptor("ah-1")).unwrap();
+    let fid = handle.flow_id().clone();
+
+    // Simulate an NTP correction: the injected wall clock leaps past the
+    // lease TTL, but nobody has stolen the lease.
+    r.clock.advance(31_000);
+    assert_eq!(
+        r.journal
+            .get_flow(&fid)
+            .unwrap()
+            .unwrap()
+            .lease_holder
+            .unwrap()
+            .as_str(),
+        "host-a:pid-1",
+        "still the recorded holder; nobody stole it"
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let out = handle
+        .execute_step(
+            &request("api.charge.internal", "c1"),
+            counting_ok(&calls, json!({ "charged": true })),
+        )
+        .await;
+
+    assert_eq!(
+        out.result, "ok",
+        "no theft occurred; a wall-clock jump alone must not fence the step"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    handle.complete_success();
+}
+
 /// A live step whose lease was stolen by another process fences with KEEL-E030
 /// and does NOT fire the effect — the split-brain double-execution the lease
 /// exists to prevent (findings flow.rs:851/846).
