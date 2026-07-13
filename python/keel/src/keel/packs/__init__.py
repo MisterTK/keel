@@ -11,14 +11,22 @@ logic of their own (adapter-pack rule 3).
 The front end folds each PRESENT provider pack's ``defaults()`` fragment into
 the policy at bootstrap (``defaults < packs < user``); the generic ``llm`` pack
 supplies ``resolve_dev_cache``.
+
+``langgraph_pack`` is the one exception living in this package: it DOES own a
+real monkey-patched seam (``StateGraph.add_node``), so it is also registered
+in ``keel.adapters.PACKS`` for lazy install-on-import, exactly like httpx/
+requests. It lives here rather than in ``keel.adapters`` because its OTHER
+half — the `KeelSaver` checkpointer — is a framework-pack API surface (like
+`tool.wrap_tool`), not a library adapter.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from . import anthropic_pack, openai_pack
+from . import anthropic_pack, langgraph_pack, openai_pack
 from .llm import DEV_CACHE_TTL, llm_pack, resolve_dev_cache
+from .langgraph_pack import KeelSaver
 from .tool import is_valid_tool_name, tool_pack, wrap_tool
 
 #: Registration order = report order (stable, deterministic).
@@ -43,4 +51,6 @@ __all__ = [
     "is_valid_tool_name",
     "tool_pack",
     "wrap_tool",
+    "langgraph_pack",
+    "KeelSaver",
 ]

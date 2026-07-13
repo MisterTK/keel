@@ -22,11 +22,15 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
+from ..packs import langgraph_pack
 from . import httpx_pack, requests_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
-PACKS = (httpx_pack, requests_pack)
+#: `langgraph_pack` is a framework pack with a real seam (`StateGraph.add_node`,
+#: not a semantic pack like `llm`/`tool`), so it arms lazily through this SAME
+#: meta-path finder, exactly like httpx/requests.
+PACKS = (httpx_pack, requests_pack, langgraph_pack)
 
 
 class _State:

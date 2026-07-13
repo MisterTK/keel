@@ -97,8 +97,14 @@ class DetectTest(unittest.TestCase):
 
     def test_available_packs_reports_both(self) -> None:
         packs = available_packs()
-        self.assertEqual({d.name for d in packs}, {"httpx", "requests"})
-        self.assertTrue(all(d.matched for d in packs))
+        matched = {d.name for d in packs if d.matched}
+        self.assertEqual(matched, {"httpx", "requests"})
+        # `langgraph_pack` is registered too (adapters/__init__.py PACKS), but
+        # langgraph is not installed in this test env — `available_packs` must
+        # still report it (never silently omit an absent library's pack), just
+        # unmatched.
+        unmatched = [d for d in packs if not d.matched]
+        self.assertEqual([d.name for d in unmatched], [""])
 
 
 class ContractParityTest(unittest.TestCase):
