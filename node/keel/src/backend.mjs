@@ -47,8 +47,18 @@ class NativeBackend {
     this.#policy = isTable(policy) ? policy : {};
     this.#core.configure(policy);
   }
-  execute(request, effect) {
-    return this.#core.executeAsync(request, effect); // returns a Promise<Outcome>
+  execute(request, effect, idempotencyKey) {
+    // `idempotencyKey` (contracts/adapter-pack.md "Idempotency-key injection")
+    // matters only while a flow is open — the native `executeAsync` ignores it
+    // on the bare-engine branch, so it is always safe to forward.
+    return this.#core.executeAsync(request, effect, idempotencyKey); // returns a Promise<Outcome>
+  }
+  /** Peek the idempotency key recorded for the active flow's next step
+   *  (rule 3) — `null` outside a flow or when nothing is recorded, and also
+   *  on an addon build too old to expose the native method (optional
+   *  chaining, mirroring `flushEvents`). */
+  recordedIdempotencyKey(stepKey) {
+    return this.#core.recordedIdempotencyKey?.(stepKey) ?? null;
   }
   report() {
     return this.#core.report();

@@ -283,7 +283,7 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
             "https://api.openai.com/v1/chat/completions",
             json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
         )
-        target, _op, idempotent, hash_ = httpx_pack._judge(req)
+        target, _op, idempotent, hash_, _injected = httpx_pack._judge(req)
         self.assertEqual(target, "llm:openai")
         self.assertFalse(idempotent, "an LLM POST stays non-idempotent (never retried)")
         self.assertIsNotNone(hash_)
@@ -292,12 +292,12 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
 
     def test_llm_get_hashes_method_and_url(self) -> None:
         url = "https://api.openai.com/v1/models"
-        _t, _op, _idem, hash_ = httpx_pack._judge(httpx.Request("GET", url))
+        _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
         self.assertEqual(hash_, _http.args_hash("GET", url))
 
     def test_non_llm_post_has_no_hash(self) -> None:
         req = httpx.Request("POST", "https://example.com/x", json={"a": 1})
-        target, _op, idempotent, hash_ = httpx_pack._judge(req)
+        target, _op, idempotent, hash_, _injected = httpx_pack._judge(req)
         self.assertEqual(target, "example.com")
         self.assertFalse(idempotent)
         self.assertIsNone(hash_, "the dev-cache exception is llm-only")

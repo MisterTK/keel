@@ -45,6 +45,7 @@ import {
   isTransientStatus,
   responseEnvelope,
   rebuildResponse,
+  stepKey,
 } from "./judge.mjs";
 import { attachOutcome } from "./runtime.mjs";
 import { KeelError } from "./engine.mjs";
@@ -116,11 +117,23 @@ export function installFetch(
       path: parsed.pathname,
     });
     const idemHeader = readIdempotencyHeader(backend, target);
+    // The FIRST hop's args_hash, derived here (ahead of the hop loop below)
+    // purely so the Tier 2 step key it feeds is known before deciding what to
+    // inject; the loop recomputes the identical value for hop 0 redundantly.
+    const hop0Hash = deriveArgsHash(target, method, parsed.href, body);
+    // Peek a crashed predecessor's key (contracts/adapter-pack.md rule 3):
+    // `null` outside a flow, on a backend with no peek surface (the stub), or
+    // when nothing is recorded. `backend.recordedIdempotencyKey` is present
+    // only on the native backend (optional chaining covers the stub, which
+    // has no Tier 2 flows at all).
+    const recordedKey = backend.recordedIdempotencyKey?.(stepKey(target, hop0Hash)) ?? null;
     // Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
     // once, before the first attempt, and set it on the normalized `headers`
     // — the same object every retry attempt below forwards as `attemptInit`,
-    // so the SAME key rides every attempt (rule 2).
-    const injectedKey = resolveIdempotencyInjection(method, headers, idemHeader, mintIdempotencyKey);
+    // so the SAME key rides every attempt (rule 2). Inside a Tier 2 flow, a
+    // crashed predecessor's key (`recordedKey`, peeked above) is reused
+    // verbatim instead of minting a fresh one (rule 3).
+    const injectedKey = resolveIdempotencyInjection(method, headers, idemHeader, mintIdempotencyKey, recordedKey);
     if (injectedKey !== null) headers.set(idemHeader, injectedKey);
     // A call is only retried if it is BOTH idempotent by method/header/injection
     // AND its body can be re-sent on a retry: an unbuffered stream body is
@@ -180,6 +193,10 @@ export function installFetch(
       heldTransient = null;
       heldErr = null;
       const started = performance.now();
+      // `injectedKey` is forwarded on every hop's request — harmless on the
+      // stub (an unused extra argument) and meaningful only while a Tier 2
+      // flow is open, where the native core journals it in the step's
+      // `running` record (rule 3).
       outcome = await backend.execute(request, async () => {
         const { signal, cancel } = withTimeout(init?.signal, timeoutMs);
         // An injected key must actually reach the wire on the ORIGINAL hop:
@@ -217,7 +234,7 @@ export function installFetch(
         } finally {
           cancel();
         }
-      });
+      }, injectedKey);
 
       discovery?.observe(target, outcome, performance.now() - started);
 

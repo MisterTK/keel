@@ -137,7 +137,7 @@ def uninstall() -> None:
 
 # --- judgment ----------------------------------------------------------------
 
-def _judge(request: Any) -> tuple[str, str, bool, str | None]:
+def _judge(request: Any) -> tuple[str, str, bool, str | None, str | None]:
     method = (request.method or "GET").upper()
     url = request.url
     parts = urlsplit(url)
@@ -149,21 +149,29 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     )
     op = f"{method} {host}{parts.path}"
     idem_header = _http.idempotency_header(target)
+    # A prepared body is bytes/str (buffered) or None; derive_args_hash ignores a
+    # streaming (generator/file) body, so this never consumes an upload stream.
+    # LLM POSTs get a canonicalized-JSON-body cache key (dev-cache exception).
+    # Derived BEFORE the injection decision: the Tier 2 step key (`target#hash`)
+    # a resume-reuse peek looks up (contracts/adapter-pack.md rule 3) must be
+    # known before deciding what to inject.
+    hash_ = _http.derive_args_hash(target, method, url, request.body)
+    recorded_key = _http.peek_recorded_idempotency_key(target, hash_)
     # Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
     # once, before the first attempt, and set it on the PreparedRequest so
     # every retry attempt resends the SAME header (`do_call` re-sends this
-    # exact request object on each attempt — see `_run_send` below).
-    injected = _http.resolve_idempotency_injection(method, request.headers.keys(), idem_header)
+    # exact request object on each attempt — see `_run_send` below). Inside a
+    # Tier 2 flow, a crashed predecessor's key (`recorded_key`, peeked above)
+    # is reused verbatim instead of minting a fresh one (rule 3).
+    injected = _http.resolve_idempotency_injection(
+        method, request.headers.keys(), idem_header, recorded_key=recorded_key
+    )
     if injected is not None:
         request.headers[idem_header] = injected  # type: ignore[index]
     idempotent = injected is not None or _http.is_idempotent(
         method, request.headers.keys(), idem_header
     )
-    # A prepared body is bytes/str (buffered) or None; derive_args_hash ignores a
-    # streaming (generator/file) body, so this never consumes an upload stream.
-    # LLM POSTs get a canonicalized-JSON-body cache key (dev-cache exception).
-    hash_ = _http.derive_args_hash(target, method, url, request.body)
-    return target, op, idempotent, hash_
+    return target, op, idempotent, hash_, injected
 
 
 def _is_response(obj: Any) -> bool:
@@ -290,7 +298,7 @@ def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
     outcome: dict[str, Any] = {}
 
     while True:
-        target, op, idempotent, hash_ = _judge(current)
+        target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
         is_llm, cap_cents = _llm_generate_gate(target, current.method or "GET")
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
@@ -326,7 +334,7 @@ def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
             return {"status": "ok", "payload": _ok_payload(resp, _buffer)}
 
         started = time.perf_counter()
-        outcome = backend.execute(env, effect)
+        outcome = _http.call_execute(backend, env, effect, injected)
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
             discovery.record(target, outcome, latency_ms)

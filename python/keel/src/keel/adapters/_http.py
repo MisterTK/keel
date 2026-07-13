@@ -213,6 +213,45 @@ def new_idempotency_key() -> str:
     return uuid.uuid4().hex
 
 
+def step_key(target: str, args_hash: str | None) -> str:
+    """The `(target)#(args_hash)` key identifying a Tier 2 effect step —
+    matches `FlowHandle::step_key` in crates/keel-core/src/flow.rs exactly
+    (`"-"` for a missing `args_hash`), so a peek here lands on the journal row
+    a resumed step would occupy."""
+    return f"{target}#{args_hash if args_hash is not None else '-'}"
+
+
+def peek_recorded_idempotency_key(target: str, args_hash: str | None) -> str | None:
+    """The idempotency key recorded for this step's NEXT execution, when a
+    Tier 2 flow is open and that record is a crashed (`running`) step under
+    this step's key (contracts/adapter-pack.md "Idempotency-key injection"
+    rule 3) — `None` outside a flow, on a backend with no peek surface (the
+    stub; a bare Tier 1 core), or when nothing is recorded. Call this BEFORE
+    building the outgoing request, so a resumed call injects the SAME key its
+    crashed predecessor did instead of minting a fresh one."""
+    if not _runtime.in_active_flow():
+        return None
+    backend = _runtime.get_backend()
+    peek = getattr(backend, "recorded_idempotency_key", None)
+    return peek(step_key(target, args_hash)) if callable(peek) else None
+
+
+def call_execute(
+    backend: Any,
+    request: dict[str, Any],
+    effect: Callable[[int], dict[str, Any]],
+    idempotency_key: str | None,
+) -> dict[str, Any]:
+    """`backend.execute(request, effect)`, threading `idempotency_key` through
+    ONLY while a Tier 2 flow is open (contracts/adapter-pack.md rule 3): the
+    parameter is native/flow-only, so passing it outside a flow — where the
+    backend may be the stub, which does not accept it — would break the plain
+    (non-flow) Tier 1 path this must never touch."""
+    if _runtime.in_active_flow():
+        return backend.execute(request, effect, idempotency_key=idempotency_key)  # type: ignore[no-any-return]
+    return backend.execute(request, effect)  # type: ignore[no-any-return]
+
+
 def resolve_idempotency_injection(
     method: str,
     header_names: Iterable[str],
@@ -471,6 +510,9 @@ __all__ = [
     "resolve_target",
     "is_idempotent",
     "new_idempotency_key",
+    "step_key",
+    "peek_recorded_idempotency_key",
+    "call_execute",
     "resolve_idempotency_injection",
     "args_hash",
     "derive_args_hash",

@@ -232,6 +232,16 @@ export function defaultMintIdempotencyKey() {
 }
 
 /**
+ * The `(target)#(argsHash)` key identifying a Tier 2 effect step — matches
+ * `FlowHandle::step_key` in crates/keel-core/src/flow.rs exactly (`"-"` for a
+ * missing `argsHash`), so a peek here lands on the journal row a resumed step
+ * would occupy. Parity with the Python twin's `_http.step_key`.
+ */
+export function stepKey(target, argsHash) {
+  return `${target}#${argsHash ?? "-"}`;
+}
+
+/**
  * The idempotency key to INJECT for this call, or `null` to inject nothing
  * (contracts/adapter-pack.md "Idempotency-key injection"):
  *
@@ -240,18 +250,26 @@ export function defaultMintIdempotencyKey() {
  *     configured for the target, or the caller already supplied the
  *     configured header — a caller-supplied key always wins; never
  *     overwritten.
- *   - otherwise a freshly minted key (`mint`, defaulting to
- *     `defaultMintIdempotencyKey`) — stable across Tier 1 retries because the
- *     caller mints/injects it once, before the first attempt, and reuses the
- *     same `headers` object on every retry.
+ *   - otherwise `recordedKey` when given (a Tier 2 resume's key, journaled
+ *     with the crashed step — rule 3 — reused verbatim so the re-execution is
+ *     deduplicable on the provider side), else a freshly minted key (`mint`,
+ *     defaulting to `defaultMintIdempotencyKey`) — stable across Tier 1
+ *     retries because the caller mints/injects it once, before the first
+ *     attempt, and reuses the same `headers` object on every retry.
  *
  * The returned key must never feed `argsHash` (rule 5): it is not part of the
  * caller's arguments, and folding it in would fence Tier 2 replay.
  */
-export function resolveIdempotencyInjection(method, headers, idempotencyHeader, mint = defaultMintIdempotencyKey) {
+export function resolveIdempotencyInjection(
+  method,
+  headers,
+  idempotencyHeader,
+  mint = defaultMintIdempotencyKey,
+  recordedKey = null,
+) {
   if (!idempotencyHeader || IDEMPOTENT_METHODS.has(method)) return null;
   if (headers.has(idempotencyHeader.toLowerCase())) return null;
-  return mint();
+  return recordedKey ?? mint();
 }
 
 export function argsHash(method, url, body) {

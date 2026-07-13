@@ -10,9 +10,16 @@
 //!   per-handle current-thread runtime under `block_on`; the JS `effect(attempt)`
 //!   callback is invoked directly on the main thread and returns an
 //!   attempt-result object.
-//! - `KeelCore.executeAsync(request, effect)` — returns a `Promise`; the async
-//!   `effect(attempt)` coroutine is awaited on the caller's libuv loop via a
-//!   [`ThreadsafeFunction`] whose return type is a JS `Promise`.
+//! - `KeelCore.executeAsync(request, effect, idempotencyKey?)` — returns a
+//!   `Promise`; the async `effect(attempt)` coroutine is awaited on the
+//!   caller's libuv loop via a [`ThreadsafeFunction`] whose return type is a JS
+//!   `Promise`. `idempotencyKey` (an adapter-injected key,
+//!   contracts/adapter-pack.md "Idempotency-key injection") is journaled with
+//!   the step's `running` record while a flow is open.
+//! - `KeelCore.recordedIdempotencyKey(stepKey)` — peeks the key recorded for
+//!   the active flow's next step, when it is a crashed (`running`) step under
+//!   `stepKey`; `null` otherwise. Adapters call this before minting/injecting a
+//!   key so a resumed call reuses the SAME one (rule 3).
 //! - `KeelCore.report()` — the deterministic report object.
 //! - `KeelCore.advanceClock(ms)` and `new KeelCore({ paused: true })` —
 //!   **harness-only** virtual-clock controls (always present, not part of the
@@ -456,12 +463,25 @@ mod bindings {
         /// inside one flow in await order (`conformance/README.md`'s ordering
         /// rule): a second concurrent call here just awaits the same async
         /// mutex, parking its task without blocking napi's runtime thread.
-        #[napi(ts_args_type = "request: object, effect: (attempt: number) => Promise<object>")]
+        ///
+        /// `idempotency_key` carries the key an adapter minted/injected for this
+        /// call (contracts/adapter-pack.md "Idempotency-key injection", rule 3) —
+        /// meaningful ONLY while a flow is open, where it is threaded to
+        /// [`FlowHandle::execute_step_with_idempotency_key`] so it is journaled in
+        /// the step's `running` record; ignored on the bare-engine branch (no
+        /// journal to carry it in). Adapters peek the prior key via
+        /// [`Self::recorded_idempotency_key`] BEFORE building the outgoing
+        /// request, so a resumed call injects the SAME key its crashed
+        /// predecessor did.
+        #[napi(
+            ts_args_type = "request: object, effect: (attempt: number) => Promise<object>, idempotencyKey?: string"
+        )]
         pub fn execute_async<'env>(
             &self,
             env: &'env Env,
             request: Value,
             effect: AsyncEffect,
+            idempotency_key: Option<String>,
         ) -> Result<PromiseRaw<'env, Value>> {
             // Sync prelude (holds `Env`): a bad envelope throws a proper `.code`.
             let request = decode_request(*env, request)?;
@@ -487,7 +507,13 @@ mod bindings {
                 // call (no flow open) never touches it.
                 let mut guard = active_flow.lock().await;
                 let outcome = if let Some(handle) = guard.as_mut() {
-                    handle.execute_step(&request, effect_fn).await
+                    handle
+                        .execute_step_with_idempotency_key(
+                            &request,
+                            idempotency_key.as_deref(),
+                            effect_fn,
+                        )
+                        .await
                 } else {
                     drop(guard);
                     engine.execute(&request, effect_fn).await
@@ -496,6 +522,38 @@ mod bindings {
                     Error::from_reason(format!("KEEL-E040: outcome not encodable: {e}"))
                 })
             })
+        }
+
+        /// Peek the idempotency key recorded for the active flow's NEXT step,
+        /// when that record is a crashed (`running`) step under `step_key` — the
+        /// resume-reuse read of contracts/adapter-pack.md "Idempotency-key
+        /// injection" rule 3 ([`FlowHandle::recorded_idempotency_key`]). Adapters
+        /// call this BEFORE building the outgoing request for an injectable
+        /// call — deriving `step_key` the same way the flow does for effect
+        /// steps (`"{target}#{args_hash-or-'-'}"`) — so a resumed call injects
+        /// the SAME key its crashed predecessor did instead of minting a fresh
+        /// one.
+        ///
+        /// `try_lock`, never `blocking_lock`/`.await`: called from the JS thread,
+        /// possibly while a DIFFERENT in-flight `executeAsync` step holds
+        /// `active_flow` across its own `.await` (that step can only resolve its
+        /// `Promise` by running JS on this SAME thread — blocking here would
+        /// deadlock, mirroring `journalTime`/`journalRandom`). Returns `null`
+        /// (never throws) on contention, when no flow is open, or when nothing
+        /// is recorded — resilience-first, matching the core method's own `None`
+        /// returns.
+        #[napi]
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "napi decodes the JS string into an owned String"
+        )]
+        pub fn recorded_idempotency_key(&self, step_key: String) -> Option<String> {
+            let Ok(guard) = self.active_flow.try_lock() else {
+                return None; // racing a concurrently in-flight step: resilience-first
+            };
+            guard
+                .as_ref()
+                .and_then(|handle| handle.recorded_idempotency_key(&step_key))
         }
 
         /// The deterministic per-target metrics/discovery report. Read inside the

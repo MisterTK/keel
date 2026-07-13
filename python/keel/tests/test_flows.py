@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import sqlite3
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,52 @@ try:
     _NATIVE = True
 except ImportError:
     _NATIVE = False
+
+
+def _pack_bare_str_map(pairs: list[tuple[str, str]]) -> bytes:
+    """Hand-rolled bare MessagePack for a small string->string map — the exact
+    bytes `crates/keel-core/src/flow.rs`'s `decode_payload` falls back to
+    decoding when a payload carries no `keel.step/v1` schema tag (the "legacy
+    bare messagepack still decodes" path its own unit test pins). Fixstr-only
+    (every key/value here is well under 32 bytes), so a single-byte header per
+    string suffices."""
+
+    def fixstr(s: str) -> bytes:
+        raw = s.encode("utf-8")
+        assert len(raw) < 32, "fixstr only; not needed for test-sized values"
+        return bytes([0xA0 | len(raw)]) + raw
+
+    out = bytes([0x80 | len(pairs)])  # fixmap header
+    for k, v in pairs:
+        out += fixstr(k) + fixstr(v)
+    return out
+
+
+def _inject_running_step(
+    journal_path: str, flow_id: str, *, seq: int, step_key: str, idempotency_key: str
+) -> None:
+    """Directly journal a `running` (unterminated) step record carrying an
+    adapter-injected idempotency key — models a crash mid-effect: the exact
+    shape `FlowHandle::run_live` writes BEFORE firing the effect (a real crash
+    between that write and the terminal record leaves precisely this row).
+    Same technique `conformance/scenarios`' JSON-driven interpreter uses via
+    its `inject_running` field (`crates/keel-core/tests/flows_conformance.rs`),
+    applied directly against the on-disk journal.db so this test proves the
+    REAL PyO3 binding surface (`recorded_idempotency_key`,
+    `execute`/`execute_async`'s `idempotency_key` parameter) rather than
+    re-deriving the core-level proof `crates/keel-core/tests/idempotency.rs`
+    already carries."""
+    payload = _pack_bare_str_map([("idempotency_key", idempotency_key)])
+    conn = sqlite3.connect(journal_path)
+    try:
+        conn.execute(
+            "INSERT INTO steps (flow_id, seq, step_key, kind, attempt, outcome, payload, "
+            "error_class, started_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (flow_id, seq, step_key, "effect", 0, "running", payload, None, int(time.time() * 1000), None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class ExtractFlowEntrypointsTest(unittest.TestCase):
@@ -408,6 +456,84 @@ class NativeFlowReplayTest(unittest.TestCase):
         core.exit_flow("completed")
         self.assertEqual(fires["n"], 3, "replay fired no effects")
         self.assertEqual(replayed_time, 1783728000, "time replayed")
+
+    def test_idempotency_key_recorded_on_crash_survives_resume(self) -> None:
+        """contracts/adapter-pack.md "Idempotency-key injection" rule 3,
+        through the REAL PyO3 binding (the gap this test closes: `execute`/
+        `execute_async` did not expose `idempotency_key`, and there was no
+        binding-level `recorded_idempotency_key` peek at all). Step 1 completes
+        normally with key ``ik-1``; step 2's crash is modeled by directly
+        journaling its `running` record (``_inject_running_step`` — see its
+        docstring) carrying key ``ik-2``. On resume: step 1's peek misses (it is
+        terminal) and its effect never re-fires; step 2's peek must resurface
+        ``ik-2`` — and the re-executed live effect, injected with THAT peeked
+        key, must actually run with the SAME key as the crashed attempt, not
+        merely with *a* key."""
+        core1 = self._core()
+        journal_path = str(Path(self._tmp.name) / "journal.db")
+        entrypoint = "py:billing.charge:main"
+        args_hash = "ah-idem-native"
+        flow_id = f"{entrypoint}#{args_hash}#"
+
+        core1.enter_flow(entrypoint, args_hash, code_hash="ch-1")
+        step1_key = "api.pay.example#c1"
+        step2_key = "api.pay.example#c2"
+        self.assertIsNone(core1.recorded_idempotency_key(step1_key))
+        out1 = core1.execute(
+            {"v": 1, "target": "api.pay.example", "op": "POST x", "args_hash": "c1", "idempotent": True},
+            lambda _a: {"status": "ok", "payload": {"charge": "ch_1"}},
+            idempotency_key="ik-1",
+        )
+        self.assertEqual(out1["result"], "ok")
+        self.assertIsNone(core1.recorded_idempotency_key(step2_key))
+
+        # Crash: step 2's `running` record (carrying ik-2) is journaled
+        # directly, never through a live `execute` call — modeling the process
+        # dying between the running-write and the terminal outcome.
+        _inject_running_step(
+            journal_path, flow_id, seq=2, step_key=step2_key, idempotency_key="ik-2"
+        )
+        del core1
+        gc.collect()
+
+        core2 = keel_core.KeelCore(journal_path=journal_path)
+        core2.configure({})
+        info = core2.enter_flow(entrypoint, args_hash, code_hash="ch-1")
+        self.assertFalse(info["replay"], "an uncompleted flow resumes live, not a pure replay")
+
+        # Step 1 is terminal: the peek misses, and a resumed re-execution
+        # (with a DIFFERENT, would-be-wrong key) is substituted, not re-fired.
+        self.assertIsNone(core2.recorded_idempotency_key(step1_key))
+        fires = {"n": 0}
+
+        def eff1(_a: int) -> dict[str, Any]:
+            fires["n"] += 1
+            return {"status": "ok", "payload": {"charge": "never"}}
+
+        out1b = core2.execute(
+            {"v": 1, "target": "api.pay.example", "op": "POST x", "args_hash": "c1", "idempotent": True},
+            eff1,
+            idempotency_key="ik-should-be-ignored",
+        )
+        self.assertEqual(out1b["payload"], {"charge": "ch_1"}, "a terminal step is substituted")
+        self.assertEqual(fires["n"], 0, "a substituted step must not fire its effect")
+
+        # Step 2: the crashed `running` record resurfaces its key — the
+        # load-bearing assertion is exact equality with the crashed attempt's
+        # key, not merely that SOME key came back.
+        peeked = core2.recorded_idempotency_key(step2_key)
+        self.assertEqual(
+            peeked, "ik-2", "the peek must resurface the SAME key the crashed attempt recorded"
+        )
+
+        out2 = core2.execute(
+            {"v": 1, "target": "api.pay.example", "op": "POST x", "args_hash": "c2", "idempotent": True},
+            lambda _a: {"status": "ok", "payload": {"charge": "ch_2"}},
+            idempotency_key=peeked,
+        )
+        self.assertEqual(out2["result"], "ok")
+        self.assertEqual(out2["attempts"], 1)
+        core2.exit_flow("completed")
 
     def test_flow_requires_a_journal(self) -> None:
         core = keel_core.KeelCore()  # in-memory, no journal

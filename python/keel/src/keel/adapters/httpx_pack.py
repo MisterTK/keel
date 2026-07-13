@@ -189,7 +189,7 @@ def uninstall() -> None:
 
 # --- judgment ----------------------------------------------------------------
 
-def _judge(request: Any) -> tuple[str, str, bool, str | None]:
+def _judge(request: Any) -> tuple[str, str, bool, str | None, str | None]:
     method = request.method
     url = request.url
     host = url.host
@@ -200,18 +200,26 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     )
     op = f"{method} {host}{url.path}"
     idem_header = _http.idempotency_header(target)
+    # args_hash is derived BEFORE the injection decision: the Tier 2 step key
+    # (`target#hash`) a resume-reuse peek looks up (contracts/adapter-pack.md
+    # rule 3) must be known before deciding what to inject.
+    hash_ = _http.derive_args_hash(target, method, str(url), _buffered_body(request))
+    recorded_key = _http.peek_recorded_idempotency_key(target, hash_)
     # Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
     # once, before the first attempt, and set it on the request so every retry
     # attempt resends the SAME header (the request object is reused verbatim
-    # by `do_call` on each attempt — see `_run_sync`/`_run_async` below).
-    injected = _http.resolve_idempotency_injection(method, request.headers.keys(), idem_header)
+    # by `do_call` on each attempt — see `_run_sync`/`_run_async` below). Inside
+    # a Tier 2 flow, a crashed predecessor's key (`recorded_key`, peeked above)
+    # is reused verbatim instead of minting a fresh one (rule 3).
+    injected = _http.resolve_idempotency_injection(
+        method, request.headers.keys(), idem_header, recorded_key=recorded_key
+    )
     if injected is not None:
         request.headers[idem_header] = injected  # type: ignore[index]
     idempotent = injected is not None or _http.is_idempotent(
         method, request.headers.keys(), idem_header
     )
-    hash_ = _http.derive_args_hash(target, method, str(url), _buffered_body(request))
-    return target, op, idempotent, hash_
+    return target, op, idempotent, hash_, injected
 
 
 def _buffered_body(request: Any) -> bytes | None:
@@ -358,7 +366,7 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
     outcome: dict[str, Any] = {}
 
     while True:
-        target, op, idempotent, hash_ = _judge(current)
+        target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
         # Buffer the body ONLY when a cache ttl is actually configured for the
         # target (mirrors Node's fetch gate), OR a budget is configured (usage
@@ -390,7 +398,7 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
             return {"status": "ok", "payload": _ok_payload(resp, _buffer)}
 
         started = time.perf_counter()
-        outcome = backend.execute(env, effect)
+        outcome = _http.call_execute(backend, env, effect, injected)
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
             discovery.record(target, outcome, latency_ms)
@@ -462,7 +470,7 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
     outcome: dict[str, Any] = {}
 
     while True:
-        target, op, idempotent, hash_ = _judge(current)
+        target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
         is_llm, cap_cents = _llm_generate_gate(target, current.method)
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
@@ -495,7 +503,15 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
                 live["ok"] = resp
                 return {"status": "ok", "payload": await _ok_payload_async(resp, _buffer)}
 
-            outcome = await exec_async(env, aeffect)
+            # Thread the resolved idempotency key through ONLY while a Tier 2
+            # flow is open (contracts/adapter-pack.md rule 3) — the parameter
+            # is native/flow-only; the plain (non-flow) Tier 1 path is
+            # untouched (this branch runs only under the native async core,
+            # so `in_active_flow()` here means a real, journal-backed flow).
+            if _runtime.in_active_flow():
+                outcome = await exec_async(env, aeffect, idempotency_key=injected)
+            else:
+                outcome = await exec_async(env, aeffect)
         else:
             # STUB async path: the synchronous stub cannot await, so each attempt is
             # driven in a worker thread that marshals the await back onto this loop.
@@ -521,7 +537,9 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
                 payload = asyncio.run_coroutine_threadsafe(_ok_payload_async(resp, _buffer), loop).result()
                 return {"status": "ok", "payload": payload}
 
-            outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
+            outcome = await loop.run_in_executor(
+                None, lambda: _http.call_execute(backend, env, effect, injected)
+            )
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
             discovery.record(target, outcome, latency_ms)

@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractFlowEntrypoints } from "../src/policy.mjs";
@@ -21,6 +22,52 @@ import { loaded as nativeLoaded, KeelCore } from "../../keel-core-native/index.m
 const gate = nativeLoaded
   ? {}
   : { skip: "keel-core-native binary absent — build with `cargo build -p keel-node --release`" };
+
+/**
+ * Hand-rolled bare MessagePack for a small string->string map — the exact
+ * bytes `crates/keel-core/src/flow.rs`'s `decode_payload` falls back to
+ * decoding when a payload carries no `keel.step/v1` schema tag (the "legacy
+ * bare messagepack still decodes" path its own unit test pins). Fixstr-only
+ * (every key/value here is well under 32 bytes), so a single-byte header per
+ * string suffices. Parity with the Python twin's `_pack_bare_str_map` in
+ * python/keel/tests/test_flows.py.
+ */
+function packBareStrMap(pairs) {
+  const parts = [Buffer.from([0x80 | pairs.length])];
+  for (const [k, v] of pairs) {
+    for (const s of [k, v]) {
+      const raw = Buffer.from(s, "utf8");
+      if (raw.length >= 32) throw new Error("fixstr only; not needed for test-sized values");
+      parts.push(Buffer.from([0xa0 | raw.length]), raw);
+    }
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Directly journal a `running` (unterminated) step record carrying an
+ * adapter-injected idempotency key — models a crash mid-effect: the exact
+ * shape `FlowHandle::run_live` writes BEFORE firing the effect (a real crash
+ * between that write and the terminal record leaves precisely this row).
+ * Same technique conformance/scenarios' JSON-driven interpreter uses via its
+ * `inject_running` field (crates/keel-core/tests/flows_conformance.rs),
+ * applied directly against the on-disk journal.db so a test proves the REAL
+ * napi binding surface (`recordedIdempotencyKey`, `executeAsync`'s
+ * `idempotencyKey` parameter) rather than re-deriving the core-level proof
+ * `crates/keel-core/tests/idempotency.rs` already carries.
+ */
+function injectRunningStep(journalPath, flowId, { seq, stepKey, idempotencyKey }) {
+  const db = new DatabaseSync(journalPath);
+  try {
+    const payload = packBareStrMap([["idempotency_key", idempotencyKey]]);
+    db.prepare(
+      "INSERT INTO steps (flow_id, seq, step_key, kind, attempt, outcome, payload, error_class, started_at, ended_at) " +
+        "VALUES (?,?,?,?,?,?,?,?,?,?)"
+    ).run(flowId, seq, stepKey, "effect", 0, "running", payload, null, Date.now(), null);
+  } finally {
+    db.close();
+  }
+}
 
 // --- extractFlowEntrypoints ---------------------------------------------------
 
@@ -321,6 +368,78 @@ test("native: a completed flow replays without refiring effects", gate, async (t
   core.exitFlow("completed");
   assert.equal(fires, 3, "replay fired no effects");
   assert.equal(t2, 1783728000, "time replayed");
+});
+
+test("native: idempotency key recorded on crash survives resume", gate, async (t) => {
+  // contracts/adapter-pack.md "Idempotency-key injection" rule 3, through the
+  // REAL napi binding (the gap this test closes: executeAsync did not expose
+  // idempotencyKey, and there was no binding-level recordedIdempotencyKey peek
+  // at all). Step 1 completes normally with key "ik-1"; step 2's crash is
+  // modeled by directly journaling its `running` record (injectRunningStep)
+  // carrying key "ik-2". On resume: step 1's peek misses (it is terminal) and
+  // its effect never re-fires; step 2's peek must resurface "ik-2" — and the
+  // re-executed live effect, injected with THAT peeked key, must actually run
+  // with the SAME key as the crashed attempt, not merely with *a* key.
+  const dir = mkdtempSync(join(tmpdir(), "keel-flow-idem-native-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const journalPath = join(dir, "journal.db");
+  const entrypoint = "ts:pipeline.mjs#main";
+  const argsHash = "ah-idem-native";
+  const flowId = `${entrypoint}#${argsHash}#`;
+
+  const core1 = new KeelCore({ journalPath });
+  core1.configure({});
+  core1.enterFlow(entrypoint, argsHash, "ch-1");
+  const step1Key = "api.pay.example#c1";
+  const step2Key = "api.pay.example#c2";
+  assert.equal(core1.recordedIdempotencyKey(step1Key), null);
+  const out1 = await core1.executeAsync(
+    { v: 1, target: "api.pay.example", op: "POST x", args_hash: "c1", idempotent: true },
+    async () => ({ status: "ok", payload: { charge: "ch_1" } }),
+    "ik-1"
+  );
+  assert.equal(out1.result, "ok");
+  assert.equal(core1.recordedIdempotencyKey(step2Key), null);
+
+  // Crash: step 2's `running` record (carrying ik-2) is journaled directly,
+  // never through a live executeAsync call — modeling the process dying
+  // between the running-write and the terminal outcome.
+  injectRunningStep(journalPath, flowId, { seq: 2, stepKey: step2Key, idempotencyKey: "ik-2" });
+
+  const core2 = new KeelCore({ journalPath });
+  core2.configure({});
+  const info = core2.enterFlow(entrypoint, argsHash, "ch-1");
+  assert.equal(info.replay, false, "an uncompleted flow resumes live, not a pure replay");
+
+  // Step 1 is terminal: the peek misses, and a resumed re-execution (with a
+  // DIFFERENT, would-be-wrong key) is substituted, not re-fired.
+  assert.equal(core2.recordedIdempotencyKey(step1Key), null);
+  let fires = 0;
+  const out1b = await core2.executeAsync(
+    { v: 1, target: "api.pay.example", op: "POST x", args_hash: "c1", idempotent: true },
+    async () => {
+      fires += 1;
+      return { status: "ok", payload: { charge: "never" } };
+    },
+    "ik-should-be-ignored"
+  );
+  assert.deepEqual(out1b.payload, { charge: "ch_1" }, "a terminal step is substituted");
+  assert.equal(fires, 0, "a substituted step must not fire its effect");
+
+  // Step 2: the crashed `running` record resurfaces its key — the
+  // load-bearing assertion is exact equality with the crashed attempt's key,
+  // not merely that SOME key came back.
+  const peeked = core2.recordedIdempotencyKey(step2Key);
+  assert.equal(peeked, "ik-2", "the peek must resurface the SAME key the crashed attempt recorded");
+
+  const out2 = await core2.executeAsync(
+    { v: 1, target: "api.pay.example", op: "POST x", args_hash: "c2", idempotent: true },
+    async () => ({ status: "ok", payload: { charge: "ch_2" } }),
+    peeked
+  );
+  assert.equal(out2.result, "ok");
+  assert.equal(out2.attempts, 1);
+  core2.exitFlow("completed");
 });
 
 test("native: a flow requires a journal (KEEL-E040)", gate, () => {

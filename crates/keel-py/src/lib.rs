@@ -5,16 +5,23 @@
 //!
 //! - `KeelCore.configure(policy: dict)` — raises [`KeelCoreError`]`(code, message)`
 //!   mapping [`KeelError`], with `.code`/`.message` attributes.
-//! - `KeelCore.execute(request: dict, effect)` — synchronous. The GIL is released
-//!   ([`Python::detach`]) while blocked in the engine and re-acquired
-//!   ([`Python::attach`]) only to invoke the Python `effect(attempt)` callback,
-//!   which returns an attempt-result dict.
-//! - `KeelCore.execute_async(request, effect)` — returns an awaitable (via
-//!   `pyo3-async-runtimes`); `effect(attempt)` is an `async def` awaited on the
-//!   caller's asyncio loop. While a flow is open this routes through the same
-//!   `FlowHandle` the synchronous path uses (see "The async flow bridge" below)
-//!   instead of the bare `Engine`, so async intercepted effects inside a flow
-//!   are journaled and replayable exactly like synchronous ones.
+//! - `KeelCore.execute(request: dict, effect, idempotency_key=None)` — synchronous.
+//!   The GIL is released ([`Python::detach`]) while blocked in the engine and
+//!   re-acquired ([`Python::attach`]) only to invoke the Python `effect(attempt)`
+//!   callback, which returns an attempt-result dict. `idempotency_key` (an
+//!   adapter-injected key, contracts/adapter-pack.md "Idempotency-key injection")
+//!   is journaled with the step's `running` record while a flow is open.
+//! - `KeelCore.execute_async(request, effect, idempotency_key=None)` — returns an
+//!   awaitable (via `pyo3-async-runtimes`); `effect(attempt)` is an `async def`
+//!   awaited on the caller's asyncio loop. While a flow is open this routes
+//!   through the same `FlowHandle` the synchronous path uses (see "The async
+//!   flow bridge" below) instead of the bare `Engine`, so async intercepted
+//!   effects inside a flow are journaled and replayable exactly like
+//!   synchronous ones.
+//! - `KeelCore.recorded_idempotency_key(step_key)` — peeks the key recorded for
+//!   the active flow's next step, when it is a crashed (`running`) step under
+//!   `step_key`; `None` otherwise. Adapters call this before minting/injecting
+//!   a key so a resumed call reuses the SAME one (rule 3).
 //! - `KeelCore.report()` — the deterministic report dict.
 //! - `KeelCore.advance_clock(ms)` and the `KeelCore(paused=True)` flag —
 //!   **harness-only** virtual-clock controls, always present but not part of the
@@ -454,11 +461,23 @@ impl KeelCore {
     /// Run one intercepted call synchronously. The GIL is released while the
     /// engine drives the layer chain and re-acquired only to invoke
     /// `effect(attempt) -> dict`. Always returns an outcome dict.
+    ///
+    /// `idempotency_key` carries the key an adapter minted/injected for this
+    /// call (contracts/adapter-pack.md "Idempotency-key injection", rule 3) —
+    /// meaningful ONLY while a flow is open, where it is threaded to
+    /// [`FlowHandle::execute_step_with_idempotency_key`] so it is journaled in
+    /// the step's `running` record; outside a flow it is accepted but unused
+    /// (the bare engine has no journal to carry it in). Adapters peek the
+    /// PRIOR key via [`Self::recorded_idempotency_key`] BEFORE building the
+    /// outgoing request, so a resumed call injects the SAME key its crashed
+    /// predecessor did.
+    #[pyo3(signature = (request, effect, idempotency_key=None))]
     fn execute(
         &self,
         py: Python<'_>,
         request: &Bound<'_, PyAny>,
         effect: Py<PyAny>,
+        idempotency_key: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         let request = decode_request(py, request)?;
         // Re-entrant call: this `execute` is running inside another call's effect
@@ -498,7 +517,11 @@ impl KeelCore {
                 })
             };
             match flow.as_mut() {
-                Some(handle) => guard.block_on(handle.execute_step(&request, effect_fn)),
+                Some(handle) => guard.block_on(handle.execute_step_with_idempotency_key(
+                    &request,
+                    idempotency_key.as_deref(),
+                    effect_fn,
+                )),
                 None => guard.block_on(engine.execute(&request, effect_fn)),
             }
         });
@@ -508,6 +531,10 @@ impl KeelCore {
     /// Run one intercepted call asynchronously, returning an awaitable that
     /// resolves to the outcome dict. `effect(attempt)` is awaited on the caller's
     /// asyncio loop, so it may be an `async def` performing real async IO.
+    ///
+    /// `idempotency_key` is [`Self::execute`]'s parameter of the same name,
+    /// carried across the await bridge to
+    /// [`FlowHandle::execute_step_with_idempotency_key`].
     ///
     /// **The async flow bridge.** While a flow is open, this routes through the
     /// active `FlowHandle` — journaled and replayable, exactly like the
@@ -522,11 +549,13 @@ impl KeelCore {
     /// order their calls *reach* the handle (FIFO on the lock), never in
     /// completion order. Outside a flow the lock is only held long enough to see
     /// `None`, so concurrent Tier 1 `execute_async` calls are unaffected.
+    #[pyo3(signature = (request, effect, idempotency_key=None))]
     fn execute_async<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'py, PyAny>,
         effect: Py<PyAny>,
+        idempotency_key: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request = decode_request(py, request)?;
         let engine = Arc::clone(&self.engine);
@@ -551,7 +580,13 @@ impl KeelCore {
             // flow that isn't theirs.
             let mut guard = active_flow.lock().await;
             let outcome = if let Some(handle) = guard.as_mut() {
-                handle.execute_step(&request, effect_fn).await
+                handle
+                    .execute_step_with_idempotency_key(
+                        &request,
+                        idempotency_key.as_deref(),
+                        effect_fn,
+                    )
+                    .await
             } else {
                 drop(guard);
                 engine.execute(&request, effect_fn).await
@@ -703,6 +738,31 @@ impl KeelCore {
             // `handle` drops here, aborting the heartbeat task.
         }
         Ok(())
+    }
+
+    /// Peek the idempotency key recorded for the active flow's NEXT step, when
+    /// that record is a crashed (`running`) step under `step_key` — the
+    /// resume-reuse read of contracts/adapter-pack.md "Idempotency-key
+    /// injection" rule 3 ([`FlowHandle::recorded_idempotency_key`]). Adapters
+    /// call this BEFORE building the outgoing request for an injectable call —
+    /// deriving `step_key` the same way the flow does for effect steps
+    /// (`"{target}#{args_hash-or-'-'}"`) — so a resumed call injects the SAME
+    /// key its crashed predecessor did instead of minting a fresh one.
+    ///
+    /// `None` (never raises): no flow is open, nothing is recorded at that key,
+    /// or the recorded step is already terminal (a terminal step is
+    /// substituted, never re-sent, so no key is due). Detached like
+    /// `journal_time`/`journal_random` to avoid a GIL-held deadlock against an
+    /// in-flight `execute_async` step that needs the GIL to invoke its Python
+    /// effect before releasing this same lock (module docs' "async flow
+    /// bridge" section).
+    fn recorded_idempotency_key(&self, py: Python<'_>, step_key: &str) -> Option<String> {
+        py.detach(|| {
+            self.active_flow
+                .blocking_lock()
+                .as_ref()
+                .and_then(|handle| handle.recorded_idempotency_key(step_key))
+        })
     }
 
     /// Journal (or, on replay, substitute) a virtualized clock read under `key`
