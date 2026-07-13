@@ -57,6 +57,16 @@
  * mid-stream drop is the caller's problem exactly as it would be without
  * Keel. This is a deliberate, spec-driven limit (a live stream is not
  * replayable), not an oversight.
+ *
+ *   - `budget` (per-run spend cap) and `fallback` (model fallback chain) — see
+ *     `llm-policy.mjs` for the shared design. This seam is the ONE place a
+ *     fallback hop can be a genuinely DIFFERENT PROVIDER (not just a same-host
+ *     model swap like the fetch seam manages): pass `keelMiddleware({ models })`
+ *     with a map of fallback name → an already-constructed `LanguageModelV2`
+ *     instance for that model, and a qualifying failure re-dispatches to it.
+ *     Without a matching entry in `models`, fallback for that hop is a no-op
+ *     (the chain stops there and the current failure is delivered) — an
+ *     unresolvable name is not silently pretended away.
  */
 
 import { createHash } from "node:crypto";
@@ -66,6 +76,16 @@ import { getBackend, getDiscovery, attachOutcome } from "../runtime.mjs";
 import { KeelError } from "../engine.mjs";
 import { parseRetryAfter } from "../judge.mjs";
 import { llmDefaults } from "../defaults.mjs";
+import {
+  parseBudgetCents,
+  spentCents,
+  recordSpend,
+  estimateCostUsd,
+  normalizeUsage,
+  budgetMessage,
+  budgetBlockedOutcome,
+  shouldFallback,
+} from "../llm-policy.mjs";
 
 const PKG_SPECIFIER = "ai/package.json";
 // The fixture pin (../../fixtures/ai-sdk-model.d.ts) mirrors ai@5.0.0's
@@ -152,8 +172,7 @@ export function classifyModelError(err) {
   return { class: "other", message: err?.message ?? String(err) };
 }
 
-function settle(outcome, target, discovery, latencyMs, held) {
-  discovery?.observe(target, outcome, latencyMs);
+function deliver(outcome, held) {
   if (outcome.result === "ok") {
     // Live call → the real provider result unchanged (identity + a live stream
     // preserved, byte-transparent). Cache hit → the round-tripped JSON payload
@@ -174,41 +193,85 @@ function settle(outcome, target, discovery, latencyMs, held) {
  * installed by the hook. `options.backend`/`options.discovery` allow injection
  * for embedding and tests. When no backend is active (Keel disabled / not
  * installed) the middleware is a transparent pass-through (DX invariant 2).
+ * `options.models` maps a `fallback` chain entry (by name) to an alternate
+ * `LanguageModelV2` instance — see the module doc's fallback section.
  */
 export function keelMiddleware(options = {}) {
   const backendOf = () => options.backend ?? getBackend();
   const discoveryOf = () => options.discovery ?? getDiscovery();
+  const modelsOf = () => (options.models && typeof options.models === "object" ? options.models : {});
 
-  const run = async ({ effect, params, model, kind, cacheable }) => {
+  const run = async ({ effect: primaryEffect, params, model: primaryModel, kind, cacheable }) => {
     const backend = backendOf();
-    if (!backend) return effect(); // disabled: transparent pass-through
-    const target = providerTarget(model);
-    const op = `${kind} ${target}${model?.modelId ? ` ${model.modelId}` : ""}`;
-    const request = {
-      v: 1,
-      target,
-      op,
-      idempotent: true,
-      args_hash: cacheable ? hashParams(params) : null,
-    };
-    const started = performance.now();
-    // Live result/error held side-band so the core payload stays JSON: the native
-    // core cannot round-trip a live stream/Date/Error. On the success path we
-    // hand back the real object (identity + streams preserved); only a cache HIT
-    // uses the JSON payload. A stream result must NEVER cross the core, so a
-    // non-cacheable effect (streams) sends no payload at all.
-    const held = { liveResult: undefined, haveResult: false, liveErr: undefined };
-    const outcome = await backend.execute(request, async () => {
-      try {
-        held.liveResult = await effect();
-        held.haveResult = true;
-        return { status: "ok", payload: cacheable ? jsonClone(held.liveResult) : null };
-      } catch (err) {
-        held.liveErr = err;
-        return { status: "error", ...classifyModelError(err) };
+    if (!backend) return primaryEffect(); // disabled: transparent pass-through
+
+    let currentModel = primaryModel;
+    let currentEffect = primaryEffect;
+    let hopIndex = 0;
+    let target;
+    let outcome;
+    let held;
+
+    // Bounded by the primary target's `fallback` chain length (re-checked below).
+    for (;;) {
+      target = providerTarget(currentModel);
+
+      if (hopIndex === 0) {
+        // Budget is gated ONLY on the PRIMARY target, once, before any dispatch
+        // (parity with fetch.mjs's design) — a fallback hop's own target is not
+        // itself budget-gated in v0.1 (documented scope; see llm-policy.mjs).
+        const capCents = parseBudgetCents(backend.layer(target, "budget"));
+        if (capCents !== null && spentCents(target) >= capCents) {
+          const message = budgetMessage(target, capCents, spentCents(target));
+          const blocked = budgetBlockedOutcome(message);
+          discoveryOf()?.observe(target, blocked, 0);
+          throw attachOutcome(new KeelError("KEEL-E012", message), blocked);
+        }
       }
-    });
-    return settle(outcome, target, discoveryOf(), performance.now() - started, held);
+
+      const capForUsage = parseBudgetCents(backend.layer(target, "budget"));
+      const op = `${kind} ${target}${currentModel?.modelId ? ` ${currentModel.modelId}` : ""}`;
+      const request = {
+        v: 1,
+        target,
+        op,
+        idempotent: true,
+        args_hash: cacheable ? hashParams(params) : null,
+      };
+      held = { liveResult: undefined, haveResult: false, liveErr: undefined };
+      const started = performance.now();
+      outcome = await backend.execute(request, async () => {
+        try {
+          held.liveResult = await currentEffect();
+          held.haveResult = true;
+          return { status: "ok", payload: cacheable ? jsonClone(held.liveResult) : null };
+        } catch (err) {
+          held.liveErr = err;
+          return { status: "error", ...classifyModelError(err) };
+        }
+      });
+      discoveryOf()?.observe(target, outcome, performance.now() - started);
+
+      if (outcome.result === "ok") {
+        if (capForUsage !== null && held.haveResult && !outcome.from_cache) {
+          const usage = normalizeUsage(held.liveResult);
+          if (usage) recordSpend(target, estimateCostUsd(currentModel?.modelId, usage));
+        }
+        break;
+      }
+
+      const fallbackCfg = backend.layer(target, "fallback");
+      const chain = Array.isArray(fallbackCfg) ? fallbackCfg.filter((m) => typeof m === "string" && m) : [];
+      if (hopIndex >= chain.length || !shouldFallback(outcome.error)) break;
+      const altModel = modelsOf()[chain[hopIndex]];
+      const methodName = kind === "generate" ? "doGenerate" : "doStream";
+      if (!altModel || typeof altModel[methodName] !== "function") break; // unresolvable — stop, honestly
+      currentModel = altModel;
+      currentEffect = () => altModel[methodName](params);
+      hopIndex += 1;
+    }
+
+    return deliver(outcome, held);
   };
 
   return {

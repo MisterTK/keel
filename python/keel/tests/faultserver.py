@@ -65,6 +65,7 @@ class FaultServer:
         self._lock = threading.Lock()
         self.requests: list[tuple[str, str]] = []  # (method, path) actually served
         self.headers: list[dict[str, str]] = []  # request headers, one dict per hit
+        self.bodies: list[bytes] = []  # request bodies actually received, same order
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -73,23 +74,28 @@ class FaultServer:
             def log_message(self, *args: Any) -> None:  # silence
                 pass
 
-            def _drain_request_body(self) -> None:
-                # Read and discard any request body so a keep-alive connection is
+            def _drain_request_body(self) -> bytes:
+                # Read (and record) any request body so a keep-alive connection is
                 # left clean for the next request. Without this, an unread POST
                 # body corrupts framing when the connection is reused (e.g. after
-                # a 200 that httpx returns to its pool).
+                # a 200 that httpx returns to its pool). Recording it lets tests
+                # assert on what a fallback hop actually sent (e.g. a rewritten
+                # `model` field), without changing the drain-everything contract.
                 length = self.headers.get("Content-Length")
                 if not length:
-                    return
+                    return b""
                 try:
                     remaining = int(length)
                 except ValueError:
-                    return
+                    return b""
+                chunks = []
                 while remaining > 0:
                     chunk = self.rfile.read(min(remaining, 65536))
                     if not chunk:
                         break
+                    chunks.append(chunk)
                     remaining -= len(chunk)
+                return b"".join(chunks)
 
             def _serve(self) -> None:
                 directive = server._next()
@@ -103,7 +109,7 @@ class FaultServer:
                     self.connection.close()
                     self.close_connection = True
                     return
-                self._drain_request_body()
+                server.bodies.append(self._drain_request_body())
                 sleep_s = directive.get("sleep")
                 if sleep_s:
                     time.sleep(sleep_s)
