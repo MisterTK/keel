@@ -13,6 +13,13 @@ passthrough. Judgment is shared with the httpx pack and the Node twin via
 ``_http``. Classification only ever reads ``status_code`` and the
 ``Retry-After`` header — never the body — so the caller receives the real,
 untouched ``requests.Response`` (success-path byte-transparency).
+
+Double-wrap guard: requests vendors its own use of urllib3's connection pools,
+so a ``requests`` call also passes through the ``urllib3`` pack's seam
+(``urllib3_pack``) if both are installed. The actual library call is run under
+``_http.run_owned`` so the urllib3 pack sees ``seam_owned()`` and passes that
+inner call straight through — one intercepted request is exactly one Keel
+``execute``, never a retry loop nested inside another (``_http`` module docs).
 """
 
 from __future__ import annotations
@@ -203,7 +210,11 @@ def _run_send(do_call: Callable[[], Any], request: Any) -> Any:
 
     def effect(_attempt: int) -> dict[str, Any]:
         try:
-            resp = do_call()
+            # requests dispatches through urllib3 under the hood (its vendored
+            # connection pools); `run_owned` marks this attempt so the urllib3
+            # pack's own seam sees `seam_owned()` and passes straight through
+            # instead of judging (and retrying) the same call a second time.
+            resp = _http.run_owned(do_call)
         except Exception as err:
             live["exc"] = err
             return _http.thrown_error(err, _classify(err))

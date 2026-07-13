@@ -22,11 +22,12 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
-from . import httpx_pack, requests_pack
+from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
-PACKS = (httpx_pack, requests_pack)
+#: Alphabetical by module name.
+PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack)
 
 
 class _State:
