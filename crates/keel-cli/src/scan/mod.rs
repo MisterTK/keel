@@ -5,8 +5,9 @@
 //! Two scanners, one merged result:
 //! - [`python`] shells an `ast`-walker out to `python3 -` for precise Python
 //!   parsing (imports of known effect libraries, URL/DSN string literals).
-//! - [`js`] does a **documented-simplification** regex scan of JS/TS for
-//!   `fetch`/`undici`/`node:http` usage, provider-SDK imports, and URL literals.
+//! - [`js`] parses JS/TS/JSX in-process with oxc (no Node toolchain needed)
+//!   for `fetch`/`undici`/`node:http` usage, provider-SDK imports, effect-lib
+//!   call sites, and URL literals.
 //!
 //! Both label every finding with `file:line`, so the generated `keel.toml` can
 //! cite where each target was found and trust stays inspectable.
@@ -26,6 +27,23 @@ pub enum TargetClass {
     Host,
     /// A semantic `llm:<provider>` target — from a provider SDK import.
     Llm,
+}
+
+/// One effect call site with enclosing-function attribution — the shape both
+/// language passes emit so `keel flows suggest` can group effect calls by the
+/// function they live in. Field order is the sort order (file, then line).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CallSite {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// 1-based line of the call expression.
+    pub line: u32,
+    /// What is called, rooted at the effect library where the receiver is
+    /// known (`fetch`, `undici.request`, `openai.chat.completions.create`).
+    pub callee: String,
+    /// Dotted enclosing-scope path (`Class.method`, `outer.inner`), or `None`
+    /// at module top level. Anonymous scopes inherit the nearest named scope.
+    pub function: Option<String>,
 }
 
 /// One place a target was seen: a project-relative path and 1-based line.
@@ -69,6 +87,10 @@ pub struct ScanResult {
     /// `openai`, `boto3`, `fetch`). `keel doctor` cross-references these against
     /// its adapter registry to classify coverage.
     pub libs: BTreeSet<String>,
+    /// Effect call sites with enclosing-function attribution, sorted. Not
+    /// gated on `http_in_use`: a call through an effect library is direct
+    /// evidence by itself.
+    pub call_sites: BTreeSet<CallSite>,
 }
 
 impl ScanResult {
@@ -114,6 +136,8 @@ pub struct LangFindings {
     pub http_in_use: bool,
     /// Effect-library names detected (for `keel doctor`'s registry cross-check).
     pub libs: BTreeSet<String>,
+    /// Effect call sites with enclosing-function attribution.
+    pub call_sites: Vec<CallSite>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -132,6 +156,9 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
     }
     for lib in &f.libs {
         result.libs.insert(lib.clone());
+    }
+    for site in &f.call_sites {
+        result.call_sites.insert(site.clone());
     }
 }
 
