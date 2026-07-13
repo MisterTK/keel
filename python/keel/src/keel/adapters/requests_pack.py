@@ -126,7 +126,11 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     url = request.url
     parts = urlsplit(url)
     host = parts.hostname or ""
-    target = _http.resolve_target(host)
+    # Pattern-aware target selection (docs/targeting.md): exact host key, else
+    # the most specific matching host/URL pattern key, else the bare host.
+    target = _http.resolve_policy_target(
+        method, host, scheme=parts.scheme, port=parts.port, path=parts.path
+    )
     op = f"{method} {host}{parts.path}"
     idem_header = _http.idempotency_header(target)
     # Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint

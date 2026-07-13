@@ -8,6 +8,7 @@ import http from "node:http";
 import { AsyncEngine, virtualClock } from "../src/engine.mjs";
 import { installFetch } from "../src/fetch.mjs";
 import { level0Defaults } from "../src/defaults.mjs";
+import { compileOutboundMatchers } from "../src/judge.mjs";
 
 /** Start a server whose handler is a scripted function of (req, hitCount). */
 async function startServer(handler) {
@@ -412,4 +413,66 @@ test("an idempotent request with an unbuffered stream body is observed, not retr
 
   assert.equal(captured[0].idempotent, false, "a stream body → observed, not retried (can't wrap safely)");
   assert.equal(captured[1].idempotent, true, "an in-memory body stays retryable");
+});
+
+// --- outbound host/URL-pattern targets (docs/targeting.md) -------------------
+
+test("installFetch: a policy pattern key becomes the call's target, verbatim", async () => {
+  const captured = [];
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  const outboundTargets = compileOutboundMatchers({
+    target: { "GET api.catalog.internal/*": {} },
+  });
+  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+
+  await globalObj.fetch("https://api.catalog.internal/items/42");
+
+  assert.equal(captured[0].target, "GET api.catalog.internal/*");
+});
+
+test("installFetch: no matching pattern falls back to the bare host (unchanged behavior)", async () => {
+  const captured = [];
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  const outboundTargets = compileOutboundMatchers({
+    target: { "other.example.com": {} },
+  });
+  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+
+  await globalObj.fetch("https://api.example.com/x");
+
+  assert.equal(captured[0].target, "api.example.com");
+});
+
+test("installFetch: the llm: host map still wins over an installed pattern", async () => {
+  const captured = [];
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  const outboundTargets = compileOutboundMatchers({ target: { "*.openai.com": {} } });
+  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+
+  await globalObj.fetch("https://api.openai.com/v1/chat/completions", { method: "POST" });
+
+  assert.equal(captured[0].target, "llm:openai");
+});
+
+test("installFetch: an exact host key wins over a matching pattern", async () => {
+  const captured = [];
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  const outboundTargets = compileOutboundMatchers({
+    target: { "api.internal": {}, "*.internal": {} },
+  });
+  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+
+  await globalObj.fetch("https://api.internal/anything");
+
+  assert.equal(captured[0].target, "api.internal");
+});
+
+test("installFetch: without any outboundTargets, resolution is unchanged (bare host)", async () => {
+  const captured = [];
+  const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
+  installFetch(captureBackend(captured), null, { globalObj });
+
+  await globalObj.fetch("https://api.stripe.com/v1/charges");
+
+  assert.equal(captured[0].target, "api.stripe.com");
 });

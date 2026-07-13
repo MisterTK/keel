@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from requests.models import PreparedRequest
 
+from keel import _targets
 from keel.adapters import _http, httpx_pack, requests_pack
 
 
@@ -27,6 +28,64 @@ class ResolveTargetTest(unittest.TestCase):
     def test_unknown_host_is_its_own_target(self) -> None:
         self.assertEqual(_http.resolve_target("example.com"), "example.com")
         self.assertEqual(_http.resolve_target("127.0.0.1"), "127.0.0.1")
+
+
+class ResolvePolicyTargetTest(unittest.TestCase):
+    """`resolve_policy_target` (docs/targeting.md): the LLM host map first,
+    then `_targets`'s exact/pattern/default resolution, driven by whatever
+    outbound matchers are process-installed (`_targets.install_outbound_targets`,
+    as `bootstrap.install_keel` does from the effective policy)."""
+
+    def tearDown(self) -> None:
+        _targets.clear_outbound_targets()
+
+    def test_no_matchers_installed_matches_resolve_target(self) -> None:
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "api.stripe.com"), "api.stripe.com"
+        )
+        self.assertEqual(
+            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
+        )
+
+    def test_llm_host_map_wins_even_over_an_installed_pattern(self) -> None:
+        _targets.install_outbound_targets({"target": {"*.openai.com": {}}})
+        self.assertEqual(
+            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
+        )
+
+    def test_exact_host_key_beats_an_installed_pattern(self) -> None:
+        _targets.install_outbound_targets(
+            {"target": {"api.internal": {}, "*.internal": {}}}
+        )
+        self.assertEqual(_http.resolve_policy_target("GET", "api.internal"), "api.internal")
+
+    def test_pattern_key_selected_by_method_port_and_path(self) -> None:
+        _targets.install_outbound_targets(
+            {"target": {"GET api.catalog.internal/*": {}}}
+        )
+        self.assertEqual(
+            _http.resolve_policy_target(
+                "GET", "api.catalog.internal", scheme="https", path="/items/5"
+            ),
+            "GET api.catalog.internal/*",
+        )
+        self.assertEqual(
+            _http.resolve_policy_target(
+                "POST", "api.catalog.internal", scheme="https", path="/items/5"
+            ),
+            "api.catalog.internal",
+            "a POST does not match a GET-prefixed pattern -> falls through",
+        )
+
+    def test_wildcard_host_segment_matches_subdomains(self) -> None:
+        _targets.install_outbound_targets({"target": {"*.internal.corp": {}}})
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "db.internal.corp"), "*.internal.corp"
+        )
+        self.assertEqual(
+            _http.resolve_policy_target("GET", "unrelated.example.com"),
+            "unrelated.example.com",
+        )
 
 
 class IdempotencyTest(unittest.TestCase):

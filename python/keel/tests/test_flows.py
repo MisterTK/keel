@@ -41,6 +41,24 @@ class ExtractFlowEntrypointsTest(unittest.TestCase):
         self.assertEqual(extract_flow_entrypoints({}), [])
         self.assertEqual(extract_flow_entrypoints({"flows": {}}), [])
 
+    def test_glob_module_with_concrete_function(self) -> None:
+        entries = extract_flow_entrypoints({"flows": {"entrypoints": ["py:jobs.*:run"]}})
+        self.assertEqual(entries, [FlowEntrypoint("py:jobs.*:run", "jobs.*", "run")])
+
+    def test_glob_shorthand_defaults_function_to_main(self) -> None:
+        entries = extract_flow_entrypoints({"flows": {"entrypoints": ["py:pipeline.*"]}})
+        self.assertEqual(entries, [FlowEntrypoint("py:pipeline.*", "pipeline.*", "main")])
+
+    def test_glob_in_function_position_is_skipped(self) -> None:
+        # The flow body must always be a concrete, named function.
+        got = extract_flow_entrypoints({"flows": {"entrypoints": ["py:jobs.ingest:*"]}})
+        self.assertEqual(got, [])
+
+    def test_concrete_module_without_function_is_still_skipped(self) -> None:
+        # Unchanged v0.1 rule: a colon-less, non-glob entry has no function to
+        # call and is not guessed.
+        self.assertEqual(extract_flow_entrypoints({"flows": {"entrypoints": ["py:pipeline"]}}), [])
+
 
 class MatchFlowTest(unittest.TestCase):
     def test_matches_by_file_stem(self) -> None:
@@ -58,6 +76,58 @@ class MatchFlowTest(unittest.TestCase):
         self.assertEqual(_flow.match_flow("/app/jobs/pipeline.py", entries), entries[0])
         self.assertIsNone(_flow.match_flow("/scratch/pipeline.py", entries))
         self.assertIsNone(_flow.match_flow("/app/other/pipeline.py", entries))
+
+    def test_glob_entry_resolves_to_concrete_matched_module(self) -> None:
+        entries = [FlowEntrypoint("py:pipeline.*:main", "pipeline.*", "main")]
+        got = _flow.match_flow("/app/pipeline/ingest.py", entries)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.module, "pipeline.ingest")
+        self.assertEqual(got.raw, "py:pipeline.ingest:main")
+        self.assertEqual(got.function, "main")
+        self.assertEqual(got.via, "py:pipeline.*:main")
+
+    def test_two_scripts_under_one_glob_get_independent_identities(self) -> None:
+        entries = [FlowEntrypoint("py:jobs.*:run", "jobs.*", "run")]
+        a = _flow.match_flow("/app/jobs/ingest.py", entries)
+        b = _flow.match_flow("/app/jobs/export.py", entries)
+        self.assertNotEqual(a.raw, b.raw)
+        self.assertEqual(a.raw, "py:jobs.ingest:run")
+        self.assertEqual(b.raw, "py:jobs.export:run")
+
+    def test_shortest_glob_candidate_wins(self) -> None:
+        # For .../jobs/nightly.py, candidates are "nightly" then "jobs.nightly"
+        # (shortest first) — a glob matching the bare stem wins.
+        entries = [FlowEntrypoint("py:*:main", "*", "main")]
+        got = _flow.match_flow("/app/jobs/nightly.py", entries)
+        self.assertEqual(got.module, "nightly")
+
+    def test_concrete_entry_wins_over_a_matching_glob(self) -> None:
+        entries = [
+            FlowEntrypoint("py:pipeline.*:main", "pipeline.*", "main"),
+            FlowEntrypoint("py:pipeline.ingest:special", "pipeline.ingest", "special"),
+        ]
+        got = _flow.match_flow("/app/pipeline/ingest.py", entries)
+        self.assertEqual(got, entries[1])
+        self.assertIsNone(got.via)
+
+    def test_glob_stops_at_the_first_non_identifier_path_component(self) -> None:
+        # "my-jobs" is not a valid Python identifier, so no dotted reading can
+        # extend past it outward — a glob that would need a component beyond it
+        # can never be reached, even though a shallower one still matches.
+        shallow = [FlowEntrypoint("py:*.ingest:main", "*.ingest", "main")]
+        self.assertEqual(
+            _flow.match_flow("/app/my-jobs/sub/ingest.py", shallow).module, "sub.ingest"
+        )
+        deep = [FlowEntrypoint("py:*.sub.ingest:main", "*.sub.ingest", "main")]
+        self.assertIsNone(_flow.match_flow("/app/my-jobs/sub/ingest.py", deep))
+
+    def test_glob_does_not_match_a_non_identifier_stem(self) -> None:
+        entries = [FlowEntrypoint("py:*:main", "*", "main")]
+        self.assertIsNone(_flow.match_flow("/app/123abc.py", entries))
+
+    def test_glob_ignored_for_non_python_target(self) -> None:
+        entries = [FlowEntrypoint("py:*:main", "*", "main")]
+        self.assertIsNone(_flow.match_flow("/app/script.txt", entries))
 
 
 class _FakeFlowBackend:

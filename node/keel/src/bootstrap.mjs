@@ -15,6 +15,7 @@ import { register } from "node:module";
 import { loadPolicy, extractFunctionTargets } from "./policy.mjs";
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
+import { compileOutboundMatchers } from "./judge.mjs";
 import { createDiscovery } from "./discovery.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
@@ -48,7 +49,13 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   const discovery = createDiscovery(cwd);
   setRuntime({ enabled: true, backend, discovery });
 
-  const uninstallFetch = installFetch(backend, discovery);
+  // Outbound host/URL-pattern matchers (docs/targeting.md), compiled from the
+  // same effective policy the backend was configured with: `fetch`'s target
+  // judgment consults these so `[target."*.internal.corp"]`-style keys actually
+  // select requests. The core still sees one exact key per call (parity with
+  // the Python front end's `install_outbound_targets`).
+  const outboundTargets = compileOutboundMatchers(policy);
+  const uninstallFetch = installFetch(backend, discovery, { outboundTargets });
   // Framework packs: auto-detect and wrap MCP client transports if present.
   // Best-effort — an absent SDK is a silent no-op; never fatal.
   const mcp = await installMcpPack({ cwd });
