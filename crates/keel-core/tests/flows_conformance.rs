@@ -9,7 +9,11 @@
 //! (drop the handle, let the lease expire), `success`, or `failed`. A step's
 //! `effect` scripts its single attempt; `expect` is subset-matched against the
 //! resulting `Outcome`; `expect_effect_calls` asserts how many step effects
-//! actually ran live (a replayed step must not call its effect).
+//! actually ran live (a replayed step must not call its effect). A step's
+//! `idempotency_key` (contracts/adapter-pack.md "Idempotency-key injection")
+//! drives `execute_step_with_idempotency_key`; `expect_recorded_key` peeks
+//! `recorded_idempotency_key` before the step runs and compares it to a JSON
+//! string or `null`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +69,19 @@ struct StepSpec {
     target: String,
     #[serde(default)]
     args_hash: Option<String>,
+    /// An idempotency key the "adapter" minted/injected for this step
+    /// (contracts/adapter-pack.md "Idempotency-key injection" rule 3); when
+    /// set, drives `execute_step_with_idempotency_key` instead of the
+    /// plain `execute_step` (identical when `None` — the former IS the
+    /// latter's implementation).
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    /// When present, PEEKED via `recorded_idempotency_key` before this step
+    /// executes and compared to this value (a JSON string, or `null` for
+    /// "no key recorded") — the resume-reuse read a real adapter performs
+    /// before minting/injecting (rule 3).
+    #[serde(default)]
+    expect_recorded_key: Option<Value>,
     /// The scripted result of this step's single attempt.
     effect: AttemptResult,
     /// Subset-matched against the step's `Outcome`.
@@ -106,6 +123,21 @@ async fn run_flow_scenario(scn: &FlowScenario) -> Vec<String> {
         };
         let calls = Arc::new(AtomicUsize::new(0));
         for (si, step) in run.steps.iter().enumerate() {
+            if let Some(expected) = &step.expect_recorded_key {
+                let step_key = format!(
+                    "{}#{}",
+                    step.target,
+                    step.args_hash.as_deref().unwrap_or("-")
+                );
+                let actual = handle
+                    .recorded_idempotency_key(&step_key)
+                    .map_or(Value::Null, Value::String);
+                if &actual != expected {
+                    failures.push(format!(
+                        "run[{ri}] step[{si}] recorded_idempotency_key({step_key:?}): expected {expected}, got {actual}"
+                    ));
+                }
+            }
             let request = Request {
                 v: ENVELOPE_VERSION,
                 target: step.target.clone(),
@@ -116,14 +148,18 @@ async fn run_flow_scenario(scn: &FlowScenario) -> Vec<String> {
             let effect = step.effect.clone();
             let calls_effect = Arc::clone(&calls);
             let outcome = handle
-                .execute_step(&request, move |_attempt: u32| {
-                    let effect = effect.clone();
-                    let calls_effect = Arc::clone(&calls_effect);
-                    async move {
-                        calls_effect.fetch_add(1, Ordering::SeqCst);
-                        effect
-                    }
-                })
+                .execute_step_with_idempotency_key(
+                    &request,
+                    step.idempotency_key.as_deref(),
+                    move |_attempt: u32| {
+                        let effect = effect.clone();
+                        let calls_effect = Arc::clone(&calls_effect);
+                        async move {
+                            calls_effect.fetch_add(1, Ordering::SeqCst);
+                            effect
+                        }
+                    },
+                )
                 .await;
             let actual = serde_json::to_value(&outcome).expect("outcome serializes");
             let mut mismatches = Vec::new();

@@ -17,7 +17,7 @@
  *                    Thrown transport errors map to conn/timeout/other.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /**
  * Host → LLM provider map. This is a parity contract with the Python front end;
@@ -72,6 +72,40 @@ export function isIdempotent(method, headers, idempotencyHeader) {
     ? [idempotencyHeader.toLowerCase()]
     : DEFAULT_IDEMPOTENCY_HEADERS;
   return candidates.some((h) => headers.has(h));
+}
+
+/**
+ * Mint one opaque idempotency key (contracts/adapter-pack.md "Idempotency-key
+ * injection" rule 2: ONE per logical call, minted before the first attempt).
+ * A fresh UUIDv4 in production; `installFetch`'s `mintIdempotencyKey` option
+ * substitutes a deterministic source for tests (parity with the Python twin's
+ * injectable `new_idempotency_key`).
+ */
+export function defaultMintIdempotencyKey() {
+  return randomUUID();
+}
+
+/**
+ * The idempotency key to INJECT for this call, or `null` to inject nothing
+ * (contracts/adapter-pack.md "Idempotency-key injection"):
+ *
+ *   - `null` when the method is already idempotent (injection only ever
+ *     targets an unsafe method — rule 1), no `idempotency.header` is
+ *     configured for the target, or the caller already supplied the
+ *     configured header — a caller-supplied key always wins; never
+ *     overwritten.
+ *   - otherwise a freshly minted key (`mint`, defaulting to
+ *     `defaultMintIdempotencyKey`) — stable across Tier 1 retries because the
+ *     caller mints/injects it once, before the first attempt, and reuses the
+ *     same `headers` object on every retry.
+ *
+ * The returned key must never feed `argsHash` (rule 5): it is not part of the
+ * caller's arguments, and folding it in would fence Tier 2 replay.
+ */
+export function resolveIdempotencyInjection(method, headers, idempotencyHeader, mint = defaultMintIdempotencyKey) {
+  if (!idempotencyHeader || IDEMPOTENT_METHODS.has(method)) return null;
+  if (headers.has(idempotencyHeader.toLowerCase())) return null;
+  return mint();
 }
 
 export function argsHash(method, url, body) {

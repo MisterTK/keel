@@ -188,7 +188,16 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None]:
     target = _http.resolve_target(host)
     op = f"{method} {host}{url.path}"
     idem_header = _http.idempotency_header(target)
-    idempotent = _http.is_idempotent(method, request.headers.keys(), idem_header)
+    # Injection (contracts/adapter-pack.md "Idempotency-key injection"): mint
+    # once, before the first attempt, and set it on the request so every retry
+    # attempt resends the SAME header (the request object is reused verbatim
+    # by `do_call` on each attempt — see `_run_sync`/`_run_async` below).
+    injected = _http.resolve_idempotency_injection(method, request.headers.keys(), idem_header)
+    if injected is not None:
+        request.headers[idem_header] = injected  # type: ignore[index]
+    idempotent = injected is not None or _http.is_idempotent(
+        method, request.headers.keys(), idem_header
+    )
     hash_ = _http.derive_args_hash(target, method, str(url), _buffered_body(request))
     return target, op, idempotent, hash_
 

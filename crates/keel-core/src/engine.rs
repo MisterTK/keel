@@ -754,6 +754,22 @@ impl Engine {
         Ok(())
     }
 
+    /// The target's resolved `idempotency = { header }` knob, read live so a
+    /// reconfigure is honored. This is the engine surface of the injection
+    /// contract (contracts/adapter-pack.md "Idempotency-key injection"):
+    /// adapters/bindings consult it to mint and inject an idempotency key on
+    /// unsafe-method calls — the engine itself never injects, and the flipped
+    /// judgment reaches it as `Request.idempotent = true`.
+    #[must_use]
+    pub fn idempotency_header(&self, target: &str) -> Option<String> {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .resolve(target)
+            .idempotency
+            .map(|i| i.header)
+    }
+
     /// The configured Tier 2 `flows.on_nondeterminism` response (default
     /// [`NondeterminismResponse::Fail`]), read live so a reconfigure is honored.
     /// The flow manager consults this when a replay `(seq, step_key)` diverges.

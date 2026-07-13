@@ -64,6 +64,7 @@ class FaultServer:
         self._i = 0
         self._lock = threading.Lock()
         self.requests: list[tuple[str, str]] = []  # (method, path) actually served
+        self.headers: list[dict[str, str]] = []  # request headers, one dict per hit
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -93,6 +94,7 @@ class FaultServer:
             def _serve(self) -> None:
                 directive = server._next()
                 server.requests.append((self.command, self.path))
+                server.headers.append({k.lower(): v for k, v in self.headers.items()})
                 if directive.get("reset"):
                     try:
                         self.connection.shutdown(socket.SHUT_RDWR)

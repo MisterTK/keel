@@ -31,6 +31,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from types import MappingProxyType
@@ -125,6 +126,46 @@ def is_idempotent(
         else DEFAULT_IDEMPOTENCY_HEADERS
     )
     return any(h in present for h in candidates)
+
+
+def new_idempotency_key() -> str:
+    """Mint one opaque idempotency key (contracts/adapter-pack.md
+    "Idempotency-key injection" rule 2: ONE per logical call, minted before the
+    first attempt). A plain module-level function — not a class/closure — so
+    tests get a deterministic source via ``monkeypatch.setattr(_http,
+    "new_idempotency_key", lambda: "fixed")``; production mints a fresh UUID4."""
+    return uuid.uuid4().hex
+
+
+def resolve_idempotency_injection(
+    method: str,
+    header_names: Iterable[str],
+    configured_header: str | None,
+    *,
+    recorded_key: str | None = None,
+) -> str | None:
+    """The idempotency key to INJECT for this call, or ``None`` to inject
+    nothing (contracts/adapter-pack.md "Idempotency-key injection"):
+
+      * ``None`` when the method is already idempotent (injection only ever
+        targets an unsafe method — rule 1), no ``idempotency.header`` is
+        configured for the target, or the caller already supplied the
+        configured header — a caller-supplied key always wins; adapters never
+        overwrite one.
+      * otherwise ``recorded_key`` when given (a Tier 2 resume's key,
+        journaled with the crashed step — rule 3 — reused verbatim so the
+        re-execution is deduplicable on the provider side), else a freshly
+        minted one (:func:`new_idempotency_key`; stable across Tier 1 retries
+        because the caller mints/injects it once, before the first attempt).
+
+    The returned key is not folded into ``args_hash`` by any caller of this
+    function — rule 5 (it would otherwise fence Tier 2 replay)."""
+    if configured_header is None or method in IDEMPOTENT_METHODS:
+        return None
+    present = {h.lower() for h in header_names}
+    if configured_header.lower() in present:
+        return None
+    return recorded_key if recorded_key is not None else new_idempotency_key()
 
 
 def args_hash(method: str, url: str, body: bytes | str | None = None) -> str:
@@ -351,6 +392,8 @@ __all__ = [
     "cache_configured",
     "resolve_target",
     "is_idempotent",
+    "new_idempotency_key",
+    "resolve_idempotency_injection",
     "args_hash",
     "derive_args_hash",
     "parse_retry_after",

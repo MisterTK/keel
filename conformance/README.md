@@ -168,6 +168,39 @@ fixed(250ms)`: three 1000 waits fill the 3s bound exactly, `fixed(10s) upTo
 5s` contributes nothing (10000 > 5000 — cascade), and the tail emits 250 ms
 waits from the fourth retry on.
 
+### Idempotency-key injection (normative for every implementation)
+
+Full injection semantics (minting, header placement, the resume-reuse
+contract) are normative in `contracts/adapter-pack.md` ("Idempotency-key
+injection") — they live in the ADAPTER, not the core, so they are not
+re-litigated here. What IS core-visible, and pinned by scenario 23
+(`idempotency-key-injection-flips-retry`) and scenario 24
+(`flow-idempotency-key-survives-resume`):
+
+- **The core never injects.** `idempotency.header` resolves through
+  `ResolvedPolicy` (`Policy::resolve`) like any other layer, but it carries no
+  behavior at the Tier 1 chain — a target configuring it is otherwise
+  execution-identical to one that doesn't. The adapter decides `Request.idempotent`
+  BEFORE the call reaches `execute`; an injected key simply means that flag is
+  `true` for a call whose method would otherwise make it `false` — item 5
+  ("Retry") of "Execution semantics" above then applies exactly as it would
+  for any idempotent request (scenario 23 is the injected-key mirror of
+  scenario 04's non-idempotent case: same POST, same 5xx-then-ok script,
+  `idempotent: true` instead of `false` → retried to success instead of
+  terminal `KEEL-E014`).
+- **Tier 2: the key rides the step's `running` record, never the step key.**
+  `FlowHandle::execute_step_with_idempotency_key` (the Tier 2 surface adapters
+  call) journals an adapter-supplied key in the `running` record's payload;
+  `recorded_idempotency_key(step_key)` peeks it back — `Some` only for a
+  crashed (still-`running`) record under the SAME step key, `None` for a
+  fresh step, a terminal (substituted) step, or a diverging/abandoned replay.
+  The key never feeds `args_hash`, so it cannot affect step-key matching
+  (contracts/adapter-pack.md rule 5): a resumed step is substituted from a
+  terminal record regardless of what key a re-execution would have injected
+  (scenario 24 resumes a completed step with a DIFFERENT key on purpose to
+  pin exactly this — the substitution wins, the differing key is never
+  observed).
+
 ## Determinism rules for scenarios
 
 Scenarios use jitter-free schedules so `waits_ms` is exactly assertable by
@@ -197,6 +230,8 @@ harness.
         {
           "target": "api.source.internal",
           "args_hash": "q1",
+          "idempotency_key": "ik-1",       // optional: drives execute_step_with_idempotency_key
+          "expect_recorded_key": null,     // optional: peeks recorded_idempotency_key first
           "effect": { /* AttemptResult for this step's single attempt */ },
           "expect": { /* subset-matched against the step's Outcome */ }
         }
@@ -211,6 +246,15 @@ harness.
   mid-flight and advances the clock past the lease TTL (the recovery shape).
 - `expect_effect_calls` counts how many step effects actually ran live in the
   run — a replayed (substituted) step must not invoke its effect.
+- `idempotency_key`, when present, is the key an adapter would have
+  minted/injected for this step (contracts/adapter-pack.md "Idempotency-key
+  injection"); the harness runs the step through
+  `execute_step_with_idempotency_key` instead of the plain `execute_step`
+  (identical when absent). `expect_recorded_key`, when present, is checked
+  BEFORE the step runs: a JSON string matches a key recorded on a crashed
+  (still-`running`) record under the same step key, `null` matches "nothing
+  recorded" (a fresh step, a terminal/substituted one, or an abandoned
+  replay) — see scenario 24.
 
 ## Tier 2 execution semantics (normative for every implementation)
 
