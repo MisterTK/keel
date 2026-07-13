@@ -15,6 +15,7 @@
 //! deterministic under test. Errors are the crate-local [`Error`]; mapping into
 //! the `KEEL-E0NN` taxonomy happens where this layer is wired into the engine.
 
+pub mod admin;
 mod clock;
 mod discovery;
 mod error;

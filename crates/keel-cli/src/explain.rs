@@ -52,17 +52,14 @@ struct ExplainReport<'a> {
     why: &'a str,
 }
 
-/// The frozen taxonomy references a few CLI affordances that v0.1 does not
+/// The frozen taxonomy references a couple of CLI affordances v0.1 does not
 /// implement yet. The taxonomy file is frozen, so rather than edit its `next`
 /// copy we append an honest qualifier at render time (finding: `next` points at
-/// nonexistent affordances — `keel replay`, the lease holder in `keel flows`,
-/// Tier 1 trace ids).
+/// nonexistent affordances — the lease holder in `keel flows`, Tier 1 trace
+/// ids). `keel replay` shipped in a later wave, so KEEL-E032's frozen `next`
+/// (which names it) is fully accurate now and carries no qualifier.
 fn planned_note(code: &str) -> Option<&'static str> {
     match code {
-        "KEEL-E032" => Some(
-            "`keel replay <flow>` is not implemented in v0.1 (planned). To force a fresh run of a \
-             dead flow now, remove its rows from .keel/journal.db.",
-        ),
         "KEEL-E030" => Some(
             "`keel flows` does not display the lease holder in v0.1 (planned); it lists flow id, \
              entrypoint, status, steps, and age.",
@@ -194,17 +191,26 @@ mod tests {
     }
 
     #[test]
-    fn planned_affordances_are_qualified_but_the_frozen_copy_stays_verbatim() {
-        // The frozen `next` still points at `keel replay`, verbatim…
+    fn e032_next_points_at_keel_replay_with_no_planned_qualifier() {
+        // The frozen `next` names `keel replay`, verbatim — and since it now
+        // exists, no honest-gap qualifier is appended (contrast with E030
+        // below, which still names an unimplemented affordance).
         let r = run("KEEL-E032");
         assert_eq!(r.exit, crate::EXIT_OK);
         assert!(
             r.human.contains("keel replay <flow>"),
             "frozen copy verbatim"
         );
-        // …but an honest planned qualifier is appended (human + JSON).
-        assert!(r.human.contains("not implemented in v0.1 (planned)"));
-        assert!(r.json["planned"].as_str().unwrap().contains("keel replay"));
+        assert!(!r.human.contains("(planned)"));
+        assert!(r.json.get("planned").is_none() || r.json["planned"].is_null());
+    }
+
+    #[test]
+    fn e030_still_carries_its_planned_qualifier() {
+        // `keel flows` genuinely does not display the lease holder yet.
+        let r = run("KEEL-E030");
+        assert!(r.human.contains("not display the lease holder"));
+        assert!(r.json["planned"].as_str().unwrap().contains("lease holder"));
     }
 
     #[test]

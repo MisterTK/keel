@@ -10,8 +10,10 @@
 //! `!Sync` connection.
 //!
 //! Deliberate v1 simplifications, recorded here per the manifesto:
-//! - Expired cache/step rows are filtered on read, not swept; a `keel fsck`
-//!   GC pass is the eventual reaper.
+//! - Expired cache rows are filtered on read; each [`open`](SqliteJournal::open)
+//!   sweeps the ones already expired (a bounded, startup-time reap so a
+//!   dev-cache-heavy project's journal does not grow without bound between
+//!   runs), and `keel fsck --fix` sweeps on demand ([`crate::admin`]).
 //! - `incomplete_flows` treats only `running` as resumable; `failed`/`dead`
 //!   are terminal for recovery (the flow manager owns the failed→retry policy
 //!   if one is ever added).
@@ -77,6 +79,14 @@ impl<C: Clock> SqliteJournal<C> {
         let conn = Connection::open(path)?;
         conn.execute_batch(CONNECTION_PRAGMAS)?;
         init_schema(&conn)?;
+        // Opportunistic reap: expired cache rows are invisible to reads but
+        // still grow the file; sweeping the backlog once per open bounds a
+        // dev-cache-heavy project's journal without touching the hot path.
+        // Best-effort — a locked or read-only file must not fail the open.
+        let _ = conn.execute(
+            "DELETE FROM cache WHERE expires_at <= ?1",
+            params![clock.now_ms()],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
@@ -727,6 +737,33 @@ mod tests {
         j.put_cache(&key, b"v2", Duration::from_secs(10)).unwrap();
         clock.advance(6_000); // past v1's expiry, within v2's
         assert_eq!(j.get_cache(&key).unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    #[test]
+    fn open_sweeps_the_expired_cache_backlog() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("journal.db");
+        {
+            let j = SqliteJournal::open(&path, ManualClock::new(T0)).unwrap();
+            j.put_cache(&CacheKey::new("stale"), b"v", Duration::from_secs(1))
+                .unwrap();
+            j.put_cache(&CacheKey::new("fresh"), b"v", Duration::from_hours(1))
+                .unwrap();
+        }
+        // Reopen well past the short TTL: the expired row is physically gone,
+        // the live one is untouched.
+        let reopened = SqliteJournal::open(&path, ManualClock::new(T0 + 10_000)).unwrap();
+        assert!(
+            reopened
+                .get_cache(&CacheKey::new("fresh"))
+                .unwrap()
+                .is_some()
+        );
+        let remaining: i64 = reopened
+            .lock()
+            .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "expired backlog swept on open");
     }
 
     #[test]

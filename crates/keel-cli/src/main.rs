@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
 use keel_cli::{
-    doctor, effective, explain, flows, flows_add, flows_suggest, init, mcp, replay, run, status,
-    tail,
+    doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, replay, resume,
+    run, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -66,7 +66,8 @@ enum Command {
     /// Show one screen of coverage and flow state.
     Status,
     /// List durable (Tier 2) flows: id, entrypoint, status, steps, age. Or, with
-    /// a subcommand, the Level 2 on-ramp: `suggest` candidates, `add` one.
+    /// a subcommand, the Level 2 on-ramp (`suggest` candidates, `add` one) or
+    /// `resume` (re-invoke a resumable flow's recorded entrypoint).
     Flows {
         /// Show only `dead` flows (those that exhausted their resume cap).
         /// Ignored when a subcommand is given.
@@ -74,6 +75,19 @@ enum Command {
         dead: bool,
         #[command(subcommand)]
         action: Option<FlowsCommand>,
+    },
+    /// Journal integrity check, safe repairs, and retention pruning
+    /// (architecture spec §6).
+    Fsck {
+        /// Apply the safe repairs (orphan steps, dangling leases, stale
+        /// running steps, expired cache) and checkpoint the WAL.
+        #[arg(long)]
+        fix: bool,
+        /// Prune `completed` flows (and their steps) not updated for this age,
+        /// e.g. `30d`, `12h`, `45m`, `90s`. There is no retention key in the
+        /// frozen policy schema, so this is an explicit operator action.
+        #[arg(long, value_name = "AGE")]
+        prune: Option<String>,
     },
     /// Serve this project over MCP on stdio (JSON-RPC 2.0). Six tools —
     /// get_status, get_doctor_report, propose_policy, get_trace, list_flows,
@@ -129,6 +143,22 @@ enum FlowsCommand {
     /// idempotent-unsafe effects, time/random reads Tier 2 would virtualize,
     /// and an estimated replay-safe verdict.
     Suggest,
+    /// Re-invoke a resumable flow's recorded entrypoint through `keel run`.
+    /// See [`keel_cli::resume`] for what it can and cannot know.
+    Resume {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        /// Omit and pass `--all` to resume every resumable flow instead.
+        flow: Option<String>,
+        /// Resume every currently-resumable flow (no live lease) instead of
+        /// naming one.
+        #[arg(long)]
+        all: bool,
+        /// Arguments forwarded to the resumed script (single-flow only —
+        /// `--all` cannot forward args since different flows may need
+        /// different ones).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() {
@@ -177,8 +207,20 @@ fn main() {
                 emit(&flows_add::run(&project, &entrypoint, diff), json)
             }
             Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(&project), json),
+            Some(FlowsCommand::Resume { flow, all, args }) => {
+                let options = resume::ResumeOptions { flow, all, args };
+                let (rendered, code) = resume::run(&project, &options, SystemClock.now_ms());
+                if let Some(r) = rendered {
+                    emit(&r, json);
+                }
+                code
+            }
             None => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
         },
+        Command::Fsck { fix, prune } => {
+            let options = fsck::FsckOptions { fix, prune };
+            emit(&fsck::run(&project, &options, SystemClock.now_ms()), json)
+        }
         Command::Mcp => {
             // The server speaks JSON-RPC regardless of --json; it exits on EOF.
             let stdin = std::io::stdin();
