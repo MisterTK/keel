@@ -28,7 +28,7 @@ use crate::clock::Clock;
 use crate::convert::{
     FLOW_COLUMNS, FlowRowData, StepRowData, duration_ms, flow_from_row, step_from_row, to_i64,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::journal::Journal;
 use crate::types::{
     CacheKey, FlowDescriptor, FlowId, FlowStatus, NewFlow, ProcessId, StepKey, StepOutcome,
