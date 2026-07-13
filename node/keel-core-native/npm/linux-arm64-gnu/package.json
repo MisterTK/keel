@@ -1,0 +1,13 @@
+{
+  "name": "@keel/core-native-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "Prebuilt keel-core-native addon for Linux aarch64/glibc (linux-arm64-gnu). Optional dependency of @keel/core-native — installed automatically on a matching platform, ignored otherwise. See scripts/napi-prebuild.sh.",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "main": "keel-core-native.linux-arm64-gnu.node",
+  "files": ["keel-core-native.linux-arm64-gnu.node"],
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

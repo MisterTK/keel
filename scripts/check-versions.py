@@ -14,6 +14,8 @@ listed here and checked byte-for-byte:
   - python/keel/src/keel/__init__.py      __version__
   - node/keel/index.mjs                   VERSION
   - crates/keel-py/pyproject.toml         must stay dynamic (no restated version)
+  - crates/keel-cli/pyproject.toml        must stay dynamic (no restated version)
+  - node/keel-core-native/npm/*/package.json  version (per-platform prebuilds)
   - python/keel/pyproject.toml            keel-core==<version> dependency pin
 
 Usage: check-versions.py [--tag vX.Y.Z]
@@ -54,6 +56,12 @@ def declarations() -> list[tuple[str, str]]:
     ):
         found.append((f"{rel} version", json.loads((REPO / rel).read_text())["version"]))
 
+    # Per-platform napi prebuild packages (scripts/napi-prebuild.sh writes the
+    # binaries; the manifests are checked in — see node/keel-core-native/npm/).
+    for pkg in sorted((REPO / "node/keel-core-native/npm").glob("*/package.json")):
+        rel = pkg.relative_to(REPO).as_posix()
+        found.append((f"{rel} version", json.loads(pkg.read_text())["version"]))
+
     init = (REPO / "python/keel/src/keel/__init__.py").read_text()
     m = re.search(r'^__version__ = "([^"]+)"$', init, re.MULTILINE)
     found.append(
@@ -79,14 +87,16 @@ def main() -> int:
         if got != want:
             errors.append(f"{location} is {got}, workspace Cargo.toml says {want}")
 
-    # keel-py must not restate the version: maturin derives it from the crate.
-    with (REPO / "crates/keel-py/pyproject.toml").open("rb") as f:
-        keel_py = tomllib.load(f)["project"]
-    if "version" in keel_py or "version" not in keel_py.get("dynamic", []):
-        errors.append(
-            'crates/keel-py/pyproject.toml must declare dynamic = ["version"] '
-            "and no [project] version (maturin reads the crate version)"
-        )
+    # keel-py / keel-cli must not restate the version: maturin derives both
+    # from their crate (workspace version), matching every other crate.
+    for rel in ("crates/keel-py/pyproject.toml", "crates/keel-cli/pyproject.toml"):
+        with (REPO / rel).open("rb") as f:
+            project = tomllib.load(f)["project"]
+        if "version" in project or "version" not in project.get("dynamic", []):
+            errors.append(
+                f'{rel} must declare dynamic = ["version"] and no [project] '
+                "version (maturin reads the crate version)"
+            )
 
     # The front-end wheel pins the native core wheel to the same version.
     with (REPO / "python/keel/pyproject.toml").open("rb") as f:

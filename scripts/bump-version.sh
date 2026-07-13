@@ -50,6 +50,9 @@ for path in (
     "node/keel-core-native/package.json",
 ):
     sub_once(path, r'^  "version": "[^"]+",$', f'  "version": "{new}",')
+# Per-platform napi prebuild packages (node/keel-core-native/npm/*/package.json).
+for path in sorted(str(p) for p in Path("node/keel-core-native/npm").glob("*/package.json")):
+    sub_once(path, r'^  "version": "[^"]+",$', f'  "version": "{new}",')
 sub_once(
     "python/keel/src/keel/__init__.py",
     r'^__version__ = "[^"]+"$',
@@ -59,6 +62,14 @@ sub_once(
     "node/keel/index.mjs",
     r'^export const VERSION = "[^"]+";$',
     f'export const VERSION = "{new}";',
+)
+# The checked-in draft formula's placeholder tag URL (sha256 stays a
+# placeholder here; scripts/render-homebrew-formula.sh fills in the real
+# digest for an actual tagged release).
+sub_once(
+    "packaging/homebrew/keel.rb",
+    r'^  url "[^"]*/archive/refs/tags/v[^"]*\.tar\.gz"$',
+    f'  url "https://github.com/MisterTK/keel/archive/refs/tags/v{new}.tar.gz"',
 )
 EOF
 
