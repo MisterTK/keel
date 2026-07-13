@@ -9,7 +9,9 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, effective, explain, flows, flows_add, flows_suggest, init, run, status};
+use keel_cli::{
+    doctor, effective, explain, flows, flows_add, flows_suggest, init, replay, run, status,
+};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -71,6 +73,15 @@ enum Command {
         dead: bool,
         #[command(subcommand)]
         action: Option<FlowsCommand>,
+    },
+    /// Inspect what re-entering a flow would do — a journal-driven dry run:
+    /// which steps substitute, which re-execute, where replay resumes.
+    Replay {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        flow: String,
+        /// Show one recorded step in full detail (payload, timings, action).
+        #[arg(long, value_name = "SEQ")]
+        step: Option<i64>,
     },
     /// Trace one flow's steps step-by-step (outcomes, attempts, timings).
     Trace {
@@ -152,6 +163,7 @@ fn main() {
             Some(FlowsCommand::Suggest) => emit(&flows_suggest::run(&project), json),
             None => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
         },
+        Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
     };

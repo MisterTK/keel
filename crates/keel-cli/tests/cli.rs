@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use keel_cli::render::json_string;
-use keel_cli::{doctor, effective, explain, flows, flows_add, flows_suggest, init, scan, status};
+use keel_cli::{
+    doctor, effective, explain, flows, flows_add, flows_suggest, init, replay, scan, status,
+};
 use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
@@ -585,6 +587,68 @@ fn flows_add_patch_applies_cleanly_with_git_apply() {
         std::fs::read_to_string(direct.path().join("keel.toml")).unwrap(),
         "diff-then-apply reproduces a direct write"
     );
+}
+
+// ---- replay: the journal-driven dry run, --json golden over all three ----
+// ---- golden flow shapes (completed / interrupted / dead)              ----
+
+/// A completed flow re-enters as a pure replay: every step substitutes and the
+/// whole `--json` plan is byte-golden.
+#[test]
+fn replay_completed_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000001", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_completed.json", &json_string(&r.json));
+}
+
+/// An interrupted flow resumes: steps 1–3 substitute, the crashed step 4
+/// re-executes, and the cursor (`live_from_seq`) stands at 4.
+#[test]
+fn replay_interrupted_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_interrupted.json", &json_string(&r.json));
+}
+
+/// A dead flow is refused (KEEL-E032): the plan renders for inspection but no
+/// step carries an action.
+#[test]
+fn replay_dead_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000003", None);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_dead.json", &json_string(&r.json));
+}
+
+/// `--step N` details one record, decoding its MessagePack payload; the
+/// enrich step (seq 3, 2 attempts, `{"ok": true}`) is byte-golden.
+#[test]
+fn replay_step_detail_json_matches_golden() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000001", Some(3));
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("replay_step3.json", &json_string(&r.json));
+}
+
+/// The human plan is deterministic too (no wall-clock anywhere), so it can be
+/// asserted directly: verdict, per-step actions, cursor.
+#[test]
+fn replay_human_plan_is_deterministic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    let r = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    let again = replay::replay(dir.path(), "01JZWY0A0000000000000002", None);
+    assert_eq!(r.human, again.human);
+    assert!(r.human.contains("dry run"));
+    assert!(r.human.contains("\u{2192} substitute"));
+    assert!(r.human.contains("\u{2192} re-execute"));
+    assert!(r.human.contains("live execution resumes at seq 4"));
 }
 
 #[test]
