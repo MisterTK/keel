@@ -747,13 +747,18 @@ mod tests {
             let j = SqliteJournal::open(&path, ManualClock::new(T0)).unwrap();
             j.put_cache(&CacheKey::new("stale"), b"v", Duration::from_secs(1))
                 .unwrap();
-            j.put_cache(&CacheKey::new("fresh"), b"v", Duration::from_secs(3600))
+            j.put_cache(&CacheKey::new("fresh"), b"v", Duration::from_hours(1))
                 .unwrap();
         }
         // Reopen well past the short TTL: the expired row is physically gone,
         // the live one is untouched.
         let reopened = SqliteJournal::open(&path, ManualClock::new(T0 + 10_000)).unwrap();
-        assert!(reopened.get_cache(&CacheKey::new("fresh")).unwrap().is_some());
+        assert!(
+            reopened
+                .get_cache(&CacheKey::new("fresh"))
+                .unwrap()
+                .is_some()
+        );
         let remaining: i64 = reopened
             .lock()
             .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))

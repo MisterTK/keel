@@ -263,9 +263,9 @@ impl JournalAdmin {
     /// The flow ids [`prune_completed_flows`](Self::prune_completed_flows)
     /// would delete for this cutoff, sorted — the preview/report view.
     pub fn prunable_completed_flow_ids(&self, cutoff_ms: i64) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT flow_id FROM flows WHERE {PRUNABLE} ORDER BY flow_id"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT flow_id FROM flows WHERE {PRUNABLE} ORDER BY flow_id"
+        ))?;
         let rows = stmt
             .query_map(params![cutoff_ms], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -277,7 +277,9 @@ impl JournalAdmin {
     /// Steps go first so the schema's foreign key holds throughout.
     pub fn prune_completed_flows(&self, cutoff_ms: i64) -> Result<PruneOutcome> {
         let steps = self.conn.execute(
-            &format!("DELETE FROM steps WHERE flow_id IN (SELECT flow_id FROM flows WHERE {PRUNABLE})"),
+            &format!(
+                "DELETE FROM steps WHERE flow_id IN (SELECT flow_id FROM flows WHERE {PRUNABLE})"
+            ),
             params![cutoff_ms],
         )?;
         let flows = self.conn.execute(
@@ -301,7 +303,9 @@ impl JournalAdmin {
     }
 
     fn count(&self, sql: &str, now_ms: i64) -> Result<u64> {
-        let n: i64 = self.conn.query_row(sql, params![now_ms], |row| row.get(0))?;
+        let n: i64 = self
+            .conn
+            .query_row(sql, params![now_ms], |row| row.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -322,7 +326,9 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::journal::Journal;
     use crate::sqlite::SqliteJournal;
-    use crate::types::{CacheKey, FlowId, FlowStatus, NewFlow, StepKey, StepKind, StepOutcome, StepStatus};
+    use crate::types::{
+        CacheKey, FlowId, FlowStatus, NewFlow, StepKey, StepKind, StepOutcome, StepStatus,
+    };
     use tempfile::TempDir;
 
     const T0: i64 = 1_783_728_000_000;
@@ -384,7 +390,7 @@ mod tests {
                 .unwrap();
 
             // Live cache row (expires in the future) + expired one.
-            j.put_cache(&CacheKey::new("live"), b"v", Duration::from_secs(3600))
+            j.put_cache(&CacheKey::new("live"), b"v", Duration::from_hours(1))
                 .unwrap();
             j.put_cache(&CacheKey::new("gone"), b"v", Duration::from_secs(1))
                 .unwrap();
@@ -602,7 +608,12 @@ mod tests {
 
         let admin = JournalAdmin::open_readwrite(&path).unwrap();
         let cutoff = T0 + 1_000_000;
-        assert!(admin.prunable_completed_flow_ids(cutoff).unwrap().is_empty());
+        assert!(
+            admin
+                .prunable_completed_flow_ids(cutoff)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             admin.prune_completed_flows(cutoff).unwrap(),
             PruneOutcome {

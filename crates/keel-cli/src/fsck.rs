@@ -346,7 +346,10 @@ fn apply_prune(admin: &JournalAdmin, age: String, cutoff_ms: i64) -> Result<Prun
 
 /// The human report, derived entirely from [`FsckReport`].
 fn human(report: &FsckReport) -> String {
-    let checks = report.checks.as_ref().expect("human() runs on full reports");
+    let checks = report
+        .checks
+        .as_ref()
+        .expect("human() runs on full reports");
     let verdict = if report.ok { "clean" } else { "FINDINGS" };
     let mut lines = vec![format!(
         "keel \u{25b8} fsck {} \u{2014} {verdict}\n",
@@ -491,8 +494,7 @@ mod tests {
         conn.execute_batch(&schema).unwrap();
         for f in fixtures {
             let sql =
-                std::fs::read_to_string(root.join("conformance/fixtures/journal").join(f))
-                    .unwrap();
+                std::fs::read_to_string(root.join("conformance/fixtures/journal").join(f)).unwrap();
             conn.execute_batch(&sql).unwrap();
         }
         let project = dir.path().to_path_buf();
@@ -535,8 +537,11 @@ mod tests {
 
     #[test]
     fn clean_fixtures_pass() {
-        let (_d, project) =
-            project_with_fixtures(&["completed-flow.sql", "interrupted-flow.sql", "dead-flow.sql"]);
+        let (_d, project) = project_with_fixtures(&[
+            "completed-flow.sql",
+            "interrupted-flow.sql",
+            "dead-flow.sql",
+        ]);
         let r = run(&project, &FsckOptions::default(), T0);
         assert_eq!(r.exit, crate::EXIT_OK);
         assert_eq!(r.json["ok"], true);
@@ -545,7 +550,10 @@ mod tests {
         assert_eq!(r.json["checks"]["dangling_leases"]["count"], 0);
         // The interrupted flow's `running` step is crash evidence, not stale.
         assert_eq!(
-            r.json["checks"]["stale_running_steps"].as_array().unwrap().len(),
+            r.json["checks"]["stale_running_steps"]
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
         // The dead flow is visible but does not fail fsck.
@@ -555,15 +563,21 @@ mod tests {
 
     #[test]
     fn findings_fail_the_check_and_fix_repairs_them() {
-        let (_d, project) =
-            project_with_fixtures(&["completed-flow.sql", "interrupted-flow.sql", "dead-flow.sql"]);
+        let (_d, project) = project_with_fixtures(&[
+            "completed-flow.sql",
+            "interrupted-flow.sql",
+            "dead-flow.sql",
+        ]);
         damage(&project);
 
         let r = run(&project, &FsckOptions::default(), T0);
-        assert_eq!(r.exit, crate::EXIT_FAILURE);
+        assert_eq!(r.exit, EXIT_FAILURE);
         assert_eq!(r.json["ok"], false);
         assert_eq!(r.json["checks"]["orphan_steps"]["rows"], 1);
-        assert_eq!(r.json["checks"]["orphan_steps"]["missing_flow_ids"][0], "09GHOST");
+        assert_eq!(
+            r.json["checks"]["orphan_steps"]["missing_flow_ids"][0],
+            "09GHOST"
+        );
         assert_eq!(r.json["checks"]["dangling_leases"]["count"], 1);
         assert_eq!(r.json["checks"]["stale_running_steps"][0]["seq"], 6);
         assert_eq!(r.json["checks"]["expired_cache_rows"], 1);
@@ -593,8 +607,11 @@ mod tests {
 
     #[test]
     fn prune_removes_old_completed_flows_only() {
-        let (_d, project) =
-            project_with_fixtures(&["completed-flow.sql", "interrupted-flow.sql", "dead-flow.sql"]);
+        let (_d, project) = project_with_fixtures(&[
+            "completed-flow.sql",
+            "interrupted-flow.sql",
+            "dead-flow.sql",
+        ]);
         // 40 days after T0, prune anything older than 30d: only the completed
         // flow qualifies (running is resumable, dead is evidence).
         let now = T0 + 40 * 86_400_000;

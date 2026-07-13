@@ -9,7 +9,7 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
-use keel_cli::{doctor, effective, explain, flows, init, replay, run, status};
+use keel_cli::{doctor, effective, explain, flows, fsck, init, replay, resume, run, status};
 use keel_journal::{Clock, SystemClock};
 
 /// Production-grade resilience for anything, with zero code changes.
@@ -62,11 +62,28 @@ enum Command {
     },
     /// Show one screen of coverage and flow state.
     Status,
-    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age.
+    /// List durable (Tier 2) flows: id, entrypoint, status, steps, age. With no
+    /// `resume` subcommand this is the only mode; `keel flows resume` acts
+    /// instead of listing.
     Flows {
         /// Show only `dead` flows (those that exhausted their resume cap).
         #[arg(long)]
         dead: bool,
+        #[command(subcommand)]
+        action: Option<FlowsAction>,
+    },
+    /// Journal integrity check, safe repairs, and retention pruning
+    /// (architecture spec §6).
+    Fsck {
+        /// Apply the safe repairs (orphan steps, dangling leases, stale
+        /// running steps, expired cache) and checkpoint the WAL.
+        #[arg(long)]
+        fix: bool,
+        /// Prune `completed` flows (and their steps) not updated for this age,
+        /// e.g. `30d`, `12h`, `45m`, `90s`. There is no retention key in the
+        /// frozen policy schema, so this is an explicit operator action.
+        #[arg(long, value_name = "AGE")]
+        prune: Option<String>,
     },
     /// Inspect what re-entering a flow would do — a journal-driven dry run:
     /// which steps substitute, which re-execute, where replay resumes.
@@ -86,6 +103,27 @@ enum Command {
     Explain {
         /// The error code, e.g. `KEEL-E014`.
         code: String,
+    },
+}
+
+/// `keel flows resume` — the one action nested under `flows` (dx-spec §1
+/// Level 2). See [`keel_cli::resume`] for what it can and cannot know.
+#[derive(Debug, Subcommand)]
+enum FlowsAction {
+    /// Re-invoke a resumable flow's recorded entrypoint through `keel run`.
+    Resume {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        /// Omit and pass `--all` to resume every resumable flow instead.
+        flow: Option<String>,
+        /// Resume every currently-resumable flow (no live lease) instead of
+        /// naming one.
+        #[arg(long)]
+        all: bool,
+        /// Arguments forwarded to the resumed script (single-flow only —
+        /// `--all` cannot forward args since different flows may need
+        /// different ones).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -130,7 +168,21 @@ fn main() {
             emit(&r, json)
         }
         Command::Status => emit(&status::run(&project), json),
-        Command::Flows { dead } => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+        Command::Flows { dead, action } => match action {
+            None => emit(&flows::flows(&project, dead, SystemClock.now_ms()), json),
+            Some(FlowsAction::Resume { flow, all, args }) => {
+                let options = resume::ResumeOptions { flow, all, args };
+                let (rendered, code) = resume::run(&project, &options, SystemClock.now_ms());
+                if let Some(r) = rendered {
+                    emit(&r, json);
+                }
+                code
+            }
+        },
+        Command::Fsck { fix, prune } => {
+            let options = fsck::FsckOptions { fix, prune };
+            emit(&fsck::run(&project, &options, SystemClock.now_ms()), json)
+        }
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Trace { flow } => emit(&flows::trace(&project, &flow), json),
         Command::Explain { code } => emit(&explain::run(&code), json),
