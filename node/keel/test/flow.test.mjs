@@ -484,7 +484,21 @@ test("native: concurrent effects inside one flow are serialized in await/claim o
   // (start-1, start-2, end-2, end-1). The ordering rule requires strict
   // admission: one step at a time, claimed in the order the calls reach the
   // handle, regardless of which finishes first.
-  const [o1, o2] = await Promise.all([step(1, 40), step(2, 1)]);
+  //
+  // Creation is staggered with a small real delay so step 1 is already
+  // admitted (holding `active_flow`'s lock, inside its own effect delay)
+  // before step 2 is even created — this is a genuinely real-time async
+  // bridge (`env.spawn_future` only ENQUEUES the future; nothing guarantees
+  // it starts executing within the same synchronous tick), so racing two
+  // calls onto napi's multi-threaded tokio runtime with no stagger makes
+  // "which one reaches the handle first" a coin flip under load rather than
+  // call order — mirrors python/keel/tests/test_flows.py's
+  // test_concurrent_async_effects_serialize_in_admission_order, which hit
+  // and documented this exact constraint first.
+  const p1 = step(1, 40);
+  await new Promise((r) => setTimeout(r, 10));
+  const p2 = step(2, 1);
+  const [o1, o2] = await Promise.all([p1, p2]);
   assert.deepEqual(order, ["start-1", "end-1", "start-2", "end-2"]);
   assert.equal(o1.payload, 1);
   assert.equal(o2.payload, 2);
@@ -526,6 +540,13 @@ test("native: exitFlow with an unawaited in-flight effect fails loud (KEEL-E040)
       return { status: "ok", payload: 1 };
     }
   );
+  // Give the spawned future a moment to actually reach and acquire
+  // `active_flow`'s lock on napi's own (multi-threaded) tokio runtime before
+  // asserting exitFlow sees it held — `env.spawn_future` only enqueues the
+  // future; nothing guarantees it starts executing within the same
+  // synchronous tick (see the concurrent-admission test above for the full
+  // explanation of this constraint).
+  await new Promise((r) => setTimeout(r, 10));
   assert.throws(
     () => core.exitFlow("completed"),
     (err) => err.code === "KEEL-E040"
@@ -551,6 +572,13 @@ test("native: enterFlow with a prior unawaited in-flight effect fails loud (KEEL
       return { status: "ok", payload: 1 };
     }
   );
+  // Give the spawned future a moment to actually reach and acquire
+  // `active_flow`'s lock on napi's own (multi-threaded) tokio runtime before
+  // asserting a second enterFlow sees it held — `env.spawn_future` only
+  // enqueues the future; nothing guarantees it starts executing within the
+  // same synchronous tick (see the concurrent-admission test above for the
+  // full explanation of this constraint).
+  await new Promise((r) => setTimeout(r, 10));
   assert.throws(
     () => core.enterFlow("ts:pipeline.mjs#second", "ah-enter-race-2"),
     (err) => err.code === "KEEL-E040"
