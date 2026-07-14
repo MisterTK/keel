@@ -1,191 +1,172 @@
 # Keel
 
-*The SQLite of durable execution — resilience and durability as a library that
-lives inside your process, not a service your process talks to.*
+[![CI](https://github.com/MisterTK/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/MisterTK/keel/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**The SQLite of durable execution.** Production-grade resilience and
+crash-resumable workflows, running *inside* your process — no service to
+deploy, no database to provision, no code to rewrite.
 
 ```
 $ keel run app.py
 keel ▸ wrapped 14 call sites (httpx ×9, openai ×4, psycopg ×1) with production defaults — `keel init` to customize
 ```
 
-Zero code changes. Retries, backoff, timeouts, circuit breakers, rate limits, an
-LLM dev-cache, and (opt-in) crash-resumable flows — declared in one `keel.toml`,
-applied at intercepted call boundaries, backed by a single local journal file.
-No daemon, no port, no login. Uninstalling the package removes the behavior and
-nothing else; your code runs identically without it.
+That's it. Your outbound HTTP calls, database queries, and LLM requests now
+retry on transient failures, back off exponentially, trip a circuit breaker
+under sustained failure, respect rate limits, and — if you opt in — survive a
+crash and resume exactly where they left off. Your code is untouched.
+Uninstall the package and you're back to exactly what you had before.
 
-## Status (2026-07-13)
+## The problem
 
-Tier 1 **and** Tier 2 (including async durable flows) work end-to-end in
-**both languages** on the **real native core**, plus the CLI, a Postgres
-journal backend for fleet durability, and a scoped Rust front end:
+Every service that talks to the network eventually gets paged for the same
+handful of reasons: a downstream dependency blipped and nothing retried it, a
+retry storm took down a service that would have recovered on its own, or a
+long-running job died halfway through and had to restart from zero. Fixing
+this yourself means scattering retry decorators across a codebase and hoping
+every new call site remembers them. Fixing it "properly" usually means
+adopting a workflow engine — a service to run, a database to provision, and a
+rewrite of business logic into activities and workflows — for problems that
+were never distributed-systems-scale to begin with.
 
-- **Real Rust core** (`crates/keel-core`): async tokio engine, layer chain
-  cache → rate (token-bucket) → breaker (count or failure-rate mode) →
-  timeout → retry (with schedule composition), per-attempt timeouts,
-  equal-jitter backoff, idempotency-key injection, a Tier-1 NDJSON event feed
-  (`keel tail`), SQLite or Postgres discovery + flow journal, opt-in OTel
-  spans and metrics (off by default — see below), and an FFI facade
-  (`crates/keel-ffi`, MessagePack over a C ABI) with PyO3 + napi async
-  bridges, both including the Tier-2 flow surface.
-- **Python front end** (`python/keel`): `keel run`, import-hook wrapping,
-  httpx/requests/aiohttp/urllib3/boto3/psycopg adapters, `llm:` packs
-  (openai/anthropic/google-genai) with the dev cache and model fallback
-  chains, `tool:`/`mcp:` semantic targets, agent-framework packs
-  (pydantic-ai/openai-agents/crewai/adk/LangGraph), and durable-flow
-  designation from `[flows]` — synchronous or async.
-- **Node front end** (`node/keel`): loader + `fetch`/undici interception,
-  AI-SDK middleware (all four ops) + eve integration, `mcp:`/`llm:` packs,
-  `pg`/`ioredis`/`mysql2` database adapters, discovery, and durable-flow
-  designation from `[flows]` (async-only, matching Node's own effect model).
-- **CLI** (`crates/keel-cli`): `run · init · doctor (--effective-policy) ·
-  status · explain · flows (suggest/add/resume) · trace · replay · tail ·
-  fsck · mcp · record (run/list/test) · sim`, every command with a
-  deterministic `--json` twin.
-- **Tier 2**: durable flows in the core + both front ends, on SQLite or
-  Postgres; `kill -9` a flow mid-run and `keel run` resumes it, replaying
-  completed steps without re-firing their effects (proven by real subprocess
-  `kill -9` tests in both languages) — including concurrent async effects
-  inside one flow, which serialize deterministically in await order.
-- **A scoped Rust front end** (`crates/keel` + `crates/keel-macros`):
-  `#[keel::wrap(target = "...")]` plus a `reqwest-middleware` adapter — no
-  `cargo-keel` subcommand or Rust static scanner yet (documented as
-  deferred, not silently missing).
+Keel takes neither path. It's a library, not a service: it intercepts calls
+you're already making, applies policy from one `keel.toml` file, and — only
+when a call needs to survive a crash — journals it to a local file. No
+daemon. No port. No new abstractions in your code.
 
-**Overhead:** the worst-case wrapped-call path measures **~0.8 µs**
-against the **10 µs** budget (DX invariant 8), emitted as a CI artifact by
-`scripts/bench-overhead.sh`.
+## Why Keel
 
-**Honest packaging gap:** wheels (`pip install keel`), the npm package
-(`npm i -D keel`), and the crate (`cargo add keel`) are **not published
-yet** — today you build from source (below). The registry names `keel`/
-`keel-core` collide with unrelated existing projects on npm/PyPI/crates.io;
-see `docs/naming-decision.md` for the options. The native Python module
-builds with `maturin`; the CLI with `cargo build`.
+|  | Hand-rolled retry decorators | Workflow engines (Temporal-style) | **Keel** |
+|---|---|---|---|
+| Code changes | Decorate every call site | Rewrite as activities/workflows | **Zero** |
+| Infrastructure | None | A service, a database, a cluster | **None** — a local file |
+| Consistency across a codebase | Whatever each engineer remembers | Enforced by the framework | Enforced by one policy file |
+| Crash-resumable execution | No | Yes | **Opt-in**, same library |
+| Removing it | Undo the decorators, one by one | A migration project | Uninstall the package |
 
-Licensed under [Apache-2.0](LICENSE).
+## What you get
 
-**OTel export is opt-in and off by default.** The OTLP exporter lives behind the
-`otel` cargo feature; the shipped wheel/addon carry no OpenTelemetry dependency.
-To export the engine's `keel.call`/`keel.attempt` spans, build a native front end
-with the feature and set `KEEL_OTEL=1` (the standard `OTEL_*` env vars configure
-the endpoint) — e.g. `maturin develop -m crates/keel-py/Cargo.toml --features otel`
-or `cargo build -p keel-node --release --features otel`. CI compiles `--features
-otel` so it can't silently rot; end-to-end export against a live collector is a
-manual verification step.
+- **Zero code changes.** Keel patches the interception seams your language
+  already exposes (Python's import hooks, Node's ESM loader, an attribute
+  macro for Rust) — your source is never touched, and uninstalling the
+  package restores your original behavior exactly.
+- **Production-grade defaults, out of the box.** Every discovered outbound
+  call gets a 30s timeout, 3 retries with jittered exponential backoff on
+  transient errors, and a per-host circuit breaker — before you write a
+  single line of config.
+- **One `keel.toml`, not a decorator per call site.** Retry schedules,
+  timeouts, rate limits, caching, and circuit breakers are policy, not code
+  — reviewed like infrastructure, not scattered through business logic.
+- **Opt-in durable execution.** Designate a function as a flow and its steps
+  are journaled: `kill -9` it mid-run, and rerunning it replays completed
+  steps from the journal instead of re-executing their side effects —
+  proven by real subprocess crash-and-resume tests, not a mocked clock.
+- **Observable when you need it, invisible when you don't.** OpenTelemetry
+  spans and metrics for every call and attempt are one build feature and one
+  env var away — off by default, so the shipped library carries no
+  OpenTelemetry dependency until you ask for it.
+- **Built for LLM and agent workloads.** First-class `llm:`/`tool:`/`mcp:`
+  targets, per-run spend caps, model fallback chains, and a dev-mode cache
+  that replays identical prompts for free — because agent code is the
+  densest concentration of flaky, expensive effects in modern software.
+- **Fast enough to be invisible.** The wrapped-call path measures ~0.8µs
+  worst case against a 10µs budget — resilience you can't feel.
+- **Agent-native tooling.** `keel mcp` serves the CLI itself as an MCP
+  server; every command has a deterministic `--json` twin; `keel explain
+  <code>` gives a coding agent the exact remedy without a web search.
+- **Two languages today, checked against each other.** Python and
+  Node/TypeScript both run on the same real, tested Rust core; a scoped
+  Rust front end covers `#[keel::wrap]`-annotated functions directly. Every
+  implementation is checked against the same conformance suite — the tests
+  are the spec, not the docs.
 
-The guiding documents:
+## Quickstart
 
-- [docs/architecture-spec.md](docs/architecture-spec.md) — what Keel is (two-tier semantics, core, journal, front ends)
-- [docs/dx-spec.md](docs/dx-spec.md) — why anyone will love it (the product's soul; conflicts resolve in its favor)
-- [docs/engineering-manifesto.md](docs/engineering-manifesto.md) — how we build it (repo standards, July 2026 SOTA)
-- [docs/sprint-plan.md](docs/sprint-plan.md) — the parallel-team work breakdown, with a completion annotation
-- [llms.txt](llms.txt) / [llms-full.txt](llms-full.txt) — the retrieval-built docs for coding agents
+Keel isn't published to a package registry yet (see [Status](#status)) —
+building from source takes about a minute.
 
-## Quickstart (from source)
+**Python** (needs Rust — `rustup` picks up the pinned toolchain
+automatically):
 
-**Python** (needs the Rust toolchain in `rust-toolchain.toml` + `maturin`):
-
-```
-maturin develop -m crates/keel-py/Cargo.toml     # builds the native keel_core into your venv
-pip install -e 'python/keel[dev]'                # the front end + httpx/requests for the demos
+```bash
+maturin develop -m crates/keel-py/Cargo.toml     # builds the native core into your venv
+pip install -e 'python/keel[dev]'
 keel run your_app.py                             # or: python -m keel run your_app.py
 ```
 
-Without the native module the front end falls back to a pure-Python core (Tier 1
-only; no persistent cache, no flows).
+Without the native module, the front end falls back to a pure-Python core:
+Tier 1 resilience still works, but there's no persistent cache and no
+durable flows.
 
 **Node** (≥ 22.5):
 
-```
-node node/keel/bin/keel-node-run.mjs your_app.mjs   # from-source `keel run` for Node
-```
-
-**CLI:**
-
-```
-cargo build -p keel-cli                # produces target/debug/keel
-target/debug/keel init                 # write a keel.toml from evidence
-target/debug/keel doctor --json        # the honesty report
+```bash
+node node/keel/bin/keel-node-run.mjs your_app.mjs
 ```
 
-## Demos
+**CLI only:**
 
-Four runnable, deterministic demos (no real network — [`tools/faultproxy`](tools/faultproxy)
-serves scripted faults). See [demos/](demos) and the 40-second
-[storyboard](demos/STORYBOARD.md).
-
-| Demo | Proves | Lang | Native? |
-|------|--------|------|---------|
-| [flaky-python](demos/flaky-python) | 503 dies bare, `keel run` retries it | Python | no |
-| [node-service](demos/node-service) | 500 dies bare, `keel run` retries it | Node | no |
-| [agent-demo](demos/agent-demo) | 429-storm survived; dev-cache makes a 2nd run ~0 calls | Python | for replay |
-| [durable-pipeline](demos/durable-pipeline) | `kill -9` mid-flow → resumes 10/10, each step once | Python | yes |
-
-## Conformance
-
-Every implementation interprets the same `conformance/scenarios/*.json` — green
-here is the definition of done (normative semantics: `conformance/README.md`).
-
-| Harness | Command | Result |
-|---------|---------|--------|
-| Real Rust core — Tier 1 | `cargo test -p keel-core --test conformance` | 21/21 (paused tokio clock) |
-| Real Rust core — Tier 2 (SQLite) | `cargo test -p keel-core --test flows_conformance` | scenarios 16–27 |
-| Real Rust core — Tier 2 (Postgres) | `cargo test -p keel-core --test flows_conformance_postgres` | a real scratch cluster, no docker |
-| Rust stub | `cargo test -p keel-core-stub` | 21/21 (Tier 2 skipped: no journal) |
-| Python stub | `python3 conformance/runner.py` | 21/21 (Tier 2 skipped) |
-| Node stub | `cd node/keel-core-stub && node --test` | 21/21 (Tier 2 skipped) |
-| Python native | `python3 conformance/runner.py --impl native` | 21/21 Tier 1 |
-
-Scenarios 01–15 plus 18/19/20/21–22/23 are Tier 1 (the last five added
-breaker rate-mode, token-bucket, schedule composition, and idempotency-key
-injection); **16–27** are Tier 2 (resume/substitution, every nondeterminism
-mode, lease contention, attempt caps, value-step replay, crash-mid-step
-re-execution, pure replay, and replay under a changed policy), which need a
-journal — so the stubs *and* the `runner.py` harness (both impls) skip them,
-and the Tier 2 scenarios are driven by the real core's `flows_conformance`
-(SQLite) and `flows_conformance_postgres` (Postgres) binaries. Tier 2
-**through the native front ends** is covered by real subprocess `kill -9` +
-resume tests in both `python/keel/tests/` and `node/keel/test/`. Plus:
-`python3 conformance/check_schema.py` (policies vs. `policy.schema.json`) and
-`python3 conformance/fixtures/journal/build_fixtures.py` (golden journal DBs).
-
-## Repo layout
-
-```
-contracts/            frozen interfaces (policy schema, FFI, journal, adapter packs) — CCR to change
-crates/
-  keel-core-api/      contract types + shared typed policy model
-  keel-core/          THE REAL CORE (Tier 1 + Tier 2 flows): tokio engine, journal, flows, events
-  keel-journal/        SQLite + Postgres Journal implementations
-  keel-ffi/           C-ABI facade (MessagePack) + async bridge
-  keel-py/            PyO3 native module (keel_core), incl. the Tier-2 async flow bridge
-  keel-node/          napi native addon, incl. the Tier-2 async flow bridge
-  keel-cli/           the `keel` binary (run|init|doctor|status|explain|flows|trace|replay|
-                        tail|fsck|mcp|record|sim), each with a scan/ static scanner (py, oxc-js)
-  keel/                scoped Rust front end: #[keel::wrap] + reqwest-middleware
-  keel-macros/          the #[keel::wrap] proc macro
-  keel-core-stub/     in-memory reference stub (Rust); keel-conformance/ shared harness
-python/keel/          Python front end (import hook, adapters, packs, flows, record, sim)
-python/keel-core-stub/  the same stub, pure Python
-node/keel/            Node front end (loader, fetch, packs, flows, record, sim)
-node/keel-core-stub/    the same stub, pure Node
-conformance/          scenario matrix + runners; fixtures/journal/ golden DBs
-demos/                four runnable demos + the storyboard
-tools/faultproxy/     scriptable deterministic fault-injecting proxy (demos, tests, keel sim)
-docs/                 the specs, sprint plan, CCRs, and the recording/sim/targeting format docs
+```bash
+cargo build -p keel-cli
+target/debug/keel init            # generate keel.toml from evidence: imports, call sites, observed traffic
+target/debug/keel doctor --json   # the honesty report — what's covered, what isn't, why
 ```
 
-## How work proceeds
+## See it work
 
-Teams build against the stub and the frozen contracts (see
-[contracts/README.md](contracts/README.md) for the change process); the stub was
-swapped for the real Rust core on integration day, with conformance the referee
-at every step. The full Sprint 0–2 plan and what shipped against it are in
-[docs/sprint-plan.md](docs/sprint-plan.md). Session context for coding agents
-lives in [CLAUDE.md](CLAUDE.md); the agent-facing docs are `llms.txt` /
-`llms-full.txt`, and `keel init --agents` drops a Keel section into `AGENTS.md`.
-MCP-native agents can run `keel mcp`: the CLI doubles as an MCP server over
-stdio (no daemon — it exits on EOF), exposing `get_status`, `get_doctor_report`,
-`propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, and
-`explain_error`, each byte-identical to the matching `--json` command.
+Four runnable, deterministic demos — no real network involved
+([`tools/faultproxy`](tools/faultproxy) serves scripted faults). See the
+40-second [storyboard](demos/STORYBOARD.md) for the shooting script.
+
+| Demo | What it proves | Language |
+|------|-----------------|----------|
+| [flaky-python](demos/flaky-python) | A bare script dies on a 503; `keel run` survives it | Python |
+| [node-service](demos/node-service) | Same story, Node: a bare script dies on a 500; `keel run` survives it | Node |
+| [agent-demo](demos/agent-demo) | An LLM call survives a 429 storm; a second run costs ~0 API calls (dev cache) | Python |
+| [durable-pipeline](demos/durable-pipeline) | `kill -9` mid-flow, rerun, and it resumes 10/10 steps — each firing exactly once | Python |
+
+## How it works
+
+Two tiers, one policy file:
+
+- **Tier 1 — resilience.** Every intercepted call passes through a fixed
+  layer chain: cache → rate limit → circuit breaker → timeout → retry.
+  Stateless, works everywhere, needs nothing but the library.
+- **Tier 2 — durable flows (opt-in).** Designate an entrypoint in `[flows]`
+  and its steps are journaled to a local SQLite file (or Postgres, for
+  fleet deployments) as they run. A crash — or a deliberate restart —
+  replays completed steps from the journal instead of re-firing their side
+  effects, then resumes live from wherever it left off.
+
+Both tiers run on the same native Rust core via a C ABI, so the Python and
+Node front ends share identical semantics — verified by a shared
+[conformance suite](conformance/README.md) that every implementation must
+pass, not just documentation asserting it.
+
+## Status
+
+Keel is pre-1.0 and not yet published to any package registry (`pip`/`npm`/
+`cargo`/`brew` — see the from-source [Quickstart](#quickstart) above; a
+package-naming decision is pending). Everything described in this README is
+real, tested, and running on the native core in both languages today — this
+isn't a roadmap, it's what's built. What's explicitly *not* built yet: a
+zero-config Rust CLI wrapper (Rust requires the `#[keel::wrap]` attribute
+instead), custom regex retry conditions, an object-store-backed journal for
+massive scale, and a hermetic/WASM simulation mode.
+
+Bug reports and pull requests are welcome — open an issue or a PR.
+
+## Learn more
+
+- [`llms.txt`](llms.txt) / [`llms-full.txt`](llms-full.txt) — compact,
+  retrieval-friendly docs for coding agents evaluating or integrating Keel.
+- [`conformance/README.md`](conformance/README.md) — the normative
+  behavior every implementation is tested against.
+- [`contracts/README.md`](contracts/README.md) — the frozen interfaces
+  (policy schema, FFI, journal, adapter-pack contract) and how they change.
+- [`python/keel/README.md`](python/keel/README.md) /
+  [`node/keel/README.md`](node/keel/README.md) — full front-end reference
+  for each language.
+
+Licensed under [Apache-2.0](LICENSE).
