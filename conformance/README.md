@@ -417,6 +417,24 @@ KEEL-E005 async-in-flow refusal):
   sequentially, or fan out in a fixed, data-independent order.
 - Value steps (`journal_time`/`journal_random`) participate in the same
   serialized sequence under the same rule.
+- **Testing this against a real binding: stagger call creation, don't race
+  it.** The async bridge (`pyo3-async-runtimes` in `keel-py`,
+  `env.spawn_future` in `keel-node`) only *enqueues* a call's future onto the
+  host language's own (typically multi-threaded) async runtime — nothing
+  guarantees it starts executing, let alone reaches the handle, within the
+  same synchronous tick it was created in. A test that fires two calls
+  back-to-back with no real delay between creating them (e.g. `Promise.all([
+  a(), b()])`, `asyncio.gather(a(), b())`) is racing them onto that runtime:
+  "which one reaches the handle first" becomes scheduler luck, not creation
+  order — usually stable on an idle machine, occasionally flaky under a
+  loaded CI runner. To pin admission order deterministically, create the
+  calls with a small real gap between them (10ms is enough in both existing
+  suites) so the first is already admitted — or already queued behind an
+  admission — before the second is even created. See
+  `python/keel/tests/test_flows.py`'s
+  `test_concurrent_async_effects_serialize_in_admission_order` (which
+  documented this first) and `node/keel/test/flow.test.mjs`'s equivalent
+  tests for the pattern.
 
 ## Adding scenarios
 
