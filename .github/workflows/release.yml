@@ -103,6 +103,12 @@ jobs:
   # (Xcode's linker/SDK support this without a separate toolchain; Rosetta 2,
   # preinstalled on these runners, is only needed to *run* the result, which
   # is why its import smoke below is skipped rather than Rosetta-wrapped).
+  #
+  # Windows: `windows-latest` builds x86_64-pc-windows-msvc natively (no
+  # cross-compilation, no manylinux concept) — same target `cli-binaries`
+  # already uses for the CLI archive. Added 2026-07-14: Windows is now a
+  # supported wheel platform, not just a raw CLI binary (local memory:
+  # keel-windows-support-added).
   # ---------------------------------------------------------------------------
   wheels-core:
     needs: preflight
@@ -124,6 +130,9 @@ jobs:
             target: aarch64
             manylinux: "2_28"
             smoke: false # cross-compiled under QEMU; not worth the emulated python cost here
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            smoke: true # native to the runner
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -139,13 +148,21 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m crates/keel-py/Cargo.toml
       - name: Install + import smoke (native-arch legs only)
-        if: matrix.smoke
+        if: matrix.smoke && matrix.os != 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           python3 -m venv .venv-smoke
           .venv-smoke/bin/pip install --quiet --disable-pip-version-check dist/keelrun_core-*.whl
           .venv-smoke/bin/python -c 'import keel_core; c = keel_core.KeelCore(); c.configure({}); print("keel_core import OK:", c.report())'
+      - name: Install + import smoke (Windows)
+        if: matrix.smoke && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python3 -m venv .venv-smoke
+          $wheel = Get-ChildItem dist\keelrun_core-*.whl | Select-Object -First 1
+          .venv-smoke\Scripts\pip.exe install --quiet --disable-pip-version-check $wheel.FullName
+          .venv-smoke\Scripts\python.exe -c "import keel_core; c = keel_core.KeelCore(); c.configure({}); print('keel_core import OK:', c.report())"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-core-${{ matrix.os }}-${{ matrix.target }}
@@ -192,10 +209,10 @@ jobs:
   # crates/keel-cli/pyproject.toml, published as `keelrun-cli`) so
   # `uvx --from keelrun-cli keel run ...` "just works" from a wheel with no
   # Rust toolchain. Same platform matrix as the core wheels (macOS x2,
-  # manylinux x2); Windows/musl CLI binaries are produced separately by
-  # `cli-binaries` below (raw binaries, not wheels — pip/uvx are out of scope
-  # for those per docs/dx-spec.md §6's install surface, which only promises
-  # pip/npm on macOS/Linux).
+  # manylinux x2, Windows — added 2026-07-14, see wheels-core's comment);
+  # `musl` CLI binaries are still produced separately by `cli-binaries` below
+  # (raw static binaries for that libc variant, not wheels — pip/uvx have no
+  # musl-specific concept, so those stay archive-only).
   # ---------------------------------------------------------------------------
   wheel-cli:
     needs: preflight
@@ -216,6 +233,8 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: "2_28"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -575,67 +594,179 @@ jobs:
           files: dist/*
 
   # ---------------------------------------------------------------------------
-  # 7. Real publishing — NOT WIRED UP. Every command below is a comment.
-  # Gated on workflow_dispatch's `publish` input so it never runs from a tag
-  # push. Uncommenting requires: (a) `CARGO_REGISTRY_TOKEN` / `PYPI_API_TOKEN`
-  # / `NPM_TOKEN` secrets provisioned, (b) node/keel-core-native's + its
-  # npm/*/ platform packages' `"private": true` flipped to `false`. The
-  # rename to the names below (docs/naming-decision.md) is already done.
+  # 7. Real publishing. Gated on workflow_dispatch's `publish` input so it
+  # never runs from a plain tag push — you must explicitly dispatch this
+  # workflow against the release tag with `publish: true`.
+  #
+  # PyPI uses Trusted Publishing (OIDC) — no stored token — via three
+  # separate jobs below, ONE PER PROJECT. This isn't a style choice: PyPI
+  # rejects registering a second "pending" publisher (Account -> Publishing)
+  # for a project that doesn't exist yet if its (repo, workflow, environment)
+  # triple exactly matches one already registered for a DIFFERENT pending
+  # project — "A pending trusted publisher matching this configuration has
+  # already been registered for a different project name" (hit this
+  # 2026-07-14 registering keelrun/keelrun-cli after keelrun-core). Since
+  # `environment:` is a job-level GitHub Actions setting, giving each project
+  # a distinct environment name requires a distinct job. Registrations:
+  #   keelrun-core -> owner MisterTK, repo keel, workflow release.yml, environment `release`
+  #   keelrun      -> same repo/workflow,                              environment `pypi-keelrun`
+  #   keelrun-cli  -> same repo/workflow,                              environment `pypi-keelrun-cli`
+  # PyPI creates each project on its first successful publish from that
+  # exact identity — see docs.pypi.org/trusted-publishers. `dist/` also holds
+  # npm tarballs, CLI archives, and the homebrew formula from the other jobs,
+  # so each job stages only its own Python files into a private directory
+  # first (`pypa/gh-action-pypi-publish` uploads everything in
+  # `packages-dir`, no per-file filtering).
+  #
+  # npm still uses a stored token (`NPM_TOKEN` repo secret, provisioned
+  # 2026-07-14) in its own job below — node/keel-core-native's + its npm/*/
+  # platform packages' `"private": true` must be flipped to `false` before
+  # those steps succeed.
+  #
+  # crates.io is deliberately NOT included here: keel-core-api, keel-journal,
+  # keelrun-core, and keelrun-cli v0.1.0 were already published manually
+  # (docs/naming-decision.md, 2026-07-14) via a locally-provisioned
+  # `cargo login` token — re-running `cargo publish` for a version that
+  # already exists fails immediately. Add the crates.io steps back as their
+  # own job for the *next* version bump — order matters (keel-core-api,
+  # keel-journal, then keelrun-core, then keelrun-cli — the same order
+  # cargo-publish-dry-run uses above) — with a `CARGO_REGISTRY_TOKEN` secret
+  # provisioned as a repo secret at that point (today it's local-only,
+  # deliberately not added to CI to avoid exactly this kind of
+  # double-publish footgun until it's needed).
   # ---------------------------------------------------------------------------
-  publish:
+  publish-pypi-keelrun-core:
     needs: draft-release
     if: github.event_name == 'workflow_dispatch' && inputs.publish == true
     runs-on: ubuntu-latest
-    environment: release # requires a manual approval gate configured in repo settings
+    environment: release # matches keelrun-core's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write # mandatory for PyPI Trusted Publishing (OIDC)
     steps:
-      - name: Publishing is not enabled
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
         run: |
-          echo "::notice::This job is a placeholder. See the commented commands below the checkout step in .github/workflows/release.yml — nothing here talks to a registry."
-      # - uses: actions/checkout@v4
-      # - uses: actions/download-artifact@v4
-      #   with:
-      #     path: dist
-      #
-      # # crates.io (dependency order; keel-core-api/keel-journal keep their
-      # # plain names — they're free and never user-facing; keel-core and
-      # # keel-cli are published as keelrun-core/keelrun-cli, see
-      # # docs/naming-decision.md):
-      # - run: cargo publish --locked -p keel-core-api
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keel-journal
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keelrun-core
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keelrun-cli
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      #
-      # # PyPI (twine; the keelrun-core wheels + sdist, then the keelrun-cli
-      # # wheels, then the pure-Python keelrun front end):
-      # - run: python3 -m pip install twine
-      # - run: twine upload dist/keelrun_core-*.whl dist/keelrun_core-*.tar.gz
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      # - run: twine upload dist/keelrun_cli-*.whl
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      # - run: twine upload dist/keelrun-*.whl dist/keelrun-*.tar.gz
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      #
-      # # npm (platform packages first, so the root package's optionalDependency
-      # # resolution has something to find; flip `"private": true` -> `false`
-      # # in each package.json before this can succeed):
-      # - run: |
-      #     for tgz in dist/keelrun-core-native-*.tgz; do
-      #       npm publish --access public "$tgz"
-      #     done
-      #     npm publish --access public dist/keelrun-*.tgz
-      #   env:
-      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun-core distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun_core-*.whl dist/keelrun_core-*.tar.gz pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        # Pinned to a commit SHA, not the `release/v1` branch tag: unlike this
+        # file's other `uses:` (tags from actions/, PyO3/, etc.), `release/v1`
+        # is a mutable branch, and this step runs with `id-token: write` and
+        # direct PyPI publish capability — meaningfully higher supply-chain
+        # stakes than the build-only steps elsewhere in this workflow.
+        # SHA is release/v1's tip as of 2026-07-14; bump deliberately (e.g. via
+        # Dependabot's github-actions ecosystem) rather than silently drifting.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+
+  publish-pypi-keelrun-cli:
+    needs: draft-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: pypi-keelrun-cli # matches keelrun-cli's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun-cli distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun_cli-*.whl pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+
+  # Not a technical requirement (PyPI doesn't check cross-project
+  # dependencies at publish time — only at install time), but `needs:
+  # publish-pypi-keelrun-core` keeps the run order matching keelrun's actual
+  # dependency on keelrun-core==<version>, so a partial-failure run leaves
+  # the more obviously-broken state (keelrun without its core) less likely.
+  publish-pypi-keelrun:
+    needs: [draft-release, publish-pypi-keelrun-core]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: pypi-keelrun # matches keelrun's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun-*.whl dist/keelrun-*.tar.gz pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+
+  publish-npm:
+    needs: draft-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: release # no protection rules configured (2026-07-14 decision) — workflow_dispatch's `publish: true` input is the only gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          ls -la dist
+
+      # npm (platform packages + the root native wrapper first, so the front
+      # end's optionalDependency resolution has something to find; flip
+      # `"private": true` -> `false` in each package.json before this can
+      # succeed). `keelrun-core-native-*.tgz` matches both the 4 per-platform
+      # tarballs and the root `keelrun-core-native-<version>.tgz` wrapper —
+      # all of them publish the same way. The front-end pattern is
+      # `keelrun-[0-9]*.tgz` (version starts right after the hyphen), not
+      # `keelrun-*.tgz`, so it does NOT also match `keelrun-core-native-*`
+      # tarballs and double-publish them.
+      - run: |
+          set -euo pipefail
+          for tgz in dist/keelrun-core-native-*.tgz; do
+            npm publish --access public "$tgz"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --access public dist/keelrun-[0-9]*.tgz
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
