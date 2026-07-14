@@ -841,13 +841,26 @@ jobs:
       # `keelrun-[0-9]*.tgz` (version starts right after the hyphen), not
       # `keelrun-*.tgz`, so it does NOT also match `keelrun-core-native-*`
       # tarballs and double-publish them.
+      #
+      # Every path below is prefixed `./` deliberately: `npm publish
+      # dist/foo.tgz` (no leading `./`) hit npm-package-arg's hosted-git-
+      # shorthand heuristic instead of being read as a local file — it tried
+      # `git ls-remote ssh://git@github.com/dist/foo.tgz.git` and failed with
+      # a bogus "Permission denied (publickey)" (hit for real running
+      # v0.1.0's release, 2026-07-14). `./`-prefixing forces file-path
+      # interpretation.
       - run: |
           set -euo pipefail
           for tgz in dist/keelrun-core-native-*.tgz; do
-            npm publish --access public "$tgz"
+            npm publish --access public "./$tgz"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish --access public dist/keelrun-[0-9]*.tgz
+      - run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tgz=(dist/keelrun-[0-9]*.tgz)
+          [ "${#tgz[@]}" -eq 1 ] || { echo "expected exactly one keelrun front-end tarball, found ${#tgz[@]}: ${tgz[*]}" >&2; exit 1; }
+          npm publish --access public "./${tgz[0]}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -39,7 +39,6 @@ dynamic = ["version"]
 description = "The keel CLI (run | init | doctor | status | explain | flows | trace) as a prebuilt binary — no Rust toolchain required to install it."
 requires-python = ">=3.8"
 classifiers = [
-    "Private :: Do Not Upload",
     "Programming Language :: Rust",
     "Environment :: Console",
 ]
