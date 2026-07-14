@@ -50,9 +50,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use keel_conformance::{scenarios_dir, subset_mismatches};
-use keel_core::{Engine, FlowConfig, FlowDescriptor, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
 use keel_journal::{Clock, Journal, ManualClock, PostgresJournal, ProcessId};
+use keelrun_core::{Engine, FlowConfig, FlowDescriptor, FlowManager};
 use serde::Deserialize;
 use serde_json::Value;
 use support::ScratchPg;

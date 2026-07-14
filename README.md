@@ -108,7 +108,7 @@ node node/keel/bin/keel-node-run.mjs your_app.mjs
 **CLI only:**
 
 ```bash
-cargo build -p keel-cli
+cargo build -p keelrun-cli
 target/debug/keel init            # generate keel.toml from evidence: imports, call sites, observed traffic
 target/debug/keel doctor --json   # the honesty report — what's covered, what isn't, why
 ```
@@ -147,8 +147,9 @@ pass, not just documentation asserting it.
 ## Status
 
 Keel is pre-1.0 and not yet published to any package registry (`pip`/`npm`/
-`cargo`/`brew` — see the from-source [Quickstart](#quickstart) above; a
-package-naming decision is pending). Everything described in this README is
+`cargo`/`brew` — see the from-source [Quickstart](#quickstart) above; the
+published name will be `keelrun`, see `docs/naming-decision.md`). Everything
+described in this README is
 real, tested, and running on the native core in both languages today — this
 isn't a roadmap, it's what's built. What's explicitly *not* built yet: a
 zero-config Rust CLI wrapper (Rust requires the `#[keel::wrap]` attribute

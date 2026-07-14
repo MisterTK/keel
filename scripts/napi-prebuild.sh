@@ -14,12 +14,12 @@
 #
 # then run this script) and copies it to:
 #
-#   node/keel-core-native/npm/<platformKey>/keel-core-native.<platformKey>.node
+#   node/keel-core-native/npm/<platformKey>/keelrun-core-native.<platformKey>.node
 #
 # — the file each npm/<platformKey>/package.json's `main` points at, matching
 # napi-rs's own naming convention (a future move to the real `@napi-rs/cli`
 # only swaps this script, not the layout or the loader). `--also-local`
-# additionally copies to node/keel-core-native/keel-core-native.node, the
+# additionally copies to node/keel-core-native/keelrun-core-native.node, the
 # "canonical" single-platform dev path index.mjs checks before target/.
 #
 # We hand-roll this instead of installing `@napi-rs/cli` (a devDependency that
@@ -56,12 +56,12 @@ if [[ ! -f "$src" ]]; then
 fi
 
 dest_dir="node/keel-core-native/npm/$platform_key"
-dest="$dest_dir/keel-core-native.$platform_key.node"
+dest="$dest_dir/keelrun-core-native.$platform_key.node"
 mkdir -p "$dest_dir"
 cp "$src" "$dest"
 echo "napi-prebuild: $src -> $dest"
 
 if [[ "$also_local" -eq 1 ]]; then
-  cp "$src" "node/keel-core-native/keel-core-native.node"
-  echo "napi-prebuild: $src -> node/keel-core-native/keel-core-native.node (--also-local)"
+  cp "$src" "node/keel-core-native/keelrun-core-native.node"
+  echo "napi-prebuild: $src -> node/keel-core-native/keelrun-core-native.node (--also-local)"
 fi

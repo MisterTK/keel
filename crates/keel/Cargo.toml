@@ -9,7 +9,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-keel-core = { path = "../keel-core" }
+keel-core = { package = "keelrun-core", path = "../keel-core" }
 keel-core-api = { path = "../keel-core-api" }
 keel-macros = { path = "../keel-macros" }
 serde = { workspace = true }

@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use keel_core::Engine;
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, ErrorClass, Request};
+use keelrun_core::Engine;
 use serde_json::json;
 
 fn request(target: &str, idempotent: bool) -> Request {

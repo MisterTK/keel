@@ -23,7 +23,7 @@
  *
  * # Why this always calls `process.exit()`
  *
- * `keel run` preloads this front end via `node --import keel/hook.mjs
+ * `keel run` preloads this front end via `node --import keelrun/hook.mjs
  * <script>`. `--import` only PRELOADS a module before Node loads `<script>` as
  * its own main module — it does not take over execution the way Python's
  * `runpy.run_path` does. So once we have imported `<script>` ourselves and run

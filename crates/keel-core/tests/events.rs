@@ -8,9 +8,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use keel_core::Engine;
-use keel_core::events::{CacheStore, Event, EventKind, EventSink, TraceRef};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, ErrorClass, ErrorCode, Request};
+use keelrun_core::Engine;
+use keelrun_core::events::{CacheStore, Event, EventKind, EventSink, TraceRef};
 use serde_json::json;
 
 /// A `Write` the test keeps a handle on after the sink boxes it.

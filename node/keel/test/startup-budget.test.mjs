@@ -1,4 +1,4 @@
-// DX invariant 8 (Node half): `keel run` (`node --import keel/hook`) adds
+// DX invariant 8 (Node half): `keel run` (`node --import keelrun/hook`) adds
 // <100ms to process startup at p50, measured in CI. Mirrors
 // python/keel/tests/test_run.py's StartupBudgetTest exactly: minimum of a few
 // runs (the stable estimator against scheduler/GC noise), asserted against a
@@ -20,7 +20,7 @@ const skip = ["1", "true", "yes"].includes(String(process.env.KEEL_SKIP_STARTUP_
   ? { skip: "KEEL_SKIP_STARTUP_BUDGET set" }
   : {};
 
-test("node --import keel/hook stays under the startup budget", skip, async () => {
+test("node --import keelrun/hook stays under the startup budget", skip, async () => {
   const result = await measureStartupBudget();
   process.stderr.write(`${formatSummary(result)}\n`);
   assert.ok(

@@ -190,7 +190,7 @@ seeds `AGENTS.md` so future sessions inherit this context.
 maturin develop -m crates/keel-py/Cargo.toml   # native keel_core into the venv (Python)
 pip install -e 'python/keel[dev]'
 node node/keel/bin/keel-node-run.mjs app.mjs   # Node from-source `keel run`
-cargo build -p keel-cli                         # the `keel` binary
+cargo build -p keelrun-cli                      # the `keel` binary
 ```
 
 ## Conformance

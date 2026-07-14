@@ -1,5 +1,5 @@
 [package]
-name = "keel-core"
+name = "keelrun-core"
 description = "The Keel kernel, Tier 1 scope: policy-driven cache/rate/breaker/timeout/retry execution on tokio, per architecture spec §4. Same conformance suite as the stub."
 version.workspace = true
 edition.workspace = true
@@ -7,8 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
-# Publishable. Note the crates.io name collision (docs/naming-decision.md):
-# publishing is a release-workflow step, blocked on the naming decision.
+# Publishable. Published as `keelrun-core` (docs/naming-decision.md): the
+# plain `keel-core` name is taken on crates.io by an unrelated project.
 # Only the explicitly declared `overhead` bench is a target; `benches/support.rs`
 # is a module of it (and of tests/overhead_guard.rs), not a bench of its own.
 autobenches = false

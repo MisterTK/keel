@@ -951,9 +951,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "http",
- "keel-core",
  "keel-core-api",
  "keel-macros",
+ "keelrun-core",
  "reqwest",
  "reqwest-middleware",
  "serde",
@@ -966,61 +966,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "keel-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "keel-core",
- "keel-core-api",
- "keel-journal",
- "oxc_allocator",
- "oxc_ast",
- "oxc_ast_visit",
- "oxc_parser",
- "oxc_span",
- "oxc_syntax",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "toml_edit",
-]
-
-[[package]]
 name = "keel-conformance"
 version = "0.1.0"
 dependencies = [
  "keel-core-api",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "keel-core"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "fastrand",
- "keel-conformance",
- "keel-core-api",
- "keel-journal",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1048,8 +999,8 @@ name = "keel-ffi"
 version = "0.1.0"
 dependencies = [
  "keel-conformance",
- "keel-core",
  "keel-core-api",
+ "keelrun-core",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -1082,9 +1033,9 @@ dependencies = [
 name = "keel-node"
 version = "0.1.0"
 dependencies = [
- "keel-core",
  "keel-core-api",
  "keel-journal",
+ "keelrun-core",
  "napi",
  "napi-build",
  "napi-derive",
@@ -1096,14 +1047,63 @@ dependencies = [
 name = "keel-py"
 version = "0.1.0"
 dependencies = [
- "keel-core",
  "keel-core-api",
  "keel-journal",
+ "keelrun-core",
  "pyo3",
  "pyo3-async-runtimes",
  "pythonize",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "keelrun-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "keel-core-api",
+ "keel-journal",
+ "keelrun-core",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "toml_edit",
+]
+
+[[package]]
+name = "keelrun-core"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "fastrand",
+ "keel-conformance",
+ "keel-core-api",
+ "keel-journal",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -9,11 +9,12 @@ cache — all declared in one `keel.toml`, enforced by the native Rust core
 inside your process. No daemon, no port, no login.
 
 ```
-$ cd python/keel && pip install -e . && keel-py-run app.py
+$ cd python/keel && pip install -e . && keelrun-py-run app.py
 keel ▸ wrapped 14 call sites (httpx ×9, openai ×4) with production defaults — `keel init` to customize
 ```
 
-(Not yet published to any registry; run from source — see `docs/naming-decision.md` for registry status.)
+(Not yet published to any registry; run from source. Published name will be
+`keelrun` — see `docs/naming-decision.md`.)
 
 Uninstalling Keel removes the behavior and nothing else: your code runs
 identically (minus resilience). No imports, no context objects, no base classes.

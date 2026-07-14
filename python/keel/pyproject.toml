@@ -3,20 +3,23 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "keel"
+# Published as `keelrun` (docs/naming-decision.md); the IMPORT name stays
+# `keel` (see [tool.setuptools.packages.find] below) — only the PyPI
+# distribution name changes.
+name = "keelrun"
 license = "Apache-2.0"
 version = "0.1.0"
 description = "Keel — resilience as a zero-config Python front end (Tier 1 bootstrap, import hook, discovery)."
 requires-python = ">=3.11"
-# The native core wheel (import name `keel_core`), version-locked to this
-# front end. When it is absent at runtime (exotic platform, failed install),
-# the vendored pure-Python stub (`keel_core_stub`, shipped in this wheel and
-# byte-identical to python/keel-core-stub — checked by
-# scripts/check-release-metadata.sh) takes over, so there is never a compile.
-# Beyond that, runtime is stdlib-only: adapters activate only when their
-# library is already present in the environment, and never import an absent
-# one.
-dependencies = ["keel-core==0.1.0"]
+# The native core wheel (import name `keel_core`, distribution name
+# `keelrun-core`), version-locked to this front end. When it is absent at
+# runtime (exotic platform, failed install), the vendored pure-Python stub
+# (`keel_core_stub`, shipped in this wheel and byte-identical to
+# python/keel-core-stub — checked by scripts/check-release-metadata.sh) takes
+# over, so there is never a compile. Beyond that, runtime is stdlib-only:
+# adapters activate only when their library is already present in the
+# environment, and never import an absent one.
+dependencies = ["keelrun-core==0.1.0"]
 
 # Test-only dependencies (the adapter contract-test farm). Install with
 # `pip install -e '.[dev]'` or `uv pip install httpx requests`. The library
@@ -27,9 +30,9 @@ dependencies = ["keel-core==0.1.0"]
 dev = ["httpx>=0.27,<0.29", "requests>=2.31,<2.33"]
 
 # Internal run entry. The public `keel run` CLI (Task 8) dispatches here for
-# Python entrypoints; `keel-py-run app.py [args...]` runs a script directly.
+# Python entrypoints; `keelrun-py-run app.py [args...]` runs a script directly.
 [project.scripts]
-keel-py-run = "keel._run:main_run_entry"
+keelrun-py-run = "keel._run:main_run_entry"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use keel_core::{Engine, FlowDescriptor, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
 use keel_journal::{Clock, Journal, ManualClock, ProcessId, SqliteJournal, StepStatus};
+use keelrun_core::{Engine, FlowDescriptor, FlowManager};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 

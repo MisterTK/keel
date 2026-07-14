@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * DX invariant 8 (Node half): `keel run` (`node --import keel/hook`) adds
+ * DX invariant 8 (Node half): `keel run` (`node --import keelrun/hook`) adds
  * <100ms to process startup at p50, measured in CI. Mirrors
  * python/keel/tests/test_run.py's `StartupBudgetTest` methodology exactly, so
  * both front ends report the same shape of number the same way: the MIN of a
  * few runs of the real wall-clock delta between a plain `node noop.mjs` launch
- * and `node --import keel/hook noop.mjs` (min, not mean/median — the most
+ * and `node --import keelrun/hook noop.mjs` (min, not mean/median — the most
  * stable estimator of pure fixed overhead against scheduler/GC noise).
  *
  * Two ways to use this module:
@@ -54,7 +54,7 @@ function minMs(cmd, { env, cwd, runs = 5 } = {}) {
 }
 
 /**
- * Measure baseline vs. `--import keel/hook` startup, on the stub backend
+ * Measure baseline vs. `--import keelrun/hook` startup, on the stub backend
  * always, and the native backend when the built addon is present (skipped
  * otherwise — a worktree without `cargo build -p keel-node --release` has no
  * addon to measure, exactly like the Python leg skips without a built wheel).

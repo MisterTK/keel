@@ -15,8 +15,8 @@ in both Python and Node on the real Rust core, with `kill -9` resume, a
 Postgres journal backend for fleet durability, `keel record`/`keel sim`, and a
 scoped Rust front end (`#[keel::wrap]` + reqwest-middleware). Wrapped-call
 overhead ~0.8 µs vs a 10 µs budget. Wheels/npm/crates are not published yet —
-build from source; see `docs/naming-decision.md` for the registry-name
-collisions blocking that.
+build from source; the published name will be `keelrun` (see
+`docs/naming-decision.md`).
 
 ## Start here
 

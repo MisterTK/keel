@@ -11,12 +11,12 @@
  * Resolution order (first that loads wins):
  *
  *   1. The installed per-platform prebuild package, e.g.
- *      `@keel/core-native-darwin-arm64` (an `optionalDependency` of this
+ *      `keelrun-core-native-darwin-arm64` (an `optionalDependency` of this
  *      package — see package.json's `napi` config + scripts/napi-prebuild.sh,
  *      which stages these under npm/<platform>/ and is what the release
  *      workflow packs). npm only pulls in the ONE optional dependency that
  *      matches the running os/cpu; the other three are silently skipped.
- *   2. `./keel-core-native.node` next to this file (a binary copied in by
+ *   2. `./keelrun-core-native.node` next to this file (a binary copied in by
  *      hand, or staged locally without going through npm install).
  *   3. `../../target/{release,debug}/<cdylib>` — the from-source dev flow:
  *      `cargo build -p keel-node --release` (or `npm run build` here), no
@@ -32,7 +32,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 // napi-rs platform key for the running process — matches the suffix on the
-// `@keel/core-native-<platformKey>` optional dependencies and the
+// `keelrun-core-native-<platformKey>` optional dependencies and the
 // npm/<platformKey>/ directories staged by scripts/napi-prebuild.sh. `null`
 // for combinations we don't build (e.g. win32, arm): falls through to the
 // dev-flow candidates below.
@@ -53,7 +53,7 @@ const CDYLIB =
       ? "libkeel_node.dylib"
       : "libkeel_node.so";
 
-/** Resolve the installed `@keel/core-native-<platformKey>` package's main
+/** Resolve the installed `keelrun-core-native-<platformKey>` package's main
  * file via normal Node module resolution — this is what makes a plain
  * `npm install` on a matching platform find the right prebuild without any
  * env/config. Returns `[]` off the 4 built platforms or when the optional
@@ -64,7 +64,7 @@ function resolvePlatformPackage() {
   if (key == null) return [];
   try {
     const require = createRequire(import.meta.url);
-    return [require.resolve(`@keel/core-native-${key}`)];
+    return [require.resolve(`keelrun-core-native-${key}`)];
   } catch {
     return []; // not installed (unmet optional dep, or a from-source checkout)
   }
@@ -74,7 +74,7 @@ function resolvePlatformPackage() {
 // artifact, then dev target/ outputs.
 const CANDIDATES = [
   ...resolvePlatformPackage(),
-  new URL("./keel-core-native.node", import.meta.url),
+  new URL("./keelrun-core-native.node", import.meta.url),
   new URL(`../../target/release/${CDYLIB}`, import.meta.url),
   new URL(`../../target/debug/${CDYLIB}`, import.meta.url),
 ];

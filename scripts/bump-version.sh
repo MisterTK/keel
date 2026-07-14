@@ -40,8 +40,8 @@ for path in ("python/keel/pyproject.toml", "python/keel-core-stub/pyproject.toml
     sub_once(path, r'^version = "[^"]+"$', f'version = "{new}"')
 sub_once(
     "python/keel/pyproject.toml",
-    r'"keel-core==[^"]+"',
-    f'"keel-core=={new}"',
+    r'"keelrun-core==[^"]+"',
+    f'"keelrun-core=={new}"',
 )
 # Regex, not json round-trip: keeps each package.json's formatting untouched.
 for path in (

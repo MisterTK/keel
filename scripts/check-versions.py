@@ -2,7 +2,7 @@
 """Assert every version declaration in the repo agrees with the single source.
 
 The source of truth is `[workspace.package] version` in the root Cargo.toml
-(all crates inherit it; the keel-core wheel reads it via maturin's
+(all crates inherit it; the keelrun-core wheel reads it via maturin's
 `dynamic = ["version"]`). Everything that cannot inherit it mechanically is
 listed here and checked byte-for-byte:
 
@@ -16,7 +16,7 @@ listed here and checked byte-for-byte:
   - crates/keel-py/pyproject.toml         must stay dynamic (no restated version)
   - crates/keel-cli/pyproject.toml        must stay dynamic (no restated version)
   - node/keel-core-native/npm/*/package.json  version (per-platform prebuilds)
-  - python/keel/pyproject.toml            keel-core==<version> dependency pin
+  - python/keel/pyproject.toml            keelrun-core==<version> dependency pin
 
 Usage: check-versions.py [--tag vX.Y.Z]
 `--tag` additionally asserts a release tag matches (for the release workflow:
@@ -101,7 +101,7 @@ def main() -> int:
     # The front-end wheel pins the native core wheel to the same version.
     with (REPO / "python/keel/pyproject.toml").open("rb") as f:
         deps = tomllib.load(f)["project"].get("dependencies", [])
-    pin = f"keel-core=={want}"
+    pin = f"keelrun-core=={want}"
     if pin not in deps:
         errors.append(f"python/keel/pyproject.toml dependencies must pin {pin!r} (got {deps!r})")
 

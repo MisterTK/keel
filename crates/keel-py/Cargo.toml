@@ -21,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Aliased to `keel_engine` in code: the crate's own Python module symbol is
 # `keel_core`, which would otherwise collide with keel-core's lib name.
-keel_engine = { package = "keel-core", path = "../keel-core" }
+keel_engine = { package = "keelrun-core", path = "../keel-core" }
 keel-core-api = { path = "../keel-core-api" }
 # The persistent journal (SQLite) attached on demand for the dev-cache
 # `scope = persistent` (Task 14 item 1) — enables cross-RUN LLM dev replay.

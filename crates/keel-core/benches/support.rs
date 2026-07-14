@@ -24,9 +24,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use keel_core::Engine;
-use keel_core::events::EventSink;
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, Request};
+use keelrun_core::Engine;
+use keelrun_core::events::EventSink;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 

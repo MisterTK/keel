@@ -1,5 +1,5 @@
 // Task 14 item 1 (load-bearing): cross-RUN dev-cache replay under the native
-// core + attached journal. Two SEPARATE `node --import keel/hook` processes hit
+// core + attached journal. Two SEPARATE `node --import keelrun/hook` processes hit
 // the same LLM-style endpoint with an identical request; the dev cache resolves
 // to `scope = "persistent"` (native + journal), so the SECOND run replays from
 // `.keel/journal.db` and makes ZERO API calls for the repeated prompt — the

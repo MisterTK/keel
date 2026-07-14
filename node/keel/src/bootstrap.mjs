@@ -1,5 +1,5 @@
 /**
- * Bootstrap: everything `--import keel/hook` does, in one testable function.
+ * Bootstrap: everything `--import keelrun/hook` does, in one testable function.
  *
  * Order matters: policy → backend.configure → runtime state → fetch seam →
  * register the ESM loader (before the app + its deps import) → exit flush →

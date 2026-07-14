@@ -2,8 +2,8 @@
 # Release-metadata gate: every package artifact must be buildable and
 # installable-from-artifact. Default mode runs the cheap checks (seconds, no
 # compiles beyond `cargo package --list`); `--full` additionally builds and
-# installs the real artifacts (npm tarball, keel wheel, keel-core sdist) into
-# throwaway prefixes — minutes, compiles the workspace.
+# installs the real artifacts (npm tarball, keelrun wheel, keelrun-core
+# sdist) into throwaway prefixes — minutes, compiles the workspace.
 #
 #   scripts/check-release-metadata.sh          # cheap: versions, vendored
 #                                              # parity, cargo package metadata
@@ -64,11 +64,11 @@ check_crate() {
 }
 check_crate keel-core-api contract/core_api.rs build.rs README.md
 check_crate keel-journal contract/journal.sql build.rs README.md
-check_crate keel-core src/engine.rs README.md
-check_crate keel-cli contract/error-codes.json contract/defaults.toml build.rs README.md
-# keel-cli's integration tests embed repo-level fixtures; they must stay out.
-if cargo package --list --allow-dirty -p keel-cli | grep -q '^tests/'; then
-  fail "keel-cli package must exclude tests/ (they embed repo-level fixtures)"
+check_crate keelrun-core src/engine.rs README.md
+check_crate keelrun-cli contract/error-codes.json contract/defaults.toml build.rs README.md
+# keelrun-cli's integration tests embed repo-level fixtures; they must stay out.
+if cargo package --list --allow-dirty -p keelrun-cli | grep -q '^tests/'; then
+  fail "keelrun-cli package must exclude tests/ (they embed repo-level fixtures)"
 fi
 echo "check-release-metadata: cargo package listings OK (4 crates)"
 
@@ -103,7 +103,7 @@ mkdir -p "$workdir/npm-proj"
   npm init -y >/dev/null 2>&1
   npm install --silent --no-audit --no-fund "$workdir/$tarball"
   KEEL_BACKEND=stub node --input-type=module -e '
-    import { loadBackend, KeelError, VERSION } from "keel";
+    import { loadBackend, KeelError, VERSION } from "keelrun";
     const backend = await loadBackend();
     backend.configure({});
     const outcome = await backend.execute(
@@ -112,19 +112,19 @@ mkdir -p "$workdir/npm-proj"
     );
     if (outcome.result !== "ok") throw new Error(`stub execute failed: ${JSON.stringify(outcome)}`);
     if (typeof KeelError !== "function" || !VERSION) throw new Error("exports broken");
-    console.log(`npm tarball import OK (keel ${VERSION}, backend ${backend.kind})`);
+    console.log(`npm tarball import OK (keelrun ${VERSION}, backend ${backend.kind})`);
   '
 )
 
-# --- 6. keel wheel: build, install (no deps: keel-core is unpublished), import
+# --- 6. keelrun wheel: build, install (no deps: keelrun-core is unpublished), import
 echo "check-release-metadata: [full] python wheel smoke..."
 python3 -m venv "$workdir/venv-wheel"
 "$workdir/venv-wheel/bin/pip" wheel --quiet --disable-pip-version-check \
   --no-deps -w "$workdir/dist" python/keel
-# --no-deps: the keel-core wheel is not on an index yet; the vendored stub
+# --no-deps: the keelrun-core wheel is not on an index yet; the vendored stub
 # must carry the import regardless (that is the point of this check).
 "$workdir/venv-wheel/bin/pip" install --quiet --disable-pip-version-check \
-  --no-deps "$workdir"/dist/keel-*.whl
+  --no-deps "$workdir"/dist/keelrun-*.whl
 (
   cd "$workdir"
   KEEL_BACKEND=stub "$workdir/venv-wheel/bin/python" - <<'EOF'
@@ -140,16 +140,16 @@ outcome = backend.execute(
     lambda attempt: {"status": "ok", "payload": {"n": 1}},
 )
 assert outcome["result"] == "ok", outcome
-requires = importlib.metadata.requires("keel") or []
-assert any(r.startswith("keel-core==") for r in requires), requires
-print(f"python wheel import OK (keel {keel.__version__}, backend stub)")
+requires = importlib.metadata.requires("keelrun") or []
+assert any(r.startswith("keelrun-core==") for r in requires), requires
+print(f"python wheel import OK (keelrun {keel.__version__}, backend stub)")
 EOF
 )
 
-# --- 7. keel-core sdist: build with maturin, compile-install from the sdist ---
+# --- 7. keelrun-core sdist: build with maturin, compile-install from the sdist
 # Proves the sdist is self-contained: the vendored contract copies (not the
 # repo's contracts/) are what the include!/include_str! macros compile.
-echo "check-release-metadata: [full] keel-core sdist smoke (compiles the core)..."
+echo "check-release-metadata: [full] keelrun-core sdist smoke (compiles the core)..."
 python3 -m venv "$workdir/venv-sdist"
 "$workdir/venv-sdist/bin/pip" install --quiet --disable-pip-version-check "maturin>=1.7,<2"
 "$workdir/venv-sdist/bin/maturin" sdist -m crates/keel-py/Cargo.toml -o "$workdir/sdist"
@@ -158,13 +158,13 @@ python3 -m venv "$workdir/venv-sdist"
 # bin dir on PATH so the subprocess finds it.
 PATH="$workdir/venv-sdist/bin:$PATH" \
   "$workdir/venv-sdist/bin/pip" install --quiet --disable-pip-version-check \
-  --no-build-isolation "$workdir"/sdist/keel_core-*.tar.gz
+  --no-build-isolation "$workdir"/sdist/keelrun_core-*.tar.gz
 "$workdir/venv-sdist/bin/python" - <<'EOF'
 import keel_core
 
 core = keel_core.KeelCore()
 core.configure({})
-print("keel-core sdist compile+import OK")
+print("keelrun-core sdist compile+import OK")
 EOF
 
 echo "check-release-metadata: OK (full)"

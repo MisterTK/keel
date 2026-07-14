@@ -1,7 +1,7 @@
 /**
- * `keel/testing` — offline replay for a `keel record` capture.
+ * `keelrun/testing` — offline replay for a `keel record` capture.
  *
- *     import { withReplay } from "keel/testing";
+ *     import { withReplay } from "keelrun/testing";
  *
  *     test("my recorded flow", async () => {
  *       await withReplay("./recording.ndjson", async () => {

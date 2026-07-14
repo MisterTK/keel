@@ -14,11 +14,11 @@ the same core semantics (see `../keel-core-stub`, `../../conformance`).
 
 ```bash
 # ESM
-node --import keel/hook app.mjs
+node --import keelrun/hook app.mjs
 # CJS (best-effort preload; prefer --import when you can)
-node --require keel/hook app.cjs
+node --require keelrun/hook app.cjs
 # or via the bin the `keel run` CLI dispatches to:
-keel-node-run app.mjs
+keelrun-node-run app.mjs
 ```
 
 On startup Keel prints one line to **stderr** (never stdout) and is otherwise

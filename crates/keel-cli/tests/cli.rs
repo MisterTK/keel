@@ -1,7 +1,7 @@
 //! Integration + snapshot tests for the `keel` CLI.
 //!
 //! Snapshots are hand-rolled golden files under `tests/golden/`. Re-generate
-//! them deliberately with `KEEL_UPDATE_GOLDEN=1 cargo test -p keel-cli`; without
+//! them deliberately with `KEEL_UPDATE_GOLDEN=1 cargo test -p keelrun-cli`; without
 //! that env var a mismatch fails the test (byte-for-byte). Determinism is the
 //! whole point (dx-spec §5) — an agent diffs these to detect change.
 //!
