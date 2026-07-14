@@ -751,6 +751,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
         with:
           packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
 
   publish-pypi-keelrun-cli:
     needs: draft-release
@@ -780,6 +785,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
         with:
           packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
 
   # Not a technical requirement (PyPI doesn't check cross-project
   # dependencies at publish time — only at install time), but `needs:
@@ -814,6 +824,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
         with:
           packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
 
   publish-npm:
     needs: draft-release
@@ -822,6 +837,16 @@ jobs:
     environment: release # no protection rules configured (2026-07-14 decision) — workflow_dispatch's `publish: true` input is the only gate
     steps:
       - uses: actions/checkout@v4
+      # Required for npm auth: setup-node's `registry-url` writes an .npmrc
+      # entry (`//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`) that
+      # npm publish reads from. Setting the NODE_AUTH_TOKEN env var alone,
+      # with no .npmrc pointing at it, does nothing — npm publish failed with
+      # ENEEDAUTH without this step (hit for real running v0.1.0's release,
+      # 2026-07-14).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
       - uses: actions/download-artifact@v4
         with:
           path: dist
