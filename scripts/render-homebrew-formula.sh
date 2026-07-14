@@ -38,7 +38,13 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/keel-homebrew-render.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
 tarball="$workdir/$tag.tar.gz"
 echo "render-homebrew-formula: fetching $archive_url"
-curl -fsSL "$archive_url" -o "$tarball"
+# GitHub's codeload archive-generation for a just-pushed tag can lag a few
+# seconds behind the tag ref itself becoming visible (hit for real running
+# v0.1.0's release build, 2026-07-14: a plain curl right after the tag push
+# 404'd). curl's default --retry does NOT retry 404s (it treats them as a
+# permanent client error, not transient) — --retry-all-errors is required to
+# actually retry this specific failure.
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors "$archive_url" -o "$tarball"
 sha256="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
 
 mkdir -p "$(dirname "$out")"
