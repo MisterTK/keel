@@ -947,43 +947,53 @@ jobs:
       # `"private": true` -> `false` in each package.json before this can
       # succeed). `keelrun-core-native-*.tgz` matches both the 4 per-platform
       # tarballs and the root `keelrun-core-native-<version>.tgz` wrapper —
-      # all of them publish the same way. The front-end pattern is
-      # `keelrun-[0-9]*.tgz` (version starts right after the hyphen), not
-      # `keelrun-*.tgz`, so it does NOT also match `keelrun-core-native-*`
-      # tarballs and double-publish them.
+      # all of them publish the same way. `keelrun-cli-*.tgz` is the same
+      # shape for the CLI's platform packages + root wrapper. The front-end
+      # pattern is `keelrun-[0-9]*.tgz` (version starts right after the
+      # hyphen), not `keelrun-*.tgz`, so it does NOT also match either
+      # `-core-native-`/`-cli-` family and double-publish them.
       #
-      # Every path below is prefixed `./` deliberately: `npm publish
-      # dist/foo.tgz` (no leading `./`) hit npm-package-arg's hosted-git-
-      # shorthand heuristic instead of being read as a local file — it tried
-      # `git ls-remote ssh://git@github.com/dist/foo.tgz.git` and failed with
-      # a bogus "Permission denied (publickey)" (hit for real running
-      # v0.1.0's release, 2026-07-14). `./`-prefixing forces file-path
-      # interpretation.
+      # Every path passed to `npm publish` is prefixed `./` deliberately:
+      # `npm publish dist/foo.tgz` (no leading `./`) hit npm-package-arg's
+      # hosted-git-shorthand heuristic instead of being read as a local file
+      # — it tried `git ls-remote ssh://git@github.com/dist/foo.tgz.git` and
+      # failed with a bogus "Permission denied (publickey)" (hit for real
+      # running v0.1.0's release, 2026-07-14).
+      #
+      # Idempotent per-package (mirrors the PyPI jobs' `skip-existing:
+      # true`): `npm view <name>@<version>` before publishing, skip if it
+      # already resolves. Needed for real, not just defensively — the first
+      # v0.1.1 run hit npm's automated spam-detection heuristic on one
+      # brand-new platform package (`keelrun-cli-win32-x64`, a 403 with no
+      # retry-after signal) after 10 sibling packages had already published
+      # in the same burst; without this, a re-run would immediately fail
+      # re-publishing any package that already succeeded, and (since each
+      # `npm publish` failure aborts the step under `set -e`) the front-end
+      # `keelrun` package below would never even be attempted.
       - run: |
           set -euo pipefail
+          publish_if_missing() {
+            local tgz="$1"
+            local pkg
+            pkg="$(tar -xOzf "$tgz" package/package.json | node -e '
+              const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              console.log(p.name + "@" + p.version);
+            ')"
+            if npm view "$pkg" version >/dev/null 2>&1; then
+              echo "already published: $pkg (skipping)"
+            else
+              npm publish --access public "./$tgz"
+            fi
+          }
           for tgz in dist/keelrun-core-native-*.tgz; do
-            npm publish --access public "./$tgz"
+            publish_if_missing "$tgz"
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      # keelrun-cli platform packages + the root wrapper — same "one glob
-      # catches both the per-platform tarballs and the root wrapper" shape
-      # as keelrun-core-native above, since `keelrun-cli-<platform>-<ver>.tgz`
-      # and the root `keelrun-cli-<ver>.tgz` both match `keelrun-cli-*.tgz`
-      # (and the front-end `keelrun-<ver>.tgz` does NOT, since it lacks the
-      # literal "cli-" segment).
-      - run: |
-          set -euo pipefail
           for tgz in dist/keelrun-cli-*.tgz; do
-            npm publish --access public "./$tgz"
+            publish_if_missing "$tgz"
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: |
-          set -euo pipefail
           shopt -s nullglob
-          tgz=(dist/keelrun-[0-9]*.tgz)
-          [ "${#tgz[@]}" -eq 1 ] || { echo "expected exactly one keelrun front-end tarball, found ${#tgz[@]}: ${tgz[*]}" >&2; exit 1; }
-          npm publish --access public "./${tgz[0]}"
+          front_end=(dist/keelrun-[0-9]*.tgz)
+          [ "${#front_end[@]}" -eq 1 ] || { echo "expected exactly one keelrun front-end tarball, found ${#front_end[@]}: ${front_end[*]}" >&2; exit 1; }
+          publish_if_missing "${front_end[0]}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
