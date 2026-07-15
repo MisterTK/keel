@@ -1,6 +1,6 @@
 {
   "name": "keelrun-core-native",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source-only in a dev checkout — binaries are built locally by `npm run build` (or scripts/napi-prebuild.sh) and never committed; the release workflow builds+packs the npm/*/ platform packages below per platform.",
   "type": "module",
@@ -24,9 +24,9 @@
     ]
   },
   "optionalDependencies": {
-    "keelrun-core-native-darwin-x64": "0.1.0",
-    "keelrun-core-native-darwin-arm64": "0.1.0",
-    "keelrun-core-native-linux-x64-gnu": "0.1.0",
-    "keelrun-core-native-linux-arm64-gnu": "0.1.0"
+    "keelrun-core-native-darwin-x64": "0.1.1",
+    "keelrun-core-native-darwin-arm64": "0.1.1",
+    "keelrun-core-native-linux-x64-gnu": "0.1.1",
+    "keelrun-core-native-linux-arm64-gnu": "0.1.1"
   }
 }

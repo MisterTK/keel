@@ -66,11 +66,13 @@ check_crate keel-core-api contract/core_api.rs build.rs README.md
 check_crate keel-journal contract/journal.sql build.rs README.md
 check_crate keelrun-core src/engine.rs README.md
 check_crate keelrun-cli contract/error-codes.json contract/defaults.toml build.rs README.md
+check_crate keel-macros README.md
+check_crate keelrun README.md
 # keelrun-cli's integration tests embed repo-level fixtures; they must stay out.
 if cargo package --list --allow-dirty -p keelrun-cli | grep -q '^tests/'; then
   fail "keelrun-cli package must exclude tests/ (they embed repo-level fixtures)"
 fi
-echo "check-release-metadata: cargo package listings OK (4 crates)"
+echo "check-release-metadata: cargo package listings OK (6 crates)"
 
 # --- 4. manifest invariants ---------------------------------------------------
 # The npm package must ship the vendored stub (src/ is in files[]).

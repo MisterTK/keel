@@ -1,19 +1,19 @@
-# Release pipeline — BUILD INFRA ONLY, no publishing.
+# Release pipeline — build always; publish only when explicitly asked.
 #
 # Produces every artifact docs/sprint-plan.md's release-candidate line
 # promises (wheels macOS/Linux x86-64/aarch64, npm package, CLI binaries,
 # brew formula draft) plus the CLI/Windows/musl legs architecture-spec's NFR5
-# adds, attaches them all to a DRAFT GitHub Release, and stops. Every
-# `cargo publish`/`twine upload`/`npm publish` step is either `--dry-run` or
-# fully commented out behind a manual `workflow_dispatch` input — see the
-# `publish` job at the bottom. Nothing in this file talks to a real package
-# registry.
+# adds, attaches them all to a DRAFT GitHub Release, and stops there — on a
+# plain `vX.Y.Z` tag push, nothing in this file talks to a real registry.
 #
-# Why not publishing yet: registry credentials aren't provisioned and the
-# `publish` job at the bottom is a deliberate manual gate (see its own
-# comment) — docs/naming-decision.md's rename (PyPI/npm `keel` -> `keelrun`,
-# crates.io/PyPI `keel-core` -> `keelrun-core`, crates.io/PyPI `keel-cli` ->
-# `keelrun-cli`) is already reflected in the manifests this workflow builds.
+# Real publishing is a SEPARATE, explicit act: dispatch this workflow against
+# the release tag with `publish: true` and the `publish-pypi-keelrun-core`/
+# `publish-pypi-keelrun-cli`/`publish-pypi-keelrun`/`publish-npm` jobs run for
+# real — PyPI via Trusted Publishing (OIDC, one environment per project, see
+# those jobs' own comment for why), npm via the stored `NPM_TOKEN` secret.
+# crates.io is excluded from this workflow entirely and stays a manual local
+# `cargo publish` (see `cargo-publish-dry-run`'s comment for why) — nothing
+# here ever touches crates.io.
 #
 # Triggers on `vX.Y.Z` tags (the version MUST already match every manifest —
 # scripts/check-versions.py --tag is the gate) and on workflow_dispatch for
@@ -39,9 +39,13 @@ on:
     inputs:
       publish:
         description: >-
-          Run the (fully commented-out) real publish steps. Left true here
-          does NOTHING today — see the `publish` job; this exists so the gate
-          is visible in the UI before any registry credentials ever land.
+          Actually publish to PyPI (OIDC Trusted Publishing, publish-pypi-*
+          jobs) and npm (stored NPM_TOKEN, publish-npm job) — real, working
+          steps, not a placeholder. Must be dispatched explicitly against a
+          release tag; a plain tag push only builds artifacts and drafts a
+          GitHub release. crates.io is not gated by this input at all — it
+          is published manually (`cargo publish`), deliberately, since
+          CARGO_REGISTRY_TOKEN is a local-only credential, never a CI secret.
         type: boolean
         default: false
 
@@ -386,6 +390,83 @@ jobs:
           path: ${{ runner.temp }}/npm-dist/*.tgz
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # 2b. `keel` CLI binary prebuilds for npm (published as `keelrun-cli`, a
+  # thin npm wrapper around the same binary `cli-binaries` below builds — see
+  # node/keel-cli/ and scripts/cli-prebuild.sh). Same 5 platforms as
+  # `cli-binaries`: musl Linux, not glibc — a CLI binary is a separate
+  # process, not a native addon loaded into Node, so a static musl build
+  # runs on glibc hosts too and no libc-specific package split is needed
+  # (unlike npm-native-prebuilds' napi addon, which genuinely does need one).
+  # ---------------------------------------------------------------------------
+  npm-cli-prebuilds:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform_key: darwin-x64
+            cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform_key: darwin-arm64
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform_key: linux-x64-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform_key: linux-arm64-musl
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform_key: win32-x64
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # See npm-native-prebuilds's identical step for why this explicit
+        # `rustup default` is needed on every job, not just known-affected
+        # ones (hit for real running v0.1.0's release build, 2026-07-14).
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install cross (musl targets)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: rustup target add ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: rustup target add "${{ matrix.target }}"
+      - name: cargo build --target ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: cargo build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
+      - name: cross build --target ${{ matrix.target }}
+        if: matrix.cross
+        run: cross build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
+      - name: Stage into node/keel-cli/npm/${{ matrix.platform_key }}
+        shell: bash
+        run: bash scripts/cli-prebuild.sh "${{ matrix.target }}"
+      - name: npm pack the platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" "./node/keel-cli/npm/${{ matrix.platform_key }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-cli-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+
   npm-pack-root:
     needs: preflight
     runs-on: ubuntu-latest
@@ -415,12 +496,13 @@ jobs:
           node-version: "22"
       - name: Full release-metadata check (npm tarball smoke + python wheel + keelrun-core sdist compile)
         run: bash scripts/check-release-metadata.sh --full
-      - name: npm pack keelrun (front end) + keelrun-core-native (source wrapper)
+      - name: npm pack keelrun (front end) + keelrun-core-native (source wrapper) + keelrun-cli (source wrapper)
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/npm-dist"
           npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel
           npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel-core-native
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel-cli
       - uses: actions/upload-artifact@v4
         with:
           name: npm-pack-root
@@ -597,9 +679,11 @@ jobs:
   # continue-on-error, since a clean local `cargo package` (checked by
   # scripts/check-release-metadata.sh) is the meaningful signal pre-publish.
   # Crate names here are the in-repo `[package] name`s (post-rename): only
-  # keel-core and keel-cli were actually renamed (to keelrun-core/keelrun-cli
-  # — their plain names are taken on crates.io); keel-core-api and
-  # keel-journal are free and stay as-is (docs/naming-decision.md).
+  # keel-core, keel-cli, and (fast-follow, 2026-07-14) the Rust front end
+  # `crates/keel` were actually renamed (to keelrun-core/keelrun-cli/keelrun
+  # — their plain names are taken on crates.io); keel-core-api, keel-journal,
+  # and keel-macros are free and stay as-is (docs/naming-decision.md).
+  # keel-macros must publish before keelrun (its path dependent).
   # ---------------------------------------------------------------------------
   cargo-publish-dry-run:
     needs: preflight
@@ -623,10 +707,10 @@ jobs:
         run: |
           rustup toolchain install
           rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-      - name: cargo publish --dry-run (keel-core-api, keel-journal, keelrun-core, keelrun-cli)
+      - name: cargo publish --dry-run (keel-core-api, keel-journal, keelrun-core, keelrun-cli, keel-macros, keelrun)
         run: |
           set -euo pipefail
-          for crate in keel-core-api keel-journal keelrun-core keelrun-cli; do
+          for crate in keel-core-api keel-journal keelrun-core keelrun-cli keel-macros keelrun; do
             echo "::group::cargo publish --dry-run -p $crate"
             cargo publish --dry-run --no-verify --locked -p "$crate"
             echo "::endgroup::"
@@ -645,6 +729,7 @@ jobs:
       - wheel-cli
       - cli-wheel-uvx-smoke
       - npm-native-prebuilds
+      - npm-cli-prebuilds
       - npm-pack-root
       - cli-binaries
       - homebrew-formula
@@ -877,6 +962,19 @@ jobs:
       - run: |
           set -euo pipefail
           for tgz in dist/keelrun-core-native-*.tgz; do
+            npm publish --access public "./$tgz"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # keelrun-cli platform packages + the root wrapper — same "one glob
+      # catches both the per-platform tarballs and the root wrapper" shape
+      # as keelrun-core-native above, since `keelrun-cli-<platform>-<ver>.tgz`
+      # and the root `keelrun-cli-<ver>.tgz` both match `keelrun-cli-*.tgz`
+      # (and the front-end `keelrun-<ver>.tgz` does NOT, since it lacks the
+      # literal "cli-" segment).
+      - run: |
+          set -euo pipefail
+          for tgz in dist/keelrun-cli-*.tgz; do
             npm publish --access public "./$tgz"
           done
         env:

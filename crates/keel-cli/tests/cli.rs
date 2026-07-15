@@ -226,6 +226,26 @@ fn init_agents_snippet_matches_golden() {
     check_golden("init_agents.md", &init::agents_block());
 }
 
+/// The packaged Claude Code Skill (`packaging/claude-skill/keel/SKILL.md`)
+/// documents the six `keel mcp` tools by name for a different audience than
+/// `AGENTS.md`'s snippet (an agent helping someone adopt/operate Keel from
+/// outside, vs. one already working inside a Keel-adopted repo) — so the
+/// prose is deliberately NOT shared, but the facts must not drift. This
+/// guards the one fact most likely to silently rot: the tool name list,
+/// cross-checked against `crate::mcp`'s own catalog rather than hardcoded
+/// twice.
+#[test]
+fn skill_tool_list_matches_mcp_catalog() {
+    const SKILL_MD: &str = include_str!("../../../packaging/claude-skill/keel/SKILL.md");
+    for name in keel_cli::mcp::TOOL_NAMES {
+        assert!(
+            SKILL_MD.contains(name),
+            "packaging/claude-skill/keel/SKILL.md does not mention MCP tool `{name}` \
+             (crate::mcp::TOOL_NAMES) — update the Skill's tool table"
+        );
+    }
+}
+
 // ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
 
 /// Two-target project for the `--diff` fixtures: `api.example.com` is already

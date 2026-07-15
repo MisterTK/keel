@@ -292,6 +292,45 @@ fn protocol_errors_answer_json_rpc_errors() {
     assert_eq!(unknown_method["error"]["code"], -32601);
 }
 
+/// `get_doctor_report` surfaces the pre-existing-resilience finding for a
+/// real project (not a synthetic `ScanResult`, unlike `doctor.rs`'s unit
+/// tests) and stays byte-identical to `keel doctor --json` for it — the
+/// concrete, persisted version of the manual verification this feature was
+/// checked with during development.
+#[test]
+fn get_doctor_report_surfaces_a_real_preexisting_resilience_finding() {
+    if Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("app.py"),
+        "import httpx\nfrom tenacity import retry\n\n@retry\ndef call():\n    return httpx.get(\"https://api.example.com\")\n",
+    )
+    .unwrap();
+
+    let script = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_doctor_report\",\"arguments\":{}}}\n";
+    let lines = run_session(dir.path(), script);
+    let text = tool_text(&lines, 1);
+
+    assert_eq!(text, json_string(&doctor::run(dir.path()).json));
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["topic"] == "preexisting-resilience")
+        .unwrap_or_else(|| panic!("no preexisting-resilience finding in {report}"));
+    assert!(finding["detail"].as_str().unwrap().contains("tenacity"));
+}
+
 /// The real binary (`keel mcp`, project = cwd) replays the same session with a
 /// byte-identical transcript: no wall-clock value reaches any response, so the
 /// in-process fixture clock and the binary's system clock cannot diverge.

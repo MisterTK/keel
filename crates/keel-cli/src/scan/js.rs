@@ -55,10 +55,10 @@ mod ast;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::{FunctionFacts, LangFindings, SKIP_DIRS};
+use super::{FunctionFacts, LangFindings, collect_files};
 
 /// Extensions the scan reads.
-const JS_EXTS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+pub(crate) const JS_EXTS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
 /// Extensions tried, in order, when resolving an extensionless relative
 /// import (`./x` → `x.ts`, …, then `x/index.ts`, …).
@@ -85,7 +85,7 @@ pub struct JsScan {
 /// Scan `project` for JS/TS effect seams.
 pub fn scan(project: &Path) -> JsScan {
     let mut files = Vec::new();
-    collect(project, &mut files);
+    collect_files(project, JS_EXTS, &mut files);
     files.sort();
 
     let rels: Vec<String> = files.iter().map(|p| relative(project, p)).collect();
@@ -156,30 +156,6 @@ fn normalize(dir: &str, spec: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
-}
-
-/// Recursively collect scannable files, skipping [`SKIP_DIRS`] and dotdirs.
-fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if path.is_dir() {
-            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
-                continue;
-            }
-            collect(&path, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| JS_EXTS.contains(&e))
-        {
-            out.push(path);
-        }
-    }
 }
 
 /// Project-relative path with `/` separators.

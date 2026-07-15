@@ -36,6 +36,10 @@ enum Command {
         /// byte-identically to having no Keel installed.
         #[arg(long)]
         disable: bool,
+        /// Skip the pre-exec advisory scan (pre-existing resilience-library
+        /// detection). Also skippable via `KEEL_SKIP_PREFLIGHT=1`.
+        #[arg(long)]
+        no_preflight: bool,
         /// The script (`.py`, `.mjs`/`.js`/`.ts`…), a `package.json`, or a
         /// project directory to run.
         target: String,
@@ -211,9 +215,14 @@ fn main() {
     let code = match cli.command {
         Command::Run {
             disable,
+            no_preflight,
             target,
             args,
         } => {
+            let skip_preflight = no_preflight || std::env::var_os("KEEL_SKIP_PREFLIGHT").is_some();
+            if !skip_preflight && let Some(banner) = doctor::preflight_advisory(&project) {
+                eprintln!("{banner}");
+            }
             let (rendered, code) = run::run(&target, &args, disable);
             if let Some(r) = rendered {
                 emit(&r, json);

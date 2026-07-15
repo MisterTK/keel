@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keel-core-stub"
-version = "0.1.0"
+version = "0.1.1"
 description = "In-memory fake keel-core for front-end development (Sprint 0 contract artifact)."
 requires-python = ">=3.10"
 

@@ -233,6 +233,26 @@ struct PolicyValidation {
     fix: Option<Proposal>,
 }
 
+/// A one-line advisory for `keel run`'s pre-exec preflight step (dx-spec's
+/// "before any calls fire" — a static scan of the whole source tree, run by
+/// the Rust CLI before the target process even starts, sees this more
+/// faithfully than hooking the Python/Node in-process bootstrap could: that
+/// bootstrap runs before the target script's own imports execute, so it
+/// could not actually see them yet). `None` when there's nothing to warn
+/// about — never runs `keel doctor`'s full report, just the one check that's
+/// cheap and relevant at this point.
+#[must_use]
+pub fn preflight_advisory(project: &Path) -> Option<String> {
+    let scan = scan::scan(project);
+    let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
+    let finding = resilience_finding(&scan, &registry_libs)?;
+    Some(format!(
+        "keel \u{25b8} {}\n  next: {} (run `keel doctor --json` for detail; skip this check with \
+         --no-preflight or KEEL_SKIP_PREFLIGHT=1)",
+        finding.detail, finding.action
+    ))
+}
+
 /// Run `keel doctor` for `project`.
 pub fn run(project: &Path) -> Rendered {
     let scan = scan::scan(project);
@@ -253,6 +273,46 @@ pub fn run(project: &Path) -> Rendered {
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
     Rendered::ok(human, to_json(&report)).with_exit(exit)
+}
+
+/// A pre-existing resilience library (e.g. `tenacity`, `backoff`) risks
+/// silently compounding with Keel's own retry/backoff/breaker — Keel patches
+/// at the transport layer, below this kind of user code, so it has no
+/// visibility into whether the library is actually configured to retry the
+/// same calls Keel wraps. Emitted only when the project ALSO uses at least
+/// one adapter library Keel wraps (`registry_libs`): a resilience library
+/// imported for something unrelated to any Keel-wrapped effect is not
+/// evidence of compounding, and flagging it anyway would be a false
+/// positive that erodes trust in doctor's other findings. Python-only as of
+/// this build (`scan::python`'s `RESILIENCE_LIBS`) — Node has no equivalent
+/// signal today (Keel doesn't even adapt `axios`, the library most
+/// associated with `axios-retry`), documented as accepted debt rather than
+/// silently absent.
+fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Option<Finding> {
+    let compounds_with = scan
+        .libs
+        .iter()
+        .any(|lib| registry_libs.contains(lib.as_str()));
+    if scan.resilience_libs.is_empty() || !compounds_with {
+        return None;
+    }
+    let libs: Vec<&str> = scan.resilience_libs.iter().map(String::as_str).collect();
+    Some(Finding {
+        action: "Delete the old retry/backoff code if Keel's policy now covers it, or scope \
+                 Keel's policy to skip this target (e.g. `attempts = 1`) if you want to keep \
+                 relying on it — don't leave both running unconfigured against each other."
+            .to_owned(),
+        detail: format!(
+            "This project imports {} alongside at least one library Keel wraps — Keel cannot \
+             see whether {} is actually configured to retry the same calls, so retries may be \
+             silently compounding.",
+            libs.join(", "),
+            if libs.len() == 1 { "it" } else { "they" }
+        ),
+        fix: None,
+        level: "warn",
+        topic: "preexisting-resilience",
+    })
 }
 
 /// An unsupported journal backend is an error finding: the app would fail to
@@ -362,6 +422,7 @@ fn build_report(
             topic: "policy",
         });
     }
+    findings.extend(resilience_finding(scan, &registry_libs));
     findings.extend(journal_finding(&journal));
 
     let ok = (policy.valid || !policy.present) && journal.supported;
@@ -618,6 +679,62 @@ mod tests {
         let openai = r.adapters.iter().find(|a| a.lib == "openai").unwrap();
         assert!(openai.detected);
         assert_eq!(openai.status, "pinned");
+    }
+
+    fn default_policy() -> PolicyValidation {
+        PolicyValidation {
+            check: PolicyCheck {
+                field: None,
+                message: None,
+                present: false,
+                valid: true,
+            },
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn resilience_lib_alongside_a_wrapped_effect_is_a_finding() {
+        let mut scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        scan.resilience_libs.insert("tenacity".to_owned());
+        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        let finding = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "preexisting-resilience")
+            .expect("tenacity + httpx should raise a finding");
+        assert_eq!(finding.level, "warn");
+        assert!(finding.detail.contains("tenacity"));
+    }
+
+    #[test]
+    fn resilience_lib_with_no_wrapped_effect_is_not_a_finding() {
+        // tenacity imported, but nothing Keel would ever wrap alongside it —
+        // no evidence of compounding, so no finding (avoids the false
+        // positive of flagging an unrelated/unused import).
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.resilience_libs.insert("tenacity".to_owned());
+        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        assert!(
+            !r.findings
+                .iter()
+                .any(|f| f.topic == "preexisting-resilience")
+        );
+    }
+
+    #[test]
+    fn no_resilience_libs_is_not_a_finding() {
+        let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        assert!(
+            !r.findings
+                .iter()
+                .any(|f| f.topic == "preexisting-resilience")
+        );
     }
 
     #[test]

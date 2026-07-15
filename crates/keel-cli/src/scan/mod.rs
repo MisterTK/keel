@@ -16,7 +16,7 @@ pub mod js;
 pub mod python;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What kind of target a sighting resolves to. Governs the policy block
 /// `keel init` writes (an `llm:*` target gets the LLM pack; a host gets the
@@ -133,6 +133,9 @@ pub struct ScanResult {
     /// Per-function attribution (see [`FunctionFacts`]), sorted by
     /// `(file, line)` — deterministic across runs.
     pub functions: Vec<FunctionFacts>,
+    /// Known resilience-library names detected (Python-only as of this
+    /// build — see [`LangFindings::resilience_libs`]).
+    pub resilience_libs: BTreeSet<String>,
 }
 
 impl ScanResult {
@@ -185,6 +188,12 @@ pub struct LangFindings {
     pub libs: BTreeSet<String>,
     /// Effect call sites with enclosing-function attribution.
     pub call_sites: Vec<CallSite>,
+    /// Known resilience-library names detected (e.g. `tenacity`, `backoff`)
+    /// — a `keel doctor` signal for pre-existing retry/backoff that might
+    /// now silently compound with Keel's own. Deliberately separate from
+    /// `libs`: these are libraries Keel never adapts, so merging them in
+    /// would misclassify them as an "invisible" coverage gap.
+    pub resilience_libs: BTreeSet<String>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -204,12 +213,20 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
     for lib in &f.libs {
         result.libs.insert(lib.clone());
     }
+    for lib in &f.resilience_libs {
+        result.resilience_libs.insert(lib.clone());
+    }
 }
 
-/// Directory names never descended into during a scan.
+/// Directory names never descended into during a filesystem walk — scans,
+/// `keel init`'s Python-file check, and `keel flows resume`'s module search
+/// all share this one list (previously three drifted copies; see the
+/// 2026-07-14 fast-follow that consolidated them).
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".keel",
     ".git",
+    ".hg",
+    ".svn",
     "__pycache__",
     "node_modules",
     ".venv",
@@ -220,6 +237,34 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "build",
     "target",
 ];
+
+/// Recursively collect files under `dir` whose extension is one of
+/// `extensions`, skipping [`SKIP_DIRS`] and dot-prefixed directories. The
+/// one walker for "find source files by extension" in this crate — shared
+/// by the JS/TS scanner ([`js`]), `keel init`'s Python-file check, and
+/// `keel run`'s directory-entry resolution.
+pub(crate) fn collect_files(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
+                continue;
+            }
+            collect_files(&path, extensions, out);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e))
+        {
+            out.push(path);
+        }
+    }
+}
 
 /// Extract the host from a `scheme://host[:port][/…]` literal, lowercased and
 /// without port/userinfo/path. Returns `None` for non-URL strings. Shared by

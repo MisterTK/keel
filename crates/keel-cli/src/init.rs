@@ -43,29 +43,12 @@ const AGENTS_BEGIN: &str = "<!-- keel:begin -->";
 const AGENTS_END: &str = "<!-- keel:end -->";
 
 /// The concise, agent-facing Keel section (dx-spec §5). Deterministic: no dates
-/// or versions, so an agent can diff it. Bytes are golden-tested.
-const AGENTS_SNIPPET: &str = "\
-## Keel (resilience & durable execution)
-
-This project uses **Keel** for production-grade resilience (retries, timeouts,
-circuit breakers, rate limits) and opt-in durable flows — applied at intercepted
-call boundaries with **zero code changes**. Policy lives in one file: `keel.toml`.
-
-Before changing any resilience behavior:
-- Run `keel doctor --json` to see what is wrapped, what is not, and why.
-- Propose policy edits as a diff: `keel init --diff` shows adds/removes from evidence.
-- Every command has a `--json` twin with deterministic, sorted output — diff it to detect change.
-
-Useful commands (all support `--json`):
-- `keel status` — coverage, retries saved, breaker events, resumable flows.
-- `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
-- `keel flows` / `keel trace <flow>` — durable (Tier 2) flow state and step ledger.
-- `keel mcp` — the same surfaces as MCP tools over stdio (get_status,
-  get_doctor_report, propose_policy, get_trace, list_flows, explain_error).
-
-Do not hand-write retry loops or backoff around calls Keel already wraps; edit
-`keel.toml` instead. Uninstalling Keel removes the behavior and nothing else —
-the code runs identically without it.";
+/// or versions, so an agent can diff it. Bytes are golden-tested. Lives in its
+/// own file (rather than an inline literal) so `packaging/claude-skill/keel/
+/// SKILL.md` and this snippet can both be checked against the same facts
+/// (tool names, `keel.toml`) without one silently drifting from the other —
+/// see `crates/keel-cli/tests/cli.rs`'s skill-consistency test.
+const AGENTS_SNIPPET: &str = include_str!("../templates/agents-snippet.md");
 
 /// The full fenced block written into `AGENTS.md` (begin marker, snippet, end
 /// marker, trailing newline). Public so the golden test can pin its bytes.
@@ -634,28 +617,9 @@ fn update_gitignore(project: &Path) -> std::io::Result<bool> {
 /// was not found" from "there was nothing to scan" in both `init` and `flows
 /// suggest`'s warnings.
 pub(crate) fn has_python_files(project: &Path) -> bool {
-    fn walk(dir: &Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if path.is_dir() {
-                if scan::SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
-                    continue;
-                }
-                if walk(&path) {
-                    return true;
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
-                return true;
-            }
-        }
-        false
-    }
-    walk(project)
+    let mut found = Vec::new();
+    scan::collect_files(project, &["py"], &mut found);
+    !found.is_empty()
 }
 
 /// A config/usage failure (exit 2), rendered for both audiences.

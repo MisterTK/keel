@@ -1,6 +1,6 @@
 {
   "name": "keelrun-core-native-darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt keel-core-native addon for macOS aarch64 (darwin-arm64). Optional dependency of keelrun-core-native — installed automatically on a matching platform, ignored otherwise. See scripts/napi-prebuild.sh.",
   "os": ["darwin"],
   "cpu": ["arm64"],

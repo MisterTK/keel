@@ -184,7 +184,17 @@ timestamps unless asked). Suggestions are emitted as applyable diffs. Run
 `keel doctor --json` before changing resilience behavior; `keel init --agents`
 seeds `AGENTS.md` so future sessions inherit this context.
 
-## Build from source (packaging not yet published)
+## Install
+
+```
+pip install keelrun keelrun-cli                # Python: library + CLI
+npm install keelrun keelrun-cli                # Node: library + CLI
+cargo add keelrun --rename keel                # Rust: library (#[keel::wrap])
+cargo install keelrun-cli                      # Rust: CLI (cargo has no single command for both)
+uvx --from keelrun-cli keel run app.py         # zero-install CLI, any language
+```
+
+Building from source (contributors):
 
 ```
 maturin develop -m crates/keel-py/Cargo.toml   # native keel_core into the venv (Python)
