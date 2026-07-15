@@ -1,0 +1,14 @@
+{
+  "name": "keelrun-cli-win32-x64",
+  "version": "0.1.1",
+  "description": "Prebuilt `keel` CLI binary for Windows x86_64 (win32-x64). Optional dependency of keelrun-cli — installed automatically on a matching platform, ignored otherwise. See scripts/cli-prebuild.sh.",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "keel.exe",
+  "files": ["keel.exe"],
+  "license": "Apache-2.0",
+  "private": false,
+  "engines": {
+    "node": ">=18"
+  }
+}

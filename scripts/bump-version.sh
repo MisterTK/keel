@@ -40,18 +40,51 @@ for path in ("python/keel/pyproject.toml", "python/keel-core-stub/pyproject.toml
     sub_once(path, r'^version = "[^"]+"$', f'version = "{new}"')
 sub_once(
     "python/keel/pyproject.toml",
-    r'"keel-core==[^"]+"',
-    f'"keel-core=={new}"',
+    r'"keelrun-core==[^"]+"',
+    f'"keelrun-core=={new}"',
 )
 # Regex, not json round-trip: keeps each package.json's formatting untouched.
+# (node/keel-core-native and node/keel-cli are handled separately below,
+# together with their optionalDependencies pins, in one pass each.)
 for path in (
     "node/keel/package.json",
     "node/keel-core-stub/package.json",
-    "node/keel-core-native/package.json",
 ):
     sub_once(path, r'^  "version": "[^"]+",$', f'  "version": "{new}",')
+# node/keel-core-native's own version PLUS its optionalDependencies pins (4
+# platform packages) — a real bug found the first time this script ran twice
+# (2026-07-14/15): a version-field-only bump left these 4 pins stale at the
+# old version, which would resolve the wrong (or, once unpublished versions
+# age out, no) platform package on install.
+napi_pkg = Path("node/keel-core-native/package.json")
+napi_text = napi_pkg.read_text()
+napi_n = napi_text.count(f'"{old}"')
+if napi_n != 5:
+    raise SystemExit(
+        f"bump-version: expected 5 occurrences of \"{old}\" in {napi_pkg} "
+        f"(own version + 4 optionalDependencies pins), found {napi_n}"
+    )
+napi_pkg.write_text(napi_text.replace(f'"{old}"', f'"{new}"'))
+print(f"  {napi_pkg}: {old} -> {new} (5 occurrences, incl. optionalDependencies)")
 # Per-platform napi prebuild packages (node/keel-core-native/npm/*/package.json).
 for path in sorted(str(p) for p in Path("node/keel-core-native/npm").glob("*/package.json")):
+    sub_once(path, r'^  "version": "[^"]+",$', f'  "version": "{new}",')
+# node/keel-cli's own version PLUS its 5 optionalDependencies pins (all six
+# occurrences of the old version string in this one file are version refs —
+# a plain literal replace, not a regex, since the description prose never
+# contains a version number).
+cli_pkg = Path("node/keel-cli/package.json")
+cli_text = cli_pkg.read_text()
+cli_n = cli_text.count(f'"{old}"')
+if cli_n != 6:
+    raise SystemExit(
+        f"bump-version: expected 6 occurrences of \"{old}\" in {cli_pkg} "
+        f"(own version + 5 optionalDependencies pins), found {cli_n}"
+    )
+cli_pkg.write_text(cli_text.replace(f'"{old}"', f'"{new}"'))
+print(f"  {cli_pkg}: {old} -> {new} (6 occurrences)")
+# Per-platform keelrun-cli npm packages (node/keel-cli/npm/*/package.json).
+for path in sorted(str(p) for p in Path("node/keel-cli/npm").glob("*/package.json")):
     sub_once(path, r'^  "version": "[^"]+",$', f'  "version": "{new}",')
 sub_once(
     "python/keel/src/keel/__init__.py",

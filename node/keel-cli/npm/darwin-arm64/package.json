@@ -1,0 +1,14 @@
+{
+  "name": "keelrun-cli-darwin-arm64",
+  "version": "0.1.1",
+  "description": "Prebuilt `keel` CLI binary for macOS aarch64 (darwin-arm64). Optional dependency of keelrun-cli — installed automatically on a matching platform, ignored otherwise. See scripts/cli-prebuild.sh.",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "main": "keel",
+  "files": ["keel"],
+  "license": "Apache-2.0",
+  "private": false,
+  "engines": {
+    "node": ">=18"
+  }
+}

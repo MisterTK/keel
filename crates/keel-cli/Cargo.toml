@@ -1,5 +1,5 @@
 [package]
-name = "keel-cli"
+name = "keelrun-cli"
 description = "The `keel` binary: run | init | doctor | status | explain. The product's face — every command has a byte-deterministic `--json` twin and stable exit codes (dx-spec §1–2, §5–6)."
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 readme.workspace = true
-# Publishable (`cargo install keel-cli` → the `keel` binary). The contract
+# Publishable (`cargo install keelrun-cli` → the `keel` binary; the plain
+# `keel-cli` name is taken on crates.io by an unrelated project). The contract
 # files the binary embeds are vendored into contract/ (drift-checked by
 # build.rs); tests/ is excluded from the package because the integration
 # tests embed repo-level conformance fixtures.
@@ -59,7 +60,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # The `keel tail` parity leg (tests/tail.rs): the real engine writes an event
 # feed through its sink and the CLI must render it byte-exactly, so the tail
 # renderer can never drift from the engine's event vocabulary unnoticed.
-keel-core = { path = "../keel-core" }
+keel-core = { package = "keelrun-core", path = "../keel-core" }
 tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
 
 [lints]

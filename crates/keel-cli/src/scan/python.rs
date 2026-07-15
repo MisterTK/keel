@@ -31,6 +31,11 @@ HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
 LLM_LIBS = {"openai", "anthropic"}
 OTHER_LIBS = {"psycopg", "boto3"}
 KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS
+# Known Python resilience libraries — a `keel doctor` signal that a target may
+# already have its own retry/backoff, separate from KNOWN (which is about
+# libraries Keel *adapts*; these are libraries Keel never adapts, so mixing
+# them into KNOWN would misclassify them as an "invisible" coverage gap).
+RESILIENCE_LIBS = {"tenacity", "backoff", "retrying", "stamina"}
 TIME_LIBS = {"time", "datetime"}
 RANDOM_LIBS = {"random", "uuid", "secrets"}
 UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
@@ -172,6 +177,7 @@ root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
 functions = []
+resilience_libs = set()
 files = 0
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = sorted(d for d in dirnames if d not in SKIP and not d.startswith("."))
@@ -192,10 +198,14 @@ for dirpath, dirnames, filenames in os.walk(root):
                     t = top(alias.name)
                     if t in KNOWN:
                         imports.append({"lib": t, "file": rel, "line": node.lineno})
+                    elif t in RESILIENCE_LIBS:
+                        resilience_libs.add(t)
             elif isinstance(node, ast.ImportFrom):
                 t = top(node.module or "")
                 if t in KNOWN:
                     imports.append({"lib": t, "file": rel, "line": node.lineno})
+                elif t in RESILIENCE_LIBS:
+                    resilience_libs.add(t)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 h = host(node.value)
                 if h:
@@ -210,7 +220,8 @@ for dirpath, dirnames, filenames in os.walk(root):
                 functions.append(fn_facts(node, rel, mod, aliases, consts))
 
 print(json.dumps({"files_scanned": files, "functions": functions,
-                  "imports": imports, "urls": urls}, sort_keys=True))
+                  "imports": imports, "resilience_libs": sorted(resilience_libs),
+                  "urls": urls}, sort_keys=True))
 "#;
 
 /// One import finding from the walker.
@@ -251,6 +262,8 @@ struct WalkerOutput {
     #[serde(default)]
     functions: Vec<PyFunction>,
     imports: Vec<Import>,
+    #[serde(default)]
+    resilience_libs: Vec<String>,
     urls: Vec<Url>,
 }
 
@@ -295,6 +308,9 @@ pub fn scan(project: &Path) -> PyScan {
     // without one of the HTTP libraries imported.
     if !output.urls.is_empty() {
         findings.http_in_use = true;
+    }
+    for lib in &output.resilience_libs {
+        findings.resilience_libs.insert(lib.clone());
     }
     for url in &output.urls {
         // The walker already returned a bare hostname (urlsplit.hostname), so it
@@ -391,6 +407,33 @@ mod tests {
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
         );
+    }
+
+    #[test]
+    fn resilience_lib_imports_are_detected_separately_from_known_libs() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nfrom tenacity import retry\nimport backoff\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(
+            scan.findings.resilience_libs,
+            ["backoff".to_owned(), "tenacity".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        // Resilience libs never pollute `libs` (which feeds doctor's
+        // "invisible/unadapted effect library" coverage classification —
+        // tenacity/backoff were never adapter candidates).
+        assert!(!scan.findings.libs.contains("tenacity"));
+        assert!(!scan.findings.libs.contains("backoff"));
+        assert!(scan.findings.libs.contains("httpx"));
     }
 
     #[test]

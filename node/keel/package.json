@@ -1,6 +1,6 @@
 {
-  "name": "keel",
-  "version": "0.1.0",
+  "name": "keelrun",
+  "version": "0.1.1",
   "description": "The SQLite of durable execution — production-grade resilience for Node with zero code changes.",
   "type": "module",
   "main": "index.mjs",
@@ -24,7 +24,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "keel-node-run": "./bin/keel-node-run.mjs"
+    "keelrun-node-run": "./bin/keel-node-run.mjs"
   },
   "engines": {
     "node": ">=22.5.0"
@@ -44,6 +44,6 @@
   "scripts": {
     "test": "node --test"
   },
-  "keywords": ["keel", "resilience", "retry", "circuit-breaker", "durable", "fetch"],
+  "keywords": ["keel", "keelrun", "resilience", "retry", "circuit-breaker", "durable", "fetch"],
   "license": "Apache-2.0"
 }

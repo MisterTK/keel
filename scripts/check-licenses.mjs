@@ -7,10 +7,12 @@
 // allowlist below is asserted, not looked up):
 //
 //   1. Every package.json below has no "dependencies" field, or an empty one.
-//      node/keel (the front end), node/keel-core-stub, and node/keel-core-native
-//      must stay dependency-free — a runtime dependency there breaks the
-//      zero-code-changes cost model and must be a deliberate, reviewed
-//      decision, not a stray `npm install --save`.
+//      node/keel (the front end), node/keel-core-stub, node/keel-core-native,
+//      and node/keel-cli must stay dependency-free — a runtime dependency
+//      there breaks the zero-code-changes cost model and must be a
+//      deliberate, reviewed decision, not a stray `npm install --save`.
+//      (node/keel-cli's optionalDependencies are its own sibling platform
+//      packages, not third-party — a separate mechanism, not checked here.)
 //   2. Any "devDependencies" entry is checked against LICENSE_ALLOWLIST below.
 //      None exist today (the adapter farm installs the real `ai` /
 //      `@modelcontextprotocol/sdk` packages ad hoc into a throwaway
@@ -32,6 +34,7 @@ const ZERO_DEP_MANIFESTS = [
   "node/keel/package.json",
   "node/keel-core-stub/package.json",
   "node/keel-core-native/package.json",
+  "node/keel-cli/package.json",
 ];
 
 // devDependency name -> [license, reason]. Update when a devDependency is

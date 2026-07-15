@@ -239,6 +239,18 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
+/// The six tool names, alphabetical — the single source [`tool_catalog`] and
+/// anything cross-checking against it (the packaged Claude Code Skill's
+/// consistency test, `crates/keel-cli/tests/cli.rs`) both read.
+pub const TOOL_NAMES: [&str; 6] = [
+    "explain_error",
+    "get_doctor_report",
+    "get_status",
+    "get_trace",
+    "list_flows",
+    "propose_policy",
+];
+
 /// The fixed tool catalog, alphabetical by name. Schemas are deterministic
 /// values (sorted keys on serialization), so `tools/list` is byte-stable.
 fn tool_catalog() -> Value {

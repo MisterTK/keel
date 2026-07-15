@@ -1,5 +1,5 @@
 /**
- * Preload entry: `node --import keel/hook app.mjs`.
+ * Preload entry: `node --import keelrun/hook app.mjs`.
  *
  * Runs on the main thread before the entrypoint. Top-level await ensures the
  * backend is configured and the fetch seam + ESM loader are installed before

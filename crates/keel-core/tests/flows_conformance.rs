@@ -30,12 +30,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use keel_conformance::{scenarios_dir, subset_mismatches};
-use keel_core::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, KeelError, Request};
 use keel_journal::{
     Clock, FlowId, Journal, ManualClock, ProcessId, SqliteJournal, StepKey, StepKind, StepOutcome,
     StepStatus,
 };
+use keelrun_core::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
 use serde::Deserialize;
 use serde_json::Value;
 use tempfile::TempDir;

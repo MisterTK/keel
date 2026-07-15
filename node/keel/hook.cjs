@@ -1,6 +1,6 @@
 "use strict";
 /**
- * CJS preload shim: `node --require keel/hook app.cjs`.
+ * CJS preload shim: `node --require keelrun/hook app.cjs`.
  *
  * `--require` runs synchronously and cannot await, so this only kicks off the
  * async ESM bootstrap. Interception is armed as soon as the dynamic import

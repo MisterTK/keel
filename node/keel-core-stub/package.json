@@ -1,6 +1,6 @@
 {
-  "name": "@keel/core-stub",
-  "version": "0.1.0",
+  "name": "keelrun-core-stub",
+  "version": "0.1.1",
   "description": "In-memory fake keel-core for front-end development (Sprint 0 contract artifact).",
   "type": "module",
   "main": "index.mjs",

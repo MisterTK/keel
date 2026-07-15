@@ -140,22 +140,10 @@ fn parse_entrypoint(entrypoint: &str) -> Option<(&str, &str, &str)> {
     Some((parts.next()?, parts.next()?, parts.next()?))
 }
 
-/// Directories a project-tree walk never descends into: version control,
-/// dependency trees, caches, and Keel's own state.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".keel",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "node_modules",
-    ".hg",
-    ".svn",
-];
-
-/// Every file under `dir` (skipping [`SKIP_DIRS`], never following symlinks —
-/// `DirEntry::file_type` reports the symlink itself, not its target) whose
-/// file name is exactly `name`. Sorted for deterministic ambiguity reports.
+/// Every file under `dir` (skipping [`crate::scan::SKIP_DIRS`], never
+/// following symlinks — `DirEntry::file_type` reports the symlink itself,
+/// not its target) whose file name is exactly `name`. Sorted for
+/// deterministic ambiguity reports.
 fn find_files_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -168,7 +156,7 @@ fn find_files_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
             let skip = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| SKIP_DIRS.contains(&n));
+                .is_some_and(|n| crate::scan::SKIP_DIRS.contains(&n));
             if !skip {
                 find_files_named(&entry.path(), name, out);
             }

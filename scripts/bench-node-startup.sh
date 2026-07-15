@@ -2,7 +2,7 @@
 # Run the Node front end's startup-budget measurement and emit a deterministic
 # CI artifact: target/bench-node-startup.json (sorted keys; timing VALUES are
 # real measurements, not fixed, but the shape/keys never vary). DX invariant 8
-# (Node half): `node --import keel/hook` adds <100ms to process startup at
+# (Node half): `node --import keelrun/hook` adds <100ms to process startup at
 # p50 — this is the repeatable-script counterpart to
 # node/keel/test/startup-budget.test.mjs's CI assert, mirroring
 # scripts/bench-overhead.sh's own "measure, then emit" shape.

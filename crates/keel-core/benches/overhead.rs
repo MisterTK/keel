@@ -2,7 +2,7 @@
 //! ≤10µs). Measures `Engine::execute` on the deployed current-thread
 //! `block_on` path across four cases (baseline / empty / cache-miss / cache-hit;
 //! see [`support`]). The ≤10µs claim lives here, in the release-optimized `bench`
-//! profile — `cargo bench -p keel-core --bench overhead`. The debug tripwire
+//! profile — `cargo bench -p keelrun-core --bench overhead`. The debug tripwire
 //! that guards CI against pathological regressions is `tests/overhead_guard.rs`.
 //!
 //! `main` has two modes. By default it runs the full criterion statistical

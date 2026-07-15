@@ -9,11 +9,22 @@ cache — all declared in one `keel.toml`, enforced by the native Rust core
 inside your process. No daemon, no port, no login.
 
 ```
-$ cd python/keel && pip install -e . && keel-py-run app.py
+$ pip install keelrun
+$ keelrun-py-run app.py
 keel ▸ wrapped 14 call sites (httpx ×9, openai ×4) with production defaults — `keel init` to customize
 ```
 
-(Not yet published to any registry; run from source — see `docs/naming-decision.md` for registry status.)
+`pip install keelrun` pulls in the prebuilt native core wheel automatically
+(pinned via the `keelrun-core` dependency) — no toolchain, no compile. The
+`keel` CLI (`run`/`doctor`/`init`/`status`/`mcp`/…) is a separate package:
+`pip install keelrun-cli`, `cargo install keelrun-cli`, `npm install -g
+keelrun-cli`, or zero-install via `uvx --from keelrun-cli keel run app.py`.
+
+Developing Keel itself, from a source checkout:
+
+```
+$ cd python/keel && pip install -e '.[dev]' && keelrun-py-run app.py
+```
 
 Uninstalling Keel removes the behavior and nothing else: your code runs
 identically (minus resilience). No imports, no context objects, no base classes.
@@ -23,8 +34,10 @@ identically (minus resilience). No imports, no context objects, no base classes.
 Keel resolves a backend at startup (`KEEL_BACKEND=auto|native|stub`):
 
 - **native** (`keel_core`) — the PyO3 module bundling the Rust core. Required
-  for the persistent dev cache and for Tier 2 durable flows. Built from
-  `crates/keel-py` (`maturin develop`); prebuilt wheels are not published yet.
+  for the persistent dev cache and for Tier 2 durable flows. A regular `pip
+  install keelrun` gets the prebuilt wheel automatically; use `maturin
+  develop` (from `crates/keel-py`) only when developing the Rust core itself
+  from a source checkout.
 - **stub** — a pure-Python core (the conformance reference). Tier 1 semantics
   only; no journal, so no persistent cache and no flows.
 

@@ -17,8 +17,7 @@ import { join } from "node:path";
 import { AsyncEngine, realClock, KeelError } from "./engine.mjs";
 
 const NATIVE_CANDIDATES = [
-  "@keel/core-native", // the addon's actual package name (node/keel-core-native)
-  "keel-core-native", // legacy unscoped probe, kept for locally-linked builds
+  "keelrun-core-native", // the addon's actual package name (node/keel-core-native)
   "../../keel-core-native/index.mjs", // in-repo sibling of node/keel (worktree), when built
 ];
 

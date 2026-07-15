@@ -9,9 +9,9 @@ allowlist below is asserted, not looked up):
 
   1. Every front end's `[project].dependencies` in pyproject.toml is `[]`,
      with ONE documented exception: `python/keel` depends on its own
-     first-party sibling wheel `keel-core` (the native core; same repo, same
-     release, version-locked) so `pip install keel` actually resolves the
-     compiled module per dx-spec §6's install-surface promise — see the
+     first-party sibling wheel `keelrun-core` (the native core; same repo,
+     same release, version-locked) so `pip install keelrun` actually
+     resolves the compiled module per dx-spec §6's install-surface promise — see the
      comment above `dependencies = [...]` in that pyproject.toml. This is
      not a third-party dependency in the sense rule 12 guards against (an
      arbitrary library sneaking into the zero-code-changes cost model); it
@@ -49,7 +49,7 @@ ZERO_DEP_MANIFESTS = (
 # manifest path -> allowed bare distribution names (version-pin agnostic, so
 # a version bump via scripts/bump-version.sh never needs a matching edit here).
 FIRST_PARTY_EXEMPT: dict[str, set[str]] = {
-    "python/keel/pyproject.toml": {"keel-core"},
+    "python/keel/pyproject.toml": {"keelrun-core"},
 }
 
 # Package (PEP 508 name, lowercased) -> (license SPDX-ish id, why it's here).

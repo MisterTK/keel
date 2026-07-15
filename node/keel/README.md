@@ -13,13 +13,19 @@ the same core semantics (see `../keel-core-stub`, `../../conformance`).
 ## Use it
 
 ```bash
+npm install keelrun
 # ESM
-node --import keel/hook app.mjs
+node --import keelrun/hook app.mjs
 # CJS (best-effort preload; prefer --import when you can)
-node --require keel/hook app.cjs
+node --require keelrun/hook app.cjs
 # or via the bin the `keel run` CLI dispatches to:
-keel-node-run app.mjs
+npx keelrun-node-run app.mjs
 ```
+
+The `keel` CLI (`run`/`doctor`/`init`/`status`/`mcp`/…) is a separate
+package: `npm install -g keelrun-cli`, `cargo install keelrun-cli`, `pip
+install keelrun-cli`, or zero-install via `uvx --from keelrun-cli keel run
+app.mjs`.
 
 On startup Keel prints one line to **stderr** (never stdout) and is otherwise
 silent on success:

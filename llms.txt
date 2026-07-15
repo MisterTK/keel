@@ -10,13 +10,16 @@ Keel intercepts a program's outbound calls (httpx/requests/fetch, LLM SDKs,
 it is `keel run app.py` / `keel run app.mjs` — no imports, no context objects, no
 base classes. Uninstalling the package removes the behavior and nothing else.
 
-Status (2026-07-13): Tier 1 and Tier 2 (including async flows) work end-to-end
+Status (2026-07-15): Tier 1 and Tier 2 (including async flows) work end-to-end
 in both Python and Node on the real Rust core, with `kill -9` resume, a
 Postgres journal backend for fleet durability, `keel record`/`keel sim`, and a
 scoped Rust front end (`#[keel::wrap]` + reqwest-middleware). Wrapped-call
-overhead ~0.8 µs vs a 10 µs budget. Wheels/npm/crates are not published yet —
-build from source; see `docs/naming-decision.md` for the registry-name
-collisions blocking that.
+overhead ~0.8 µs vs a 10 µs budget. Published: `pip install keelrun
+keelrun-cli`, `npm install keelrun keelrun-cli`, `cargo add keelrun --rename
+keel` + `cargo install keelrun-cli`, or zero-install via `uvx --from
+keelrun-cli keel run app.py`. A Claude Code Skill
+(`packaging/claude-skill/keel/`) and `keel doctor`'s pre-existing-resilience
+detection (tenacity/backoff, Python-first) also ship as of this release.
 
 ## Start here
 

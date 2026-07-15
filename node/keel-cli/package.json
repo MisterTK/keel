@@ -1,0 +1,24 @@
+{
+  "name": "keelrun-cli",
+  "version": "0.1.1",
+  "license": "Apache-2.0",
+  "description": "The `keel` CLI binary (run/doctor/init/status/mcp/explain/...) via npm. Downloads nothing at install time — the matching platform package is an optionalDependency, resolved the same way keel-core-native's napi addon is. Source-only in a dev checkout; binaries are staged by scripts/cli-prebuild.sh and packed per platform by the release workflow.",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "keel": "./bin/keel.mjs"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "keelrun-cli-darwin-x64": "0.1.1",
+    "keelrun-cli-darwin-arm64": "0.1.1",
+    "keelrun-cli-linux-x64-musl": "0.1.1",
+    "keelrun-cli-linux-arm64-musl": "0.1.1",
+    "keelrun-cli-win32-x64": "0.1.1"
+  }
+}

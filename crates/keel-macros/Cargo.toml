@@ -6,8 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-# Not meant to be depended on directly — re-exported by `keel` as `keel::wrap`.
-publish = false
+readme.workspace = true
+# Not meant to be depended on directly — re-exported by `keelrun` (imported
+# as `keel`) as `keel::wrap`. Publishable; must be published before
+# `keelrun` (its path dependent) — see scripts/check-release-metadata.sh.
 
 [lib]
 proc-macro = true

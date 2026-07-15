@@ -1,18 +1,19 @@
-# Release pipeline — BUILD INFRA ONLY, no publishing.
+# Release pipeline — build always; publish only when explicitly asked.
 #
 # Produces every artifact docs/sprint-plan.md's release-candidate line
 # promises (wheels macOS/Linux x86-64/aarch64, npm package, CLI binaries,
 # brew formula draft) plus the CLI/Windows/musl legs architecture-spec's NFR5
-# adds, attaches them all to a DRAFT GitHub Release, and stops. Every
-# `cargo publish`/`twine upload`/`npm publish` step is either `--dry-run` or
-# fully commented out behind a manual `workflow_dispatch` input — see the
-# `publish` job at the bottom. Nothing in this file talks to a real package
-# registry.
+# adds, attaches them all to a DRAFT GitHub Release, and stops there — on a
+# plain `vX.Y.Z` tag push, nothing in this file talks to a real registry.
 #
-# Why: docs/naming-decision.md is not resolved yet (PyPI `keel`/npm `keel`/
-# crates.io `keel`+`keel-core` are all taken by someone else). Wave 0 fixed
-# every manifest's name as-is until that decision lands; this workflow builds
-# artifacts under those names without publishing them anywhere.
+# Real publishing is a SEPARATE, explicit act: dispatch this workflow against
+# the release tag with `publish: true` and the `publish-pypi-keelrun-core`/
+# `publish-pypi-keelrun-cli`/`publish-pypi-keelrun`/`publish-npm` jobs run for
+# real — PyPI via Trusted Publishing (OIDC, one environment per project, see
+# those jobs' own comment for why), npm via the stored `NPM_TOKEN` secret.
+# crates.io is excluded from this workflow entirely and stays a manual local
+# `cargo publish` (see `cargo-publish-dry-run`'s comment for why) — nothing
+# here ever touches crates.io.
 #
 # Triggers on `vX.Y.Z` tags (the version MUST already match every manifest —
 # scripts/check-versions.py --tag is the gate) and on workflow_dispatch for
@@ -26,7 +27,7 @@
 #   PATH="$HOME/.rustup/toolchains/1.97.0-aarch64-apple-darwin/bin:$PATH" \
 #     maturin build --release -m crates/keel-py/Cargo.toml -o dist   # native wheel
 #   maturin build --release -m crates/keel-cli/Cargo.toml -o dist    # CLI wheel
-#   uvx --from ./dist/keel_cli-*.whl keel --help                    # uvx entrypoint
+#   uvx --from ./dist/keelrun_cli-*.whl keel --help                 # uvx entrypoint
 #   (cd node/keel && npm pack) && ...                                # npm tarball
 #   ruby -c packaging/homebrew/keel.rb                                # brew draft
 name: release
@@ -38,9 +39,13 @@ on:
     inputs:
       publish:
         description: >-
-          Run the (fully commented-out) real publish steps. Left true here
-          does NOTHING today — see the `publish` job; this exists so the gate
-          is visible in the UI before any registry credentials ever land.
+          Actually publish to PyPI (OIDC Trusted Publishing, publish-pypi-*
+          jobs) and npm (stored NPM_TOKEN, publish-npm job) — real, working
+          steps, not a placeholder. Must be dispatched explicitly against a
+          release tag; a plain tag push only builds artifacts and drafts a
+          GitHub release. crates.io is not gated by this input at all — it
+          is published manually (`cargo publish`), deliberately, since
+          CARGO_REGISTRY_TOKEN is a local-only credential, never a CI secret.
         type: boolean
         default: false
 
@@ -75,7 +80,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # directory (rust-toolchain.toml). That's not enough for any cargo
+        # invocation that happens outside the checked-out repo tree — e.g.
+        # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
+        # maturin sdist, which pip extracts and builds from /tmp/pip-req-build-*,
+        # a directory with no rust-toolchain.toml of its own. Without an
+        # explicit `rustup default`, that build fell back to whatever
+        # rustup's machine-wide default was (1.96.1 on this runner image) and
+        # failed keel-core-api/keel-journal/keelrun-core's `rust-version =
+        # "1.97"` gate — hit for real running v0.1.0's release build
+        # (2026-07-14). Setting the default explicitly closes that gap
+        # everywhere, not just for known-affected jobs.
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
       - name: Assert tag matches every version declaration
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -102,6 +121,12 @@ jobs:
   # (Xcode's linker/SDK support this without a separate toolchain; Rosetta 2,
   # preinstalled on these runners, is only needed to *run* the result, which
   # is why its import smoke below is skipped rather than Rosetta-wrapped).
+  #
+  # Windows: `windows-latest` builds x86_64-pc-windows-msvc natively (no
+  # cross-compilation, no manylinux concept) — same target `cli-binaries`
+  # already uses for the CLI archive. Added 2026-07-14: Windows is now a
+  # supported wheel platform, not just a raw CLI binary (local memory:
+  # keel-windows-support-added).
   # ---------------------------------------------------------------------------
   wheels-core:
     needs: preflight
@@ -123,6 +148,9 @@ jobs:
             target: aarch64
             manylinux: "2_28"
             smoke: false # cross-compiled under QEMU; not worth the emulated python cost here
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            smoke: true # native to the runner
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -138,13 +166,21 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m crates/keel-py/Cargo.toml
       - name: Install + import smoke (native-arch legs only)
-        if: matrix.smoke
+        if: matrix.smoke && matrix.os != 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           python3 -m venv .venv-smoke
-          .venv-smoke/bin/pip install --quiet --disable-pip-version-check dist/keel_core-*.whl
+          .venv-smoke/bin/pip install --quiet --disable-pip-version-check dist/keelrun_core-*.whl
           .venv-smoke/bin/python -c 'import keel_core; c = keel_core.KeelCore(); c.configure({}); print("keel_core import OK:", c.report())'
+      - name: Install + import smoke (Windows)
+        if: matrix.smoke && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python3 -m venv .venv-smoke
+          $wheel = Get-ChildItem dist\keelrun_core-*.whl | Select-Object -First 1
+          .venv-smoke\Scripts\pip.exe install --quiet --disable-pip-version-check $wheel.FullName
+          .venv-smoke\Scripts\python.exe -c "import keel_core; c = keel_core.KeelCore(); c.configure({}); print('keel_core import OK:', c.report())"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-core-${{ matrix.os }}-${{ matrix.target }}
@@ -188,13 +224,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 1c. The `keel` CLI as a pip-installable wheel (maturin `bin` bindings —
-  # crates/keel-cli/pyproject.toml) so `uvx keel-cli run ...` — and, once
-  # docs/naming-decision.md resolves the PyPI name, `uvx keel run ...` —
-  # "just works" from a wheel with no Rust toolchain. Same platform matrix as
-  # the core wheels (macOS x2, manylinux x2); Windows/musl CLI binaries are
-  # produced separately by `cli-binaries` below (raw binaries, not wheels —
-  # pip/uvx are out of scope for those per docs/dx-spec.md §6's install
-  # surface, which only promises pip/npm on macOS/Linux).
+  # crates/keel-cli/pyproject.toml, published as `keelrun-cli`) so
+  # `uvx --from keelrun-cli keel run ...` "just works" from a wheel with no
+  # Rust toolchain. Same platform matrix as the core wheels (macOS x2,
+  # manylinux x2, Windows — added 2026-07-14, see wheels-core's comment);
+  # `musl` CLI binaries are still produced separately by `cli-binaries` below
+  # (raw static binaries for that libc variant, not wheels — pip/uvx have no
+  # musl-specific concept, so those stay archive-only).
   # ---------------------------------------------------------------------------
   wheel-cli:
     needs: preflight
@@ -215,6 +251,8 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: "2_28"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -236,9 +274,10 @@ jobs:
           if-no-files-found: error
 
   # The literal docs/sprint-plan.md release-gate spelling (`uvx keel run`)
-  # needs the PyPI name `keel`, which is blocked on docs/naming-decision.md;
-  # this proves the mechanism works via `uvx --from`, which is what changes
-  # once that name lands (no other code changes required).
+  # needs the PyPI name `keel` itself — i.e. the `keelrun` front-end wheel
+  # (wheel-frontend above), not this CLI wheel. This job proves the `uvx
+  # --from` mechanism works against the actual published CLI wheel name,
+  # `keelrun-cli`.
   cli-wheel-uvx-smoke:
     needs: wheel-cli
     runs-on: ubuntu-latest
@@ -249,22 +288,23 @@ jobs:
         with:
           name: wheel-cli-ubuntu-latest-x86_64
           path: dist
-      - name: uvx --from ./dist/keel_cli-*.whl keel ...
+      - name: uvx --from ./dist/keelrun_cli-*.whl keel ...
         run: |
           set -euo pipefail
-          uvx --from ./dist/keel_cli-*.whl keel --help
-          uvx --from ./dist/keel_cli-*.whl keel --version
-          out="$(uvx --from ./dist/keel_cli-*.whl keel explain KEEL-E011 --json)"
+          uvx --from ./dist/keelrun_cli-*.whl keel --help
+          uvx --from ./dist/keelrun_cli-*.whl keel --version
+          out="$(uvx --from ./dist/keelrun_cli-*.whl keel explain KEEL-E011 --json)"
           echo "$out"
           echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"] == "KEEL-E011", d'
 
   # ---------------------------------------------------------------------------
-  # 2. napi native-addon prebuilds for `keel-core-native`, staged into the
-  # per-platform npm layout (node/keel-core-native/npm/<platform>/ —
-  # package.json's `napi` config + optionalDependencies; see
-  # scripts/napi-prebuild.sh for why this doesn't shell out to @napi-rs/cli).
-  # Then `npm pack` of the front-end `keel` package for the tarball-install
-  # smoke test (docs/dx-spec.md §6: "no toolchain, no compile, ever").
+  # 2. napi native-addon prebuilds for `keel-core-native` (published as
+  # `keelrun-core-native`, unscoped), staged into the per-platform npm layout
+  # (node/keel-core-native/npm/<platform>/ — package.json's `napi` config +
+  # optionalDependencies; see scripts/napi-prebuild.sh for why this doesn't
+  # shell out to @napi-rs/cli). Then `npm pack` of the front-end package
+  # (published as `keelrun`) for the tarball-install smoke test
+  # (docs/dx-spec.md §6: "no toolchain, no compile, ever").
   # ---------------------------------------------------------------------------
   npm-native-prebuilds:
     needs: preflight
@@ -294,7 +334,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # directory (rust-toolchain.toml). That's not enough for any cargo
+        # invocation that happens outside the checked-out repo tree — e.g.
+        # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
+        # maturin sdist, which pip extracts and builds from /tmp/pip-req-build-*,
+        # a directory with no rust-toolchain.toml of its own. Without an
+        # explicit `rustup default`, that build fell back to whatever
+        # rustup's machine-wide default was (1.96.1 on this runner image) and
+        # failed keel-core-api/keel-journal/keelrun-core's `rust-version =
+        # "1.97"` gate — hit for real running v0.1.0's release build
+        # (2026-07-14). Setting the default explicitly closes that gap
+        # everywhere, not just for known-affected jobs.
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -318,15 +372,98 @@ jobs:
         if: matrix.native
         run: |
           set -euo pipefail
-          cp "node/keel-core-native/npm/${{ matrix.platform_key }}/keel-core-native.${{ matrix.platform_key }}.node" \
-            node/keel-core-native/keel-core-native.node
+          cp "node/keel-core-native/npm/${{ matrix.platform_key }}/keelrun-core-native.${{ matrix.platform_key }}.node" \
+            node/keel-core-native/keelrun-core-native.node
           (cd node/keel-core-native && node --test)
-          rm node/keel-core-native/keel-core-native.node
+          rm node/keel-core-native/keelrun-core-native.node
       - name: npm pack the platform package
-        run: npm pack --pack-destination "$RUNNER_TEMP/npm-dist" "./node/keel-core-native/npm/${{ matrix.platform_key }}"
+        # `--pack-destination` does not create the directory itself (hit for
+        # real running v0.1.0's release build, 2026-07-14: ENOENT on the
+        # .tgz path) — unlike npm-pack-root below, which already had this
+        # mkdir.
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" "./node/keel-core-native/npm/${{ matrix.platform_key }}"
       - uses: actions/upload-artifact@v4
         with:
           name: npm-native-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2b. `keel` CLI binary prebuilds for npm (published as `keelrun-cli`, a
+  # thin npm wrapper around the same binary `cli-binaries` below builds — see
+  # node/keel-cli/ and scripts/cli-prebuild.sh). Same 5 platforms as
+  # `cli-binaries`: musl Linux, not glibc — a CLI binary is a separate
+  # process, not a native addon loaded into Node, so a static musl build
+  # runs on glibc hosts too and no libc-specific package split is needed
+  # (unlike npm-native-prebuilds' napi addon, which genuinely does need one).
+  # ---------------------------------------------------------------------------
+  npm-cli-prebuilds:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform_key: darwin-x64
+            cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform_key: darwin-arm64
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform_key: linux-x64-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform_key: linux-arm64-musl
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform_key: win32-x64
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        # See npm-native-prebuilds's identical step for why this explicit
+        # `rustup default` is needed on every job, not just known-affected
+        # ones (hit for real running v0.1.0's release build, 2026-07-14).
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install cross (musl targets)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: rustup target add ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: rustup target add "${{ matrix.target }}"
+      - name: cargo build --target ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+        run: cargo build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
+      - name: cross build --target ${{ matrix.target }}
+        if: matrix.cross
+        run: cross build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
+      - name: Stage into node/keel-cli/npm/${{ matrix.platform_key }}
+        shell: bash
+        run: bash scripts/cli-prebuild.sh "${{ matrix.target }}"
+      - name: npm pack the platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" "./node/keel-cli/npm/${{ matrix.platform_key }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-cli-${{ matrix.platform_key }}
           path: ${{ runner.temp }}/npm-dist/*.tgz
           if-no-files-found: error
 
@@ -336,21 +473,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # directory (rust-toolchain.toml). That's not enough for any cargo
+        # invocation that happens outside the checked-out repo tree — e.g.
+        # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
+        # maturin sdist, which pip extracts and builds from /tmp/pip-req-build-*,
+        # a directory with no rust-toolchain.toml of its own. Without an
+        # explicit `rustup default`, that build fell back to whatever
+        # rustup's machine-wide default was (1.96.1 on this runner image) and
+        # failed keel-core-api/keel-journal/keelrun-core's `rust-version =
+        # "1.97"` gate — hit for real running v0.1.0's release build
+        # (2026-07-14). Setting the default explicitly closes that gap
+        # everywhere, not just for known-affected jobs.
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Full release-metadata check (npm tarball smoke + python wheel + keel-core sdist compile)
+      - name: Full release-metadata check (npm tarball smoke + python wheel + keelrun-core sdist compile)
         run: bash scripts/check-release-metadata.sh --full
-      - name: npm pack keel (front end) + @keel/core-native (source wrapper)
+      - name: npm pack keelrun (front end) + keelrun-core-native (source wrapper) + keelrun-cli (source wrapper)
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/npm-dist"
           npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel
           npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel-core-native
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist" ./node/keel-cli
       - uses: actions/upload-artifact@v4
         with:
           name: npm-pack-root
@@ -405,7 +557,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
+        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # directory (rust-toolchain.toml). That's not enough for any cargo
+        # invocation that happens outside the checked-out repo tree — e.g.
+        # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
+        # maturin sdist, which pip extracts and builds from /tmp/pip-req-build-*,
+        # a directory with no rust-toolchain.toml of its own. Without an
+        # explicit `rustup default`, that build fell back to whatever
+        # rustup's machine-wide default was (1.96.1 on this runner image) and
+        # failed keel-core-api/keel-journal/keelrun-core's `rust-version =
+        # "1.97"` gate — hit for real running v0.1.0's release build
+        # (2026-07-14). Setting the default explicitly closes that gap
+        # everywhere, not just for known-affected jobs.
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
       - name: Install cross (musl targets)
         if: matrix.cross
         uses: taiki-e/install-action@v2
@@ -416,10 +582,10 @@ jobs:
         run: rustup target add "${{ matrix.target }}"
       - name: cargo build --target ${{ matrix.target }}
         if: ${{ !matrix.cross }}
-        run: cargo build -p keel-cli --release --locked --target "${{ matrix.target }}"
+        run: cargo build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
       - name: cross build --target ${{ matrix.target }}
         if: matrix.cross
-        run: cross build -p keel-cli --release --locked --target "${{ matrix.target }}"
+        run: cross build -p keelrun-cli --release --locked --target "${{ matrix.target }}"
       - name: Smoke test (native-arch legs only)
         if: matrix.runnable && matrix.os != 'windows-latest'
         shell: bash
@@ -478,6 +644,11 @@ jobs:
   homebrew-formula:
     needs: preflight
     runs-on: ubuntu-latest
+    # Homebrew is deliberately out of scope for now (2026-07-14 decision,
+    # local memory: keel-homebrew-skipped) — a hiccup here (e.g. GitHub's
+    # tag-archive generation lagging the tag push) shouldn't block
+    # draft-release/publish for the registries that actually matter.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: ruby -c (syntax)
@@ -507,6 +678,12 @@ jobs:
   # registry, which doesn't have them yet. This is advisory, not a hard gate —
   # continue-on-error, since a clean local `cargo package` (checked by
   # scripts/check-release-metadata.sh) is the meaningful signal pre-publish.
+  # Crate names here are the in-repo `[package] name`s (post-rename): only
+  # keel-core, keel-cli, and (fast-follow, 2026-07-14) the Rust front end
+  # `crates/keel` were actually renamed (to keelrun-core/keelrun-cli/keelrun
+  # — their plain names are taken on crates.io); keel-core-api, keel-journal,
+  # and keel-macros are free and stay as-is (docs/naming-decision.md).
+  # keel-macros must publish before keelrun (its path dependent).
   # ---------------------------------------------------------------------------
   cargo-publish-dry-run:
     needs: preflight
@@ -515,11 +692,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install
-      - name: cargo publish --dry-run (keel-core-api, keel-journal, keel-core, keel-cli)
+        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # directory (rust-toolchain.toml). That's not enough for any cargo
+        # invocation that happens outside the checked-out repo tree — e.g.
+        # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
+        # maturin sdist, which pip extracts and builds from /tmp/pip-req-build-*,
+        # a directory with no rust-toolchain.toml of its own. Without an
+        # explicit `rustup default`, that build fell back to whatever
+        # rustup's machine-wide default was (1.96.1 on this runner image) and
+        # failed keel-core-api/keel-journal/keelrun-core's `rust-version =
+        # "1.97"` gate — hit for real running v0.1.0's release build
+        # (2026-07-14). Setting the default explicitly closes that gap
+        # everywhere, not just for known-affected jobs.
+        run: |
+          rustup toolchain install
+          rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+      - name: cargo publish --dry-run (keel-core-api, keel-journal, keelrun-core, keelrun-cli, keel-macros, keelrun)
         run: |
           set -euo pipefail
-          for crate in keel-core-api keel-journal keel-core keel-cli; do
+          for crate in keel-core-api keel-journal keelrun-core keelrun-cli keel-macros keelrun; do
             echo "::group::cargo publish --dry-run -p $crate"
             cargo publish --dry-run --no-verify --locked -p "$crate"
             echo "::endgroup::"
@@ -538,6 +729,7 @@ jobs:
       - wheel-cli
       - cli-wheel-uvx-smoke
       - npm-native-prebuilds
+      - npm-cli-prebuilds
       - npm-pack-root
       - cli-binaries
       - homebrew-formula
@@ -568,67 +760,230 @@ jobs:
           files: dist/*
 
   # ---------------------------------------------------------------------------
-  # 7. Real publishing — NOT WIRED UP. Every command below is a comment.
-  # Gated on workflow_dispatch's `publish` input so it never runs from a tag
-  # push. Uncommenting requires: (a) docs/naming-decision.md resolved for
-  # every registry, (b) `CARGO_REGISTRY_TOKEN` / `PYPI_API_TOKEN` /
-  # `NPM_TOKEN` secrets provisioned, (c) node/keel-core-native's + its
-  # npm/*/ platform packages' `"private": true` flipped to `false`.
+  # 7. Real publishing. Gated on workflow_dispatch's `publish` input so it
+  # never runs from a plain tag push — you must explicitly dispatch this
+  # workflow against the release tag with `publish: true`.
+  #
+  # PyPI uses Trusted Publishing (OIDC) — no stored token — via three
+  # separate jobs below, ONE PER PROJECT. This isn't a style choice: PyPI
+  # rejects registering a second "pending" publisher (Account -> Publishing)
+  # for a project that doesn't exist yet if its (repo, workflow, environment)
+  # triple exactly matches one already registered for a DIFFERENT pending
+  # project — "A pending trusted publisher matching this configuration has
+  # already been registered for a different project name" (hit this
+  # 2026-07-14 registering keelrun/keelrun-cli after keelrun-core). Since
+  # `environment:` is a job-level GitHub Actions setting, giving each project
+  # a distinct environment name requires a distinct job. Registrations:
+  #   keelrun-core -> owner MisterTK, repo keel, workflow release.yml, environment `release`
+  #   keelrun      -> same repo/workflow,                              environment `pypi-keelrun`
+  #   keelrun-cli  -> same repo/workflow,                              environment `pypi-keelrun-cli`
+  # PyPI creates each project on its first successful publish from that
+  # exact identity — see docs.pypi.org/trusted-publishers. `dist/` also holds
+  # npm tarballs, CLI archives, and the homebrew formula from the other jobs,
+  # so each job stages only its own Python files into a private directory
+  # first (`pypa/gh-action-pypi-publish` uploads everything in
+  # `packages-dir`, no per-file filtering).
+  #
+  # npm still uses a stored token (`NPM_TOKEN` repo secret, provisioned
+  # 2026-07-14) in its own job below — node/keel-core-native's + its npm/*/
+  # platform packages' `"private": true` must be flipped to `false` before
+  # those steps succeed.
+  #
+  # crates.io is deliberately NOT included here: keel-core-api, keel-journal,
+  # keelrun-core, and keelrun-cli v0.1.0 were already published manually
+  # (docs/naming-decision.md, 2026-07-14) via a locally-provisioned
+  # `cargo login` token — re-running `cargo publish` for a version that
+  # already exists fails immediately. Add the crates.io steps back as their
+  # own job for the *next* version bump — order matters (keel-core-api,
+  # keel-journal, then keelrun-core, then keelrun-cli — the same order
+  # cargo-publish-dry-run uses above) — with a `CARGO_REGISTRY_TOKEN` secret
+  # provisioned as a repo secret at that point (today it's local-only,
+  # deliberately not added to CI to avoid exactly this kind of
+  # double-publish footgun until it's needed).
   # ---------------------------------------------------------------------------
-  publish:
+  publish-pypi-keelrun-core:
     needs: draft-release
     if: github.event_name == 'workflow_dispatch' && inputs.publish == true
     runs-on: ubuntu-latest
-    environment: release # requires a manual approval gate configured in repo settings
+    environment: release # matches keelrun-core's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write # mandatory for PyPI Trusted Publishing (OIDC)
     steps:
-      - name: Publishing is not enabled
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
         run: |
-          echo "::notice::This job is a placeholder. See the commented commands below the checkout step in .github/workflows/release.yml — nothing here talks to a registry."
-      # - uses: actions/checkout@v4
-      # - uses: actions/download-artifact@v4
-      #   with:
-      #     path: dist
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun-core distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun_core-*.whl dist/keelrun_core-*.tar.gz pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        # Pinned to a commit SHA, not the `release/v1` branch tag: unlike this
+        # file's other `uses:` (tags from actions/, PyO3/, etc.), `release/v1`
+        # is a mutable branch, and this step runs with `id-token: write` and
+        # direct PyPI publish capability — meaningfully higher supply-chain
+        # stakes than the build-only steps elsewhere in this workflow.
+        # SHA is release/v1's tip as of 2026-07-14; bump deliberately (e.g. via
+        # Dependabot's github-actions ecosystem) rather than silently drifting.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
+
+  publish-pypi-keelrun-cli:
+    needs: draft-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: pypi-keelrun-cli # matches keelrun-cli's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun-cli distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun_cli-*.whl pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
+
+  # Not a technical requirement (PyPI doesn't check cross-project
+  # dependencies at publish time — only at install time), but `needs:
+  # publish-pypi-keelrun-core` keeps the run order matching keelrun's actual
+  # dependency on keelrun-core==<version>, so a partial-failure run leaves
+  # the more obviously-broken state (keelrun without its core) less likely.
+  publish-pypi-keelrun:
+    needs: [draft-release, publish-pypi-keelrun-core]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: pypi-keelrun # matches keelrun's pending-publisher registration
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+      - name: Stage keelrun distributions
+        run: |
+          set -euo pipefail
+          mkdir -p pypi-dist
+          cp dist/keelrun-*.whl dist/keelrun-*.tar.gz pypi-dist/
+          ls -la pypi-dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        with:
+          packages-dir: pypi-dist
+          # Makes re-running this workflow for the same version idempotent:
+          # without this, a re-run after e.g. the npm leg failing would also
+          # re-attempt already-succeeded PyPI uploads and get a hard "file
+          # already exists" error instead of a clean skip.
+          skip-existing: true
+
+  publish-npm:
+    needs: draft-release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    environment: release # no protection rules configured (2026-07-14 decision) — workflow_dispatch's `publish: true` input is the only gate
+    steps:
+      - uses: actions/checkout@v4
+      # Required for npm auth: setup-node's `registry-url` writes an .npmrc
+      # entry (`//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`) that
+      # npm publish reads from. Setting the NODE_AUTH_TOKEN env var alone,
+      # with no .npmrc pointing at it, does nothing — npm publish failed with
+      # ENEEDAUTH without this step (hit for real running v0.1.0's release,
+      # 2026-07-14).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten downloaded artifacts (same as draft-release)
+        run: |
+          set -euo pipefail
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          ls -la dist
+
+      # npm (platform packages + the root native wrapper first, so the front
+      # end's optionalDependency resolution has something to find; flip
+      # `"private": true` -> `false` in each package.json before this can
+      # succeed). `keelrun-core-native-*.tgz` matches both the 4 per-platform
+      # tarballs and the root `keelrun-core-native-<version>.tgz` wrapper —
+      # all of them publish the same way. The front-end pattern is
+      # `keelrun-[0-9]*.tgz` (version starts right after the hyphen), not
+      # `keelrun-*.tgz`, so it does NOT also match `keelrun-core-native-*`
+      # tarballs and double-publish them.
       #
-      # # crates.io (dependency order; needs docs/naming-decision.md's renames
-      # # first — the crate names below are today's in-repo names, not the
-      # # eventual published ones):
-      # - run: cargo publish --locked -p keel-core-api
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keel-journal
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keel-core
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # - run: cargo publish --locked -p keel-cli
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      #
-      # # PyPI (twine; the keel-core wheels + sdist, then the keel-cli wheels,
-      # # then the pure-Python keel front end):
-      # - run: python3 -m pip install twine
-      # - run: twine upload dist/keel_core-*.whl dist/keel_core-*.tar.gz
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      # - run: twine upload dist/keel_cli-*.whl
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      # - run: twine upload dist/keel-*.whl dist/keel-*.tar.gz
-      #   env:
-      #     TWINE_USERNAME: __token__
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      #
-      # # npm (platform packages first, so the root package's optionalDependency
-      # # resolution has something to find; flip `"private": true` -> `false`
-      # # in each package.json before this can succeed):
-      # - run: |
-      #     for tgz in dist/keel-core-native-*.tgz; do
-      #       npm publish --access public "$tgz"
-      #     done
-      #     npm publish --access public dist/keel-core-native-*.tgz
-      #     npm publish --access public dist/keel-*.tgz
-      #   env:
-      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Every path below is prefixed `./` deliberately: `npm publish
+      # dist/foo.tgz` (no leading `./`) hit npm-package-arg's hosted-git-
+      # shorthand heuristic instead of being read as a local file — it tried
+      # `git ls-remote ssh://git@github.com/dist/foo.tgz.git` and failed with
+      # a bogus "Permission denied (publickey)" (hit for real running
+      # v0.1.0's release, 2026-07-14). `./`-prefixing forces file-path
+      # interpretation.
+      - run: |
+          set -euo pipefail
+          for tgz in dist/keelrun-core-native-*.tgz; do
+            npm publish --access public "./$tgz"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # keelrun-cli platform packages + the root wrapper — same "one glob
+      # catches both the per-platform tarballs and the root wrapper" shape
+      # as keelrun-core-native above, since `keelrun-cli-<platform>-<ver>.tgz`
+      # and the root `keelrun-cli-<ver>.tgz` both match `keelrun-cli-*.tgz`
+      # (and the front-end `keelrun-<ver>.tgz` does NOT, since it lacks the
+      # literal "cli-" segment).
+      - run: |
+          set -euo pipefail
+          for tgz in dist/keelrun-cli-*.tgz; do
+            npm publish --access public "./$tgz"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tgz=(dist/keelrun-[0-9]*.tgz)
+          [ "${#tgz[@]}" -eq 1 ] || { echo "expected exactly one keelrun front-end tarball, found ${#tgz[@]}: ${tgz[*]}" >&2; exit 1; }
+          npm publish --access public "./${tgz[0]}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

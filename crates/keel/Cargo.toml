@@ -1,17 +1,27 @@
 [package]
-name = "keel"
-description = "Keel as a Rust front end: #[keel::wrap] plus a reqwest-middleware adapter, routing calls through the keel-core Engine chain (cache/rate/breaker/timeout/retry) from one `keel.toml`. No import hook (Rust has none to hang off of) — call `keel::init()` once from your own `main`."
+name = "keelrun"
+description = "Keel as a Rust front end: #[keel::wrap] plus a reqwest-middleware adapter, routing calls through the keel-core Engine chain (cache/rate/breaker/timeout/retry) from one `keel.toml`. No import hook (Rust has none to hang off of) — call `keel::init()` once from your own `main`. Published as `keelrun` (plain `keel` is taken on crates.io); add it as `cargo add keelrun --rename keel` so `#[keel::wrap]` resolves — see README.md."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-publish = false
+readme = "README.md"
+# Publishable. keel-macros must be published first (path dep below needs a
+# resolvable registry version) — see scripts/check-release-metadata.sh.
+
+[lib]
+# The compiled/import name stays `keel` (dx-spec.md invariant 1: one
+# attribute, `#[keel::wrap]`) even though the crates.io *package* name is
+# `keelrun` — this keeps this crate's own tests/doctests (which already say
+# `keel::`) compiling unchanged. External consumers get the same name via
+# an explicit rename on add — see src/lib.rs's crate docs.
+name = "keel"
 
 [dependencies]
-keel-core = { path = "../keel-core" }
-keel-core-api = { path = "../keel-core-api" }
-keel-macros = { path = "../keel-macros" }
+keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.1.0" }
+keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
+keel-macros = { path = "../keel-macros", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Parse keel.toml at runtime (mirrors python/keel's `tomllib.loads` /

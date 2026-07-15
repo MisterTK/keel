@@ -1,5 +1,5 @@
 /**
- * Process-wide runtime state, shared between the bootstrap (`--import keel/hook`,
+ * Process-wide runtime state, shared between the bootstrap (`--import keelrun/hook`,
  * main thread) and the code injected into transformed modules by the ESM loader
  * (`loader-runtime.mjs`, also main thread). Both import THIS module from the
  * same absolute path, so Node's module cache guarantees they see one instance.

@@ -2,7 +2,7 @@
 """Assert every version declaration in the repo agrees with the single source.
 
 The source of truth is `[workspace.package] version` in the root Cargo.toml
-(all crates inherit it; the keel-core wheel reads it via maturin's
+(all crates inherit it; the keelrun-core wheel reads it via maturin's
 `dynamic = ["version"]`). Everything that cannot inherit it mechanically is
 listed here and checked byte-for-byte:
 
@@ -16,7 +16,10 @@ listed here and checked byte-for-byte:
   - crates/keel-py/pyproject.toml         must stay dynamic (no restated version)
   - crates/keel-cli/pyproject.toml        must stay dynamic (no restated version)
   - node/keel-core-native/npm/*/package.json  version (per-platform prebuilds)
-  - python/keel/pyproject.toml            keel-core==<version> dependency pin
+  - node/keel-core-native/package.json     4 optionalDependencies pins
+  - node/keel-cli/package.json             version + 5 optionalDependencies pins
+  - node/keel-cli/npm/*/package.json       version (per-platform prebuilds)
+  - python/keel/pyproject.toml            keelrun-core==<version> dependency pin
 
 Usage: check-versions.py [--tag vX.Y.Z]
 `--tag` additionally asserts a release tag matches (for the release workflow:
@@ -56,9 +59,27 @@ def declarations() -> list[tuple[str, str]]:
     ):
         found.append((f"{rel} version", json.loads((REPO / rel).read_text())["version"]))
 
+    # keel-core-native's optionalDependencies pins (4 platform packages) —
+    # checked separately from its own "version" field above; these two can
+    # drift independently (and did, once — see scripts/bump-version.sh).
+    native_pkg = json.loads((REPO / "node/keel-core-native/package.json").read_text())
+    for name, pinned in native_pkg.get("optionalDependencies", {}).items():
+        found.append((f"node/keel-core-native/package.json optionalDependencies[{name}]", pinned))
+
     # Per-platform napi prebuild packages (scripts/napi-prebuild.sh writes the
     # binaries; the manifests are checked in — see node/keel-core-native/npm/).
     for pkg in sorted((REPO / "node/keel-core-native/npm").glob("*/package.json")):
+        rel = pkg.relative_to(REPO).as_posix()
+        found.append((f"{rel} version", json.loads(pkg.read_text())["version"]))
+
+    # keel-cli's npm wrapper: its own version, plus every optionalDependencies
+    # pin (scripts/cli-prebuild.sh writes the binaries; manifests are checked
+    # in — see node/keel-cli/npm/).
+    cli_pkg = json.loads((REPO / "node/keel-cli/package.json").read_text())
+    found.append(("node/keel-cli/package.json version", cli_pkg["version"]))
+    for name, pinned in cli_pkg.get("optionalDependencies", {}).items():
+        found.append((f"node/keel-cli/package.json optionalDependencies[{name}]", pinned))
+    for pkg in sorted((REPO / "node/keel-cli/npm").glob("*/package.json")):
         rel = pkg.relative_to(REPO).as_posix()
         found.append((f"{rel} version", json.loads(pkg.read_text())["version"]))
 
@@ -101,7 +122,7 @@ def main() -> int:
     # The front-end wheel pins the native core wheel to the same version.
     with (REPO / "python/keel/pyproject.toml").open("rb") as f:
         deps = tomllib.load(f)["project"].get("dependencies", [])
-    pin = f"keel-core=={want}"
+    pin = f"keelrun-core=={want}"
     if pin not in deps:
         errors.append(f"python/keel/pyproject.toml dependencies must pin {pin!r} (got {deps!r})")
 

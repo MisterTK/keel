@@ -1,6 +1,7 @@
 /**
- * Public programmatic surface for the `keel` Node package. The primary entry is
- * the preload hook (`node --import keel/hook app.mjs`); this module exposes the
+ * Public programmatic surface for the `keel` Node package (published as
+ * `keelrun`). The primary entry is the preload hook (`node --import
+ * keelrun/hook app.mjs`); this module exposes the
  * same bootstrap for embedding and the pieces useful to tooling/tests.
  */
 
@@ -17,4 +18,4 @@ export { llmPack, resolveDevCache, DEV_CACHE_TTL } from "./src/packs/llm.mjs";
 export { mcpPack, installMcpPack, patchClientRequest } from "./src/packs/mcp.mjs";
 export { toolPack, wrapTool, classifyToolError, isValidToolName, toolTarget } from "./src/packs/tool.mjs";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";

@@ -73,7 +73,7 @@ jobs:
       - name: Conformance (Rust stub, verbose)
         run: cargo test -p keel-core-stub --test conformance -- --nocapture
       - name: Conformance (real core — Tier 1 + Tier 2 16-17)
-        run: cargo test -p keel-core --test conformance --test flows_conformance -- --nocapture
+        run: cargo test -p keelrun-core --test conformance --test flows_conformance -- --nocapture
 
   python:
     runs-on: ubuntu-latest
@@ -296,6 +296,6 @@ jobs:
         with:
           python-version: "3.11" # keel-py links libpython under a non-wheel build
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p keel-core --features otel --all-targets --locked -- -D warnings
+      - run: cargo clippy -p keelrun-core --features otel --all-targets --locked -- -D warnings
       - run: cargo build -p keel-node --features otel --locked
       - run: cargo build -p keel-py --features otel --locked

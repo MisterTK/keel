@@ -101,7 +101,7 @@ class BannerAndPassthroughTest(unittest.TestCase):
         self.assertEqual(enabled.stdout.decode().strip(), f"[{ECHO!r}, 'a', 'b']")
 
     def test_run_entry_exit_code_passthrough(self) -> None:
-        # The keel-py-run entry runs a script directly (no `run` subcommand)
+        # The keelrun-py-run entry runs a script directly (no `run` subcommand)
         # and passes the script's exit code through.
         with TemporaryDirectory() as d:
             proc = _run(

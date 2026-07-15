@@ -538,7 +538,7 @@ def _keel_binary() -> str | None:
     return None
 
 
-@unittest.skipUnless(_keel_binary(), "keel CLI binary not built (cargo build -p keel-cli)")
+@unittest.skipUnless(_keel_binary(), "keel CLI binary not built (cargo build -p keelrun-cli)")
 class CliRendersCheckpointStepsTest(unittest.TestCase):
     """`keel trace`/`keel flows` need no change to show LangGraph checkpoint
     steps sensibly (module docs): the step-key convention is ordinary

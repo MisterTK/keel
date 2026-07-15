@@ -8,7 +8,7 @@ use std::time::Duration;
 use keel_conformance::{
     Scenario, ScriptedEffect, Step, load_dir, scenarios_dir, subset_mismatches,
 };
-use keel_core::Engine;
+use keelrun_core::Engine;
 
 async fn run_scenario(scenario: &Scenario) -> Vec<String> {
     let engine = Engine::new();

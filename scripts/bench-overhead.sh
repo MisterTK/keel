@@ -18,13 +18,13 @@ out="$repo_root/target/bench-overhead.json"
 mkdir -p "$repo_root/target"
 
 # (1) Statistical benchmark. The ≤10µs claim is read from this report.
-cargo bench -p keel-core --bench overhead
+cargo bench -p keelrun-core --bench overhead
 
 # (2) Deterministic artifact. KEEL_BENCH_EMIT_JSON short-circuits criterion in
 #     the bench binary's main; KEEL_BENCH_OUT pins the absolute output path
 #     (the bench binary's CWD is the crate dir, not the workspace root).
 KEEL_BENCH_EMIT_JSON=1 KEEL_BENCH_OUT="$out" \
-  cargo bench -p keel-core --bench overhead
+  cargo bench -p keelrun-core --bench overhead
 
 echo "bench-overhead: artifact at $out"
 cat "$out"

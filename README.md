@@ -83,11 +83,45 @@ daemon. No port. No new abstractions in your code.
 
 ## Quickstart
 
-Keel isn't published to a package registry yet (see [Status](#status)) —
-building from source takes about a minute.
+Keel is published today — `pip`, `npm`, and `cargo` all work.
 
-**Python** (needs Rust — `rustup` picks up the pinned toolchain
-automatically):
+**Python** — library only, or library + the `keel` CLI in one line:
+
+```bash
+pip install keelrun                  # library only
+keelrun-py-run your_app.py           # or: python -m keel run your_app.py
+
+pip install keelrun keelrun-cli      # library + keel CLI (doctor/init/status/mcp/...)
+keel run your_app.py
+```
+
+**Node** (≥ 22.5) — same shape:
+
+```bash
+npm install keelrun                  # library only
+npx keelrun-node-run your_app.mjs
+
+npm install keelrun keelrun-cli      # library + keel CLI
+keel run your_app.mjs
+```
+
+**Rust** — the library (`#[keel::wrap]`) and the CLI are always separate
+installs; `cargo add`/`cargo install` are different operations and cargo has
+no single command spanning both:
+
+```bash
+cargo add keelrun --rename keel      # library — #[keel::wrap], see crates/keel/README.md
+cargo install keelrun-cli            # CLI binary
+```
+
+**Just want the CLI, no persistent install, any language?**
+
+```bash
+uvx --from keelrun-cli keel run your_app.py
+```
+
+**Building from source** (contributors — needs Rust; `rustup` picks up the
+pinned toolchain automatically):
 
 ```bash
 maturin develop -m crates/keel-py/Cargo.toml     # builds the native core into your venv
@@ -98,20 +132,6 @@ keel run your_app.py                             # or: python -m keel run your_a
 Without the native module, the front end falls back to a pure-Python core:
 Tier 1 resilience still works, but there's no persistent cache and no
 durable flows.
-
-**Node** (≥ 22.5):
-
-```bash
-node node/keel/bin/keel-node-run.mjs your_app.mjs
-```
-
-**CLI only:**
-
-```bash
-cargo build -p keel-cli
-target/debug/keel init            # generate keel.toml from evidence: imports, call sites, observed traffic
-target/debug/keel doctor --json   # the honesty report — what's covered, what isn't, why
-```
 
 ## See it work
 
@@ -144,11 +164,62 @@ Node front ends share identical semantics — verified by a shared
 [conformance suite](conformance/README.md) that every implementation must
 pass, not just documentation asserting it.
 
+## Agent integration
+
+Two ways a coding agent picks up Keel:
+
+- **A Claude Code Skill** (`packaging/claude-skill/keel/`) — covers adopting
+  Keel in a project, day-to-day commands, and driving `keel mcp`. Install it
+  by copying the directory into `~/.claude/skills/keel/` or a project's
+  `.claude/skills/keel/`.
+- **`keel init --agents`** drops a concise, deterministic section into
+  `AGENTS.md` so every future agent session in an already-Keel-adopted repo
+  inherits the ground rules without installing anything extra.
+
+`keel mcp` serves the CLI itself as an MCP server over stdio — six tools,
+each byte-identical to its `--json` CLI twin (`get_status`,
+`get_doctor_report`, `propose_policy`, `get_trace`, `list_flows`,
+`explain_error`). It has no `--project` flag; it always reports on its own
+current working directory. Project-scoped `<project>/.mcp.json` (Claude
+Code — already launched with the right `cwd`):
+
+```json
+{
+  "mcpServers": {
+    "keel": {
+      "command": "keel",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Global config (Claude Desktop's `claude_desktop_config.json`, or any client
+that doesn't launch from the project directory) needs an explicit `cwd`:
+
+```json
+{
+  "mcpServers": {
+    "keel": {
+      "command": "keel",
+      "args": ["mcp"],
+      "cwd": "/absolute/path/to/the/project"
+    }
+  }
+}
+```
+
+No `keel` on PATH (only installed via `uvx`)? Swap in
+`"command": "uvx", "args": ["--from", "keelrun-cli", "keel", "mcp"]`.
+
 ## Status
 
-Keel is pre-1.0 and not yet published to any package registry (`pip`/`npm`/
-`cargo`/`brew` — see the from-source [Quickstart](#quickstart) above; a
-package-naming decision is pending). Everything described in this README is
+Keel is pre-1.0 and published on every registry (`pip`, `npm`, `cargo` — see
+[Quickstart](#quickstart) above; the front-end name is `keelrun`, the CLI is
+`keelrun-cli`, see `docs/naming-decision.md`). `brew install keel` is not
+available — the Homebrew tap was deliberately not created (private repo;
+`cargo`/`pip`/`npm`/`uvx` already cover every platform). Everything
+described in this README is
 real, tested, and running on the native core in both languages today — this
 isn't a roadmap, it's what's built. What's explicitly *not* built yet: a
 zero-config Rust CLI wrapper (Rust requires the `#[keel::wrap]` attribute

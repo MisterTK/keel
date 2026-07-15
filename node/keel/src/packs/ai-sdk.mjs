@@ -5,7 +5,7 @@
  * on the framework's OWN blessed extension point: the user plugs Keel in via
  *
  *     import { wrapLanguageModel } from "ai";
- *     import { keelMiddleware } from "keel/ai-sdk";
+ *     import { keelMiddleware } from "keelrun/ai-sdk";
  *     const model = wrapLanguageModel({ model: base, middleware: keelMiddleware() });
  *
  * and changes nothing else. The real `ai` package is NOT a dependency of Keel;

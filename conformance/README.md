@@ -7,7 +7,7 @@ here, not "the author says it works."
 ## Running
 
 ```
-$ cargo test -p keel-core --test conformance    # REAL core (paused tokio clock)
+$ cargo test -p keelrun-core --test conformance # REAL core (paused tokio clock)
 $ cargo test -p keel-core-stub                  # Rust stub (virtual clock)
 $ python3 conformance/runner.py                 # Python stub
 $ (cd node/keel-core-stub && node --test)       # Node stub

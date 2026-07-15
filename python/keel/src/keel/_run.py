@@ -4,7 +4,7 @@ correct `__main__` semantics, argv, and exit-code passthrough.
 Two entry shapes share one core (`run_target`):
   * `python -m keel run app.py [args...]`  → `main_module` (parses the `run`
     subcommand)
-  * `keel-py-run app.py [args...]`         → `main_run_entry` (the internal
+  * `keelrun-py-run app.py [args...]`      → `main_run_entry` (the internal
     console_script the public `keel run` CLI dispatches to)
 
 When KEEL_DISABLE is set the script still runs, but with NO wrapping, NO
@@ -20,7 +20,7 @@ from typing import Mapping, Sequence
 from ._errors import is_keel_error
 
 _USAGE_MODULE = "usage: python -m keel run <app.py> [args...]\n"
-_USAGE_ENTRY = "usage: keel-py-run <app.py> [args...]\n"
+_USAGE_ENTRY = "usage: keelrun-py-run <app.py> [args...]\n"
 
 
 def run_target(
@@ -122,7 +122,7 @@ def main_module(argv: Sequence[str] | None = None) -> None:
 
 
 def main_run_entry(argv: Sequence[str] | None = None) -> None:
-    """Entry for the `keel-py-run` console_script: runs a script directly."""
+    """Entry for the `keelrun-py-run` console_script: runs a script directly."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv:
         run_target(argv[0], argv[1:])

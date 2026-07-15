@@ -1,4 +1,4 @@
-# Build config for the `keel_core` native module (PyO3 over keel-core::Engine).
+# Build config for the `keel_core` native module (PyO3 over keelrun_core::Engine).
 # Source only — no wheels are committed. Build/install into a venv with maturin:
 #
 #   uv venv .venv && . .venv/bin/activate
@@ -12,15 +12,18 @@ build-backend = "maturin"
 
 [project]
 # Distribution name; the IMPORT name is `keel_core` (the cdylib `[lib].name`).
-name = "keel-core"
+# `keel-core` was actually free on PyPI, but published as `keelrun-core` for
+# brand consistency with the front end (`keelrun`) and crates.io
+# (`keelrun-core`, where the plain `keel-core` name is taken) — see
+# docs/naming-decision.md.
+name = "keelrun-core"
 license = "Apache-2.0"
 # Version is read by maturin from the crate (which inherits the workspace
 # version) — the single version source; do not restate it here.
 dynamic = ["version"]
-description = "Keel native core (keel_core): PyO3 binding over keel-core::Engine."
+description = "Keel native core (keel_core): PyO3 binding over keelrun_core::Engine."
 requires-python = ">=3.11"
 classifiers = [
-    "Private :: Do Not Upload",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
 ]

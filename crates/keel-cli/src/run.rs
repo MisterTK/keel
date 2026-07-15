@@ -5,7 +5,12 @@
 //!
 //! - `*.py`                     → `python3 -m keel run <script> [args…]`
 //! - `*.{mjs,js,ts,cjs,…}`      → `node --import keel/hook <script> [args…]`
-//! - a dir / `package.json`     → resolve its `main`, then the Node path
+//! - a `package.json`, or a dir containing one → resolve its `main`, then
+//!   the Node path
+//! - any other dir              → a conventional entry name (`main.py`,
+//!   `__main__.py`, `index.*`), then — if exactly one Python or Node source
+//!   file sits directly inside it — that file; ambiguous or empty is a
+//!   precise error, never a guess
 //! - anything else              → a precise what/why/next error, exit 2
 //!
 //! The child inherits the environment (so every `KEEL_*` var passes through);
@@ -46,6 +51,12 @@ pub enum RunError {
     UnknownKind { target: String },
     /// A Node package dir/`package.json` had no resolvable entry file.
     NoEntry { target: String },
+    /// A directory had more than one plausible entry file and no
+    /// `package.json`/conventional name to disambiguate.
+    AmbiguousEntry {
+        target: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl RunError {
@@ -68,6 +79,17 @@ impl RunError {
                 "The directory/package.json has no resolvable `main` (and no index.js).".to_owned(),
                 "Add a `main` to package.json, or pass the entry script directly.".to_owned(),
                 "no-entry",
+            ),
+            Self::AmbiguousEntry { target, candidates } => (
+                format!("Cannot run `{target}`: multiple possible entry files."),
+                format!(
+                    "No package.json or conventional entry (main.py, __main__.py, index.*) — \
+                     found {} candidate scripts directly inside this directory: {}.",
+                    candidates.len(),
+                    candidates.join(", ")
+                ),
+                "Pass the entry script directly, e.g. `keel run <path-to-script>`.".to_owned(),
+                "ambiguous-entry",
             ),
         };
         let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
@@ -112,9 +134,7 @@ pub fn plan(target: &str, args: &[String], disable: bool) -> Result<RunPlan, Run
         if manifest.exists() {
             return node_package(&manifest, args, disable);
         }
-        return Err(RunError::UnknownKind {
-            target: target.to_owned(),
-        });
+        return resolve_directory(target, path, args, disable);
     }
     if !path.exists() {
         return Err(RunError::NotFound {
@@ -194,6 +214,89 @@ fn node_package(manifest: &Path, args: &[String], disable: bool) -> Result<RunPl
         });
     }
     Ok(node_plan(&entry.to_string_lossy(), args, disable))
+}
+
+/// Conventional entry file names tried, in order, before falling back to a
+/// directory walk.
+const PY_CONVENTIONAL_ENTRIES: &[&str] = &["main.py", "__main__.py"];
+const NODE_CONVENTIONAL_ENTRIES: &[&str] = &[
+    "index.mjs",
+    "index.js",
+    "index.cjs",
+    "index.ts",
+    "index.mts",
+    "index.cts",
+];
+
+/// Resolve a directory target with no `package.json`: a conventional entry
+/// name first, then — if exactly one Python or Node source file sits
+/// directly inside the directory (not recursively; a nested script is never
+/// guessed at) — that file. Ambiguous or empty is a precise error, never a
+/// silent guess (dx-spec's "a Level 0 surprise is a P0 bug" invariant).
+fn resolve_directory(
+    target: &str,
+    dir: &Path,
+    args: &[String],
+    disable: bool,
+) -> Result<RunPlan, RunError> {
+    for name in PY_CONVENTIONAL_ENTRIES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(python_plan(&candidate.to_string_lossy(), args, disable));
+        }
+    }
+    for name in NODE_CONVENTIONAL_ENTRIES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(node_plan(&candidate.to_string_lossy(), args, disable));
+        }
+    }
+
+    let py_files = top_level_files_with_extension(dir, &["py"]);
+    let node_files = top_level_files_with_extension(dir, NODE_EXTS);
+    let mut candidates: Vec<PathBuf> = py_files.iter().chain(&node_files).cloned().collect();
+    candidates.sort();
+
+    match candidates.as_slice() {
+        [] => Err(RunError::UnknownKind {
+            target: target.to_owned(),
+        }),
+        [only] => {
+            if py_files.contains(only) {
+                Ok(python_plan(&only.to_string_lossy(), args, disable))
+            } else {
+                Ok(node_plan(&only.to_string_lossy(), args, disable))
+            }
+        }
+        many => Err(RunError::AmbiguousEntry {
+            target: target.to_owned(),
+            candidates: many.iter().map(|p| p.display().to_string()).collect(),
+        }),
+    }
+}
+
+/// Regular files directly inside `dir` (no recursion into subdirectories)
+/// whose extension is one of `extensions`, sorted. Deliberately shallow —
+/// unlike [`crate::scan::collect_files`]'s recursive project-wide scan, `keel
+/// run`'s directory disambiguation only ever considers the top level.
+fn top_level_files_with_extension(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.contains(&e))
+        {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Execute a [`RunPlan`], inheriting the environment (so `KEEL_*` passes
@@ -368,6 +471,74 @@ mod tests {
         fs::write(dir.path().join("package.json"), "{ \"main\": \"nope.js\" }").unwrap();
         let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
         assert!(matches!(err, RunError::NoEntry { .. }));
+    }
+
+    #[test]
+    fn dir_with_conventional_python_entry_resolves_to_main_py() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.py"), "print('hi')\n").unwrap();
+        fs::write(dir.path().join("helpers.py"), "# not the entry\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert_eq!(plan.program, "python3");
+        assert!(plan.argv.last().unwrap().ends_with("main.py"));
+    }
+
+    #[test]
+    fn dir_with_dunder_main_resolves_when_no_main_py() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("__main__.py"), "print('hi')\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert!(plan.argv.last().unwrap().ends_with("__main__.py"));
+    }
+
+    #[test]
+    fn dir_with_conventional_node_entry_resolves_without_package_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("index.mjs"), "// entry\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert_eq!(plan.program, "node");
+        assert!(plan.argv[2].ends_with("index.mjs"));
+    }
+
+    #[test]
+    fn dir_with_sole_python_file_resolves_by_walk() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("pipeline.py"), "print('hi')\n").unwrap();
+        let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
+        assert_eq!(plan.program, "python3");
+        assert!(plan.argv.last().unwrap().ends_with("pipeline.py"));
+    }
+
+    #[test]
+    fn dir_with_multiple_candidates_is_ambiguous() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.py"), "print(1)\n").unwrap();
+        fs::write(dir.path().join("b.py"), "print(2)\n").unwrap();
+        let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
+        assert!(matches!(err, RunError::AmbiguousEntry { .. }));
+        let rendered = err.render();
+        assert_eq!(rendered.exit, EXIT_USAGE);
+        assert_eq!(rendered.json["error"], "ambiguous-entry");
+    }
+
+    #[test]
+    fn empty_dir_is_still_unknown_kind() {
+        let dir = TempDir::new().unwrap();
+        let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
+        assert!(matches!(err, RunError::UnknownKind { .. }));
+    }
+
+    #[test]
+    fn nested_scripts_are_never_guessed_at() {
+        // A subdirectory's scripts are not candidates — resolution is
+        // top-level only, so an otherwise-empty dir with only nested files
+        // still errors rather than reaching into a subdirectory.
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("nested");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("deep.py"), "print('hi')\n").unwrap();
+        let err = plan(&dir.path().to_string_lossy(), &[], false).unwrap_err();
+        assert!(matches!(err, RunError::UnknownKind { .. }));
     }
 
     #[test]

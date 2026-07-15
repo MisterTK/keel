@@ -1,8 +1,8 @@
 /**
- * `keel/ai-sdk` — the Vercel AI SDK middleware seam.
+ * `keelrun/ai-sdk` — the Vercel AI SDK middleware seam.
  *
  *     import { wrapLanguageModel } from "ai";
- *     import { keelMiddleware } from "keel/ai-sdk";
+ *     import { keelMiddleware } from "keelrun/ai-sdk";
  *     const model = wrapLanguageModel({ model: base, middleware: keelMiddleware() });
  *
  * Zero other code changes: every generate/stream on the wrapped model gets
