@@ -26,7 +26,16 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from unittest import mock
 
-from fake_adk import FakeAdkModules, FakeApp, FakeBasePlugin, FakeInMemoryRunner, FakeRunner, FakeTool, FakeSlottedTool
+from fake_adk import (
+    FakeAdkModules,
+    FakeApp,
+    FakeBasePlugin,
+    FakeInMemoryRunner,
+    FakeRunner,
+    FakeTool,
+    FakeSlottedTool,
+    McpTool,
+)
 
 from keel import _runtime
 from keel._backend import load_backend
@@ -419,6 +428,54 @@ class SetattrFallbackTest(AdkTestBase):
         ) as err:
             asyncio.run(plugin.before_tool_callback(tool=tool, tool_args={}, tool_context=object()))
         self.assertEqual(err.getvalue(), "")
+
+
+class McpErrorDictTest(AdkTestBase):
+    """ADK graceful error handling returns {"error": ...} dicts from McpTool
+    — a *successful* call from a naive wrapper's perspective. Keel must
+    count it as a failure (breaker/discovery) while returning it unchanged."""
+
+    def plugin(self) -> Any:
+        with FakeAdkModules():
+            return adk_pack._plugin()
+
+    def rebound(self, tool: Any) -> Any:
+        plugin = self.plugin()
+        asyncio.run(plugin.before_tool_callback(tool=tool, tool_args={}, tool_context=object()))
+        return tool
+
+    def test_error_dict_counts_as_failure_but_returns_unchanged(self) -> None:
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        tool = self.rebound(McpTool("mcp_search", lambda: {"error": "connection closed"}))
+        result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, {"error": "connection closed"}, "agent-visible value unchanged")
+        self.assertEqual(tool.calls, 1, "never re-invoked: tools stay non-idempotent")
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 1, "breaker/discovery sees the failure")
+
+    def test_successful_mcp_result_recorded_as_success(self) -> None:
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        tool = self.rebound(McpTool("mcp_search", lambda: {"content": ["hit"]}))
+        result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, {"content": ["hit"]})
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 0)
+
+    def test_non_mcp_tool_error_shaped_dict_is_not_reclassified(self) -> None:
+        # A plain FunctionTool legitimately returning {"error": ...} is a
+        # RESULT, not a failure — classification applies to McpTool only.
+        _, discovery = self.install_runtime({"target": {"tool:validator": {}}})
+        tool = self.rebound(FakeTool("validator", lambda: {"error": "field x is required"}))
+        result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, {"error": "field x is required"})
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:validator"]["failures"], 0)
+
+    def test_extra_keys_or_non_string_error_is_not_an_error_dict(self) -> None:
+        self.assertFalse(adk_pack._is_mcp_error_dict({"error": "x", "detail": "y"}))
+        self.assertFalse(adk_pack._is_mcp_error_dict({"error": 500}))
+        self.assertFalse(adk_pack._is_mcp_error_dict(["error"]))
+        self.assertTrue(adk_pack._is_mcp_error_dict({"error": "x"}))
 
 
 if __name__ == "__main__":

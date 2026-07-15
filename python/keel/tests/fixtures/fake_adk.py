@@ -194,6 +194,14 @@ class FakeSlottedTool:
         return self.func(**args)
 
 
+class McpTool(FakeTool):
+    """Structural twin of ``google.adk.tools.mcp_tool.mcp_tool.McpTool`` for
+    adk_pack's MRO-name-based detection (`_is_mcp_tool`): under ADK's
+    graceful error handling (`_MCP_GRACEFUL_ERROR_HANDLING`), a failed MCP
+    call RETURNS ``{"error": "<message>"}`` instead of raising — the class
+    name (not this fixture's module path) is the detection key."""
+
+
 def _fake_module(name: str, **attrs: Any) -> types.ModuleType:
     mod = types.ModuleType(name)
     mod.__spec__ = ModuleSpec(name, loader=None, is_package=True)
@@ -269,4 +277,5 @@ __all__ = [
     "FakeRunner",
     "FakeTool",
     "FakeSlottedTool",
+    "McpTool",
 ]

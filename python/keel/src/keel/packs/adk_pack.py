@@ -348,22 +348,81 @@ async def _on_before_tool(tool: Any, tool_args: dict[str, Any], tool_context: An
     return await _call_via_plugin_loop(tool, tool_args, tool_context)
 
 
+class _McpErrorDict(Exception):
+    """Internal sentinel: an ADK graceful-error dict, raised inside the
+    wrapped effect so the core records a failure, then caught at the rebound
+    wrapper and unwrapped — the agent-visible value never changes."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("error", "")))
+        self.payload = payload
+
+
+def _is_mcp_tool(tool: Any) -> bool:
+    """MRO-name check (no ADK import, works for subclasses): ADK's class is
+    ``google.adk.tools.mcp_tool.mcp_tool.McpTool`` (verified against the real
+    package during Task 3 Step 1: ``class McpTool(BaseAuthenticatedTool)`` at
+    ``mcp_tool.py`` line 124, plus its deprecated alias
+    ``class MCPTool(McpTool)`` at line 602 — matching either MRO class name
+    covers both spellings without importing ``google.adk``)."""
+    return any(c.__name__ in ("McpTool", "MCPTool") for c in type(tool).__mro__)
+
+
+def _is_mcp_error_dict(result: Any) -> bool:
+    """Mirror of ADK's graceful-error shape (``_MCP_GRACEFUL_ERROR_HANDLING``
+    → ``{"error": "<message>"}``, exactly one key, string value). Verified
+    directly against ``mcp_tool.py``'s ``run_async`` (lines 358-367, Task 3
+    Step 1): under the feature flag, both swallowed-failure branches return
+    exactly this shape — ``except McpError as e: return {"error": f"MCP tool
+    execution failed: {e}"}`` and ``except Exception as e: return {"error":
+    f"Unexpected error during MCP tool execution: {e}"}`` — no other keys, a
+    plain ``str`` message either way, confirming the plan's expected shape
+    exactly (no divergence to mirror). Note: ``_detect_error_in_response``
+    (line 472) checks a DIFFERENT shape (``{"isError": True}``, the raw MCP
+    tool-result convention) and is dead telemetry code in this ADK version —
+    nothing calls it from ``run_async``/``_run_async_impl`` — so it is not
+    the rule to mirror here. Deliberately strict: a non-MCP-shaped dict is a
+    tool RESULT and must never be reclassified."""
+    return (
+        isinstance(result, dict)
+        and set(result) == {"error"}
+        and isinstance(result["error"], str)
+    )
+
+
 def _rebind_tool(tool: Any, name: str) -> bool:
     """Rebind ``tool.run_async`` (instance attribute shadowing the class
     method) to a Keel-wrapped version. The breaker still guards attempt 1:
     ``wrap_tool``'s wrapper consults policy before the first underlying
-    invoke. Returns ``False`` when the instance rejects attribute assignment."""
+    invoke. Returns ``False`` when the instance rejects attribute assignment.
+
+    MCP error-dict classification: under ADK's ``_MCP_GRACEFUL_ERROR_HANDLING``
+    feature flag, a failed ``McpTool`` call RETURNS ``{"error": "..."}``
+    instead of raising — a naive wrapper records success and the breaker
+    never trips. For an ``McpTool`` (``is_mcp``, detected once per rebind),
+    the wrapped effect raises the internal ``_McpErrorDict`` sentinel on an
+    MCP-shaped error dict so ``wrap_tool``'s core records a failure
+    (``classify_tool_error`` files it under ``other``); the rebound
+    ``run_async`` unwraps it back to the identical payload on the way out, so
+    the agent sees byte-identical output either way."""
     original = tool.run_async  # the bound method, captured pre-shadow
+    is_mcp = _is_mcp_tool(tool)
 
     async def _invoke(*, args: dict[str, Any], tool_context: Any) -> Any:
-        return await original(args=args, tool_context=tool_context)
+        result = await original(args=args, tool_context=tool_context)
+        if is_mcp and _is_mcp_error_dict(result):
+            raise _McpErrorDict(result)  # counted as a failure by the core
+        return result
 
     _invoke.__qualname__ = f"adk.tool.{name}"
     inner = wrap_tool(name, _invoke, idempotent=False)
 
     @functools.wraps(original)
     async def run_async(*, args: dict[str, Any], tool_context: Any) -> Any:
-        return await inner(args=args, tool_context=tool_context)
+        try:
+            return await inner(args=args, tool_context=tool_context)
+        except _McpErrorDict as err:
+            return err.payload  # unwrap: the agent sees exactly what ADK produced
 
     setattr(run_async, _REBOUND_ATTR, True)
     prior = tool.__dict__.get("run_async", _ABSENT) if hasattr(tool, "__dict__") else _ABSENT
