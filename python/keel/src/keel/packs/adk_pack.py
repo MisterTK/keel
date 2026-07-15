@@ -378,11 +378,15 @@ def _is_mcp_error_dict(result: Any) -> bool:
     f"Unexpected error during MCP tool execution: {e}"}`` — no other keys, a
     plain ``str`` message either way, confirming the plan's expected shape
     exactly (no divergence to mirror). Note: ``_detect_error_in_response``
-    (line 472) checks a DIFFERENT shape (``{"isError": True}``, the raw MCP
-    tool-result convention) and is dead telemetry code in this ADK version —
-    nothing calls it from ``run_async``/``_run_async_impl`` — so it is not
-    the rule to mirror here. Deliberately strict: a non-MCP-shaped dict is a
-    tool RESULT and must never be reclassified."""
+    (line 472, checking a DIFFERENT shape — ``{"isError": True}``, the raw
+    MCP tool-result convention) IS wired up, but only into ADK's own
+    ``functions.py`` ``_detect_error_type_for_telemetry`` — logging only,
+    explicitly documented there as "does not modify the response" and swallows
+    its own exceptions — so it never changes what `run_async` returns and is
+    not the rule to mirror here; the ``{"error": ...}`` shape checked above is
+    the one that actually reaches the agent as the tool's result. Deliberately
+    strict: a non-MCP-shaped dict is a tool RESULT and must never be
+    reclassified."""
     return (
         isinstance(result, dict)
         and set(result) == {"error"}
