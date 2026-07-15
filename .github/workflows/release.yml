@@ -965,13 +965,23 @@ jobs:
       # already resolves. Needed for real, not just defensively — the first
       # v0.1.1 run hit npm's automated spam-detection heuristic on one
       # brand-new platform package (`keelrun-cli-win32-x64`, a 403 with no
-      # retry-after signal) after 10 sibling packages had already published
-      # in the same burst; without this, a re-run would immediately fail
-      # re-publishing any package that already succeeded, and (since each
-      # `npm publish` failure aborts the step under `set -e`) the front-end
-      # `keelrun` package below would never even be attempted.
+      # retry-after signal, and NOT a burst-rate fluke: it recurred
+      # identically on a from-scratch re-run ~10 hours later, so this is a
+      # persistent block on that specific name, not something a retry
+      # fixes — resolving it needs an npm support request from the account
+      # owner, https://www.npmjs.com/support).
+      #
+      # Best-effort, not fail-fast: each package is attempted independently
+      # (`|| record_failure`, not bare `set -e`) so one package's permanent
+      # 403 can never again block every OTHER package in the same job —
+      # exactly what happened the first time, when the win32-x64 403 under
+      # plain `set -e` aborted the step before the front-end `keelrun`
+      # package's publish was even attempted. The step still fails overall
+      # (non-zero exit) if anything genuinely failed, so CI stays honest —
+      # it just doesn't let one bad package take the rest down with it.
       - run: |
-          set -euo pipefail
+          set -uo pipefail
+          failures=()
           publish_if_missing() {
             local tgz="$1"
             local pkg
@@ -981,8 +991,11 @@ jobs:
             ')"
             if npm view "$pkg" version >/dev/null 2>&1; then
               echo "already published: $pkg (skipping)"
+            elif npm publish --access public "./$tgz"; then
+              echo "published: $pkg"
             else
-              npm publish --access public "./$tgz"
+              echo "::error::failed to publish $pkg"
+              failures+=("$pkg")
             fi
           }
           for tgz in dist/keelrun-core-native-*.tgz; do
@@ -993,7 +1006,15 @@ jobs:
           done
           shopt -s nullglob
           front_end=(dist/keelrun-[0-9]*.tgz)
-          [ "${#front_end[@]}" -eq 1 ] || { echo "expected exactly one keelrun front-end tarball, found ${#front_end[@]}: ${front_end[*]}" >&2; exit 1; }
-          publish_if_missing "${front_end[0]}"
+          if [ "${#front_end[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one keelrun front-end tarball, found ${#front_end[@]}: ${front_end[*]}"
+            failures+=("keelrun (tarball count mismatch)")
+          else
+            publish_if_missing "${front_end[0]}"
+          fi
+          if [ "${#failures[@]}" -ne 0 ]; then
+            echo "::error::${#failures[@]} package(s) failed to publish: ${failures[*]}"
+            exit 1
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
