@@ -15,7 +15,10 @@ tool name, discovery recording).
 from __future__ import annotations
 
 import asyncio
+import io
+import os
 import sqlite3
+import sys
 import unittest
 from importlib import metadata
 from pathlib import Path
@@ -23,7 +26,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from unittest import mock
 
-from fake_adk import FakeAdkModules, FakeApp, FakeBasePlugin, FakeInMemoryRunner, FakeRunner, FakeTool
+from fake_adk import FakeAdkModules, FakeApp, FakeBasePlugin, FakeInMemoryRunner, FakeRunner, FakeTool, FakeSlottedTool
 
 from keel import _runtime
 from keel._backend import load_backend
@@ -360,6 +363,62 @@ class RebindLifecycleTest(AdkTestBase):
             adk_pack.uninstall()
             self.assertNotIn("run_async", tool.__dict__, "shadow removed: class method restored")
             self.assertEqual(asyncio.run(tool.run_async(args={"city": "x"}, tool_context=object())), "x")
+
+
+class SetattrFallbackTest(AdkTestBase):
+    """A tool instance that rejects rebinding still gets full Keel coverage
+    via the old loop-in-callback path — coverage never silently drops."""
+
+    def plugin(self) -> Any:
+        with FakeAdkModules():
+            return adk_pack._plugin()
+
+    def test_slotted_tool_falls_back_to_plugin_loop_with_normalized_result(self) -> None:
+        self.install_runtime({"target": {"tool:count": {}}})
+        tool = FakeSlottedTool("count", lambda: 42)
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            result = asyncio.run(
+                self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
+            )
+        # Fallback = the pre-redesign contract: executed in the callback,
+        # normalized like ADK's own __build_response_event.
+        self.assertEqual(result, {"result": 42})
+        self.assertEqual(tool.calls, 1)
+        self.assertIn("rejects attribute rebinding", err.getvalue())
+
+    def test_fallback_failure_accounting_and_e014(self) -> None:
+        _, discovery = self.install_runtime(
+            {"target": {"tool:charge": {"retry": {"attempts": 3, "on": ["conn"], "schedule": "fixed(1ms)"}}}}
+        )
+        original = ConnectionError("reset")
+
+        def charge() -> None:
+            raise original
+
+        tool = FakeSlottedTool("charge", charge)
+        with self.assertRaises(ConnectionError) as ctx:
+            asyncio.run(
+                self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
+            )
+        self.assertIs(ctx.exception, original)
+        self.assertEqual(tool.calls, 1)
+        self.assertEqual(ctx.exception.keel_outcome["error"]["code"], "KEEL-E014")
+        self.assertEqual(self.read_rows(discovery)["tool:charge"]["failures"], 1)
+
+    def test_fallback_note_emitted_once_and_quietable(self) -> None:
+        self.install_runtime({"target": {"tool:count": {}}})
+        plugin = self.plugin()
+        tool = FakeSlottedTool("count", lambda: 1)
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            asyncio.run(plugin.before_tool_callback(tool=tool, tool_args={}, tool_context=object()))
+            asyncio.run(plugin.before_tool_callback(tool=tool, tool_args={}, tool_context=object()))
+        self.assertEqual(err.getvalue().count("rejects attribute rebinding"), 1, "noted once, not per-call")
+        adk_pack._noted_fallbacks.clear()
+        with mock.patch.dict(os.environ, {"KEEL_QUIET": "1"}), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as err:
+            asyncio.run(plugin.before_tool_callback(tool=tool, tool_args={}, tool_context=object()))
+        self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":

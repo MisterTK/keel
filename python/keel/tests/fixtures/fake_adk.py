@@ -173,6 +173,27 @@ class FakeTool:
         return self.func(**args)
 
 
+class FakeSlottedTool:
+    """A ``__slots__``-restricted tool: ``setattr(tool, "run_async", …)``
+    raises ``AttributeError``, exercising adk_pack's rebind-refusal fallback
+    (the plugin-loop path). Same observable surface as ``FakeTool``."""
+
+    __slots__ = ("name", "func", "calls")
+
+    def __init__(self, name: str, func: Callable[..., Any]) -> None:
+        self.name = name
+        self.func = func
+        self.calls = 0
+
+    async def run_async(self, *, args: dict[str, Any], tool_context: Any) -> Any:
+        self.calls += 1
+        import inspect
+
+        if inspect.iscoroutinefunction(self.func):
+            return await self.func(**args)
+        return self.func(**args)
+
+
 def _fake_module(name: str, **attrs: Any) -> types.ModuleType:
     mod = types.ModuleType(name)
     mod.__spec__ = ModuleSpec(name, loader=None, is_package=True)
@@ -247,4 +268,5 @@ __all__ = [
     "FakePluginManager",
     "FakeRunner",
     "FakeTool",
+    "FakeSlottedTool",
 ]
