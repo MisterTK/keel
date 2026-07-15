@@ -36,6 +36,8 @@ from keel.packs import adk_pack
 class AdkTestBase(unittest.TestCase):
     def setUp(self) -> None:
         adk_pack._noted_skips.clear()
+        adk_pack._noted_fallbacks.clear()
+        adk_pack._rebound.clear()
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
         self._discoveries: list[Discovery] = []
@@ -247,40 +249,54 @@ class InstallAdaptersIntegrationTest(unittest.TestCase):
 
 
 class ToolWrappingTest(AdkTestBase):
+    """The redesigned seam: before_tool_callback REBINDS tool.run_async on
+    first sight and returns None, so ADK's own sequence (agent-level
+    before-callbacks -> real call -> on_tool_error path) proceeds unchanged
+    with Keel wrapped directly around the real call."""
+
     def plugin(self) -> Any:
         with FakeAdkModules():
             return adk_pack._plugin()  # lazily built against the fake BasePlugin
 
-    def test_valid_tool_success_short_circuits_with_dict_result(self) -> None:
+    def see(self, plugin: Any, tool: Any, tool_args: dict[str, Any] | None = None) -> Any:
+        """One before_tool_callback invocation (ADK's step 1)."""
+        return asyncio.run(
+            plugin.before_tool_callback(tool=tool, tool_args=tool_args or {}, tool_context=object())
+        )
+
+    def test_first_sight_rebinds_and_returns_none(self) -> None:
+        # Returning None is the contract that preserves agent-level
+        # before_tool_callbacks: ADK only skips them on a non-None return.
         self.install_runtime({"target": {"tool:get_weather": {}}})
         tool = FakeTool("get_weather", lambda city: {"forecast": f"sunny in {city}"})
+        self.assertIsNone(self.see(self.plugin(), tool))
+        self.assertTrue(getattr(tool.run_async, adk_pack._REBOUND_ATTR, False))
+        self.assertEqual(tool.calls, 0, "the callback never executes the tool itself")
+
+    def test_rebound_run_async_returns_raw_result(self) -> None:
+        # Keel now sits BELOW ADK's __build_response_event, so results pass
+        # through raw — dicts and scalars alike; ADK normalizes above us.
+        self.install_runtime({"target": {"tool:get_weather": {}}})
         plugin = self.plugin()
-        result = asyncio.run(
-            plugin.before_tool_callback(tool=tool, tool_args={"city": "nyc"}, tool_context=object())
-        )
+        tool = FakeTool("get_weather", lambda city: {"forecast": f"sunny in {city}"})
+        self.see(plugin, tool)
+        result = asyncio.run(tool.run_async(args={"city": "nyc"}, tool_context=object()))
         self.assertEqual(result, {"forecast": "sunny in nyc"})
         self.assertEqual(tool.calls, 1)
+        scalar = FakeTool("count", lambda: 42)
+        self.see(plugin, scalar)
+        self.assertEqual(asyncio.run(scalar.run_async(args={}, tool_context=object())), 42)
 
-    def test_scalar_return_normalized_like_adks_own_build_response_event(self) -> None:
-        self.install_runtime({"target": {"tool:count": {}}})
-        tool = FakeTool("count", lambda: 42)
-        result = asyncio.run(
-            self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-        )
-        self.assertEqual(result, {"result": 42})
+    def test_second_sight_does_not_double_wrap(self) -> None:
+        self.install_runtime({"target": {"tool:get_weather": {}}})
+        plugin = self.plugin()
+        tool = FakeTool("get_weather", lambda city: city)
+        self.see(plugin, tool)
+        wrapped_once = tool.run_async
+        self.assertIsNone(self.see(plugin, tool))
+        self.assertIs(tool.run_async, wrapped_once, "second sight is a no-op")
 
-    def test_none_return_still_short_circuits_unambiguously(self) -> None:
-        # A legitimate `None` tool result must still read as "handled" to
-        # ADK's `is None` short-circuit check, not "no override".
-        self.install_runtime({"target": {"tool:noop": {}}})
-        tool = FakeTool("noop", lambda: None)
-        result = asyncio.run(
-            self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-        )
-        self.assertIsNotNone(result)
-        self.assertEqual(result, {"result": None})
-
-    def test_non_idempotent_default_not_retried_e014(self) -> None:
+    def test_non_idempotent_default_not_retried_e014_and_error_raises_at_the_real_call(self) -> None:
         _, discovery = self.install_runtime(
             {"target": {"tool:charge_card": {"retry": {"attempts": 3, "on": ["conn"], "schedule": "fixed(1ms)"}}}}
         )
@@ -290,11 +306,14 @@ class ToolWrappingTest(AdkTestBase):
             raise original
 
         tool = FakeTool("charge_card", charge)
+        plugin = self.plugin()
+        # Step 1 (before_tool_callback) must NOT raise — the failure has to
+        # surface from the real call (ADK's step 3), inside ADK's
+        # try/except, so user on_tool_error handlers fire again.
+        self.assertIsNone(self.see(plugin, tool))
         with self.assertRaises(ConnectionError) as ctx:
-            asyncio.run(
-                self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-            )
-        self.assertIs(ctx.exception, original)
+            asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertIs(ctx.exception, original, "original exception, not RuntimeError-wrapped")
         self.assertEqual(tool.calls, 1, "a side-effecting ADK tool is never auto-retried")
         self.assertEqual(ctx.exception.keel_outcome["error"]["code"], "KEEL-E014")
         rows = self.read_rows(discovery)
@@ -307,28 +326,40 @@ class ToolWrappingTest(AdkTestBase):
             return {"page": "1"}
 
         tool = FakeTool("fetch", fetch)
-        result = asyncio.run(
-            self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-        )
-        self.assertEqual(result, {"page": "1"})
+        plugin = self.plugin()
+        self.see(plugin, tool)
+        self.assertEqual(asyncio.run(tool.run_async(args={}, tool_context=object())), {"page": "1"})
 
     def test_invalid_tool_name_skipped_unwrapped(self) -> None:
         self.install_runtime({})
         tool = FakeTool("get weather", lambda: {"ok": True})  # space: not a valid tool: name
-        result = asyncio.run(
-            self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-        )
-        self.assertIsNone(result, "no override: ADK invokes the tool itself, unwrapped")
-        self.assertEqual(tool.calls, 0, "the plugin never called the tool directly")
+        self.assertIsNone(self.see(self.plugin(), tool))
+        self.assertFalse(getattr(tool.run_async, adk_pack._REBOUND_ATTR, False))
+        self.assertEqual(tool.calls, 0)
 
     def test_missing_or_non_string_name_skipped(self) -> None:
         self.install_runtime({})
         tool = FakeTool("", lambda: 1)
         tool.name = None  # some exotic tool object
-        result = asyncio.run(
-            self.plugin().before_tool_callback(tool=tool, tool_args={}, tool_context=object())
-        )
-        self.assertIsNone(result)
+        self.assertIsNone(self.see(self.plugin(), tool))
+        self.assertFalse(getattr(tool.run_async, adk_pack._REBOUND_ATTR, False))
+
+
+class RebindLifecycleTest(AdkTestBase):
+    def test_uninstall_restores_rebound_instances(self) -> None:
+        self.install_runtime({"target": {"tool:get_weather": {}}})
+        with FakeAdkModules():
+            adk_pack.install()
+            tool = FakeTool("get_weather", lambda city: city)
+            asyncio.run(
+                adk_pack._plugin().before_tool_callback(
+                    tool=tool, tool_args={}, tool_context=object()
+                )
+            )
+            self.assertIn("run_async", tool.__dict__, "rebind shadows the class method")
+            adk_pack.uninstall()
+            self.assertNotIn("run_async", tool.__dict__, "shadow removed: class method restored")
+            self.assertEqual(asyncio.run(tool.run_async(args={"city": "x"}, tool_context=object())), "x")
 
 
 if __name__ == "__main__":

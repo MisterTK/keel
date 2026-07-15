@@ -101,6 +101,7 @@ import functools
 import importlib.metadata
 import os
 import sys
+import weakref
 from typing import Any, Callable
 
 from ..adapters._pack import Detection, Seam, TargetDecl
@@ -127,6 +128,19 @@ _installed = False
 _orig: dict[str, Any] = {}
 _plugin_singleton: Any = None
 _noted_skips: set[str] = set()
+
+#: Marker attribute set on a rebound instance's replacement ``run_async``.
+_REBOUND_ATTR = "__keel_adk_rebound__"
+
+#: Sentinel: the tool had NO instance-level ``run_async`` before rebinding
+#: (the overwhelmingly normal case — the method lives on the class).
+_ABSENT = object()
+
+#: Rebound tool instance → its prior instance-dict ``run_async`` entry (or
+#: ``_ABSENT``). Weak keys: a garbage-collected tool needs no restoration.
+#: A tool that cannot be weak-referenced still gets rebound — it just cannot
+#: be individually restored by ``uninstall()`` (noted in the docstring).
+_rebound: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 # --- contract operations -----------------------------------------------------
@@ -229,13 +243,12 @@ def install() -> None:
 
 
 def uninstall() -> None:
-    """Restore the original ``Runner.__init__``. Runners already constructed
-    keep whatever plugins they were given (mirrors httpx_pack: uninstall
-    un-arms future construction, not already-live objects). Defensive against
-    the module having somehow become unimportable since ``install()`` (never
-    expected for a real install; guards against a permanently-stuck
-    ``_installed`` state either way)."""
+    """Restore the original ``Runner.__init__`` and un-shadow every rebound
+    tool instance still alive (weak registry — collected tools need nothing).
+    Runners already constructed keep whatever plugins they were given
+    (mirrors httpx_pack: uninstall un-arms future construction)."""
     global _installed
+    _restore_rebound()
     if not _installed:
         return
     try:
@@ -247,6 +260,19 @@ def uninstall() -> None:
     Runner.__init__ = _orig["init"]  # type: ignore[method-assign]
     _orig.clear()
     _installed = False
+
+
+def _restore_rebound() -> None:
+    for tool, prior in list(_rebound.items()):
+        try:
+            if prior is _ABSENT:
+                if "run_async" in tool.__dict__:
+                    delattr(tool, "run_async")
+            else:
+                setattr(tool, "run_async", prior)
+        except (AttributeError, TypeError):
+            pass  # never let a hostile tool object break uninstall
+    _rebound.clear()
 
 
 def _init_wrapper(orig_init: Callable[..., None]) -> Callable[..., None]:
@@ -293,13 +319,66 @@ def _plugin() -> Any:
             async def before_tool_callback(
                 self, *, tool: Any, tool_args: dict[str, Any], tool_context: Any
             ) -> dict[str, Any] | None:
-                return await _run_tool(tool, tool_args, tool_context)
+                return await _on_before_tool(tool, tool_args, tool_context)
 
         _plugin_singleton = _KeelPlugin()
     return _plugin_singleton
 
 
-async def _run_tool(tool: Any, tool_args: dict[str, Any], tool_context: Any) -> dict[str, Any] | None:
+async def _on_before_tool(tool: Any, tool_args: dict[str, Any], tool_context: Any) -> dict[str, Any] | None:
+    """The ``before_tool_callback`` body. Returning ``None`` is the contract
+    that keeps ADK's own sequence intact: agent-level before-callbacks still
+    run (ADK only skips them on a non-``None`` plugin return), the real call
+    happens at ADK's step 3 through our rebound wrapper, and a terminal
+    failure raises from the real call — inside ADK's try/except — so user
+    ``on_tool_error`` plugins/callbacks (including ADK's own
+    ``ReflectAndRetryToolPlugin``) fire exactly as they would unwrapped."""
+    name = getattr(tool, "name", None)
+    if not is_valid_tool_name(name):
+        _note_skip(name)
+        return None  # not our target grammar: let ADK invoke it, unwrapped
+    if getattr(getattr(tool, "run_async", None), _REBOUND_ATTR, False):
+        return None  # already rebound on a prior sight
+    if _rebind_tool(tool, name):
+        return None  # rebound: ADK proceeds normally, Keel wraps the real call
+    # Instance rejects setattr (slots/frozen): keep coverage via the old
+    # loop-in-callback path — documented trade-off (agent-level
+    # before-callbacks are bypassed for THIS tool only).
+    _note_fallback(name)
+    return await _call_via_plugin_loop(tool, tool_args, tool_context)
+
+
+def _rebind_tool(tool: Any, name: str) -> bool:
+    """Rebind ``tool.run_async`` (instance attribute shadowing the class
+    method) to a Keel-wrapped version. The breaker still guards attempt 1:
+    ``wrap_tool``'s wrapper consults policy before the first underlying
+    invoke. Returns ``False`` when the instance rejects attribute assignment."""
+    original = tool.run_async  # the bound method, captured pre-shadow
+
+    async def _invoke(*, args: dict[str, Any], tool_context: Any) -> Any:
+        return await original(args=args, tool_context=tool_context)
+
+    _invoke.__qualname__ = f"adk.tool.{name}"
+    inner = wrap_tool(name, _invoke, idempotent=False)
+
+    @functools.wraps(original)
+    async def run_async(*, args: dict[str, Any], tool_context: Any) -> Any:
+        return await inner(args=args, tool_context=tool_context)
+
+    setattr(run_async, _REBOUND_ATTR, True)
+    prior = tool.__dict__.get("run_async", _ABSENT) if hasattr(tool, "__dict__") else _ABSENT
+    try:
+        setattr(tool, "run_async", run_async)
+    except (AttributeError, TypeError):
+        return False
+    try:
+        _rebound[tool] = prior
+    except TypeError:
+        pass  # not weakref-able: rebound, but uninstall() cannot restore it
+    return True
+
+
+async def _call_via_plugin_loop(tool: Any, tool_args: dict[str, Any], tool_context: Any) -> dict[str, Any] | None:
     """The ``before_tool_callback`` body (module-level so it needs no ADK
     types): resolve the tool's name against the frozen ``tool:<name>``
     grammar — skip-and-note (Level 0: "if a call site cannot be wrapped
@@ -336,6 +415,25 @@ def _note_skip(name: object) -> None:
         f"keel ▸ adk: tool name {name!r} does not match the tool: target "
         "grammar ([A-Za-z0-9_][A-Za-z0-9_.-]*) — left unwrapped (still runs, "
         "just without Keel's breaker/timeout/discovery coverage)\n"
+    )
+
+
+_noted_fallbacks: set[str] = set()
+
+
+def _note_fallback(name: str) -> None:
+    """Note (once per name) a tool instance that rejected the rebind: Keel
+    keeps full coverage via the plugin-loop path, but agent-level
+    before_tool_callbacks are bypassed for this tool — worth a line."""
+    if name in _noted_fallbacks:
+        return
+    _noted_fallbacks.add(name)
+    if os.environ.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return
+    sys.stderr.write(
+        f"keel ▸ adk: tool {name!r} rejects attribute rebinding (slots/frozen) — "
+        "covered via the plugin loop instead; agent-level before_tool_callbacks "
+        "are bypassed for this tool only\n"
     )
 
 
