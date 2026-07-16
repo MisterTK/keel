@@ -246,6 +246,54 @@ fn skill_tool_list_matches_mcp_catalog() {
     }
 }
 
+// ---- init: agents-cli layout redirection ----
+
+/// A real `keel init` run over the checked-in agents-cli fixture (manifest +
+/// `app/` at the project root): the generated `keel.toml` lands inside `app/`,
+/// not at the project root, and its bytes match what a plain `keel init`
+/// would produce for that same tree — the redirection changes *where* the
+/// file goes, never *what* gets written.
+#[test]
+fn init_writes_into_the_agent_dir_for_the_agents_cli_fixture() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures()
+            .join("agents_cli_project")
+            .join("agents-cli-manifest.yaml"),
+        dir.path().join("agents-cli-manifest.yaml"),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("app")).unwrap();
+    std::fs::copy(
+        fixtures()
+            .join("agents_cli_project")
+            .join("app")
+            .join("app.mjs"),
+        dir.path().join("app").join("app.mjs"),
+    )
+    .unwrap();
+
+    let r = init::run(dir.path(), init::InitOptions::default());
+
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert!(
+        !dir.path().join("keel.toml").exists(),
+        "no keel.toml left at the project root"
+    );
+    let written_path = dir.path().join("app").join("keel.toml");
+    assert!(written_path.exists(), "keel.toml lands in app/");
+    assert_eq!(
+        r.json["wrote"].as_str().unwrap(),
+        written_path.display().to_string()
+    );
+
+    // Same bytes a non-redirected `keel init` would have written for this
+    // tree — redirection only changes the destination path.
+    let scanned = scan::scan(dir.path());
+    let expected = init::render_keel_toml(&scanned, &[], None);
+    assert_eq!(std::fs::read_to_string(&written_path).unwrap(), expected);
+}
+
 // ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
 
 /// Two-target project for the `--diff` fixtures: `api.example.com` is already
@@ -429,6 +477,48 @@ fn doctor_json_matches_golden_for_agent_stack() {
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK);
     check_golden("doctor_agent_stack.json", &json_string(&r.json));
+}
+
+/// An agents-cli project (a manifest naming `agent_directory: app`) with a
+/// `keel.toml` left at the project root: the generated Dockerfile only COPYs
+/// `pyproject.toml`, `README.md`, `uv.lock*`, and `app` into the image, so
+/// doctor must flag the root file with an `agents-cli-config-placement`
+/// warning. Built on the JS fixture (pure Rust scan, no python3) so the rest
+/// of the report stays deterministic across machines.
+#[test]
+fn doctor_json_matches_golden_for_agents_cli_placement() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures()
+            .join("agents_cli_project")
+            .join("agents-cli-manifest.yaml"),
+        dir.path().join("agents-cli-manifest.yaml"),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("app")).unwrap();
+    std::fs::copy(
+        fixtures()
+            .join("agents_cli_project")
+            .join("app")
+            .join("app.mjs"),
+        dir.path().join("app").join("app.mjs"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "[target.\"api.example.com\"]\nretry = { attempts = 5 }\n",
+    )
+    .unwrap();
+
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "a warn finding does not fail ok");
+    let findings = r.json["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["topic"] == "agents-cli-config-placement" && f["level"] == "warn")
+    );
+    check_golden("doctor_agents_cli_placement.json", &json_string(&r.json));
 }
 
 /// An invalid keel.toml turns the doctor policy finding into an applyable fix

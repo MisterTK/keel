@@ -17,6 +17,7 @@ use std::path::Path;
 use keel_journal::TargetStats;
 use serde::Serialize;
 
+use crate::agents_cli;
 use crate::diff::{ChangeHunk, PolicyOp, PolicyPath, propose};
 use crate::render::to_json;
 use crate::scan::{ScanResult, TargetClass, TargetEvidence};
@@ -166,7 +167,7 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     let content = render_keel_toml(&scan, &discovery, opts.stamp.then(today_utc).as_deref());
     let targets = merged_targets(&scan, &discovery);
 
-    let toml_path = evidence::keel_toml(project);
+    let toml_path = agents_cli_toml_path(project).unwrap_or_else(|| evidence::keel_toml(project));
     if opts.diff {
         return diff(&toml_path, &scan, &discovery, &targets, &content);
     }
@@ -213,6 +214,29 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
         wrote: toml_path.display().to_string(),
     };
     Rendered::ok(human, to_json(&report))
+}
+
+/// When `project` is inside a Google `agents-cli` layout (an
+/// `agents-cli-manifest.yaml` naming an `agent_directory`) and that agent
+/// directory is itself inside `project`, redirect the generated `keel.toml`
+/// there instead of the project root — the generated Dockerfile only `COPY`s
+/// `pyproject.toml`, `README.md`, `uv.lock*`, and the agent directory into the
+/// image, so a root `keel.toml` would never ship. Prints one deterministic
+/// stderr note when it redirects. Returns `None` for a non-agents-cli project
+/// (or one whose agent directory lies outside `project`), so the caller falls
+/// back to the ordinary `<project>/keel.toml` path.
+fn agents_cli_toml_path(project: &Path) -> Option<std::path::PathBuf> {
+    let layout = agents_cli::find_agents_cli_layout(project)?;
+    if !layout.agent_dir.starts_with(project) {
+        return None;
+    }
+    let path = layout.agent_dir.join("keel.toml");
+    eprintln!(
+        "keel \u{25b8} agents-cli project detected \u{2014} writing {} so it ships in the \
+         container image",
+        path.display()
+    );
+    Some(path)
 }
 
 /// The set of targets the generated file will contain: static findings unioned
@@ -952,6 +976,85 @@ mod tests {
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             "# hand-written\n"
         );
+    }
+
+    // ---- agents-cli layout redirection ----
+
+    /// An `agents-cli` project (manifest + agent dir at the root) gets its
+    /// generated `keel.toml` written into the agent directory, not the
+    /// project root — the generated Dockerfile only COPYs the agent dir.
+    #[test]
+    fn agents_cli_project_writes_keel_toml_into_the_agent_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("app")).unwrap();
+        fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "schema_version: 1\nagent_directory: app\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(!dir.path().join("keel.toml").exists(), "no root keel.toml");
+        assert!(
+            dir.path().join("app").join("keel.toml").exists(),
+            "keel.toml lands in the agent directory"
+        );
+        assert_eq!(
+            r.json["wrote"].as_str().unwrap(),
+            dir.path()
+                .join("app")
+                .join("keel.toml")
+                .display()
+                .to_string()
+        );
+    }
+
+    /// A project with no `agents-cli-manifest.yaml` is unaffected: `keel.toml`
+    /// still lands at the project root, byte-identical to the non-agents-cli
+    /// goldens.
+    #[test]
+    fn non_agents_cli_project_writes_keel_toml_at_the_root() {
+        let dir = TempDir::new().unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(dir.path().join("keel.toml").exists());
+    }
+
+    /// The refuse-if-exists guard applies to the redirected path: an existing
+    /// `keel.toml` inside the agent directory blocks the write even though the
+    /// project root has none.
+    #[test]
+    fn agents_cli_refuses_when_the_redirected_path_already_exists() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("app")).unwrap();
+        fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("app").join("keel.toml"), "# hand-written\n").unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.human.contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("app").join("keel.toml")).unwrap(),
+            "# hand-written\n"
+        );
+    }
+
+    /// `agents_cli_toml_path` itself: `None` for a non-agents-cli project, and
+    /// `None` (not a panic or an escaping path) when the manifest's agent
+    /// directory would resolve outside `project`.
+    #[test]
+    fn agents_cli_toml_path_is_none_without_a_manifest() {
+        let dir = TempDir::new().unwrap();
+        assert!(agents_cli_toml_path(dir.path()).is_none());
     }
 
     #[test]

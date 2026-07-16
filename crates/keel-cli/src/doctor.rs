@@ -27,7 +27,7 @@ use serde::Serialize;
 use crate::diff::{PolicyOp, PolicyPath, Proposal, propose, resolve_dotted_path};
 use crate::render::to_json;
 use crate::scan::ScanResult;
-use crate::{EXIT_OK, EXIT_USAGE, Rendered, evidence, scan};
+use crate::{EXIT_OK, EXIT_USAGE, Rendered, agents_cli, evidence, scan};
 
 /// One known adapter/pack: its library, the language(s), the semantic target
 /// class it exposes, and whether it is version-pinned or best-effort.
@@ -325,7 +325,8 @@ pub fn run(project: &Path) -> Rendered {
     };
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
-    let report = build_report(&scan, &discovery, policy, journal);
+    let agents_cli_finding = agents_cli_placement_finding(project);
+    let report = build_report(&scan, &discovery, policy, journal, agents_cli_finding);
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
     Rendered::ok(human, to_json(&report)).with_exit(exit)
@@ -371,6 +372,52 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
     })
 }
 
+/// A root `keel.toml` in a Google `agents-cli` project (an
+/// `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches the
+/// container: the generated Dockerfile only `COPY`s `pyproject.toml`,
+/// `README.md`, `uv.lock*`, and the agent directory itself. Emitted only when
+/// a manifest is found, `<project>/keel.toml` actually exists, and the agent
+/// directory is not `project` itself — when `agent_directory` names the
+/// project root, the root `keel.toml` already sits inside the one directory
+/// the Dockerfile ships, so there is no placement problem to report.
+fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
+    let layout = agents_cli::find_agents_cli_layout(project)?;
+    if layout.agent_dir == project || !evidence::keel_toml(project).exists() {
+        return None;
+    }
+    // Display paths relative to `project` (the common case: `agent_directory`
+    // names a subdirectory of the project it's declared in) rather than the
+    // absolute filesystem path — keeps the finding's text, and therefore
+    // `--json`, reproducible across checkouts instead of embedding wherever
+    // this particular clone happens to sit on disk.
+    let agent_dir = relative_display(project, &layout.agent_dir);
+    let moved_to = relative_display(project, &layout.agent_dir.join("keel.toml"));
+    Some(Finding {
+        action: format!(
+            "Move keel.toml to {moved_to} (or add a `COPY keel.toml` line to the Dockerfile)."
+        ),
+        detail: format!(
+            "This is an agents-cli project — its generated Dockerfile only COPYs \
+             pyproject.toml, README.md, uv.lock*, and {agent_dir} into the image, so the \
+             keel.toml at the project root never ships to the container."
+        ),
+        fix: None,
+        level: "warn",
+        topic: "agents-cli-config-placement",
+    })
+}
+
+/// `target` relative to `base` when it is actually nested under `base`, else
+/// the absolute path unchanged (a manifest found above `project`, or on a
+/// different mount — pathological, but must not panic or produce nonsense
+/// like `../../../../tmp/x`).
+fn relative_display(base: &Path, target: &Path) -> String {
+    target.strip_prefix(base).map_or_else(
+        |_| target.display().to_string(),
+        |rel| rel.display().to_string(),
+    )
+}
+
 /// An unsupported journal backend is an error finding: the app would fail to
 /// configure with KEEL-E005, so doctor must not read clean.
 fn journal_finding(journal: &JournalReport) -> Option<Finding> {
@@ -386,13 +433,17 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the four evidence inputs. Pure, so the golden test
-/// pins it without a filesystem or `python3`.
+/// Assemble the report from the five evidence inputs. Pure, so the golden test
+/// pins it without a filesystem or `python3` — the one filesystem-dependent
+/// input (`agents_cli_finding`, since it needs to walk for a manifest and
+/// check for a root `keel.toml`) is computed by the caller and passed in
+/// already resolved, the same pattern `policy`/`journal` already use.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
     policy: PolicyValidation,
     journal: JournalReport,
+    agents_cli_finding: Option<Finding>,
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
     let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
@@ -480,6 +531,7 @@ fn build_report(
     }
     findings.extend(resilience_finding(scan, &registry_libs));
     findings.extend(journal_finding(&journal));
+    findings.extend(agents_cli_finding);
 
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
@@ -721,7 +773,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal());
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
@@ -765,7 +817,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &BTreeSet::new(), policy, default_journal());
+        let r = build_report(&scan, &BTreeSet::new(), policy, default_journal(), None);
 
         assert!(
             r.coverage.invisible.is_empty(),
@@ -811,7 +863,13 @@ mod tests {
     fn resilience_lib_alongside_a_wrapped_effect_is_a_finding() {
         let mut scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
         scan.resilience_libs.insert("tenacity".to_owned());
-        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
         let finding = r
             .findings
             .iter()
@@ -832,7 +890,13 @@ mod tests {
             ..ScanResult::default()
         };
         scan.resilience_libs.insert("tenacity".to_owned());
-        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
         assert!(
             !r.findings
                 .iter()
@@ -843,7 +907,13 @@ mod tests {
     #[test]
     fn no_resilience_libs_is_not_a_finding() {
         let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
-        let r = build_report(&scan, &BTreeSet::new(), default_policy(), default_journal());
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
         assert!(
             !r.findings
                 .iter()
@@ -864,7 +934,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal());
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
         assert!(!r.ok);
         assert!(
             r.findings
@@ -895,7 +965,7 @@ mod tests {
             source: "keel.toml",
             supported: false,
         };
-        let r = build_report(&scan, &wrapped, policy, journal);
+        let r = build_report(&scan, &wrapped, policy, journal, None);
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
             .findings
@@ -909,6 +979,100 @@ mod tests {
         let text = human(&r);
         assert!(text.contains("postgres"));
         assert!(text.contains("NOT supported"));
+    }
+
+    // ---- agents-cli config placement ----
+
+    /// A manifest naming an agent directory other than the project root, plus
+    /// a root `keel.toml`, is exactly the layout that never ships: the finding
+    /// fires with the Dockerfile explanation and a move-it action.
+    #[test]
+    fn agents_cli_placement_finding_fires_for_a_root_keel_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+
+        let finding =
+            agents_cli_placement_finding(dir.path()).expect("root keel.toml should be flagged");
+        assert_eq!(finding.level, "warn");
+        assert_eq!(finding.topic, "agents-cli-config-placement");
+        assert!(finding.detail.contains("Dockerfile"));
+        assert!(finding.detail.contains("pyproject.toml"));
+        assert!(finding.detail.contains("app"));
+        assert!(
+            finding.action.contains("app/keel.toml") || finding.action.contains("app\\keel.toml"),
+            "action names the relative move-to path: {}",
+            finding.action
+        );
+    }
+
+    /// No manifest at all: never a finding, regardless of a root `keel.toml`.
+    #[test]
+    fn agents_cli_placement_finding_is_none_without_a_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+        assert!(agents_cli_placement_finding(dir.path()).is_none());
+    }
+
+    /// The `keel.toml` already lives in the agent directory (the correct
+    /// place) and the project root has none: nothing to flag.
+    #[test]
+    fn agents_cli_placement_finding_is_none_when_keel_toml_is_already_in_the_agent_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("app").join("keel.toml"), "[target.\"x\"]\n").unwrap();
+
+        assert!(agents_cli_placement_finding(dir.path()).is_none());
+    }
+
+    /// A manifest whose `agent_directory` names the project root itself: the
+    /// root `keel.toml` already sits inside the one directory the Dockerfile
+    /// ships, so there is nothing to flag.
+    #[test]
+    fn agents_cli_placement_finding_is_none_when_agent_dir_is_the_project_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: .\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+
+        assert!(agents_cli_placement_finding(dir.path()).is_none());
+    }
+
+    /// End-to-end through `run()`: the finding surfaces in the full report and
+    /// (being a warn, not an error) does not flip `ok` to false.
+    #[test]
+    fn doctor_run_surfaces_the_agents_cli_placement_finding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+
+        let r = run(dir.path());
+        assert_eq!(r.exit, EXIT_OK);
+        assert_eq!(r.json["ok"], true);
+        let findings = r.json["findings"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["topic"] == "agents-cli-config-placement" && f["level"] == "warn")
+        );
     }
 
     /// End-to-end over a real project dir: doctor resolves and reports the

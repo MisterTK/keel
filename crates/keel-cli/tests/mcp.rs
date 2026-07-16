@@ -331,6 +331,46 @@ fn get_doctor_report_surfaces_a_real_preexisting_resilience_finding() {
     assert!(finding["detail"].as_str().unwrap().contains("tenacity"));
 }
 
+/// `get_doctor_report` surfaces the `agents-cli-config-placement` finding for
+/// a real agents-cli project (manifest + `app/` + a root `keel.toml`) and
+/// stays byte-identical to `keel doctor --json` for it, per the same
+/// established pattern as the preexisting-resilience parity test above.
+#[test]
+fn get_doctor_report_surfaces_a_real_agents_cli_placement_finding() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("agents-cli-manifest.yaml"),
+        "agent_directory: app\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("app")).unwrap();
+    std::fs::write(
+        dir.path().join("app").join("app.mjs"),
+        "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "[target.\"api.example.com\"]\nretry = { attempts = 5 }\n",
+    )
+    .unwrap();
+
+    let script = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_doctor_report\",\"arguments\":{}}}\n";
+    let lines = run_session(dir.path(), script);
+    let text = tool_text(&lines, 1);
+
+    assert_eq!(text, json_string(&doctor::run(dir.path()).json));
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["topic"] == "agents-cli-config-placement")
+        .unwrap_or_else(|| panic!("no agents-cli-config-placement finding in {report}"));
+    assert_eq!(finding["level"], "warn");
+    assert!(finding["detail"].as_str().unwrap().contains("Dockerfile"));
+}
+
 /// The real binary (`keel mcp`, project = cwd) replays the same session with a
 /// byte-identical transcript: no wall-clock value reaches any response, so the
 /// in-process fixture clock and the binary's system clock cannot diverge.
