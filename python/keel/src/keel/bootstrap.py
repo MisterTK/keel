@@ -43,6 +43,7 @@ class _State:
     discovery: Discovery | None = None
     exit_registered: bool = False
     mcp_uninstall: Any = None
+    state: dict[str, Any] | None = None
 
 
 _STATE = _State()
@@ -56,7 +57,15 @@ def install_keel(
     if is_disabled(env):
         return {"enabled": False, "reason": "KEEL_DISABLE"}
     if _STATE.installed:
-        return {"enabled": True, "reason": "already-installed"}
+        # Return the SAME full state the first install produced (backend,
+        # discovery, flow_entrypoints, …) rather than a bare marker — callers
+        # like `_run.run_target` index into this dict unconditionally, and a
+        # second `install_keel()` call in the same process (e.g. the .pth
+        # shim's `keel._auto` installing before `_run.run_target` installs
+        # again) must not silently drop that state (KEEL-… double-activation
+        # regression).
+        assert _STATE.state is not None
+        return {**_STATE.state, "reason": "already-installed"}
     _STATE.installed = True
 
     cwd = Path(cwd or Path.cwd())
@@ -112,7 +121,7 @@ def install_keel(
     _register_exit_flush()
     _banner(env, source, [t.key for t in targets], adapters, mcp)
 
-    return {
+    state = {
         "enabled": True,
         "backend": backend,
         "discovery": discovery,
@@ -122,6 +131,8 @@ def install_keel(
         "adapters": adapters,
         "mcp": mcp,
     }
+    _STATE.state = state
+    return state
 
 
 def apply_journal_env_override(
@@ -158,6 +169,7 @@ def uninstall_keel() -> None:
     clear_outbound_targets()
     clear_runtime()
     _STATE.installed = False
+    _STATE.state = None
 
 
 def _register_exit_flush() -> None:

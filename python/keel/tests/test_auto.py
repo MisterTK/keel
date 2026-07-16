@@ -16,9 +16,27 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from . import child_env
+from . import FIXTURES, child_env
+from keel import bootstrap
 
 _IMPORT_AUTO = "import keel._auto; print('APP-RAN')"
+
+FLOW_TARGET = str(FIXTURES / "flow_target.py")
+NOOP = str(FIXTURES / "noop_app.py")
+
+# The double-activation repro (WS2 final-review Important finding):
+# `import keel._auto` performs the FIRST `install_keel()` — exactly what the
+# `.pth` shim's gated import line does (real site processing of that line is
+# covered separately by test_pth_wheel.py) — then `main_module()` (the same
+# entry `python -m keel run <target>` uses) triggers `_run.run_target`'s OWN
+# `install_keel()` call, the SECOND install in this same process.
+_DOUBLE_ACTIVATE_THEN_RUN = (
+    "import os; os.environ['KEEL_ENABLE'] = '1'\n"
+    "import keel._auto\n"
+    "import sys; sys.argv = ['keel', 'run', {target!r}]\n"
+    "from keel._run import main_module\n"
+    "main_module()\n"
+)
 
 # Discovery (`_discovery.py:196-209`) only creates `.keel/` on the FIRST
 # recorded call — construction just sets `db_path`, it does not `mkdir`. A
@@ -115,6 +133,91 @@ class AutoActivationTest(unittest.TestCase):
         # The gate must run BEFORE any keel import: 'keel' may appear only
         # inside the __import__ call that the gate guards.
         self.assertLess(line.index("KEEL_ENABLE"), line.index("keel._auto"))
+
+
+class DoubleActivationStateTest(unittest.TestCase):
+    """In-process leg: a second `install_keel()` call in the same process (the
+    already-installed early return) must hand back the SAME full state the
+    first call produced, not a bare `{"enabled": True, "reason": ...}` marker
+    — `_run.run_target` indexes `state["backend"]` unconditionally on the
+    KEEL_SIM_PLAN/KEEL_RECORD paths and reads `state.get("flow_entrypoints")`
+    for flow dispatch, so a dropped key there is a KeyError or a silently
+    skipped flow, not just a cosmetic difference."""
+
+    def test_second_install_returns_the_same_cached_state(self) -> None:
+        self.addCleanup(bootstrap.uninstall_keel)
+        with TemporaryDirectory() as d:
+            Path(d, "keel.toml").write_text(
+                '[flows]\nentrypoints = ["py:pipeline:main"]\n', encoding="utf-8"
+            )
+            env = {"KEEL_QUIET": "1"}
+            first = bootstrap.install_keel(cwd=d, env=env)
+            second = bootstrap.install_keel(cwd=d, env=env)
+
+        self.assertEqual(second["reason"], "already-installed")
+        self.assertTrue(first["enabled"])
+        self.assertTrue(second["enabled"])
+        for key in (
+            "backend",
+            "discovery",
+            "source",
+            "function_targets",
+            "flow_entrypoints",
+            "adapters",
+            "mcp",
+        ):
+            self.assertIn(key, second, f"{key!r} missing from the already-installed state")
+        self.assertIs(second["backend"], first["backend"])
+        self.assertIs(second["discovery"], first["discovery"])
+        self.assertEqual(second["flow_entrypoints"], first["flow_entrypoints"])
+        self.assertTrue(second["flow_entrypoints"], "flow entrypoints must survive a second install")
+
+
+class DoubleActivationEndToEndTest(unittest.TestCase):
+    """Child-process legs of the same regression, through the real
+    `keel._auto` → `keel run` chain (see `_DOUBLE_ACTIVATE_THEN_RUN`)."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.cwd = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def write_policy(self, body: str = "") -> None:
+        Path(self.cwd, "keel.toml").write_text(body, encoding="utf-8")
+
+    def test_flow_dispatch_survives_double_activation(self) -> None:
+        # A lost `flow_entrypoints` state would make `match_flow` see an empty
+        # list and silently fall through to a plain script run — no dispatch,
+        # no error, "FLOW-RAN" never printed (main() is only called by flow
+        # dispatch, never at import time). A preserved state instead reaches
+        # `run_as_flow`, which — on the stub backend, which has no Tier 2
+        # surface — fails LOUDLY with KEEL-E005. That loud, precise failure is
+        # the discriminating observable: it proves dispatch was attempted.
+        self.write_policy('[flows]\nentrypoints = ["py:flow_target:main"]\n')
+        code = _DOUBLE_ACTIVATE_THEN_RUN.format(target=FLOW_TARGET)
+        proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_QUIET="1"), cwd=self.cwd)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"KEEL-E005", proc.stderr)
+        self.assertIn(b"needs the native core", proc.stderr)
+        self.assertNotIn(b"FLOW-RAN", proc.stdout, "flow dispatch must not silently run main()")
+
+    def test_keel_record_does_not_crash_after_double_activation(self) -> None:
+        # Before the fix, the already-installed state had no "backend" key,
+        # so `_run.run_target`'s `state["backend"] = install_recording(...)`
+        # raised a bare KeyError under KEEL_RECORD.
+        self.write_policy()
+        with TemporaryDirectory() as record_dir:
+            record_path = str(Path(record_dir) / "recording.ndjson")
+            code = _DOUBLE_ACTIVATE_THEN_RUN.format(target=NOOP)
+            proc = _run(
+                code,
+                env=child_env(KEEL_ENABLE="1", KEEL_RECORD=record_path, KEEL_QUIET="1"),
+                cwd=self.cwd,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(b"KeyError", proc.stderr)
 
 
 if __name__ == "__main__":

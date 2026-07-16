@@ -86,6 +86,23 @@ class PthWheelTest(unittest.TestCase):
             self.assertIn(b"APP-RAN", proc.stdout)
             self.assertIn(b"auto-activation failed", proc.stderr)
 
+    def test_keel_cwd_relocates_activation_under_real_pth_processing(self) -> None:
+        # cwd itself has NO keel.toml (a clean-defaults activation there would
+        # print a banner, not fail) — only `app/`, relocated to via KEEL_CWD,
+        # has one, and it's invalid. If the .pth-activated shim ignored
+        # KEEL_CWD it would read cwd's (absent) config and activate cleanly;
+        # asserting the "auto-activation failed" failure instead proves it
+        # actually read the config at KEEL_CWD.
+        with TemporaryDirectory() as cwd:
+            Path(cwd, "app").mkdir()
+            Path(cwd, "app", "keel.toml").write_text("not [valid toml", encoding="utf-8")
+            proc = self.run_in_venv(
+                "print('APP-RAN')", cwd=cwd, KEEL_ENABLE="1", KEEL_CWD="app"
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(b"APP-RAN", proc.stdout)
+            self.assertIn(b"auto-activation failed", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
