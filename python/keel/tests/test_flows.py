@@ -117,6 +117,18 @@ class ExtractFlowEntrypointsTest(unittest.TestCase):
         # call and is not guessed.
         self.assertEqual(extract_flow_entrypoints({"flows": {"entrypoints": ["py:pipeline"]}}), [])
 
+    def test_dotted_qualname_function_slot_parses(self) -> None:
+        # The ADK Runner-flow designation (keel.packs.adk_pack.RUNNER_FLOW_ENTRYPOINT)
+        # depends on rsplit-based parsing admitting a dotted qualname in the
+        # function slot — fence it against future grammar/parser changes.
+        out = extract_flow_entrypoints(
+            {"flows": {"entrypoints": ["py:google.adk.runners:Runner.run_async"]}}
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].module, "google.adk.runners")
+        self.assertEqual(out[0].function, "Runner.run_async")
+        self.assertEqual(out[0].raw, "py:google.adk.runners:Runner.run_async")
+
 
 class MatchFlowTest(unittest.TestCase):
     def test_matches_by_file_stem(self) -> None:
