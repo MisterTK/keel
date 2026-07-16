@@ -51,7 +51,7 @@ Distribution (WS4). `packaging/agents-cli-template/` gives
 `agents-cli scaffold create` a Keel-wrapped starting point out of the box.
 A Claude Code Skill (`skills/keel/`) is installable via `npx skills add
 MisterTK/keel` — the repository is public, so both this and the
-`agents-cli create -a MisterTK/keel/packaging/agents-cli-template` template
+`agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template` template
 consume path work today. A live demo (`demos/adk-demo`)
 is certified against the real ADK stack. README and the `llms.txt`/`llms-full.txt`
 surface now lead with the agent story.
