@@ -28,9 +28,18 @@ import ast, json, os, sys
 from urllib.parse import urlsplit
 
 HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
-LLM_LIBS = {"openai", "anthropic"}
+LLM_LIBS = {"openai", "anthropic", "google.genai"}
 OTHER_LIBS = {"psycopg", "boto3"}
-KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS
+# The agent-framework packs (dx-spec agent-first-class work). pydantic_ai,
+# crewai, langgraph, and openai-agents (import name `agents`) are plain
+# top-level module names, classified exactly like HTTP_LIBS/LLM_LIBS/
+# OTHER_LIBS above. `mcp` is the SDK's own import name (mcp_pack) — a normal
+# adapter lib here, not special-cased. `google.adk` is handled separately via
+# dotted-prefix matching (see `import_entries`): bare `google` is a namespace
+# package shared with unrelated distributions (google-protobuf and friends)
+# and must record nothing.
+AGENT_LIBS = {"pydantic_ai", "crewai", "langgraph", "agents", "mcp"}
+KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS | AGENT_LIBS | {"google.adk"}
 # Known Python resilience libraries — a `keel doctor` signal that a target may
 # already have its own retry/backoff, separate from KNOWN (which is about
 # libraries Keel *adapts*; these are libraries Keel never adapts, so mixing
@@ -48,10 +57,47 @@ OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
              "execvp", "execvpe", "spawnl", "spawnv", "spawnvp"}
 SKIP = {".keel", ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", "dist", "build", "target"}
+# The two `google` submodules Keel adapts. Bare `import google` (the
+# namespace package) records nothing — it also hosts unrelated distributions
+# (google-protobuf and friends) that are none of Keel's business.
+GOOGLE_SUBMODULES = {"adk", "genai"}
 
 
 def top(mod):
     return mod.split(".", 1)[0] if mod else ""
+
+
+def import_entries(node):
+    """Yield (module_key, bound_name) for each name an Import/ImportFrom node
+    binds. Handles the `google.adk` / `google.genai` dotted-prefix special
+    case: `import google.adk`, `from google.adk import ...`, and
+    `from google import genai, adk` all resolve to `google.<name>`; a bare
+    `google` import (or `from google import <something else>`) yields
+    nothing — the google namespace package alone is not evidence of either
+    library."""
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            parts = alias.name.split(".")
+            if len(parts) >= 2 and parts[0] == "google" and parts[1] in GOOGLE_SUBMODULES:
+                key = "google." + parts[1]
+            else:
+                key = parts[0]
+            yield key, (alias.asname or alias.name).split(".", 1)[0]
+    elif isinstance(node, ast.ImportFrom):
+        mod = node.module or ""
+        mparts = mod.split(".")
+        if len(mparts) >= 2 and mparts[0] == "google" and mparts[1] in GOOGLE_SUBMODULES:
+            key = "google." + mparts[1]
+            for alias in node.names:
+                yield key, alias.asname or alias.name
+        elif mod == "google":
+            for alias in node.names:
+                if alias.name in GOOGLE_SUBMODULES:
+                    yield "google." + alias.name, alias.asname or alias.name
+        else:
+            key = top(mod)
+            for alias in node.names:
+                yield key, alias.asname or alias.name
 
 
 def host(s):
@@ -86,21 +132,16 @@ def is_constructor(name):
 
 
 def aliases_of(tree):
-    """Binding name -> tracked top-level module. Also follows one hop of
+    """Binding name -> tracked module (top-level, or `google.adk`/
+    `google.genai` — see `import_entries`). Also follows one hop of
     constructor assignment (client = OpenAI() -> client is an openai handle),
     the dominant SDK-client pattern."""
     a = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for al in node.names:
-                t = top(al.name)
-                if t in TRACKED:
-                    a[(al.asname or al.name).split(".", 1)[0]] = t
-        elif isinstance(node, ast.ImportFrom):
-            t = top(node.module or "")
-            if t in TRACKED:
-                for al in node.names:
-                    a[al.asname or al.name] = t
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for key, bound in import_entries(node):
+                if key in TRACKED:
+                    a[bound] = key
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
             lib = a.get(call_root(node.value.func))
@@ -193,19 +234,12 @@ for dirpath, dirnames, filenames in os.walk(root):
             continue
         files += 1
         for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    t = top(alias.name)
-                    if t in KNOWN:
-                        imports.append({"lib": t, "file": rel, "line": node.lineno})
-                    elif t in RESILIENCE_LIBS:
-                        resilience_libs.add(t)
-            elif isinstance(node, ast.ImportFrom):
-                t = top(node.module or "")
-                if t in KNOWN:
-                    imports.append({"lib": t, "file": rel, "line": node.lineno})
-                elif t in RESILIENCE_LIBS:
-                    resilience_libs.add(t)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for key, _bound in import_entries(node):
+                    if key in KNOWN:
+                        imports.append({"lib": key, "file": rel, "line": node.lineno})
+                    elif key in RESILIENCE_LIBS:
+                        resilience_libs.add(key)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 h = host(node.value)
                 if h:
@@ -282,6 +316,23 @@ pub struct PyScan {
 
 const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3"];
 
+/// Normalize a walker-reported import key to the name `keel doctor`'s
+/// `REGISTRY` (see `crate::doctor`) keys its adapters by. The walker emits
+/// raw Python identifiers (`google.adk`, `pydantic_ai`, `agents`); doctor's
+/// registry — and the docs/findings that reference it — use the packs'
+/// PyPI-ish public names (`google-adk`, `pydantic-ai`, `openai-agents`).
+/// Everything else passes through unchanged (`crewai`, `langgraph`, `mcp`,
+/// `httpx`, `openai`, …).
+fn normalize_lib(lib: &str) -> String {
+    match lib {
+        "google.adk" => "google-adk".to_owned(),
+        "google.genai" => "google-genai".to_owned(),
+        "pydantic_ai" => "pydantic-ai".to_owned(),
+        "agents" => "openai-agents".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// Run the walker over `project`. A missing `python3`, or a walker that fails,
 /// yields an empty unavailable result — never a panic.
 pub fn scan(project: &Path) -> PyScan {
@@ -290,17 +341,20 @@ pub fn scan(project: &Path) -> PyScan {
     };
     let mut findings = LangFindings::default();
     for imp in &output.imports {
-        findings.libs.insert(imp.lib.clone());
+        let lib = normalize_lib(&imp.lib);
+        findings.libs.insert(lib.clone());
         let sighting = Sighting {
             file: imp.file.clone(),
             line: imp.line,
         };
-        match imp.lib.as_str() {
+        match lib.as_str() {
             "openai" => findings.llm.push(("openai".to_owned(), sighting)),
             "anthropic" => findings.llm.push(("anthropic".to_owned(), sighting)),
+            "google-genai" => findings.llm.push(("google-genai".to_owned(), sighting)),
             lib if HTTP_LIBS.contains(&lib) => findings.http_in_use = true,
-            // psycopg/boto3: recorded as effect libraries via their DSN/URL
-            // literals (if any); no synthetic host target from the import alone.
+            // psycopg/boto3/agent-pack libs: recorded as effect libraries via
+            // their DSN/URL literals (if any) or the doctor adapter registry;
+            // no synthetic host target from the import alone.
             _ => {}
         }
     }
@@ -407,6 +461,54 @@ mod tests {
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
         );
+    }
+
+    #[test]
+    fn agent_pack_imports_and_the_google_dotted_prefix_are_classified() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import google\n\
+             import google.adk\n\
+             from google.genai import types\n\
+             from google import genai, adk\n\
+             from pydantic_ai import Agent\n\
+             import crewai\n\
+             from langgraph.graph import StateGraph\n\
+             from agents import Agent as OpenAIAgent\n\
+             import mcp\n\
+             from tenacity import retry\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert!(scan.available);
+        // The six agent-framework packs + the two google submodules, all
+        // normalized to doctor's REGISTRY names.
+        for lib in [
+            "google-adk",
+            "google-genai",
+            "pydantic-ai",
+            "crewai",
+            "langgraph",
+            "openai-agents",
+            "mcp",
+        ] {
+            assert!(scan.findings.libs.contains(lib), "missing lib: {lib}");
+        }
+        // google.genai joins the llm findings, alongside openai/anthropic.
+        assert!(scan.findings.llm.iter().any(|(p, _)| p == "google-genai"));
+        // tenacity is resilience, not a coverage-relevant lib.
+        assert_eq!(
+            scan.findings.resilience_libs,
+            ["tenacity".to_owned()].into_iter().collect()
+        );
+        // Bare `google` (the namespace package) must record NOTHING — it
+        // also hosts unrelated distributions (google-protobuf and friends).
+        assert!(!scan.findings.libs.contains("google"));
     }
 
     #[test]

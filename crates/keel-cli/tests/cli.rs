@@ -410,6 +410,27 @@ fn doctor_json_matches_golden() {
     check_golden("doctor_node.json", &json_string(&r.json));
 }
 
+/// A project importing the six agent-framework packs plus google-adk/
+/// google-genai: doctor's static scan classifies every one of them into
+/// `findings.libs` (normalized to the REGISTRY names) with no "invisible"
+/// coverage gap, since Task 4 registered adapters for all of them.
+#[test]
+fn doctor_json_matches_golden_for_agent_stack() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::copy(
+        fixtures().join("py_agent_stack").join("app.py"),
+        dir.path().join("app.py"),
+    )
+    .unwrap();
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    check_golden("doctor_agent_stack.json", &json_string(&r.json));
+}
+
 /// An invalid keel.toml turns the doctor policy finding into an applyable fix
 /// (dx-spec §5): the whole `--json` twin — findings, `fix.patch`,
 /// `fix.changes` — is byte-golden, and the patch applies cleanly with the real

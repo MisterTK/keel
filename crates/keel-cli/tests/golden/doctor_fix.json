@@ -50,6 +50,48 @@
     },
     {
       "detected": false,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": false,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
+      "detected": false,
       "lib": "fetch",
       "status": "pinned",
       "target": "host"

@@ -91,6 +91,58 @@ const REGISTRY: &[Adapter] = &[
         target: "llm:anthropic",
         best_effort: false,
     },
+    // The six agent-framework packs (dx-spec agent-first-class work) plus the
+    // google-genai LLM provider pack — all contract-tested against real
+    // libraries by the adapter farm (see .github/workflows/adapter-farm.yml),
+    // so pinned like httpx/openai rather than best-effort. `target` mirrors
+    // each pack's own declared `TargetDecl.pattern` exactly (adk_pack.py,
+    // pydantic_ai_pack.py, openai_agents_pack.py, crewai_pack.py,
+    // langgraph_pack.py: `"tool:<name>"`; mcp_pack.py: `"mcp:<server>"`).
+    Adapter {
+        lib: "google-adk",
+        lang: "python",
+        target: "tool:<name>",
+        best_effort: false,
+    },
+    Adapter {
+        lib: "google-genai",
+        lang: "python",
+        target: "llm:google-genai",
+        best_effort: false,
+    },
+    Adapter {
+        lib: "pydantic-ai",
+        lang: "python",
+        target: "tool:<name>",
+        best_effort: false,
+    },
+    Adapter {
+        lib: "openai-agents",
+        lang: "python",
+        target: "tool:<name>",
+        best_effort: false,
+    },
+    Adapter {
+        lib: "crewai",
+        lang: "python",
+        target: "tool:<name>",
+        best_effort: false,
+    },
+    Adapter {
+        lib: "langgraph",
+        lang: "python",
+        target: "tool:<name>",
+        best_effort: false,
+    },
+    // A second `mcp` row: the Python client SDK (mcp_pack), distinct from the
+    // Node `mcp` client below — same import/package name, different runtime,
+    // different (per-server) target grammar.
+    Adapter {
+        lib: "mcp",
+        lang: "python",
+        target: "mcp:<server>",
+        best_effort: false,
+    },
     Adapter {
         lib: "fetch",
         lang: "node",
@@ -679,6 +731,68 @@ mod tests {
         let openai = r.adapters.iter().find(|a| a.lib == "openai").unwrap();
         assert!(openai.detected);
         assert_eq!(openai.status, "pinned");
+    }
+
+    /// The six agent-framework packs + google-genai are registered adapters:
+    /// detected, pinned, and their `target` matches each pack's own declared
+    /// `TargetDecl.pattern` — so importing them is coverage, not an
+    /// "invisible" finding.
+    #[test]
+    fn agent_pack_adapters_are_registered_pinned_and_detected() {
+        let scan = scan_with(
+            "llm:google-genai",
+            TargetClass::Llm,
+            &[
+                "google-adk",
+                "google-genai",
+                "pydantic-ai",
+                "openai-agents",
+                "crewai",
+                "langgraph",
+                "mcp",
+            ],
+        );
+        let policy = PolicyValidation {
+            check: PolicyCheck {
+                field: None,
+                message: None,
+                present: false,
+                valid: true,
+            },
+            fix: None,
+        };
+        let r = build_report(&scan, &BTreeSet::new(), policy, default_journal());
+
+        assert!(
+            r.coverage.invisible.is_empty(),
+            "every imported agent-pack lib has a registry adapter: {:?}",
+            r.coverage.invisible
+        );
+        for (lib, target) in [
+            ("google-adk", "tool:<name>"),
+            ("google-genai", "llm:google-genai"),
+            ("pydantic-ai", "tool:<name>"),
+            ("openai-agents", "tool:<name>"),
+            ("crewai", "tool:<name>"),
+            ("langgraph", "tool:<name>"),
+        ] {
+            let a = r
+                .adapters
+                .iter()
+                .find(|a| a.lib == lib && a.target == target)
+                .unwrap_or_else(|| panic!("missing REGISTRY entry for {lib} -> {target}"));
+            assert!(a.detected, "{lib} should be detected");
+            assert_eq!(a.status, "pinned");
+        }
+        // `mcp` has two REGISTRY rows (Node client, Python client) sharing a
+        // lib name — the Python one's target is the per-server grammar.
+        let mcp_py = r
+            .adapters
+            .iter()
+            .find(|a| a.lib == "mcp" && a.target == "mcp:<server>")
+            .expect("python mcp REGISTRY row");
+        assert!(mcp_py.detected);
+        assert_eq!(mcp_py.status, "pinned");
     }
 
     fn default_policy() -> PolicyValidation {
