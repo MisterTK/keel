@@ -63,10 +63,10 @@ def install_keel(
         # second `install_keel()` call in the same process (e.g. the .pth
         # shim's `keel._auto` installing before `_run.run_target` installs
         # again) must not silently drop that state (KEEL-… double-activation
-        # regression).
-        assert _STATE.state is not None
+        # regression). `_STATE.installed` is only ever set True in lockstep
+        # with `_STATE.state` (right before this function returns below), so
+        # reaching this branch guarantees `_STATE.state` is populated.
         return {**_STATE.state, "reason": "already-installed"}
-    _STATE.installed = True
 
     cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
@@ -131,7 +131,15 @@ def install_keel(
         "adapters": adapters,
         "mcp": mcp,
     }
+    # Set together, at the very end, after every raise point above (load_policy's
+    # KEEL-E001, backend.configure's KEEL-E001/KEEL-E005) has already passed:
+    # a failed install must leave `_STATE.installed` False so a retry (e.g. the
+    # NEXT `install_keel()` call in the same process) re-parses the policy and
+    # surfaces the SAME loud error again, rather than wrongly believing itself
+    # already-installed with no cached state to return (the AssertionError /
+    # TypeError this ordering previously risked).
     _STATE.state = state
+    _STATE.installed = True
     return state
 
 

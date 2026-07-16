@@ -23,6 +23,7 @@ _IMPORT_AUTO = "import keel._auto; print('APP-RAN')"
 
 FLOW_TARGET = str(FIXTURES / "flow_target.py")
 NOOP = str(FIXTURES / "noop_app.py")
+HELLO = str(FIXTURES / "hello_app.py")
 
 # The double-activation repro (WS2 final-review Important finding):
 # `import keel._auto` performs the FIRST `install_keel()` — exactly what the
@@ -172,6 +173,25 @@ class DoubleActivationStateTest(unittest.TestCase):
         self.assertEqual(second["flow_entrypoints"], first["flow_entrypoints"])
         self.assertTrue(second["flow_entrypoints"], "flow entrypoints must survive a second install")
 
+    def test_failed_first_install_retries_cleanly_instead_of_latching(self) -> None:
+        # Round 2 (fail-open regression): a broken keel.toml raises KEEL-E001
+        # from `load_policy`, BEFORE `_STATE.installed` is ever set — so a
+        # second `install_keel()` call must re-parse the policy and raise the
+        # SAME loud error again, not an AssertionError/TypeError from a stale
+        # "installed" flag with no cached state to return.
+        from keel._errors import KeelError
+
+        self.addCleanup(bootstrap.uninstall_keel)
+        with TemporaryDirectory() as d:
+            Path(d, "keel.toml").write_text("not [valid toml", encoding="utf-8")
+            env = {"KEEL_QUIET": "1"}
+            with self.assertRaises(KeelError) as first_ctx:
+                bootstrap.install_keel(cwd=d, env=env)
+            with self.assertRaises(KeelError) as second_ctx:
+                bootstrap.install_keel(cwd=d, env=env)
+        self.assertEqual(first_ctx.exception.code, "KEEL-E001")
+        self.assertEqual(second_ctx.exception.code, "KEEL-E001", "retry must raise the same error, not crash differently")
+
 
 class DoubleActivationEndToEndTest(unittest.TestCase):
     """Child-process legs of the same regression, through the real
@@ -218,6 +238,33 @@ class DoubleActivationEndToEndTest(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn(b"KeyError", proc.stderr)
+
+    def test_broken_config_e2e_matches_plain_keel_run_failure(self) -> None:
+        # Round 2 (fail-open regression): `keel._auto`'s first install fails
+        # open on the broken keel.toml (its own "auto-activation failed" line;
+        # host survives), leaving `_STATE.installed` False. The SECOND install
+        # (`_run.run_target`'s own bootstrap call) then re-parses the SAME
+        # broken policy and raises the SAME KEEL-E001 again, so `keel run`
+        # exits loudly — identical to what plain `keel run` on a broken config
+        # always does, never a crash from a stale "installed" flag with no
+        # cached state (AssertionError pre-round-2, TypeError under -O).
+        self.write_policy("not [valid toml")
+        code = _DOUBLE_ACTIVATE_THEN_RUN.format(target=HELLO)
+        proc = _run(code, env=child_env(KEEL_ENABLE="1"), cwd=self.cwd)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"auto-activation failed", proc.stderr, "the .pth-shim's own fail-open line")
+        # `_run.py`'s OWN top-level error line (`f"keel ▸ {code}: {message}"`,
+        # emitted from its `except BaseException` handler around the SECOND
+        # install) — distinct from the substring "KEEL-E001" that already
+        # appears (wrapped, inside parens) in the auto-activation-failed line
+        # above, so this specifically proves the second install raised its own
+        # clean KeelError rather than an uncaught AssertionError/TypeError
+        # (which `is_keel_error` would not recognize, so `_run.py` would
+        # re-raise it as a bare traceback instead of this loud one-liner).
+        self.assertIn(b"keel \xe2\x96\xb8 KEEL-E001:", proc.stderr, "keel run's own loud config error")
+        self.assertNotIn(b"AssertionError", proc.stderr)
+        self.assertNotIn(b"Traceback", proc.stderr)
+        self.assertNotIn(b"stdout-line-1", proc.stdout, "the fixture must never run on a broken config")
 
 
 if __name__ == "__main__":
