@@ -63,13 +63,11 @@ class AutoActivationTest(unittest.TestCase):
 
     def test_unset_gate_means_no_keel_import_at_all(self) -> None:
         self.write_policy()
-        code = "import keel._auto" if False else (
-            # The gate lives in the .pth LINE, not in the module import — so this
-            # test asserts the module-level contract instead: _activate() checks
-            # the gate again and does nothing (belt and suspenders, and it makes
-            # `import keel._auto` safe under any future import path).
-            "import sys, keel._auto; print('.keel-modules', [m for m in sys.modules if m == 'keel.bootstrap'])"
-        )
+        # The gate lives in the .pth LINE, not in the module import — so this
+        # test asserts the module-level contract instead: _activate() checks
+        # the gate again and does nothing (belt and suspenders, and it makes
+        # `import keel._auto` safe under any future import path).
+        code = "import sys, keel._auto; print('.keel-modules', [m for m in sys.modules if m == 'keel.bootstrap'])"
         proc = _run(code, env=child_env(), cwd=self.cwd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(b".keel-modules []", proc.stdout, "bootstrap never imported when gate is off")
