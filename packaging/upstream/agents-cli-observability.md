@@ -9,6 +9,19 @@ TK's contribution to send, not a Claude Code artifact.
 
 ---
 
+## Preconditions before sending
+
+**The Keel repo (MisterTK/keel) must be made public before sending this PR.**
+
+As of 2026-07-16 the repo is private; the Deep Dive URL
+(`https://github.com/MisterTK/keel/blob/main/llms.txt`) will return 404 for
+skill reviewers and for the skill's WebFetch consumption if the repo remains
+private. After flipping visibility to public in GitHub settings, re-verify the
+URL resolves unauthenticated before shipping. If the GitHub org or username
+changes, update both the platform-table row and Deep Dive row accordingly.
+
+---
+
 ## 1. Platform table row
 
 Insert as a new row in the "Third-Party Integrations" table
@@ -16,7 +29,7 @@ Insert as a new row in the "Third-Party Integrations" table
 bold-platform-name convention:
 
 ```markdown
-| **Keel** | Policy-driven resilience + deterministic replay: keel status/trace/tail, NDJSON event stream, crash-resumable flows — zero code changes | Minimal | Yes (local files) |
+| **Keel** | Zero-code resilience policy, deterministic replay, crash-resumable flows | Minimal | Yes (local files) |
 ```
 
 ## 2. Deep Dive row
@@ -29,8 +42,7 @@ rows use:
 | Keel | `https://github.com/MisterTK/keel/blob/main/llms.txt` |
 ```
 
-(`MisterTK/keel` is the actual, already-public repo — confirmed via
-`git remote -v` — so no org placeholder is needed.)
+(`MisterTK/keel` is the actual repo — must be made public before sending.)
 
 ## 3. PR body
 
@@ -59,7 +71,7 @@ On the observability side, Keel exposes:
 - **Deterministic `--json` output and an MCP server**: every CLI command
   has a `--json` twin with sorted keys and no timestamps, and `keel mcp`
   exposes the same data (`get_status`, `get_trace`, `get_doctor_report`,
-  `list_flows`, `explain_error`) as MCP tools whose text output is
+  `list_flows`, `propose_policy`, `explain_error`) as MCP tools whose text output is
   byte-identical to the matching `--json` command — so a coding agent or
   a CI check can diff two calls and see only real change.
 - **Optional OTel export**: spans and metrics (attempts, retries,
@@ -102,11 +114,8 @@ MisterTK/keel @ worktree-agent-first-class before this doc was written:
   ratio, rate-limit throttling, breaker transitions, flow resumes):
   crates/keel-core/src/metrics.rs (module-doc instrument table).
 - `keel status` / `keel trace` / `keel tail` exist as CLI subcommands:
-  crates/keel-cli/src/main.rs (subcommand dispatch imports `status,
-  tail, ...`), crates/keel-cli/src/status.rs, crates/keel-cli/src/tail.rs.
-  (`keel trace` referenced by crates/keel-core/src/events.rs's `TraceRef`
-  doc comment: "the token Tier 1 failure messages carry after `trace:
-  keel trace`".)
+  crates/keel-cli/src/main.rs (subcommand dispatch, `Command::Trace`
+  variant lines 136–139), crates/keel-cli/src/status.rs, crates/keel-cli/src/tail.rs.
 - NDJSON event sink: crates/keel-core/src/events.rs (`EventKind`,
   `EventSink`, module doc: "The event vocabulary, tagged `"event"` with
   `snake_case` names").
@@ -133,9 +142,10 @@ MisterTK/keel @ worktree-agent-first-class before this doc was written:
   and conformance/scenarios/16-flow-resume-substitutes-steps.json, unit
   test crates/keel-core/tests/flows.rs
   (`crash_after_step_three_resumes_substituting_completed_steps`).
-- Repo is already public at the stated URL: `git remote -v` →
+- Repo URL: `MisterTK/keel` as confirmed by `git remote -v` →
   `git@github.com:MisterTK/keel.git`; `Cargo.toml` `repository =
   "https://github.com/MisterTK/keel"`; `llms.txt` exists at repo root.
+  MUST be public before PR merge for Deep Dive link to resolve.
 - Upstream table/row formats matched against
   /Users/tk/dev/agents-cli/skills/google-agents-cli-observability/SKILL.md
   (Third-Party Integrations table, lines ~111-119; Deep Dive table,
