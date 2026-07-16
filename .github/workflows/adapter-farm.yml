@@ -34,6 +34,9 @@
 #   python   | httpx                         | 0.27.2, 0.28.1            | python/keel/src/keel/adapters/httpx_pack.py
 #   python   | requests                      | 2.33.1, 2.34.2            | python/keel/src/keel/adapters/requests_pack.py
 #   python   | google-adk                    | 2.4.0                     | python/keel/src/keel/packs/adk_pack.py
+#   python   | google-adk + mcp (composition)| 2.4.0 + 1.28.1            | adk_pack.py + mcp_pack.py (real LlmAgent
+#            |                               |                           | + Runner + MCPToolset over a real stdio
+#            |                               |                           | server — tests.test_farm_adk_composition)
 #   python   | pydantic-ai                   | 2.9.0                     | python/keel/src/keel/packs/pydantic_ai_pack.py
 #   python   | openai-agents                 | 0.18.2                    | python/keel/src/keel/packs/openai_agents_pack.py
 #   python   | crewai                        | 1.15.2                    | python/keel/src/keel/packs/crewai_pack.py
@@ -123,6 +126,14 @@ jobs:
             # google.adk.tools.mcp_tool imports `mcp` at module level even
             # though google-adk does not declare it as a dependency — install
             # it alongside the pin or the farm test's import fails outright.
+            extra_deps: "mcp==1.28.1"
+          - lib: google-adk
+            version: "2.4.0"
+            test_module: tests.test_farm_adk_composition
+            # The composition E2E (WS3 Task 3): a real LlmAgent + Runner +
+            # MCPToolset over a real stdio MCP server, with adk_pack AND
+            # mcp_pack both live — same co-install requirement as the plain
+            # adk_pack leg above.
             extra_deps: "mcp==1.28.1"
           - lib: pydantic-ai
             version: "2.9.0"
