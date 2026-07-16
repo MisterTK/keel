@@ -176,6 +176,25 @@ Two ways a coding agent picks up Keel:
   `AGENTS.md` so every future agent session in an already-Keel-adopted repo
   inherits the ground rules without installing anything extra.
 
+### Activation without `keel run`
+
+When another tool owns the process launch (`agents-cli run`, `adk api_server`,
+uvicorn, a test runner), Keel can activate as a plain dependency:
+
+- **Python** — the `keelrun` wheel ships a site-packages `.pth` shim gated on
+  one env var. Set `KEEL_ENABLE=1` (e.g. in your project `.env`) and every
+  Python process in that environment boots with the same policy engine
+  `keel run` uses — `keel.toml` from the working directory, or from
+  `KEEL_CWD=<dir>` when your config lives in the deployable app directory.
+- **Node** — add `NODE_OPTIONS="--import keelrun/register"` alongside
+  `KEEL_ENABLE=1`.
+
+Activation is fail-open by design: a broken install or invalid `keel.toml`
+prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
+always wins. What the shim deliberately does not do (those stay `keel run`
+features): the preflight resilience advisory, `keel record`/`keel sim`
+wiring, and flow-entrypoint dispatch.
+
 `keel mcp` serves the CLI itself as an MCP server over stdio — six tools,
 each byte-identical to its `--json` CLI twin (`get_status`,
 `get_doctor_report`, `propose_policy`, `get_trace`, `list_flows`,

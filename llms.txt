@@ -47,4 +47,5 @@ detection (tenacity/backoff, Python-first) also ship as of this release.
 - Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
 - `keel init --agents` drops a Keel section into `AGENTS.md`.
 - `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
+- Zero-launcher activation: pip/npm dependency + `KEEL_ENABLE=1` (`.pth` / `NODE_OPTIONS=--import keelrun/register`); `KEEL_CWD` relocates the config root.
 - Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.
