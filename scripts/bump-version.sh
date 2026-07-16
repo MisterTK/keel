@@ -36,6 +36,24 @@ def sub_once(path: str, pattern: str, replacement: str) -> None:
     print(f"  {path}: {old} -> {new}")
 
 sub_once("Cargo.toml", r'^version = "[^"]+"$', f'version = "{new}"')
+# Publishable crates' intra-workspace path dependencies each carry their own
+# literal "version" requirement alongside the path — required for the crate
+# to be publishable to crates.io at all, since crates.io strips path deps and
+# re-resolves the dependency by version against the registry. These pins
+# cannot inherit `version.workspace = true` (that only sets a crate's *own*
+# version) and were never covered here, so they silently drifted through the
+# 0.1.0 -> 0.1.1 bump (masked: Cargo's ^0.1.0 range still matched 0.1.1)
+# until a real bump (0.1.1 -> 0.2.0) broke `cargo update` outright with
+# "failed to select a version". Sweep every crates/*/Cargo.toml and rewrite
+# every such pin unconditionally (matching on the pattern, not on `old`,
+# since some were already stale before this bump).
+path_dep_pin = re.compile(r'(path = "\.\./[A-Za-z0-9_-]+", version = )"[^"]+"')
+for manifest in sorted(Path("crates").glob("*/Cargo.toml")):
+    text = manifest.read_text()
+    new_text, n = path_dep_pin.subn(rf'\1"{new}"', text)
+    if n:
+        manifest.write_text(new_text)
+        print(f"  {manifest}: {n} path-dependency version pin(s) -> {new}")
 for path in ("python/keel/pyproject.toml", "python/keel-core-stub/pyproject.toml"):
     sub_once(path, r'^version = "[^"]+"$', f'version = "{new}"')
 sub_once(

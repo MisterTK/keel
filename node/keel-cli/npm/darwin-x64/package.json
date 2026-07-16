@@ -1,6 +1,6 @@
 {
   "name": "keelrun-cli-darwin-x64",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Prebuilt `keel` CLI binary for macOS x86_64 (darwin-x64). Optional dependency of keelrun-cli — installed automatically on a matching platform, ignored otherwise. See scripts/cli-prebuild.sh.",
   "os": ["darwin"],
   "cpu": ["x64"],

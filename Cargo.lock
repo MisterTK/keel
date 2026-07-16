@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "keel-conformance"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-core-api",
  "serde",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "keel-core-api"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "keel-core-stub"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-conformance",
  "keel-core-api",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "keel-ffi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-conformance",
  "keel-core-api",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "keel-journal"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-core-api",
  "postgres",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "keel-macros"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "keel-node"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-core-api",
  "keel-journal",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "keel-py"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "keel-core-api",
  "keel-journal",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "keelrun"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "http",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "keelrun-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "keel-core-api",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "keelrun-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "fastrand",

@@ -1,6 +1,6 @@
 {
   "name": "keelrun",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "The SQLite of durable execution — production-grade resilience for Node with zero code changes.",
   "type": "module",
   "main": "index.mjs",
