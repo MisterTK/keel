@@ -404,12 +404,15 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
     call — undesignated Runners, or any Runner built while Keel has no
     backend at all.
 
-    Note: unlike `_flow.py`'s `run_as_flow`, `KeyboardInterrupt` here
-    intentionally follows the same failed-path as any other `BaseException`
-    rather than being left `running` for resume — this wrapper runs inside a
-    SURVIVING process (a long-lived Runner host), not one about to exit, so
-    the same surviving-process rationale that governs `GeneratorExit` below
-    applies: leaving the flow open-forever on interrupt is never free here."""
+    Note: unlike `_flow.py`'s `run_as_flow`, `KeyboardInterrupt` (and
+    `asyncio.CancelledError` — an async-generator's own abandonment/cancel
+    signal, name-checked here alongside it since both reach this same
+    `except BaseException` arm) here intentionally follow the same
+    failed-path as any other `BaseException` rather than being left
+    `running` for resume — this wrapper runs inside a SURVIVING process (a
+    long-lived Runner host), not one about to exit, so the same
+    surviving-process rationale that governs `GeneratorExit` below applies:
+    leaving the flow open-forever on interrupt is never free here."""
 
     @functools.wraps(orig)
     async def _run_async_flow_wrapper(
@@ -680,7 +683,13 @@ async def _model_fallback(llm_request: Any, error: Exception) -> Any:
     against ``_llm_policy.should_fallback``'s ``not error`` / ``code not in
     _NO_FALLBACK_CODES`` shape — an EMPTY dict would read as "no error" and
     wrongly block the chase, so the sentinel dict is a real dict with an
-    absent code, not `{}`)."""
+    absent code, not `{}`). Note: `callback_context` (a `ReadonlyContext`)
+    exposes no model accessor either — the other half of the same-class-skip
+    rationale above: neither it nor `llm_request` hands back a model
+    INSTANCE to `type()` directly, which is why `failing_cls` below is
+    resolved from `llm_request.model`'s plain name string via the same
+    `LLMRegistry.resolve` path used for chain entries, rather than read off
+    either context object."""
     chain = _model_fallback_chain()
     if not chain:
         return None

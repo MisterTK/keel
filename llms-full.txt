@@ -129,6 +129,15 @@ init` into the agent directory). `demos/adk-demo` runs a real `LlmAgent`
 riding out a 429 storm below the agent loop, and `skills/keel/` (`npx skills
 add MisterTK/keel`) is the coding-agent skill.
 
+Two more ADK-specific capabilities, both farm-certified against the real
+`google-adk` package: durable, crash-resumable agent turns — designate
+`py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` (one
+flow per process in v1; see `docs/targeting.md` for the full limitations
+list) — and cross-model fallback that survives a provider switch — set
+`fallback = [...]` on `llm:google-genai`; the plugin's `on_model_error` hook
+resolves and constructs the fallback model via ADK's own `LLMRegistry`,
+unlike the generic host/fetch seam's same-provider-only model rewrite.
+
 ## CLI reference
 
 Global: `--json` on any command emits deterministic JSON (sorted keys, no

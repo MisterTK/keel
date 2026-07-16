@@ -34,6 +34,7 @@ detection (tenacity/backoff, Python-first) also ship as of this release.
 - [Level 2 — durable flows](demos/durable-pipeline/README.md): list `py:mod:fn` (Python) or `ts:mod#fn` (Node) under `[flows]`; a crashed run resumes and replays completed steps without re-firing effects, including concurrent async effects inside one flow.
 - [Targets](contracts/policy.schema.json): `host` (e.g. `api.stripe.com`), `py:`/`ts:` functions, and semantic `llm:<provider>` / `tool:<name>` / `mcp:<server>`.
 - [LLM dev-cache](demos/agent-demo/README.md): `cache = { mode = "dev" }` replays identical prompts off `KEEL_ENV=prod`; with the native core it persists across runs (~0 API calls on a repeat).
+- [ADK Runner flows + cross-model fallback](README.md): designate `py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` for durable, crash-resumable agent turns, and set `fallback = [...]` on `llm:google-genai` for real cross-provider fallback via the plugin's `on_model_error` hook — both farm-certified against real `google-adk`.
 
 ## Reference
 

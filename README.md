@@ -255,6 +255,18 @@ including a full agent-over-MCP composition test. See `demos/adk-demo` for
 a runnable 429-survival demo, and `skills/keel/` (`npx skills add
 MisterTK/keel`) for the coding-agent skill.
 
+Two ADK-specific capabilities beyond the target list above, both
+farm-certified against the real `google-adk` package: list
+`py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` for
+durable, crash-resumable agent turns (a designated `Runner.run_async` call
+becomes a Tier 2 flow — see `docs/targeting.md` for the v1 limitations,
+notably one flow per process); and set `fallback = [...]` on the
+`llm:google-genai` target for cross-model fallback that survives a
+provider switch, not just a same-provider retry — the plugin's
+`on_model_error` hook resolves and constructs a real fallback model via
+ADK's own `LLMRegistry`, the one seam that can build a request for a
+genuinely different provider.
+
 ## Status
 
 Keel is pre-1.0 and published on every registry (`pip`, `npm`, `cargo` — see
