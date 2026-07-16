@@ -71,6 +71,7 @@ mcp_pack``), which sees raw failures regardless of the graceful flag.
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.metadata
 import os
 import sys
@@ -78,10 +79,19 @@ import weakref
 from typing import Any, Callable
 
 from ..adapters._pack import Detection, Seam, TargetDecl
+from .._errors import KeelError
+from .._flow import backend_has_journal, backend_supports_flows
 from ._provider import module_present
 from .tool import is_valid_tool_name, wrap_tool
 
 MODULE = "google.adk"
+
+#: The designated Tier-2 Runner entrypoint (frozen `entrypointRef` grammar
+#: `^(py|ts|rs):\S+$`; `_policy.py`'s rsplit-based parser already accepts a
+#: dotted qualname like ``Runner.run_async`` as the function segment —
+#: verified by reading ``extract_flow_entrypoints``). A user opts in by
+#: adding this exact string to ``[flows] entrypoints`` in ``keel.toml``.
+RUNNER_FLOW_ENTRYPOINT = "py:google.adk.runners:Runner.run_async"
 #: The PyPI distribution name differs from the import name; used for the
 #: `importlib.metadata.version` lookup only.
 NAME = "google-adk"
@@ -197,6 +207,124 @@ def defaults() -> dict[str, Any]:
     (``tool:`` → ``[defaults.outbound]``; ``llm:google-genai`` →
     ``[defaults.llm]``) — mirrors the ``tool:``/``mcp:`` packs exactly."""
     return {}
+
+
+# --- Tier 2 Runner-flow designation (WS5 foundation) ------------------------
+#
+# A user opts a specific ADK `Runner.run_async` invocation into Tier 2 by
+# adding `RUNNER_FLOW_ENTRYPOINT` to `[flows] entrypoints` in `keel.toml`.
+# This section is FOUNDATION ONLY: the designation matcher, the Tier-2 gates,
+# and the flow-identity helpers a generator wrap (a later task) will consume
+# via `backend.enter_flow(*_runner_flow_identity(...))`. No wrap lives here.
+
+
+def _flow_entrypoint_designated() -> str | None:
+    """The designated Runner-flow entrypoint's raw string
+    (``RUNNER_FLOW_ENTRYPOINT``, echoed back verbatim), or ``None`` when
+    undesignated OR when Keel bootstrap is disabled/never ran.
+
+    Reads ``keel.bootstrap._STATE.state`` directly — a deliberate
+    module-private reach into a sibling module, not a new ``_runtime`` API.
+    ``keel.bootstrap.install_keel()`` is re-entrant (its already-installed
+    path returns the full cached state, including ``flow_entrypoints``), but
+    calling it here to *read* that state would also *perform* a fresh
+    install as a side effect on a bare/not-yet-bootstrapped process — wrong
+    for what is meant to be a passive designation check invoked from
+    arbitrary Runner-construction code. Reading the cached ``_STATE.state``
+    instead never triggers that side effect: ``None`` (never installed, or
+    ``KEEL_DISABLE`` short-circuited before ``_STATE.state`` was ever
+    populated — ``install_keel`` returns before touching ``_STATE`` in that
+    branch, so the two cases are indistinguishable here, and correctly so:
+    both mean "no Tier 2 designation is in force") means undesignated,
+    exactly like finding no matching entry.
+
+    The match is EXACT: only an entrypoint whose parsed ``module``/
+    ``function`` are precisely ``"google.adk.runners"`` /
+    ``"Runner.run_async"`` designates this arm — a glob entrypoint (even one
+    that could in principle resolve to the same pair) does not count, since
+    `[flows] entrypoints` globs are designed for `keel run`'s script-path
+    matching (`_flow.match_flow`), not for matching a live Python call site.
+    """
+    # Local import: avoids a circular import at module-load time (`bootstrap`
+    # -> `keel.packs` -> this module, since `bootstrap.install_keel` imports
+    # `keel.packs` for `install_mcp_pack`/`present_provider_defaults` — a
+    # module-level `from .. import bootstrap` here would deadlock that chain
+    # the first time either module is imported first; verified by import
+    # order flip: `import keel.packs.adk_pack` before any `keel.bootstrap`
+    # import raised `ImportError: cannot import name 'install_mcp_pack' from
+    # partially initialized module 'keel.packs'`).
+    from .. import bootstrap
+
+    state = bootstrap._STATE.state
+    if state is None:
+        return None
+    for entry in state.get("flow_entrypoints") or ():
+        if entry.module == "google.adk.runners" and entry.function == "Runner.run_async":
+            return entry.raw
+    return None
+
+
+def _flow_gates_or_raise(backend: Any) -> None:
+    """Tier 2 requires the native core AND an attached journal — the same two
+    gates `keel._flow.run_as_flow` checks for `keel run` (`_unsupported_on_stub`
+    / `_unsupported_without_journal`), reused here via `backend_supports_flows`/
+    `backend_has_journal` and re-worded for the Runner context. Unlike those
+    CLI-facing helpers, this RAISES `KeelError` (KEEL-E005) rather than writing
+    to stderr and calling `SystemExit` — a designated Runner call is a library
+    call inside a long-lived process, not a CLI entrypoint to exit."""
+    if not backend_supports_flows(backend):
+        raise KeelError(
+            "KEEL-E005",
+            f"Tier 2 durable flow {RUNNER_FLOW_ENTRYPOINT!r} needs the native core.\n"
+            "  why:  crash-safe resume journals and replays each step; the pure-Python "
+            "stub backend cannot do that.\n"
+            "  next: build the native module (`maturin develop` in crates/keel-py) or set "
+            "KEEL_BACKEND=native, then re-run.",
+        )
+    if not backend_has_journal(backend):
+        raise KeelError(
+            "KEEL-E005",
+            f"durable flow {RUNNER_FLOW_ENTRYPOINT!r} needs a journal, but none is attached.\n"
+            "  why:  Tier 2 journals and replays each step; with no journal there is nothing "
+            "to record to or resume from.\n"
+            "  next: let the native core open .keel/journal.db (check KEEL_JOURNAL and "
+            "directory permissions), or remove this entrypoint from [flows].",
+        )
+
+
+def _runner_args_hash(parts: list[str]) -> str:
+    """A stable 16-hex-char sha256 of ``repr(list(parts))`` — the same
+    algorithm as ``keel._flow._args_hash``, reimplemented here (not imported)
+    to keep this pack decoupled from that module's private helper."""
+    return hashlib.sha256(repr(list(parts)).encode("utf-8")).hexdigest()[:16]
+
+
+def _content_fingerprint(new_message: Any) -> str:
+    """A stable 16-hex-char sha256 of ``repr(new_message)`` — the fallback
+    identity component `_runner_flow_identity` uses when ADK hands back no
+    ``invocation_id`` (``None``): the message content itself stands in for
+    "this specific call" so two calls with the same content still resume the
+    same flow, and two different messages never collide."""
+    return hashlib.sha256(repr(new_message).encode("utf-8")).hexdigest()[:16]
+
+
+def _runner_flow_identity(
+    user_id: str, session_id: str, invocation_id: str | None, new_message: Any
+) -> tuple[str, str]:
+    """The designated Runner flow's identity: ``(entrypoint_raw, args_hash)``,
+    directly usable as ``backend.enter_flow(*_runner_flow_identity(...))``'s
+    first two positional arguments.
+
+    ``entrypoint_raw`` is always ``RUNNER_FLOW_ENTRYPOINT`` — the exact-match
+    designation this whole module section exists for. ``args_hash`` folds in
+    ``user_id``/``session_id`` plus a stable per-call identifier: ADK's own
+    ``invocation_id`` when present, or ``_content_fingerprint(new_message)``
+    when it is ``None`` — so the SAME ``(user, session, invocation)`` always
+    hashes to the SAME value (stable identity across a crash/resume), while a
+    different invocation (or, lacking one, different message content) hashes
+    to a different value."""
+    ident = invocation_id if invocation_id is not None else _content_fingerprint(new_message)
+    return RUNNER_FLOW_ENTRYPOINT, _runner_args_hash([user_id, session_id, ident])
 
 
 # --- install / uninstall -----------------------------------------------------
@@ -486,6 +614,7 @@ __all__ = [
     "MODULE",
     "NAME",
     "PLUGIN_NAME",
+    "RUNNER_FLOW_ENTRYPOINT",
     "detect",
     "seams",
     "targets",

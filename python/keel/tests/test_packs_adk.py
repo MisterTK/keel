@@ -15,6 +15,7 @@ tool name, discovery recording).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import sqlite3
@@ -37,10 +38,11 @@ from fake_adk import (
     McpTool,
 )
 
-from keel import _runtime
+from keel import _runtime, bootstrap
 from keel._backend import load_backend
 from keel._discovery import Discovery
 from keel._errors import KeelError
+from keel._policy import FlowEntrypoint
 from keel.adapters import available_packs, install_adapters, uninstall_adapters
 from keel.packs import adk_pack
 
@@ -476,6 +478,159 @@ class McpErrorDictTest(AdkTestBase):
         self.assertFalse(adk_pack._is_mcp_error_dict({"error": 500}))
         self.assertFalse(adk_pack._is_mcp_error_dict(["error"]))
         self.assertTrue(adk_pack._is_mcp_error_dict({"error": "x"}))
+
+
+class _NoFlowSurfaceBackend:
+    """A stub-shaped backend: no `enter_flow`/`exit_flow` at all."""
+
+
+class _FlowCapableBackend:
+    """A native-shaped backend: has the flow surface; `persistent` toggles
+    whether a journal is attached."""
+
+    def __init__(self, persistent: bool) -> None:
+        self.persistent = persistent
+
+    def enter_flow(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    def exit_flow(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+class RunnerFlowDesignationTest(unittest.TestCase):
+    """WS5 foundation: the Runner-flow designation matcher, Tier-2 gates, and
+    flow-identity helpers that Task 2's generator wrap will consume. No
+    generator wrap here — that is the NEXT task."""
+
+    def setUp(self) -> None:
+        self._prior_state = bootstrap._STATE.state
+        self._prior_installed = bootstrap._STATE.installed
+
+    def tearDown(self) -> None:
+        # `_flow_entrypoint_designated` reads `bootstrap._STATE` directly
+        # (module-private, deliberately — see its docstring), so every test
+        # that pokes it must restore the real suite-wide state afterward.
+        bootstrap._STATE.state = self._prior_state
+        bootstrap._STATE.installed = self._prior_installed
+
+    # -- _flow_entrypoint_designated ------------------------------------
+
+    def test_designated_when_exact_match_present(self) -> None:
+        entry = FlowEntrypoint(
+            raw="py:google.adk.runners:Runner.run_async",
+            module="google.adk.runners",
+            function="Runner.run_async",
+        )
+        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
+        bootstrap._STATE.installed = True
+        self.assertEqual(
+            adk_pack._flow_entrypoint_designated(),
+            "py:google.adk.runners:Runner.run_async",
+        )
+
+    def test_undesignated_when_never_installed_or_disabled(self) -> None:
+        # `install_keel()` never populates `_STATE.state` when KEEL_DISABLE is
+        # set (it returns before that point) — bootstrap-disabled and
+        # never-installed are the SAME shape here: `_STATE.state is None`.
+        bootstrap._STATE.state = None
+        bootstrap._STATE.installed = False
+        self.assertIsNone(adk_pack._flow_entrypoint_designated())
+
+    def test_undesignated_when_no_matching_entrypoint(self) -> None:
+        other = FlowEntrypoint(raw="py:pipeline:main", module="pipeline", function="main")
+        bootstrap._STATE.state = {"flow_entrypoints": [other]}
+        bootstrap._STATE.installed = True
+        self.assertIsNone(adk_pack._flow_entrypoint_designated())
+
+    def test_undesignated_when_no_flow_entrypoints_at_all(self) -> None:
+        bootstrap._STATE.state = {"flow_entrypoints": []}
+        bootstrap._STATE.installed = True
+        self.assertIsNone(adk_pack._flow_entrypoint_designated())
+
+    def test_glob_entrypoint_does_not_designate(self) -> None:
+        # Designation is EXACT-match only: a glob over
+        # google.adk.runners does not count, even though it could in
+        # principle resolve to the same module/function pair.
+        glob_entry = FlowEntrypoint(
+            raw="py:google.adk.*:Runner.run_async",
+            module="google.adk.*",
+            function="Runner.run_async",
+        )
+        bootstrap._STATE.state = {"flow_entrypoints": [glob_entry]}
+        bootstrap._STATE.installed = True
+        self.assertIsNone(adk_pack._flow_entrypoint_designated())
+
+    def test_runner_flow_entrypoint_constant(self) -> None:
+        self.assertEqual(
+            adk_pack.RUNNER_FLOW_ENTRYPOINT, "py:google.adk.runners:Runner.run_async"
+        )
+
+    # -- _flow_gates_or_raise --------------------------------------------
+
+    def test_gates_raise_e005_on_stub_shaped_backend(self) -> None:
+        with self.assertRaises(KeelError) as ctx:
+            adk_pack._flow_gates_or_raise(_NoFlowSurfaceBackend())
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+        self.assertIn("needs the native core", ctx.exception.message)
+
+    def test_gates_raise_e005_without_journal(self) -> None:
+        with self.assertRaises(KeelError) as ctx:
+            adk_pack._flow_gates_or_raise(_FlowCapableBackend(persistent=False))
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+        self.assertIn("needs a journal", ctx.exception.message)
+
+    def test_gates_pass_on_flow_capable_backend(self) -> None:
+        self.assertIsNone(adk_pack._flow_gates_or_raise(_FlowCapableBackend(persistent=True)))
+
+    def test_gates_never_raise_system_exit(self) -> None:
+        # `keel._flow`'s CLI-facing helpers exit the process; this pack's
+        # gates must RAISE instead, since a Runner call is a library call,
+        # not a CLI entrypoint.
+        try:
+            adk_pack._flow_gates_or_raise(_NoFlowSurfaceBackend())
+        except SystemExit:
+            self.fail("_flow_gates_or_raise must raise KeelError, never SystemExit")
+        except KeelError:
+            pass
+
+    # -- _runner_flow_identity / _runner_args_hash / _content_fingerprint --
+
+    def test_identity_stable_for_same_user_session_invocation(self) -> None:
+        first = adk_pack._runner_flow_identity("u1", "s1", "inv-1", {"role": "user"})
+        second = adk_pack._runner_flow_identity("u1", "s1", "inv-1", {"role": "user"})
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], adk_pack.RUNNER_FLOW_ENTRYPOINT)
+
+    def test_identity_differs_across_invocation_ids(self) -> None:
+        first = adk_pack._runner_flow_identity("u1", "s1", "inv-1", {"role": "user"})
+        second = adk_pack._runner_flow_identity("u1", "s1", "inv-2", {"role": "user"})
+        self.assertNotEqual(first[1], second[1])
+
+    def test_identity_differs_across_users_or_sessions(self) -> None:
+        base = adk_pack._runner_flow_identity("u1", "s1", "inv-1", {})
+        other_user = adk_pack._runner_flow_identity("u2", "s1", "inv-1", {})
+        other_session = adk_pack._runner_flow_identity("u1", "s2", "inv-1", {})
+        self.assertNotEqual(base[1], other_user[1])
+        self.assertNotEqual(base[1], other_session[1])
+
+    def test_identity_uses_content_fingerprint_when_invocation_id_none(self) -> None:
+        same_message = {"role": "user", "text": "hi"}
+        first = adk_pack._runner_flow_identity("u1", "s1", None, same_message)
+        second = adk_pack._runner_flow_identity("u1", "s1", None, same_message)
+        self.assertEqual(first, second, "same content fingerprint => same identity")
+        different = adk_pack._runner_flow_identity("u1", "s1", None, {"role": "user", "text": "bye"})
+        self.assertNotEqual(first[1], different[1])
+
+    def test_content_fingerprint_is_16_hex_sha256_of_repr(self) -> None:
+        message = {"role": "user", "text": "hi"}
+        expected = hashlib.sha256(repr(message).encode()).hexdigest()[:16]
+        self.assertEqual(adk_pack._content_fingerprint(message), expected)
+
+    def test_runner_args_hash_matches_flow_args_hash_algorithm(self) -> None:
+        parts = ["u1", "s1", "inv-1"]
+        expected = hashlib.sha256(repr(list(parts)).encode()).hexdigest()[:16]
+        self.assertEqual(adk_pack._runner_args_hash(parts), expected)
 
 
 if __name__ == "__main__":
