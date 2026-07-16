@@ -30,69 +30,41 @@ Two Keel target classes come out of this pack, split by where the seam lives:
   retry itself opt-in exactly like every other ``tool:`` call site (Level 0
   hard rule; see "Idempotency" below).
 
-Honest limitation (do not oversell): a raw Gemini ``generateContent`` call is
-an HTTP POST, so it is non-idempotent by the same Level 0 hard rule — observed
-on a 429, not retried (KEEL-E014) — until the separate idempotency-key
-injection follow-up (``contracts/adapter-pack.md`` "Idempotency-key
-injection", ``docs/ccr/0002-*.md``) lands in the httpx/requests adapters. That
-follow-up is a different task's territory; this pack does not implement it.
-What IS real and shippable today is tool-call resilience (below) and any
-``llm:google-genai`` call that already carries a recognized idempotency
-header (e.g. one supplied by the caller) or is itself a safe GET.
+Idempotency-key injection HAS landed in the shared HTTP adapters (CCR-2:
+``contracts/adapter-pack.md`` "Idempotency-key injection";
+``keel.adapters._http.resolve_idempotency_injection``) — policy-gated,
+per-target opt-in. So an ``llm:google-genai`` POST is observed-not-retried
+(KEEL-E014) by default, and becomes safely retryable when the target's
+policy opts into injection. Tool calls are unaffected either way: a
+framework pack never asserts re-invoke safety on a tool author's behalf.
 
-Zero-code-change seam: plugin auto-registration, not a runner wrapper
-----------------------------------------------------------------------
-The brief poses a choice: monkey-patch ``BaseTool.run_async`` (or wrap
-whatever object the user passes to ``Runner``), or register a ``BasePlugin``
-automatically. This pack takes the **plugin** path:
+Rebind-on-first-sight (why the plugin does NOT execute tools itself):
+``PluginManager._run_callbacks`` stops at the first non-``None`` result AND
+ADK's tool executor skips agent-level ``before_tool_callback``s and the real
+call once a plugin returns non-``None`` — so a plugin that executes the tool
+and returns its result silently bypasses agent-level before-callbacks, and a
+failure raised from the plugin surfaces OUTSIDE the executor's try/except,
+where user ``on_tool_error`` handlers (including ADK's own
+``ReflectAndRetryToolPlugin``) never see it. Keel's callback therefore only
+REBINDS ``tool.run_async`` (instance attribute shadowing the class method,
+marker-guarded, restored by ``uninstall()``) and returns ``None``: ADK's
+sequence proceeds exactly as unwrapped — agent before-callbacks run, the
+real call happens at step 3 through Keel's wrapper (breaker/timeout guard
+attempt 1: policy is consulted before the first underlying invoke), and a
+terminal failure raises from the real call as the ORIGINAL exception, never
+``RuntimeError``-wrapped. Instances that reject ``setattr`` (slots/frozen)
+fall back to executing via the plugin loop — full Keel coverage, with the
+documented cost that agent-level before-callbacks are bypassed for that
+tool only (noted once on stderr).
 
-* ADK already ships a first-class, documented, versioned extension point for
-  exactly this (``google.adk.plugins.base_plugin.BasePlugin``) — patching a
-  tool's private execution method would reach for something ADK never
-  promised to keep stable.
-* A plugin is *reversible* by construction: ``PluginManager`` exposes
-  ``get_plugin``/``register_plugin`` (never private state), so attaching and
-  detaching Keel's plugin never mutates anything ADK doesn't already expose.
-* It composes with a user's own plugins/callbacks instead of shadowing them:
-  ``PluginManager._run_callbacks`` runs registered plugins in order and stops
-  at the first non-``None`` result, so a user-authored ``before_tool_callback``
-  (agent-level or another plugin) still runs exactly where it always did.
-
-The patch point is ``google.adk.runners.Runner.__init__`` — the single
-construction chokepoint, verified against the real package: ``InMemoryRunner.
-__init__`` forwards to ``Runner.__init__`` via ``super().__init__(...)``, and
-``agent=``/``node=``/``app=`` all resolve (``Runner._resolve_app``) into one
-``App`` *before* ``self.plugin_manager = PluginManager(plugins=app.plugins,
-...)`` is built. Patching post-construction and reading back
-``self.plugin_manager`` (rather than rewriting the ``plugins=``/``app=``
-keyword arguments pre-init) covers every construction shape uniformly —
-including the modern, recommended ``Runner(app=App(plugins=[...]))`` shape,
-where ``plugins=`` itself is documented as deprecated.
-
-Idempotency (Level 0 hard rule, mirrors ``keel.packs.tool``): a tool runs
-arbitrary side-effecting code, so every ADK tool call is wrapped with
-``idempotent=False`` — always. This pack auto-wraps *every* plugin-visible
-tool call generically; unlike a hand-written ``wrap_tool(..., idempotent=True)``
-call authored by the tool's own implementer, a framework pack has no way to
-assert a given tool is safe to re-invoke. Every call still gets
-breaker/timeout/discovery coverage (a real win — this is exactly the
-resilience ADK's own vendor gap says does not exist today); retry itself
-stays off until the tool's own author opts in some other way (there is no
-keel.toml knob for this in v0.1, the same documented decision ``tool.py``
-makes).
-
-``before_tool_callback`` is the whole seam, not ``on_tool_error_callback``:
-ADK's own tool-execution code (``flows/llm_flows/functions.py``,
-``_execute_single_function_call_async``) runs ``before_tool_callback`` FIRST
-and skips the real ``tool.run_async`` entirely once a plugin returns non-
-``None`` — so driving the full ``wrap_tool`` attempt loop from inside
-``before_tool_callback`` (short-circuiting with the eventual result, or
-letting a terminal failure raise) is the only way for Keel's breaker/timeout
-to guard the FIRST attempt too, not just retries after ADK's own call already
-failed. A terminal failure raised here surfaces to the caller as
-``RuntimeError`` (ADK's ``PluginManager._run_callbacks`` wraps any exception a
-plugin callback raises, chaining the original as ``__cause__``) — a framework
-convention outside this pack's control, not a Keel behavior change.
+MCP interplay: under ADK's ``_MCP_GRACEFUL_ERROR_HANDLING`` feature flag,
+``McpTool`` converts failures into ``{"error": "<message>"}`` results. The
+rebound wrapper detects MCP tools structurally (MRO class name) and counts
+an error-shaped dict as a FAILURE for breaker/discovery accounting while
+returning it to the agent unchanged. ``McpTool``'s own single blind retry
+runs beneath Keel; each underlying JSON-RPC attempt is separately visible
+to the ``mcp:<server>`` target at the transport seam (``keel.packs.
+mcp_pack``), which sees raw failures regardless of the graceful flag.
 """
 
 from __future__ import annotations
@@ -177,7 +149,10 @@ def seams() -> list[Seam]:
                 "post-construction and registering through its own documented "
                 "get_plugin/register_plugin API (never poking private state) "
                 "covers every construction shape uniformly and stays fully "
-                "reversible."
+                "reversible. Tool coverage rides instance-level run_async "
+                "rebinding done lazily from before_tool_callback — the callback "
+                "itself always returns None for rebindable tools, preserving "
+                "ADK's own callback and error sequence."
             ),
         )
     ]
@@ -442,17 +417,19 @@ def _rebind_tool(tool: Any, name: str) -> bool:
 
 
 async def _call_via_plugin_loop(tool: Any, tool_args: dict[str, Any], tool_context: Any) -> dict[str, Any] | None:
-    """The ``before_tool_callback`` body (module-level so it needs no ADK
-    types): resolve the tool's name against the frozen ``tool:<name>``
-    grammar — skip-and-note (Level 0: "if a call site cannot be wrapped
-    safely, do nothing" — ``tool.py``'s own guidance for auto-wrap packs) — or
-    drive the full retry-eligible call through :func:`keel.packs.tool.
-    wrap_tool` and hand back a result ADK's own normalization already treats
-    identically to a real call's raw return (``__build_response_event``:
-    ``if not isinstance(function_result, dict): function_result = {'result':
-    function_result}``) — this pack just applies the same rule one step
-    earlier, so the plugin's ``is not None`` short-circuit check is
-    unambiguous even for a tool that legitimately returns ``None``."""
+    """Setattr-rejection fallback path: when a tool instance rejects
+    ``setattr`` (slots/frozen), execute the tool's Keel wrapper via the
+    plugin loop instead of rebinding ``run_async``. Resolve the tool's name
+    against the frozen ``tool:<name>`` grammar — skip-and-note (Level 0:
+    "if a call site cannot be wrapped safely, do nothing" — ``tool.py``'s
+    own guidance for auto-wrap packs) — or drive the full retry-eligible
+    call through :func:`keel.packs.tool.wrap_tool` and hand back a result
+    ADK's own normalization already treats identically to a real call's raw
+    return (``__build_response_event``: ``if not isinstance(function_result,
+    dict): function_result = {'result': function_result}``) — this pack just
+    applies the same rule one step earlier, so the plugin's ``is not None``
+    short-circuit check is unambiguous even for a tool that legitimately
+    returns ``None``."""
     name = getattr(tool, "name", None)
     if not is_valid_tool_name(name):
         _note_skip(name)
