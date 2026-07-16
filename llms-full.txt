@@ -149,8 +149,8 @@ timestamps) instead of prose. Same command, two audiences.
 When another tool owns the process (test runners, `agents-cli`, `adk api_server`, uvicorn), activate Keel via environment variables:
 
 - **Python**: the `keelrun` wheel ships a `.pth` shim gated on `KEEL_ENABLE=1`. Set it in your `.env` and every Python process boots with the same policy engine as `keel run` — loading `keel.toml` from the working directory, or from `KEEL_CWD=<dir>` when config lives in the deployable app. `KEEL_DISABLE=1` always wins.
-- **Node**: add `NODE_OPTIONS="--import keelrun/register"` alongside `KEEL_ENABLE=1`. Same gate and cwd-search semantics as Python.
-- Activation is fail-open: a broken install or invalid `keel.toml` prints one `keel ▸` warning line; your app runs unwrapped. What stays a `keel run` feature: the preflight resilience advisory, `keel record` / `keel sim` wiring, and flow-entrypoint dispatch (designated via `[flows] entrypoints`, not auto-detected).
+- **Node**: add `NODE_OPTIONS="--import keelrun/register"` alongside `KEEL_ENABLE=1`. Same `KEEL_ENABLE` gate as Python; `KEEL_CWD` is Python-only — Node always uses the process working directory.
+- Activation is fail-open: a broken install or invalid `keel.toml` prints one `keel ▸` warning line; your app runs unwrapped. The preflight resilience advisory stays a `keel run`-only, CLI-side feature in both languages. Python's `.pth` shim additionally skips `keel record` / `keel sim` wiring and flow-entrypoint dispatch (designated via `[flows] entrypoints`, not auto-detected). Node's `keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload `keel run` uses — flow-entrypoint dispatch and `KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
 
 ## Error codes (frozen taxonomy)
 

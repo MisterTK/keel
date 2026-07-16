@@ -191,9 +191,13 @@ uvicorn, a test runner), Keel can activate as a plain dependency:
 
 Activation is fail-open by design: a broken install or invalid `keel.toml`
 prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
-always wins. What the shim deliberately does not do (those stay `keel run`
-features): the preflight resilience advisory, `keel record`/`keel sim`
-wiring, and flow-entrypoint dispatch.
+always wins. The preflight resilience advisory stays a `keel run`-only,
+CLI-side feature in both languages. Python's `.pth` shim additionally does
+not wire `keel record`/`keel sim` or dispatch flow entrypoints — a `.pth` has
+no target script to match `[flows] entrypoints` against. Node's
+`keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload
+`keel run` uses — flow-entrypoint dispatch and
+`KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
 
 `keel mcp` serves the CLI itself as an MCP server over stdio — six tools,
 each byte-identical to its `--json` CLI twin (`get_status`,
