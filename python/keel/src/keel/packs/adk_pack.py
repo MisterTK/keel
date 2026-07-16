@@ -28,7 +28,8 @@ Two Keel target classes come out of this pack, split by where the seam lives:
   discovery/breaker/timeout coverage for free and turning "on_tool_error
   wiring" from hand-written callback code into policy (dx-spec §4.2) — with
   retry itself opt-in exactly like every other ``tool:`` call site (Level 0
-  hard rule; see "Idempotency" below).
+  hard rule — see ``keel.packs.tool``'s module docs; a framework pack never
+  asserts re-invoke safety on a tool author's behalf).
 
 Idempotency-key injection HAS landed in the shared HTTP adapters (CCR-2:
 ``contracts/adapter-pack.md`` "Idempotency-key injection";
