@@ -39,6 +39,18 @@ throwaway venv, see ws3-task-1-report.md for the full certification log):
   ``google-adk``'s own distribution metadata does not declare it as a hard
   dependency — the farm venv installs both ``google-adk==2.4.0`` and the
   pinned ``mcp`` version together (no conflict; see the report).
+* WS5 Task 5 (5b): the farm venv deliberately has NO ``anthropic`` package
+  installed (it is not a declared dependency of ``google-adk`` — verified via
+  ``pip show google-adk``'s ``Requires:`` list, which does not mention it),
+  so a ``claude-*`` model name hits ``LLMRegistry.resolve``'s real
+  ``ImportError``-swallowing branch and its actionable ``ValueError`` remedy
+  ("Claude models require the anthropic package...") for real — exactly the
+  resolution-failure shape ``adk_pack._resolve_model_class``'s
+  ``note_on_failure=True`` branch exists to skip-and-note rather than crash
+  on. ``on_model_error_callback``'s cross-model construction
+  (``LLMRegistry.new_llm``) and the real ``PluginManager.
+  run_on_model_error_callback`` early-exit-on-non-``None`` dispatch are
+  certified below too.
 """
 
 from __future__ import annotations
@@ -58,7 +70,9 @@ if FARM:  # real imports only in farm mode — never at fast-path collection tim
     from google.adk.agents import BaseAgent
     from google.adk.agents.llm_agent import LlmAgent
     from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_request import LlmRequest
     from google.adk.models.llm_response import LlmResponse
+    from google.adk.models.registry import LLMRegistry
     from google.adk.plugins.base_plugin import BasePlugin
     from google.adk.runners import InMemoryRunner, Runner
     from google.adk.tools.function_tool import FunctionTool
@@ -158,6 +172,108 @@ class AdkFarmContractTest(unittest.TestCase):
         fake = type("X", (McpTool,), {})  # subclass detection via MRO name
         self.assertTrue(adk_pack._is_mcp_tool(object.__new__(fake)))
         self.assertTrue(adk_pack._is_mcp_error_dict({"error": "boom"}))
+
+    # -- WS5 Task 5: on_model_error real-registry + real-PluginManager certs
+    # (5b) — the real-package counterparts of test_packs_adk.py's
+    # ModelFallbackTest/ModelFallbackPluginShapeTest (which run entirely
+    # against FakeLLMRegistry). -------------------------------------------
+
+    def test_llm_registry_new_llm_constructs_a_real_gemini_instance(self) -> None:
+        """5b cert: ``_model_fallback``'s chain-entry construction call —
+        ``LLMRegistry.new_llm(entry)`` — actually builds a real provider
+        model for a real registered name. This is the exact call
+        ``adk_pack._model_fallback`` makes for a same-provider (Gemini)
+        chain entry (before the same-class skip below it decides whether to
+        use the result)."""
+        from google.adk.models.google_llm import Gemini
+
+        model = LLMRegistry.new_llm("gemini-2.0-flash")
+        self.assertIsInstance(model, Gemini)
+        self.assertEqual(model.model, "gemini-2.0-flash")
+
+    def test_claude_name_without_anthropic_raises_actionable_error_our_skip_swallows(self) -> None:
+        """5b cert: this farm venv has google-adk but deliberately NO
+        anthropic package installed (module docstring) — resolving a
+        claude-family name against the REAL LLMRegistry hits exactly the
+        resolution-failure shape ``adk_pack._resolve_model_class``'s
+        ``note_on_failure=True`` branch exists for: a real ``ValueError``
+        carrying ADK's own actionable "requires the anthropic package"
+        remedy. ``_model_fallback`` treats this as a skip-and-note
+        chain-entry failure, not a crash — certified directly against our
+        own helper below, fed the real registry."""
+        claude_name = "claude-sonnet-cert-4-5"  # matches the real `claude-.*-4.*` regex
+        with self.assertRaises(ValueError) as cm:
+            LLMRegistry.resolve(claude_name)
+        self.assertIn("anthropic", str(cm.exception).lower())
+
+        # Our own helper swallows exactly this failure into a skip, not a crash.
+        self.assertIsNone(adk_pack._resolve_model_class(LLMRegistry, claude_name, note_on_failure=True))
+
+    def test_on_model_error_callback_drives_real_fallback_and_early_exits(self) -> None:
+        """5b behavioral cert: registers a REAL provider model into the REAL
+        LLMRegistry, then drives a REAL
+        ``PluginManager.run_on_model_error_callback`` end-to-end — proving
+        both that Keel's ``on_model_error_callback`` is reachable through
+        ADK's real dispatch path, and that ``PluginManager``'s real
+        early-exit-on-non-``None`` behavior (the WS1 carry-forward claim,
+        here for the model-error hook rather than ``before_tool_callback``)
+        actually fires: a later-registered probe plugin's own
+        ``on_model_error_callback`` never runs."""
+        fallback_calls: list[str] = []
+        fallback_name = "keel-farm-cert-fallback-model"
+
+        class _FarmFallbackModel(BaseLlm):
+            @classmethod
+            def supported_models(cls) -> list[str]:
+                return [fallback_name]
+
+            async def generate_content_async(self, llm_request: Any, stream: bool = False):
+                fallback_calls.append(self.model)
+                yield LlmResponse(
+                    content=types.Content(role="model", parts=[types.Part(text="fallback-answer")]),
+                    partial=False,
+                )
+
+        LLMRegistry.register(_FarmFallbackModel)
+        try:
+            backend = _runtime.get_backend()
+            backend.configure({"target": {"llm:google-genai": {"fallback": [fallback_name]}}})
+
+            runner = InMemoryRunner(agent=self._agent(), app_name="farm-model-fallback")
+            manager = runner.plugin_manager  # keel's plugin auto-registered by Runner.__init__
+
+            probe_seen: list[str] = []
+
+            class Probe(BasePlugin):
+                def __init__(self) -> None:
+                    super().__init__(name="probe")
+
+                async def on_model_error_callback(self, *, callback_context, llm_request, error):
+                    probe_seen.append("probe-ran")
+                    return None
+
+            manager.register_plugin(Probe())
+
+            llm_request = LlmRequest(model="gemini-2.0-flash")  # the ORIGINAL failing model
+            result = asyncio.run(
+                manager.run_on_model_error_callback(
+                    callback_context=None, llm_request=llm_request, error=RuntimeError("boom")
+                )
+            )
+            self.assertIsInstance(result, LlmResponse)
+            self.assertEqual(
+                fallback_calls, [fallback_name], "the real fallback model was actually constructed and driven"
+            )
+            self.assertEqual(
+                probe_seen,
+                [],
+                "keel's non-None return short-circuited the real PluginManager before the probe ran",
+            )
+        finally:
+            from google.adk.models import registry as registry_module
+
+            registry_module._llm_registry_dict.pop(fallback_name, None)
+            LLMRegistry.resolve.cache_clear()
 
     # -- WS5 Task 3: structural certs for the Runner-flow wrap (farm-only,
     # NO native module requirement on this leg — see module docs above) -----
