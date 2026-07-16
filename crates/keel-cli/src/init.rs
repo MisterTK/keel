@@ -1349,4 +1349,78 @@ timeout = \"5s\"
             original
         );
     }
+
+    /// CRITICAL containment test: `agents_cli_toml_path` rejects an absolute
+    /// agent directory using canonicalization (layer 2), not Path::starts_with
+    /// (which is purely syntactic). This is defense in depth: even though a
+    /// manifest with `agent_directory: /etc` contains no `..` component (so
+    /// layer 1 in agents_cli.rs does not reject it), `canonicalize` resolves it
+    /// to the actual `/etc` on disk, which fails the starts_with check and
+    /// returns None. If layer 2 were removed and only layer 1 remained, this
+    /// would escape the project.
+    #[test]
+    fn agents_cli_toml_path_rejects_absolute_path_agent_directory() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        fs::write(
+            project.join("agents-cli-manifest.yaml"),
+            // Using the actual outside TempDir path (absolute, no ..) — layer 1
+            // does NOT reject this because there's no ParentDir component.
+            format!("agent_directory: {}\n", outside.display()),
+        )
+        .unwrap();
+
+        // agents_cli_toml_path should return None because canonicalization
+        // resolves the absolute path and discovers it's outside project.
+        assert!(agents_cli_toml_path(&project).is_none());
+
+        // End-to-end through run: writes to project root, never to outside.
+        let r = run(&project, InitOptions::default());
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(project.join("keel.toml").exists());
+        assert!(!outside.join("keel.toml").exists());
+    }
+
+    /// CRITICAL containment test: `agents_cli_toml_path` rejects a symlink
+    /// agent directory that points outside the project. This is defense in
+    /// depth: the manifest's `agent_directory` is a valid relative path inside
+    /// `project`, but if it's a symlink pointing outside, `canonicalize` will
+    /// resolve it to the actual target and fail the starts_with check. Layer 1
+    /// (agents_cli.rs rejecting `..`) does not catch this — only canonicalization
+    /// (layer 2) does.
+    #[cfg(unix)]
+    #[test]
+    fn agents_cli_toml_path_rejects_symlink_escape_to_outside_project() {
+        use std::os::unix::fs as unix_fs;
+
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        // Create a symlink inside project that points to outside.
+        let symlink = project.join("app");
+        unix_fs::symlink(&outside, &symlink).unwrap();
+
+        fs::write(
+            project.join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+
+        // agents_cli_toml_path should return None because canonicalize resolves
+        // the symlink to outside and fails the starts_with check.
+        assert!(agents_cli_toml_path(&project).is_none());
+
+        // End-to-end through run: writes to project root, never to outside.
+        let r = run(&project, InitOptions::default());
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(project.join("keel.toml").exists());
+        assert!(!outside.join("keel.toml").exists());
+    }
 }
