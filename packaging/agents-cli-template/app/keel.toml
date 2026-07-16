@@ -1,0 +1,17 @@
+# Keel policy for this agent. Lives inside the agent directory ON PURPOSE:
+# the generated Dockerfile COPYs pyproject/README/uv.lock and this directory
+# only, so a repo-root keel.toml would silently never reach the container.
+# Docs: https://github.com/MisterTK/keel (llms.txt for the full surface).
+
+[defaults.llm]
+# Gemini calls (llm:google-genai via the google-genai SDK) inherit
+# Retry-After-aware retry on 429/5xx/timeout from Keel's built-in defaults;
+# pin overrides here when you need them, e.g.:
+# retry = { attempts = 4 }
+
+[target."llm:google-genai"]
+# budget = "$5/run"           # per-process spend cap (breaker-shaped trip)
+# fallback = ["gemini-2.0-flash"]  # same-host model fallback
+
+# Tool calls (tool:<name>) are observed, never auto-retried (side effects);
+# breaker/timeout still protect them. MCP servers get mcp:<server> targets.

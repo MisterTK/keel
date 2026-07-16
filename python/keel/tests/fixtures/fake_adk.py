@@ -17,6 +17,10 @@ package:
   agent=None, *, app_name=None, plugins=None, app=None, ...)`` forwards to it
   via ``super().__init__(...)``.
 * ``BaseTool.run_async(self, *, args: dict, tool_context) -> Any``.
+* ``Runner.run_async(self, *, user_id: str, session_id: str, invocation_id:
+  Optional[str] = None, new_message=None, ...) -> AsyncGenerator[Event,
+  None]``; ``Runner.run(...)`` is the synchronous bridge, draining
+  ``run_async`` over its own event loop.
 """
 
 from __future__ import annotations
@@ -98,6 +102,26 @@ class FakePluginManager:
         return next((p for p in self.plugins if p.name == name), None)
 
 
+class FakeEvent:
+    """Structural twin of ``google.adk.events.event.Event``: adk_pack's
+    Runner-flow wrap reads only ``.invocation_id`` off an event (to
+    correlate the flow via ``backend.journal_random``), so that is the only
+    attribute this fake sets by default — any other keyword becomes an
+    attribute too, for tests that want to assert byte-transparency of
+    richer event shapes."""
+
+    def __init__(self, invocation_id: str | None = None, **extra: Any) -> None:
+        self.invocation_id = invocation_id
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeEvent) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeEvent({vars(self)!r})"
+
+
 class FakeRunner:
     """Structural twin of ``google.adk.runners.Runner``: real ADK resolves
     ``agent=``/``node=``/``app=`` into one ``App`` before building
@@ -105,7 +129,19 @@ class FakeRunner:
     fake skips the App indirection (irrelevant to the pack under test) but
     preserves the externally-observable contract: after construction,
     ``self.plugin_manager`` holds every plugin passed via ``plugins=`` (or via
-    a fake ``app.plugins``, if supplied instead)."""
+    a fake ``app.plugins``, if supplied instead).
+
+    ``run_async`` is an async generator yielding ``events`` in order (queued
+    at construction via ``events=``) — matching the real ``Runner.run_async``
+    keyword-only signature (``user_id``, ``session_id``, ``invocation_id=
+    None``, ``new_message=None``, plus ``**kwargs`` tolerance for forward
+    compatibility). An item that is a ``BaseException`` instance is raised
+    instead of yielded, modeling a mid-stream failure. ``run`` is the
+    synchronous bridge real ADK provides: it drains ``self.run_async(...)``
+    over a fresh event loop — i.e. it calls through whatever ``run_async``
+    PRESENTLY resolves to (patched or not), exactly like the real bridge, so
+    a class-level ``Runner.run_async`` patch covers ``run()`` callers too
+    without ``run`` itself ever needing a separate patch."""
 
     def __init__(
         self,
@@ -115,6 +151,7 @@ class FakeRunner:
         agent: Any = None,
         node: Any = None,
         plugins: list[Any] | None = None,
+        events: list[Any] | None = None,
         **_: Any,
     ) -> None:
         self.app = app
@@ -124,6 +161,46 @@ class FakeRunner:
         if app is not None:
             resolved.extend(getattr(app, "plugins", None) or [])
         self.plugin_manager = FakePluginManager(plugins=resolved)
+        self.events = list(events or [])
+
+    async def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        for item in self.events:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def run(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        import asyncio
+
+        async def _drain() -> list[Any]:
+            return [
+                event
+                async for event in self.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    new_message=new_message,
+                    **kwargs,
+                )
+            ]
+
+        return asyncio.run(_drain())
 
 
 class FakeInMemoryRunner(FakeRunner):
@@ -173,6 +250,158 @@ class FakeTool:
         return self.func(**args)
 
 
+class FakeSlottedTool:
+    """A ``__slots__``-restricted tool: ``setattr(tool, "run_async", …)``
+    raises ``AttributeError``, exercising adk_pack's rebind-refusal fallback
+    (the plugin-loop path). Same observable surface as ``FakeTool``."""
+
+    __slots__ = ("name", "func", "calls")
+
+    def __init__(self, name: str, func: Callable[..., Any]) -> None:
+        self.name = name
+        self.func = func
+        self.calls = 0
+
+    async def run_async(self, *, args: dict[str, Any], tool_context: Any) -> Any:
+        self.calls += 1
+        import inspect
+
+        if inspect.iscoroutinefunction(self.func):
+            return await self.func(**args)
+        return self.func(**args)
+
+
+class McpTool(FakeTool):
+    """Structural twin of ``google.adk.tools.mcp_tool.mcp_tool.McpTool`` for
+    adk_pack's MRO-name-based detection (`_is_mcp_tool`): under ADK's
+    graceful error handling (`_MCP_GRACEFUL_ERROR_HANDLING`), a failed MCP
+    call RETURNS ``{"error": "<message>"}`` instead of raising — the class
+    name (not this fixture's module path) is the detection key."""
+
+
+class FakeLlmRequest:
+    """Structural twin of ``google.adk.models.llm_request.LlmRequest``:
+    ``adk_pack``'s ``on_model_error`` fallback reads only ``.model`` off it
+    (a plain model-name string, per the real ADK field, verified against the
+    2.4.0 package) to resolve the FAILING model's class for the same-class
+    skip rule — the object itself is passed through unchanged to a fallback
+    hop's ``generate_content_async``."""
+
+    def __init__(self, model: str | None = None, **extra: Any) -> None:
+        self.model = model
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeLlmRequest) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeLlmRequest({vars(self)!r})"
+
+
+class FakeLlmResponse:
+    """Structural twin of ``google.adk.models.llm_response.LlmResponse`` —
+    enough of a shell to assert identity/content across a fallback hop."""
+
+    def __init__(self, content: Any = None, **extra: Any) -> None:
+        self.content = content
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeLlmResponse) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeLlmResponse({vars(self)!r})"
+
+
+class FakeModel:
+    """Structural twin of a ``google.adk.models.base_llm.BaseLlm`` backend:
+    ``generate_content_async`` is an async generator yielding a scripted
+    response sequence (or raising a scripted exception on first drive),
+    recording every ``llm_request`` it was driven with — enough to assert a
+    fallback hop actually ran (or didn't)."""
+
+    def __init__(self, *, responses: list[Any] | None = None, error: Exception | None = None) -> None:
+        self.responses = list(responses or [])
+        self.error = error
+        self.calls: list[Any] = []
+
+    async def generate_content_async(self, llm_request: Any, stream: bool = False) -> Any:
+        self.calls.append(llm_request)
+        if self.error is not None:
+            raise self.error
+        for resp in self.responses:
+            yield resp
+
+
+class FakeGemini(FakeModel):
+    """A fake google-genai-backed model class — the same \"provider class\"
+    a failing Gemini call's own model would resolve to, for exercising
+    decision 7's same-class skip rule (a same-provider chain entry is left
+    for the transport seam to have already chased)."""
+
+
+class FakeClaude(FakeModel):
+    """A fake distinct-provider model class, for exercising a genuine
+    cross-provider fallback hop."""
+
+
+class FakeLLMRegistry:
+    """Structural twin of ``google.adk.models.registry.LLMRegistry`` (real
+    ADK: ``resolve(model: str) -> type[BaseLlm]`` / ``new_llm(model: str) ->
+    BaseLlm``, both classmethods matching a registered pattern per model
+    name). This fake is a plain per-test dict lookup — CLASS-level state,
+    shared across every fake ``LLMRegistry`` import, so every test using it
+    MUST call ``reset()`` in ``setUp``/``tearDown``.
+
+    ``configure(name, instance)`` registers a model name that resolves
+    (``resolve``) to ``instance``'s class and constructs (``new_llm``) to
+    ``instance`` itself — the ordinary "this chain entry works" case.
+    ``break_new_llm(name, model_class, error)`` registers a name whose
+    ``resolve`` succeeds (so the same-class check still sees a real class)
+    but whose ``new_llm`` raises ``error`` — the "resolvable name, but its
+    provider package isn't actually installed" shape. A name never
+    registered at all makes ``resolve`` raise (the "unknown model name"
+    shape)."""
+
+    _classes: dict[str, type] = {}
+    _instances: dict[str, Any] = {}
+    _new_llm_errors: dict[str, Exception] = {}
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._classes = {}
+        cls._instances = {}
+        cls._new_llm_errors = {}
+
+    @classmethod
+    def configure(cls, name: str, instance: Any, *, model_class: type | None = None) -> None:
+        cls._classes[name] = model_class or type(instance)
+        cls._instances[name] = instance
+
+    @classmethod
+    def break_new_llm(cls, name: str, model_class: type, error: Exception) -> None:
+        cls._classes[name] = model_class
+        cls._new_llm_errors[name] = error
+
+    @classmethod
+    def resolve(cls, model: str) -> type:
+        try:
+            return cls._classes[model]
+        except KeyError:
+            raise ValueError(f"Model {model!r} not found.") from None
+
+    @classmethod
+    def new_llm(cls, model: str) -> Any:
+        if model in cls._new_llm_errors:
+            raise cls._new_llm_errors[model]
+        try:
+            return cls._instances[model]
+        except KeyError:
+            raise ValueError(f"Model {model!r} not found.") from None
+
+
 def _fake_module(name: str, **attrs: Any) -> types.ModuleType:
     mod = types.ModuleType(name)
     mod.__spec__ = ModuleSpec(name, loader=None, is_package=True)
@@ -191,6 +420,8 @@ _MODULE_NAMES = (
     "google.adk.runners",
     "google.adk.plugins",
     "google.adk.plugins.base_plugin",
+    "google.adk.models",
+    "google.adk.models.registry",
 )
 
 
@@ -217,17 +448,23 @@ class FakeAdkModules:
         )
         plugins_pkg = _fake_module("google.adk.plugins")
         base_plugin_mod = _fake_module("google.adk.plugins.base_plugin", BasePlugin=FakeBasePlugin)
+        models_pkg = _fake_module("google.adk.models")
+        registry_mod = _fake_module("google.adk.models.registry", LLMRegistry=FakeLLMRegistry)
 
         google_mod.adk = adk_mod
         adk_mod.runners = runners_mod
         adk_mod.plugins = plugins_pkg
+        adk_mod.models = models_pkg
         plugins_pkg.base_plugin = base_plugin_mod
+        models_pkg.registry = registry_mod
 
         sys.modules["google"] = google_mod
         sys.modules["google.adk"] = adk_mod
         sys.modules["google.adk.runners"] = runners_mod
         sys.modules["google.adk.plugins"] = plugins_pkg
         sys.modules["google.adk.plugins.base_plugin"] = base_plugin_mod
+        sys.modules["google.adk.models"] = models_pkg
+        sys.modules["google.adk.models.registry"] = registry_mod
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -243,8 +480,17 @@ __all__ = [
     "FakeAdkModules",
     "FakeApp",
     "FakeBasePlugin",
+    "FakeClaude",
+    "FakeEvent",
+    "FakeGemini",
     "FakeInMemoryRunner",
+    "FakeLLMRegistry",
+    "FakeLlmRequest",
+    "FakeLlmResponse",
+    "FakeModel",
     "FakePluginManager",
     "FakeRunner",
     "FakeTool",
+    "FakeSlottedTool",
+    "McpTool",
 ]

@@ -1,0 +1,13 @@
+{
+  "default": {
+    "status": 200,
+    "body": "{\"reply\":\"42\"}",
+    "headers": { "content-type": "application/json" }
+  },
+  "paths": {
+    "/v1/complete": [
+      { "status": 429, "headers": { "Retry-After": "0" }, "repeat": 2 },
+      { "status": 200, "body": "{\"reply\":\"42\"}", "headers": { "content-type": "application/json" } }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+name: "keel-adk-template"
+description: "Google ADK agent with Keel resilience built in: retry/backoff/timeout/breaker/cache policy in one keel.toml, zero code changes."
+base_template: "adk"
+agent_directory: "app"
+settings:
+  extra_dependencies:
+    # Deep-merge REPLACES this list (it does not append), so the base adk
+    # template's own dependencies must be repeated here alongside keelrun.
+    - "google-adk[gcp]>=2.0.0,<3.0.0"
+    - "a2a-sdk[http-server]~=0.3.22"
+    - "aiohttp>=3.13.4"
+    - "keelrun>=0.2.0"

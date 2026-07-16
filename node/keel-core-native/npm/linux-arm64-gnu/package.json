@@ -1,6 +1,6 @@
 {
   "name": "keelrun-core-native-linux-arm64-gnu",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Prebuilt keel-core-native addon for Linux aarch64/glibc (linux-arm64-gnu). Optional dependency of keelrun-core-native — installed automatically on a matching platform, ignored otherwise. See scripts/napi-prebuild.sh.",
   "os": ["linux"],
   "cpu": ["arm64"],

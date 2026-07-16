@@ -33,6 +33,15 @@
 #   ---------|-------------------------------|---------------------------|------------------------------------------
 #   python   | httpx                         | 0.27.2, 0.28.1            | python/keel/src/keel/adapters/httpx_pack.py
 #   python   | requests                      | 2.33.1, 2.34.2            | python/keel/src/keel/adapters/requests_pack.py
+#   python   | google-adk                    | 2.4.0                     | python/keel/src/keel/packs/adk_pack.py
+#   python   | google-adk + mcp (composition)| 2.4.0 + 1.28.1            | adk_pack.py + mcp_pack.py (real LlmAgent
+#            |                               |                           | + Runner + MCPToolset over a real stdio
+#            |                               |                           | server — tests.test_farm_adk_composition)
+#   python   | pydantic-ai                   | 2.9.0                     | python/keel/src/keel/packs/pydantic_ai_pack.py
+#   python   | openai-agents                 | 0.18.2                    | python/keel/src/keel/packs/openai_agents_pack.py
+#   python   | crewai                        | 1.15.2                    | python/keel/src/keel/packs/crewai_pack.py
+#   python   | langgraph                     | 1.0.10                    | python/keel/src/keel/packs/langgraph_pack.py
+#   python   | mcp                           | 1.28.1                    | python/keel/src/keel/packs/mcp_pack.py
 #   python   | aiohttp                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
 #   python   | urllib3                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
 #   python   | boto3                         | (planned — no pack yet)   | not yet in the doctor REGISTRY either
@@ -96,6 +105,80 @@ jobs:
         run: python3 -m unittest ${{ matrix.test_module }} -v
 
   # ---------------------------------------------------------------------------
+  # Python: the six agent-framework packs (WS3), each against its real, pinned
+  # library — a separate job (not folded into python-pinned's matrix) so the
+  # httpx/requests entries above stay completely untouched: these contract
+  # tests are gated on KEEL_ADAPTER_FARM=1 (python/keel/tests/test_farm_*.py),
+  # so every entry here needs that env var on its unittest step, unlike the
+  # unconditional httpx/requests tests. Pins are frozen exactly as certified
+  # in ws3-task-1-report.md — bump only alongside a fresh local certification
+  # pass, never blind.
+  # ---------------------------------------------------------------------------
+  python-pinned-frameworks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lib: google-adk
+            version: "2.4.0"
+            test_module: tests.test_farm_adk
+            # google.adk.tools.mcp_tool imports `mcp` at module level even
+            # though google-adk does not declare it as a dependency — install
+            # it alongside the pin or the farm test's import fails outright.
+            extra_deps: "mcp==1.28.1"
+          - lib: google-adk
+            version: "2.4.0"
+            test_module: tests.test_farm_adk_composition
+            # The composition E2E (WS3 Task 3): a real LlmAgent + Runner +
+            # MCPToolset over a real stdio MCP server, with adk_pack AND
+            # mcp_pack both live — same co-install requirement as the plain
+            # adk_pack leg above.
+            extra_deps: "mcp==1.28.1"
+          - lib: google-adk
+            version: "2.4.0"
+            test_module: tests.test_demos
+            # demos/adk-demo (WS4 Task 4): a real LlmAgent + FunctionTool +
+            # InMemoryRunner riding out a 429 storm below the agent loop.
+            # Unlike the two legs above, no extra_deps: this module's
+            # AdkDemoTest never touches MCPToolset, and httpx (which
+            # flaky-python/agent-demo's own tests in this same module need)
+            # already arrives transitively via google-genai — verified in a
+            # scratch venv with ONLY google-adk==2.4.0 installed (see
+            # ws4-task-4-report.md). Not gated on KEEL_ADAPTER_FARM=1 itself
+            # (AdkDemoTest's own skip condition is "google.adk importable");
+            # setting the env var here is harmless, just unused by this leg.
+          - lib: pydantic-ai
+            version: "2.9.0"
+            test_module: tests.test_farm_pydantic_ai
+          - lib: openai-agents
+            version: "0.18.2"
+            test_module: tests.test_farm_openai_agents
+          - lib: crewai
+            version: "1.15.2"
+            test_module: tests.test_farm_crewai
+          - lib: langgraph
+            version: "1.0.10"
+            test_module: tests.test_farm_langgraph
+          - lib: mcp
+            version: "1.28.1"
+            test_module: tests.test_farm_mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ${{ matrix.lib }}==${{ matrix.version }} (pinned, isolated)
+        run: python3 -m pip install --upgrade pip "${{ matrix.lib }}==${{ matrix.version }}" ${{ matrix.extra_deps }}
+      - name: Grading sanity — detect() must report 'pinned' at this version
+        run: python3 scripts/check-adapter-grading.py ${{ matrix.lib }} pinned
+      - name: Contract tests (${{ matrix.test_module }}) against the real, pinned ${{ matrix.lib }}
+        working-directory: python/keel
+        env:
+          KEEL_ADAPTER_FARM: "1"
+        run: python3 -m unittest ${{ matrix.test_module }} -v
+
+  # ---------------------------------------------------------------------------
   # Python: an OUT-OF-RANGE install, asserting the pinned->best_effort grading
   # actually flips on a real install (not just a monkeypatched version string
   # in a unit test) — the gap this workflow exists to close.
@@ -147,3 +230,77 @@ jobs:
         if: always()
         working-directory: node/keel
         run: rm -rf node_modules package-lock.json
+
+  # ---------------------------------------------------------------------------
+  # Python: uv-installed wheel activation (spec §11 risk 4, deferred from WS2).
+  # python/keel/tests/test_pth_wheel.py's PthWheelTest already proves the
+  # `.pth` fires under `python -m venv` + `pip install` — this leg proves the
+  # SAME three contracts under a completely different installer (uv venv + uv
+  # pip install --no-deps), which resolves and links wheels itself rather than
+  # shelling out to pip. A `.pth`-processing gap specific to uv's installer
+  # would slip past every existing Python test, since none of them touch uv.
+  # A shell job, not a Python test: the point is the real install path, not
+  # another unittest harness.
+  # ---------------------------------------------------------------------------
+  python-uv-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build + uv
+        run: python3 -m pip install --upgrade pip build uv
+      - name: Build the keelrun wheel
+        working-directory: python/keel
+        run: python3 -m build --wheel --outdir dist .
+      - name: Create a uv venv and install the wheel (--no-deps, uv's own installer)
+        working-directory: python/keel
+        run: |
+          uv venv /tmp/uvenv
+          uv pip install --python /tmp/uvenv/bin/python --no-deps dist/keelrun-*.whl
+      - name: Gate ON — banner fires through uv-installed .pth processing
+        run: |
+          mkdir -p /tmp/uvwheel-on && cd /tmp/uvwheel-on
+          : > keel.toml
+          KEEL_ENABLE=1 /tmp/uvenv/bin/python -c "print('APP-RAN')" >stdout.log 2>stderr.log
+          cat stdout.log stderr.log
+          grep -q "APP-RAN" stdout.log
+          grep -q "keel ▸" stderr.log
+      - name: Gate OFF — keel is never imported on an idle install
+        run: |
+          mkdir -p /tmp/uvwheel-off && cd /tmp/uvwheel-off
+          /tmp/uvenv/bin/python -c "import sys; print('keel-loaded', any(m == 'keel' or m.startswith('keel.') for m in sys.modules))" >stdout.log 2>stderr.log
+          cat stdout.log stderr.log
+          grep -q "keel-loaded False" stdout.log
+          [ ! -s stderr.log ]
+      - name: Broken keel.toml fails open — app still runs under uv's install
+        run: |
+          mkdir -p /tmp/uvwheel-broken && cd /tmp/uvwheel-broken
+          printf 'not [valid toml' > keel.toml
+          KEEL_ENABLE=1 /tmp/uvenv/bin/python -c "print('APP-RAN')" >stdout.log 2>stderr.log
+          cat stdout.log stderr.log
+          grep -q "APP-RAN" stdout.log
+          grep -q "auto-activation failed" stderr.log
+
+  # ---------------------------------------------------------------------------
+  # packaging/agents-cli-template/ certification (WS4 Task 1): installs the
+  # REAL google-agents-cli package and scaffolds a project from the template
+  # using its local path (scripts/smoke-agents-cli-template.sh), then asserts
+  # the generated project actually carries Keel's wiring — app/keel.toml,
+  # keelrun + the base template's own deps in pyproject.toml, and
+  # KEEL_ENABLE=1 in .env.example. This is the same "layer verbatim over the
+  # rendered base template" mechanism a real
+  # `agents-cli create -a MisterTK/keel/packaging/agents-cli-template` would
+  # use, just fed a local path instead of a git fetch — needs network for pip
+  # (google-agents-cli itself), not for the scaffold step.
+  # ---------------------------------------------------------------------------
+  agents-cli-template-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Certify packaging/agents-cli-template/ against the real agents-cli
+        run: scripts/smoke-agents-cli-template.sh

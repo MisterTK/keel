@@ -1,0 +1,170 @@
+{
+  "adapters": [
+    {
+      "detected": false,
+      "lib": "httpx",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "requests",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "aiohttp",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib3",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "openai",
+      "status": "pinned",
+      "target": "llm:openai"
+    },
+    {
+      "detected": false,
+      "lib": "anthropic",
+      "status": "pinned",
+      "target": "llm:anthropic"
+    },
+    {
+      "detected": true,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": true,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
+      "detected": false,
+      "lib": "fetch",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "undici",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "http",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "ai-sdk",
+      "status": "pinned",
+      "target": "llm:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
+    }
+  ],
+  "coverage": {
+    "invisible": [],
+    "visible_unwrapped": [
+      "llm:google-genai"
+    ],
+    "wrapped": []
+  },
+  "findings": [
+    {
+      "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
+      "detail": "`llm:google-genai` is visible in your code but has no observed runtime evidence.",
+      "level": "warn",
+      "topic": "visible-unwrapped"
+    },
+    {
+      "action": "If a dependency makes calls Keel never reports, file an adapter request.",
+      "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
+      "level": "info",
+      "topic": "invisible"
+    }
+  ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
+  "ok": true,
+  "policy": {
+    "field": null,
+    "message": null,
+    "present": false,
+    "valid": true
+  }
+}

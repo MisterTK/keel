@@ -1,0 +1,6 @@
+# The agent's one tool makes an ordinary httpx.get to a fake, flaky
+# completion endpoint on loopback. Retry it like any other idempotent GET —
+# no dev cache needed here; the demo's whole point is that the retry happens
+# BELOW the agent loop, inside the tool call, so the LLM never sees the storm.
+[target."127.0.0.1"]
+retry = { attempts = 6 }

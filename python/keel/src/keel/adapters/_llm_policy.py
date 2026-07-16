@@ -59,12 +59,17 @@ segment. It CANNOT construct a request for a genuinely different provider
 shape). A ``fallback`` chain that names a model from a different provider than
 the one that failed is sent to the SAME provider with that (unrecognized)
 model name, which the provider will typically reject with its own 4xx — a
-safe, honest failure, not silent data loss, but not the cross-provider magic
-the dx-spec's ``fallback = ["gemini-2.5-pro", "claude-sonnet-4.5"]`` example
-suggests either. True cross-provider fallback needs a seam that already knows
-how to build a request per provider (Node's ``packs/ai-sdk.mjs``
-``keelMiddleware({ models })`` supports that; Python has no equivalent
-provider-agnostic SDK middleware seam in v0.1).
+safe, honest failure, not silent data loss, but not cross-provider fallback
+either. True cross-provider fallback needs a seam that already knows how to
+build a request per provider: Node's ``packs/ai-sdk.mjs``
+``keelMiddleware({ models })`` supports that generically (the caller supplies
+a real model instance per fallback name); Python's cross-provider seam is
+narrower and framework-specific — ``keel.packs.adk_pack``'s
+``on_model_error_callback`` (ADK apps only) resolves and constructs a fresh
+provider model via ``google.adk.models.registry.LLMRegistry``, a real Python
+call site this generic httpx/requests module can never be. Outside an ADK
+app, Python still has no provider-agnostic SDK middleware seam in v0.1 — this
+module's rewrite-only fallback is what a non-ADK Python caller gets.
 """
 
 from __future__ import annotations

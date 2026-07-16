@@ -22,6 +22,7 @@
 //! [`EXIT_OK`], [`EXIT_FAILURE`], [`EXIT_USAGE`]. The command modules are the
 //! testable core; [`main`](../keel/index.html) is a thin clap front.
 
+pub mod agents_cli;
 pub mod diff;
 pub mod doctor;
 pub mod effective;

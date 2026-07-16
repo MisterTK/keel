@@ -203,7 +203,7 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 1b. The pure-Python `keel` front-end wheel (setuptools, platform-independent
+  # 1b. The pure-Python `keel` front-end wheel (hatchling, platform-independent
   # — see python/keel/pyproject.toml). One build covers every platform.
   # ---------------------------------------------------------------------------
   wheel-frontend:

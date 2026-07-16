@@ -20,7 +20,7 @@ members = [
 # (`dynamic = ["version"]`), and scripts/check-versions.py asserts the
 # remaining manifests (pyproject/package.json/front-end constants) agree.
 # Bump with scripts/bump-version.sh, never by hand.
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 repository = "https://github.com/MisterTK/keel"

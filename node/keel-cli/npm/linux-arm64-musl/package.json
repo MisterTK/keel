@@ -1,6 +1,6 @@
 {
   "name": "keelrun-cli-linux-arm64-musl",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Prebuilt `keel` CLI binary for Linux aarch64, statically linked (musl) — runs on glibc hosts too, so no libc restriction is declared here. Optional dependency of keelrun-cli — installed automatically on a matching platform, ignored otherwise. See scripts/cli-prebuild.sh.",
   "os": ["linux"],
   "cpu": ["arm64"],

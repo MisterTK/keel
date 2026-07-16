@@ -49,6 +49,48 @@
       "target": "llm:anthropic"
     },
     {
+      "detected": false,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": false,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
       "detected": true,
       "lib": "fetch",
       "status": "pinned",
@@ -71,12 +113,6 @@
       "lib": "ai-sdk",
       "status": "pinned",
       "target": "llm:*"
-    },
-    {
-      "detected": false,
-      "lib": "mcp",
-      "status": "best-effort",
-      "target": "mcp:*"
     },
     {
       "detected": false,

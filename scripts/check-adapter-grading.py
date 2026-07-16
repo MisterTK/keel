@@ -11,8 +11,15 @@ requests_pack.py) is otherwise only ever exercised by unit tests that
 monkeypatch `importlib.metadata.version` — never against a real install
 outside the pinned range.
 
+Also doubles as the weekly adapter-farm's pinned-version smoke check for the
+six agent-framework packs (see .github/workflows/adapter-farm.yml): with the
+pinned real library installed in the current interpreter, `detect()` must
+report "pinned" — the same honest-detection contract the farm's unit tests
+(python/keel/tests/test_farm_*.py) exercise in depth.
+
 Usage: check-adapter-grading.py <pack> <pinned|best_effort>
-  <pack>  one of: httpx, requests
+  <pack>  one of: httpx, requests, google-adk, pydantic-ai, openai-agents,
+          crewai, langgraph, mcp
 Exit 0 if detect().confidence matches, 1 (with a diagnostic) otherwise.
 """
 
@@ -28,6 +35,12 @@ sys.path.insert(0, str(REPO / "python" / "keel" / "src"))
 PACKS = {
     "httpx": "keel.adapters.httpx_pack",
     "requests": "keel.adapters.requests_pack",
+    "google-adk": "keel.packs.adk_pack",
+    "pydantic-ai": "keel.packs.pydantic_ai_pack",
+    "openai-agents": "keel.packs.openai_agents_pack",
+    "crewai": "keel.packs.crewai_pack",
+    "langgraph": "keel.packs.langgraph_pack",
+    "mcp": "keel.packs.mcp_pack",
 }
 
 

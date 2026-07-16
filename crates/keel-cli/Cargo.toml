@@ -23,8 +23,8 @@ name = "keel"
 path = "src/main.rs"
 
 [dependencies]
-keel-core-api = { path = "../keel-core-api", version = "0.1.0" }
-keel-journal = { path = "../keel-journal", version = "0.1.0" }
+keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
+keel-journal = { path = "../keel-journal", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 # Read `.keel/journal.db` for `keel status` directly. The schema is frozen
 # (contracts/journal.sql); keel-journal owns writes, the CLI only reads.

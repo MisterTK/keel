@@ -4,7 +4,7 @@
 //! Python and Node packages; `run` is only the dispatcher (dx-spec §1, Level 0):
 //!
 //! - `*.py`                     → `python3 -m keel run <script> [args…]`
-//! - `*.{mjs,js,ts,cjs,…}`      → `node --import keel/hook <script> [args…]`
+//! - `*.{mjs,js,ts,cjs,…}`      → `node --import keelrun/hook <script> [args…]`
 //! - a `package.json`, or a dir containing one → resolve its `main`, then
 //!   the Node path
 //! - any other dir              → a conventional entry name (`main.py`,
@@ -24,10 +24,10 @@ use serde::Serialize;
 
 use crate::{EXIT_FAILURE, EXIT_USAGE, Rendered};
 
-/// Node's resolver name for the preload hook (the `keel` package's `./hook`
+/// Node's resolver name for the preload hook (the `keelrun` package's `./hook`
 /// export). Resolved from the project's `node_modules`, exactly as
-/// `node --import keel/hook` would in a project that installed `keel`.
-const NODE_HOOK: &str = "keel/hook";
+/// `node --import keelrun/hook` would in a project that installed `keelrun`.
+const NODE_HOOK: &str = "keelrun/hook";
 
 /// The concrete plan: which interpreter to exec with which argv, and whether to
 /// disable Keel in the child. Pure data, so dispatch is unit-testable without
@@ -327,9 +327,9 @@ pub(crate) fn exec_with(
                 plan.program
             );
             let next = if plan.program == "python3" {
-                "Install Python 3 and the `keel` package (`pip install keel`)."
+                "Install Python 3 and the `keelrun` package (`pip install keelrun`)."
             } else {
-                "Install Node.js and the `keel` package (`npm i -D keel`)."
+                "Install Node.js and the `keelrun` package (`npm i -D keelrun`)."
             };
             let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
             let report = RunErrorReport {
@@ -400,7 +400,7 @@ mod tests {
         let plan = plan(&script.to_string_lossy(), &[], true).unwrap();
         assert_eq!(plan.program, "node");
         assert_eq!(plan.argv[0], "--import");
-        assert_eq!(plan.argv[1], "keel/hook");
+        assert_eq!(plan.argv[1], "keelrun/hook");
         assert!(plan.disable);
     }
 

@@ -43,6 +43,7 @@ class _State:
     discovery: Discovery | None = None
     exit_registered: bool = False
     mcp_uninstall: Any = None
+    state: dict[str, Any] | None = None
 
 
 _STATE = _State()
@@ -56,8 +57,16 @@ def install_keel(
     if is_disabled(env):
         return {"enabled": False, "reason": "KEEL_DISABLE"}
     if _STATE.installed:
-        return {"enabled": True, "reason": "already-installed"}
-    _STATE.installed = True
+        # Return the SAME full state the first install produced (backend,
+        # discovery, flow_entrypoints, …) rather than a bare marker — callers
+        # like `_run.run_target` index into this dict unconditionally, and a
+        # second `install_keel()` call in the same process (e.g. the .pth
+        # shim's `keel._auto` installing before `_run.run_target` installs
+        # again) must not silently drop that state (KEEL-… double-activation
+        # regression). `_STATE.installed` is only ever set True in lockstep
+        # with `_STATE.state` (right before this function returns below), so
+        # reaching this branch guarantees `_STATE.state` is populated.
+        return {**_STATE.state, "reason": "already-installed"}
 
     cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
@@ -112,7 +121,7 @@ def install_keel(
     _register_exit_flush()
     _banner(env, source, [t.key for t in targets], adapters, mcp)
 
-    return {
+    state = {
         "enabled": True,
         "backend": backend,
         "discovery": discovery,
@@ -122,6 +131,16 @@ def install_keel(
         "adapters": adapters,
         "mcp": mcp,
     }
+    # Set together, at the very end, after every raise point above (load_policy's
+    # KEEL-E001, backend.configure's KEEL-E001/KEEL-E005) has already passed:
+    # a failed install must leave `_STATE.installed` False so a retry (e.g. the
+    # NEXT `install_keel()` call in the same process) re-parses the policy and
+    # surfaces the SAME loud error again, rather than wrongly believing itself
+    # already-installed with no cached state to return (the AssertionError /
+    # TypeError this ordering previously risked).
+    _STATE.state = state
+    _STATE.installed = True
+    return state
 
 
 def apply_journal_env_override(
@@ -158,6 +177,7 @@ def uninstall_keel() -> None:
     clear_outbound_targets()
     clear_runtime()
     _STATE.installed = False
+    _STATE.state = None
 
 
 def _register_exit_flush() -> None:
