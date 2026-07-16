@@ -1,0 +1,1 @@
+import os; (os.environ.get("KEEL_ENABLE", "").strip().lower() in ("1", "true", "yes")) and __import__("keel._auto")
