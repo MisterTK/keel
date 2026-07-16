@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
 
 [project]
 # Published as `keelrun` (docs/naming-decision.md); the IMPORT name stays
-# `keel` (see [tool.setuptools.packages.find] below) — only the PyPI
+# `keel` (see [tool.hatch.build.targets.wheel] below) — only the PyPI
 # distribution name changes.
 name = "keelrun"
 license = "Apache-2.0"
@@ -34,7 +34,12 @@ dev = ["httpx>=0.27,<0.29", "requests>=2.31,<2.33"]
 [project.scripts]
 keelrun-py-run = "keel._run:main_run_entry"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-# `keel*` also picks up the vendored `keel_core_stub` fallback (see above).
-include = ["keel*"]
+[tool.hatch.build.targets.wheel]
+# Also picks up the vendored `keel_core_stub` fallback (see above).
+packages = ["src/keel", "src/keel_core_stub"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"keelrun_activate.pth" = "keelrun_activate.pth"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "keelrun_activate.pth", "README.md", "pyproject.toml"]
