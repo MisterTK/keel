@@ -135,7 +135,7 @@ durable flows.
 
 ## See it work
 
-Four runnable, deterministic demos — no real network involved
+Five runnable, deterministic demos — no real network involved
 ([`tools/faultproxy`](tools/faultproxy) serves scripted faults). See the
 40-second [storyboard](demos/STORYBOARD.md) for the shooting script.
 
@@ -144,6 +144,7 @@ Four runnable, deterministic demos — no real network involved
 | [flaky-python](demos/flaky-python) | A bare script dies on a 503; `keel run` survives it | Python |
 | [node-service](demos/node-service) | Same story, Node: a bare script dies on a 500; `keel run` survives it | Node |
 | [agent-demo](demos/agent-demo) | An LLM call survives a 429 storm; a second run costs ~0 API calls (dev cache) | Python |
+| [adk-demo](demos/adk-demo) | A real `google-adk` agent's tool call survives a 429 storm below the agent loop — zero extra LLM tokens | Python |
 | [durable-pipeline](demos/durable-pipeline) | `kill -9` mid-flow, rerun, and it resumes 10/10 steps — each firing exactly once | Python |
 
 ## How it works

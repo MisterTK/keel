@@ -5,6 +5,8 @@ files (app/scenario/keel.toml) rather than duplicating them.
   * flaky-python: bare app dies on the 503; `keel run` survives (Tier 1; stub OK).
   * agent-demo:   429 storm ridden out, then dev-cache replays across two native
                   runs with ~0 API calls (native-only; skips otherwise).
+  * adk-demo:     a real google-adk LlmAgent's tool call rides out the same
+                  storm below the agent loop (needs google-adk; skips otherwise).
 """
 
 from __future__ import annotations
@@ -29,6 +31,13 @@ try:
     _NATIVE = True
 except ImportError:
     _NATIVE = False
+
+try:
+    import google.adk  # noqa: F401
+
+    _HAS_ADK = True
+except ImportError:
+    _HAS_ADK = False
 
 
 def _scenario(demo: str) -> Scenario:
@@ -84,6 +93,25 @@ class AgentDemoDevCacheTest(unittest.TestCase):
             self.assertEqual(run2.returncode, 0, run2.stderr.decode())
             self.assertEqual(run2.stdout, b"reply=42 from_cache=True\n", run2.stderr.decode())
             self.assertEqual(len(proxy.log), 3, "run 2 replayed from the dev cache — 0 new calls")
+
+
+@unittest.skipUnless(_HAS_ADK, "google-adk not installed (farm leg covers this)")
+class AdkDemoTest(unittest.TestCase):
+    def test_429_storm_survives_below_the_agent_loop(self) -> None:
+        demo = _DEMOS / "adk-demo"
+        with FaultProxy(_scenario("adk-demo")) as proxy, TemporaryDirectory() as d:
+            Path(d, "keel.toml").write_text((demo / "keel.toml").read_text())
+            url = proxy.url("/v1/complete")
+
+            result = subprocess.run(
+                [sys.executable, "-m", "keel", "run", str(demo / "agent.py")],
+                env=child_env(KEEL_DEMO_URL=url, KEEL_QUIET="1"),
+                cwd=d,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout, b"reply=42\n", result.stderr.decode())
+            self.assertEqual(len(proxy.log), 3, "one agent turn absorbed a 2x429 + 1x200 storm")
 
 
 if __name__ == "__main__":

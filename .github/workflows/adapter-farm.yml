@@ -135,6 +135,19 @@ jobs:
             # mcp_pack both live — same co-install requirement as the plain
             # adk_pack leg above.
             extra_deps: "mcp==1.28.1"
+          - lib: google-adk
+            version: "2.4.0"
+            test_module: tests.test_demos
+            # demos/adk-demo (WS4 Task 4): a real LlmAgent + FunctionTool +
+            # InMemoryRunner riding out a 429 storm below the agent loop.
+            # Unlike the two legs above, no extra_deps: this module's
+            # AdkDemoTest never touches MCPToolset, and httpx (which
+            # flaky-python/agent-demo's own tests in this same module need)
+            # already arrives transitively via google-genai — verified in a
+            # scratch venv with ONLY google-adk==2.4.0 installed (see
+            # ws4-task-4-report.md). Not gated on KEEL_ADAPTER_FARM=1 itself
+            # (AdkDemoTest's own skip condition is "google.adk importable");
+            # setting the env var here is harmless, just unused by this leg.
           - lib: pydantic-ai
             version: "2.9.0"
             test_module: tests.test_farm_pydantic_ai
