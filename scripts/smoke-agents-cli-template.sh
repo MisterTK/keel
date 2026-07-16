@@ -75,7 +75,9 @@ source "${venv_dir}/bin/activate"
 
 echo "smoke-agents-cli-template: installing google-agents-cli..."
 pip install --quiet --upgrade pip
-pip install --quiet google-agents-cli
+# uv too: `agents-cli create` hard-requires it on PATH ("Error: 'uv' is not
+# installed or not on PATH") — present on dev machines, absent on CI runners.
+pip install --quiet google-agents-cli uv
 
 agents_cli_pkg_dir="$(python3 -c 'import google.agents.cli as m, pathlib; print(pathlib.Path(m.__file__).parent)')"
 remote_template_py="${agents_cli_pkg_dir}/scaffold/utils/remote_template.py"
