@@ -237,6 +237,16 @@ fn init_agents_snippet_matches_golden() {
 #[test]
 fn skill_tool_list_matches_mcp_catalog() {
     const SKILL_MD: &str = include_str!("../../../packaging/claude-skill/keel/SKILL.md");
+    const SKILLS_CHANNEL_MD: &str = include_str!("../../../skills/keel/SKILL.md");
+
+    // skills/keel/SKILL.md must stay byte-identical to packaging/claude-skill/keel/SKILL.md —
+    // edit one and copy to the other.
+    assert_eq!(
+        SKILL_MD, SKILLS_CHANNEL_MD,
+        "skills/keel/SKILL.md must stay byte-identical to packaging/claude-skill/keel/SKILL.md — \
+         edit one, copy to the other"
+    );
+
     for name in keel_cli::mcp::TOOL_NAMES {
         assert!(
             SKILL_MD.contains(name),
