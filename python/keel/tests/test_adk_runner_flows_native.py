@@ -28,7 +28,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from fake_adk import FakeAdkModules, FakeEvent, FakeRunner
+from fake_adk import (
+    FakeAdkModules,
+    FakeEvent,
+    FakeLLMRegistry,
+    FakeLlmRequest,
+    FakeLlmResponse,
+    FakeModel,
+    FakeRunner,
+)
 
 from keel import _runtime, bootstrap
 from keel._backend import load_backend
@@ -532,6 +540,216 @@ class KeelFlowsCliShowsTheFlowTest(_NativeAdkFlowTestBase):
         self.assertEqual(report["count"], 1)
         self.assertEqual(report["flows"][0]["status"], "completed")
         self.assertEqual(report["flows"][0]["entrypoint"], adk_pack.RUNNER_FLOW_ENTRYPOINT)
+
+
+class ModelFallbackWithinFlowCompositionTest(_NativeAdkFlowTestBase):
+    """WS5 coda: the 5a x 5b COMPOSITION — an ``on_model_error`` cross-model
+    fallback (``adk_pack._model_fallback``, decision 7) firing INSIDE an open
+    designated Runner flow (``adk_pack._run_async_wrapper``, the amendment
+    this whole module otherwise certifies). Both halves are proven
+    separately: the flow wrap over the REAL journal above in this module;
+    the fallback callback against ``FakeLLMRegistry`` in ``test_packs_adk.
+    py``'s ``ModelFallbackTest``. This class proves they compose over the
+    REAL native backend: the fallback hop's own effect — performed inside
+    whatever model ``_model_fallback`` resolves and drives — journals as a
+    genuine flow step through ``execute_async`` into the SAME open flow
+    (the native ``KeelCore`` instance tracks "a flow is open" as its own
+    state once ``enter_flow`` has run; every ``wrap_tool`` call reaching it
+    before the matching ``exit_flow`` journals as that flow's next step,
+    regardless of how deep in the call stack it originates — proven already
+    by ``EndToEndRecoveryTest``'s two-effect runner above), admission-ordered
+    after the correlation step and the runner body's own first effect —
+    and, the load-bearing claim, SUBSTITUTES (never re-fires) on a
+    crash+reenter exactly like any other flow step.
+
+    The designated Runner body below deliberately yields once FIRST (the
+    same convention ``WrappedEffectAdmissionOrderTest``'s ``_StaggeredRunner``
+    uses) so the correlation step admits before either effect — matching
+    this class's ordering assertion — rather than folding everything into
+    one eager first ``__anext__()`` (which would admit both effects before
+    the wrapper ever sees an event to correlate against).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        FakeLLMRegistry.reset()
+        adk_pack._noted_model_fallback_skips.clear()
+
+    def _scenario(self) -> tuple[type, dict[str, int]]:
+        """Build one designated Runner class over a shared side-effect
+        counter and a fallback model registered into ``FakeLLMRegistry`` —
+        fresh closures per test (the registry itself is reset in ``setUp``).
+        """
+        counter: dict[str, int] = {}
+
+        async def bump(label: str) -> Any:
+            async def _do() -> dict[str, Any]:
+                counter[label] = counter.get(label, 0) + 1
+                return {"label": label, "n": counter[label]}
+
+            return await wrap_tool(f"bump_{label}", _do)()
+
+        fallback_response = FakeLlmResponse(content="fallback-answer")
+
+        class _FallbackModelWithEffect(FakeModel):
+            """The chosen fallback hop's model: its OWN
+            ``generate_content_async`` performs a real keel-wrapped async
+            effect (``bump('fallback')``) before yielding a scripted
+            response — proving the hop's side effect journals through
+            ``execute_async`` into whatever flow is currently open, exactly
+            like any other awaited effect inside the designated Runner
+            body."""
+
+            async def generate_content_async(self, llm_request: Any, stream: bool = False) -> Any:
+                self.calls.append(llm_request)
+                await bump("fallback")
+                yield fallback_response
+
+        fallback_model = _FallbackModelWithEffect()
+        FakeLLMRegistry.configure("fake-fallback-model", fallback_model)
+
+        failing_error = RuntimeError("model transport failure")
+        failing_error.keel_outcome = {"error": {"code": "KEEL-E010"}}  # non-E012: chaseable
+        failing_model = FakeModel(error=failing_error)
+
+        class _ComposedRunner(FakeRunner):
+            """Designated body: yield once first (correlation trigger), one
+            keel-wrapped effect, a failing model call driven straight into
+            the real ``_KeelPlugin.on_model_error_callback`` (the exact
+            plugin surface ADK itself would call on a model failure), then a
+            final event quoting whatever response the fallback resolved."""
+
+            async def run_async(
+                self,
+                *,
+                user_id: str,
+                session_id: str,
+                invocation_id: str | None = None,
+                new_message: Any = None,
+                **kwargs: Any,
+            ) -> Any:
+                yield self.events[0]
+                await bump("one")
+                llm_request = FakeLlmRequest(model="gemini-2.0-flash")
+                error: Exception | None = None
+                try:
+                    async for _ in failing_model.generate_content_async(llm_request, stream=False):
+                        pass
+                except Exception as exc:
+                    error = exc
+                response = await adk_pack._plugin().on_model_error_callback(
+                    callback_context=object(), llm_request=llm_request, error=error
+                )
+                yield FakeEvent(
+                    invocation_id=invocation_id,
+                    content=response.content if response is not None else None,
+                )
+
+        return _ComposedRunner, counter
+
+    def test_fallback_hop_effect_journals_inside_the_open_flow_admission_ordered(self) -> None:
+        self.designate()
+        backend = self.native_backend()
+        backend.configure({"target": {"llm:google-genai": {"fallback": ["fake-fallback-model"]}}})
+        runner_cls, counter = self._scenario()
+
+        with FakeAdkModules():
+            import google.adk.runners as runners_mod
+
+            runners_mod.Runner = runner_cls
+            adk_pack.install()
+            runner = runners_mod.Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            events = asyncio.run(
+                self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1].content, "fallback-answer", "final event quotes the fallback response")
+        self.assertEqual(counter, {"one": 1, "fallback": 1})
+        self.assertFalse(_runtime.in_active_flow())
+
+        flow = self._flow_row()
+        self.assertEqual(flow["status"], "completed")
+        steps = self._steps(flow["flow_id"])
+        random_steps = [s for s in steps if s["kind"] == "random"]
+        effect_steps = [s for s in steps if s["kind"] == "effect"]
+        self.assertEqual(len(random_steps), 1)
+        self.assertEqual(
+            [s["step_key"] for s in effect_steps],
+            ["tool:bump_one#-", "tool:bump_fallback#-"],
+            "the runner's own effect, then the fallback hop's effect, in call order",
+        )
+        self.assertLess(
+            random_steps[0]["seq"],
+            effect_steps[0]["seq"],
+            "both effects admit AFTER the correlation step",
+        )
+        self.assertLess(
+            effect_steps[0]["seq"],
+            effect_steps[1]["seq"],
+            "admission order: the runner's own effect before the fallback hop's",
+        )
+
+    def test_abandon_after_the_fallback_hop_then_reenter_substitutes_both_effects(self) -> None:
+        self.designate()
+        backend = self.native_backend()
+        backend.configure({"target": {"llm:google-genai": {"fallback": ["fake-fallback-model"]}}})
+        runner_cls, counter = self._scenario()
+
+        with FakeAdkModules():
+            import google.adk.runners as runners_mod
+
+            runners_mod.Runner = runner_cls
+            adk_pack.install()
+
+            runner1 = runners_mod.Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+
+            async def abandon_after_the_fallback_hop() -> Any:
+                gen = runner1.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                await gen.__anext__()  # the correlation-trigger event
+                second = await gen.__anext__()  # fallback-quoting event: BOTH effects have journaled by now
+                await gen.aclose()  # crash shape: abandon before the generator's own StopAsyncIteration
+                return second
+
+            second_event = asyncio.run(abandon_after_the_fallback_hop())
+            self.assertEqual(second_event.content, "fallback-answer")
+            self.assertEqual(
+                counter, {"one": 1, "fallback": 1}, "both effects fired exactly once before abandonment"
+            )
+            self.assertFalse(_runtime.in_active_flow(), "abandonment released the flow handle")
+
+            # NOTE: deliberately no sqlite3 read here between the abandon and the
+            # resume — see EndToEndRecoveryTest's "poisoned write" note earlier in
+            # this module: a second connection opened against this journal while
+            # this test's own KeelCore is still alive silently drops its later
+            # writes. Every assertion below is deferred to after all flow work is
+            # fully done.
+
+            runner2 = runners_mod.Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            second_run_events = asyncio.run(
+                self._drain(runner2.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+
+        self.assertEqual(len(second_run_events), 2, "the resumed run completes normally")
+        self.assertEqual(second_run_events[1].content, "fallback-answer")
+        self.assertEqual(
+            counter,
+            {"one": 1, "fallback": 1},
+            "BOTH the runner's own effect and the fallback hop's effect substitute on replay -- neither re-fires",
+        )
+
+        flow = self._flow_row()
+        self.assertEqual(flow["status"], "completed")
+        markers = self._steps(flow["flow_id"], kind="marker")
+        self.assertEqual(markers[0]["attempt"], 2, "abandonment consumed attempt 1; resume is attempt 2")
+        effect_steps = self._steps(flow["flow_id"], kind="effect")
+        self.assertEqual(
+            [s["step_key"] for s in effect_steps],
+            ["tool:bump_one#-", "tool:bump_fallback#-"],
+            "exactly one journal row per effect, ever -- no duplicate for either substituted effect",
+        )
 
 
 if __name__ == "__main__":
