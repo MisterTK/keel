@@ -656,6 +656,12 @@ class _FakeAdkFlowBackend:
         self.random: dict[str, bytes] = {}
         self._replay = replay
         self.persistent = persistent
+        # Minimal re-enter support (decision 8 revision): once a prior
+        # attempt for a given (entrypoint, args_hash) identity has recorded
+        # an exit (any status — abandonment now exits "failed" too), the
+        # NEXT enter_flow for that same identity comes back as a replay,
+        # modeling the native core substituting the already-recorded steps.
+        self._prior_exit_for: dict[tuple[str, str], str] = {}
 
     def enter_flow(
         self,
@@ -666,14 +672,18 @@ class _FakeAdkFlowBackend:
         lease_ms: int | None = None,
     ) -> dict[str, Any]:
         self.entered.append((entrypoint, args_hash, code_hash, explicit_key, lease_ms))
+        replay = self._replay or (entrypoint, args_hash) in self._prior_exit_for
         return {
             "flow_id": "fid-1",
-            "status": "completed" if self._replay else "running",
-            "replay": self._replay,
+            "status": "completed" if replay else "running",
+            "replay": replay,
         }
 
     def exit_flow(self, status: str) -> None:
         self.exited.append(status)
+        if self.entered:
+            entrypoint, args_hash = self.entered[-1][0], self.entered[-1][1]
+            self._prior_exit_for[(entrypoint, args_hash)] = status
 
     def journal_random(self, key: str, data: bytes) -> bytes:
         return self.random.setdefault(key, data)
@@ -788,12 +798,12 @@ class RunnerFlowWrapTest(AdkTestBase):
 
     # -- abandonment (GeneratorExit) -----------------------------------------
 
-    def test_abandonment_leaves_flow_running_and_active(self) -> None:
-        # Test-adjudicated (brief NOTE): breaking out of the async-for and
-        # closing the generator must NOT call exit_flow, and must leave
-        # _flow_active True — the crash shape (decision 8). set_flow_active
-        # is therefore NOT in a finally in the wrapper; this test is what
-        # proves that placement correct.
+    def test_abandonment_releases_the_flow_for_in_process_retry(self) -> None:
+        # Decision 8, revised: in a SURVIVING process, leaving the flow
+        # running-and-active forever after abandonment wedges every later
+        # same-identity turn (silently unwrapped) and makes in-process
+        # resume impossible. Abandonment now counts an attempt (exit
+        # "failed") and releases the handle, exactly like any other failure.
         self.designate()
         backend = _FakeAdkFlowBackend()
         self.use_backend(backend)
@@ -817,11 +827,90 @@ class RunnerFlowWrapTest(AdkTestBase):
                 return first
 
             first = asyncio.run(abandon())
+            self.assertIsNotNone(first)
+            self.assertEqual(len(backend.entered), 1)
+            self.assertEqual(backend.exited, ["failed"], "abandonment now counts an attempt")
+            self.assertFalse(_runtime.in_active_flow(), "abandonment releases the flow handle")
+
+            # A second designated run_async with the SAME identity, on the
+            # SAME backend, must be able to re-enter (not wedged busy) and
+            # complete wrapped.
+            runner2 = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            events2 = asyncio.run(
+                self._drain(
+                    runner2.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                )
+            )
             adk_pack.uninstall()
-        self.assertIsNotNone(first)
-        self.assertEqual(len(backend.entered), 1)
-        self.assertEqual(backend.exited, [], "abandonment must never call exit_flow")
-        self.assertTrue(_runtime.in_active_flow(), "GeneratorExit leaves the flow running (decision 8)")
+        self.assertEqual(len(events2), 1, "second turn completes wrapped, not the busy path")
+        self.assertEqual(len(backend.entered), 2, "re-entered for the retry, not skipped as busy")
+        self.assertEqual(backend.exited, ["failed", "completed"])
+
+    def test_replay_completed_entry_never_demoted(self) -> None:
+        # An already-COMPLETED (replayed) flow must never be demoted to
+        # failed — the `if not replayed` guard on the failure paths.
+        self.designate()
+
+        # (a) exhaustion path: a replay=True entry still records "completed"
+        # on success — `exit_flow("completed")` in the success branch is
+        # unconditional on `replayed`, mirroring `_flow.py`'s own
+        # completed -> completed unconditional final line.
+        backend_ok = _FakeAdkFlowBackend(replay=True)
+        self.use_backend(backend_ok)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            events = asyncio.run(
+                self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(backend_ok.exited, ["completed"])
+
+        # (b) mid-stream exception on a replay=True entry: exit_flow(
+        # "failed") must NOT be recorded.
+        backend_fail = _FakeAdkFlowBackend(replay=True)
+        self.use_backend(backend_fail)
+        boom = RuntimeError("boom")
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend_fail.exited, [], "a replayed flow is never demoted to failed")
+        self.assertFalse(_runtime.in_active_flow(), "flow_active still reset without an exit_flow call")
+
+    # -- raise before the first event (review trace 2) -----------------------
+
+    def test_raise_before_first_event_marks_failed_and_resets_flag(self) -> None:
+        # The inner generator's very first __anext__ raises, before any
+        # event is ever yielded (so `correlated`/journal_random never fire).
+        # Must still mark the flow failed and reset flow_active.
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = RuntimeError("boom before any event")
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[boom])
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset even on an immediate failure")
 
     # -- busy path (another flow already open) -------------------------------
 

@@ -386,7 +386,14 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
     Tier 2 durable flow around a DESIGNATED call's event stream, and is
     byte-transparent (via `functools.wraps` over `orig`) for every other
     call — undesignated Runners, or any Runner built while Keel has no
-    backend at all."""
+    backend at all.
+
+    Note: unlike `_flow.py`'s `run_as_flow`, `KeyboardInterrupt` here
+    intentionally follows the same failed-path as any other `BaseException`
+    rather than being left `running` for resume — this wrapper runs inside a
+    SURVIVING process (a long-lived Runner host), not one about to exit, so
+    the same surviving-process rationale that governs `GeneratorExit` below
+    applies: leaving the flow open-forever on interrupt is never free here."""
 
     @functools.wraps(orig)
     async def _run_async_flow_wrapper(
@@ -433,7 +440,15 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
                     backend.journal_random("adk:invocation_id", inv.encode("utf-8"))
                     correlated = True
                 yield event
-        except GeneratorExit:  # abandonment -> flow stays running (decision 8)
+        except GeneratorExit:
+            # Abandonment (client disconnect, caller aclose) in a SURVIVING
+            # process: release the handle so the next same-identity turn can
+            # re-enter and substitute completed steps. Counts an attempt
+            # (exit "failed"), unlike keel run's KeyboardInterrupt precedent
+            # — there the process dies, so leaving the flow running is free.
+            if not replayed:
+                backend.exit_flow("failed")
+            _runtime.set_flow_active(False)
             raise
         except BaseException:
             if not replayed:  # never demote an already-completed (replayed) flow
@@ -443,16 +458,21 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
         else:
             backend.exit_flow("completed")
             _runtime.set_flow_active(False)
-        # NOTE: set_flow_active(False) deliberately NOT in a finally — on
-        # GeneratorExit the flow stays open-and-running only until process
-        # exit anyway (abandonment is the crash shape); a finally would also
-        # fire on it and mask the running-flow semantics. This mirrors
-        # `_flow.py`'s own asymmetric handling (its final `exit_flow(
-        # "completed")` is unconditional on success, while every failure
-        # branch guards on `replayed`). Test-adjudicated: see
-        # `RunnerFlowWrapTest.test_abandonment_leaves_flow_running_and_active`
-        # in `test_packs_adk.py`, which asserts `in_active_flow()` stays True
-        # and NO `exit_flow` call is recorded after an `aclose()`.
+        # NOTE (decision 8, revised): abandonment now exits the flow "failed"
+        # and clears flow_active exactly like any other failure, rather than
+        # leaving the handle open-and-running forever — this wrapper lives in
+        # a SURVIVING process (a long-lived Runner host), where an
+        # open-forever handle would wedge every later same-identity turn
+        # (silently unwrapped) and make in-process resume impossible. This
+        # differs from `_flow.py`'s `KeyboardInterrupt` precedent, which
+        # leaves the flow `running` for resume BECAUSE there the process is
+        # about to die — an open handle costs nothing in that shape.
+        # `exit_flow("completed")` in the success (`else`) branch stays
+        # unconditional on `replayed`, mirroring `_flow.py`'s own asymmetric
+        # handling (unconditional success stamp, `replayed`-guarded failure
+        # stamp). Test-adjudicated: see `RunnerFlowWrapTest.
+        # test_abandonment_releases_the_flow_for_in_process_retry` and
+        # `test_replay_completed_entry_never_demoted` in `test_packs_adk.py`.
 
     return _run_async_flow_wrapper
 
