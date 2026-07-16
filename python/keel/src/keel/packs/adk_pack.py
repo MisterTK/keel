@@ -14,14 +14,24 @@ matching the vendor claim exactly.
 
 Two Keel target classes come out of this pack, split by where the seam lives:
 
-* ``llm:google-genai`` — **needs no code here.** ADK's Gemini model backend
-  rides the ``google-genai`` SDK, which rides ``httpx``; ``keel.adapters.
-  httpx_pack`` already intercepts every ``httpx.Client``/``AsyncClient``
-  request and ``adapters._http.LLM_HOST_PROVIDERS`` already host-maps
-  ``generativelanguage.googleapis.com`` → ``llm:google-genai``. This pack
-  declares the target (below) for documentation/doctor visibility only — the
+* ``llm:google-genai`` — **needs no transport code here.** ADK's Gemini model
+  backend rides the ``google-genai`` SDK, which rides ``httpx``; ``keel.
+  adapters.httpx_pack`` already intercepts every ``httpx.Client``/
+  ``AsyncClient`` request and ``adapters._http.LLM_HOST_PROVIDERS`` already
+  host-maps ``generativelanguage.googleapis.com`` → ``llm:google-genai``. This
+  pack declares the target (below) for documentation/doctor visibility, the
   same "declared but not owned" pattern ``openai_pack``/``anthropic_pack`` use
-  for their own ``llm:<provider>`` targets.
+  for their own ``llm:<provider>`` targets — EXCEPT for one seam the
+  transport layer structurally cannot cover: cross-PROVIDER fallback. The
+  transport seam can only rewrite a model name on the SAME host/endpoint it
+  already targeted (a JSON body field or URL path segment); it can never
+  construct a request for a genuinely different provider (different auth,
+  endpoint, request/response shape). ``_KeelPlugin.on_model_error_callback``
+  below fills that gap: ADK's own ``on_model_error`` plugin hook is a real
+  Python call site that CAN build a fresh request via ``google.adk.models.
+  registry.LLMRegistry``, so a ``fallback`` chain entry naming a different
+  provider's model is actually dispatched to that provider, not merely
+  rewritten onto the failing one's endpoint.
 * ``tool:<name>`` — **is this pack's actual seam.** Every ADK tool invocation
   is wrapped through :func:`keel.packs.tool.wrap_tool` at ADK's own
   ``before_tool_callback`` plugin hook (below), giving every tool call
@@ -79,6 +89,7 @@ import weakref
 from typing import Any, Callable
 
 from .. import _runtime
+from ..adapters import _http, _llm_policy
 from ..adapters._pack import Detection, Seam, TargetDecl
 from .._errors import KeelError
 from .._flow import backend_has_journal, backend_supports_flows
@@ -212,8 +223,13 @@ def targets() -> list[TargetDecl]:
                 "intercepted by keel.adapters.httpx_pack's transport seam and "
                 "host-mapped to llm:google-genai (adapters/_http.py "
                 "LLM_HOST_PROVIDERS). This pack owns no model-call seam of "
-                "its own; declared here for doctor/documentation visibility "
-                "only, mirroring openai_pack/anthropic_pack."
+                "its own; declared here for doctor/documentation visibility, "
+                "mirroring openai_pack/anthropic_pack. It DOES additionally "
+                "enforce this target's `fallback` chain at the plugin level "
+                "(`on_model_error_callback`) for genuinely cross-provider "
+                "hops — the one Python call site that can construct a "
+                "request for a different provider; the transport seam above "
+                "can only rewrite the model name on the same host."
             ),
             args_hash_rule="as for the httpx host-mapped llm: target",
         ),
@@ -581,6 +597,11 @@ def _plugin() -> Any:
             ) -> dict[str, Any] | None:
                 return await _on_before_tool(tool, tool_args, tool_context)
 
+            async def on_model_error_callback(
+                self, *, callback_context: Any, llm_request: Any, error: Exception
+            ) -> Any:
+                return await _model_fallback(llm_request, error)
+
         _plugin_singleton = _KeelPlugin()
     return _plugin_singleton
 
@@ -606,6 +627,113 @@ async def _on_before_tool(tool: Any, tool_args: dict[str, Any], tool_context: An
     # before-callbacks are bypassed for THIS tool only).
     _note_fallback(name)
     return await _call_via_plugin_loop(tool, tool_args, tool_context)
+
+
+def _model_fallback_chain() -> list[str]:
+    """The configured ``llm:google-genai`` fallback chain, read live per call
+    (mirrors ``httpx_pack``/``requests_pack``'s own ``_llm_fallback_chain``)
+    — non-list or missing config collapses to ``[]`` (fast path: no chain
+    configured, do nothing)."""
+    cfg = _http.resolve_layer("llm:google-genai", "fallback")
+    return [m for m in cfg if isinstance(m, str) and m] if isinstance(cfg, list) else []
+
+
+def _resolve_model_class(registry: Any, name: Any, *, note_on_failure: bool = False) -> Any | None:
+    """``LLMRegistry.resolve(name)``, or ``None`` on any failure (unknown
+    model name / not a string). ``note_on_failure`` is set only for CHAIN
+    entries — a failure resolving the ORIGINAL failing model's own class
+    (``llm_request.model``) is silently tolerated (it just disables the
+    same-class skip below, rather than being reported as a fallback-chain
+    problem)."""
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        return registry.resolve(name)
+    except Exception:
+        if note_on_failure:
+            _note_model_fallback_skip(name)
+        return None
+
+
+async def _model_fallback(llm_request: Any, error: Exception) -> Any:
+    """The ``on_model_error_callback`` body (decision 7 / 5b): true
+    cross-model fallback. ADK's plugin hook contract (``PluginManager``):
+    returning a non-``None`` ``LlmResponse`` SUBSTITUTES it — yielded to the
+    agent exactly as if the (failing) model had answered itself; returning
+    ``None`` lets the original error propagate unchanged. This is the one
+    Python call site that can construct a request for a genuinely different
+    PROVIDER (``google.adk.models.registry.LLMRegistry`` resolves a model
+    name to whichever provider-specific class owns it and builds a fresh
+    request from ``llm_request``) — the transport seam (httpx_pack) can only
+    rewrite the model name on the SAME host/endpoint the failing call already
+    targeted, so it defers same-provider hops to itself and leaves
+    cross-provider hops to this hook (same-class skip, below).
+
+    No-chase guard: reuses ``_llm_policy.should_fallback`` — never chases a
+    breaker-open/budget-exhausted failure (KEEL-E012), exactly like the
+    transport seam. Transport-seam-thrown exceptions carry a ``keel_outcome``
+    attribute (``adapters._http.attach_outcome``); an error WITHOUT one (e.g.
+    a failure raised before Keel's transport seam ever saw it — a
+    request-construction error inside ADK/the SDK itself) has no ``code`` to
+    disqualify it, so it is treated as chaseable: fed to ``should_fallback``
+    as ``{"code": None}``, which is truthy-and-not-E012 (deliberate; verified
+    against ``_llm_policy.should_fallback``'s ``not error`` / ``code not in
+    _NO_FALLBACK_CODES`` shape — an EMPTY dict would read as "no error" and
+    wrongly block the chase, so the sentinel dict is a real dict with an
+    absent code, not `{}`)."""
+    chain = _model_fallback_chain()
+    if not chain:
+        return None
+    outcome = getattr(error, "keel_outcome", None)
+    error_dict = outcome.get("error") if isinstance(outcome, dict) else None
+    if not _llm_policy.should_fallback(error_dict if error_dict is not None else {"code": None}):
+        return None  # KEEL-E012 (breaker/budget): never chase — same rule as the transport seam
+
+    from google.adk.models.registry import LLMRegistry  # function-local: adapter-pack rule 1
+
+    failing_cls = _resolve_model_class(LLMRegistry, getattr(llm_request, "model", None))
+
+    for entry in chain:
+        entry_cls = _resolve_model_class(LLMRegistry, entry, note_on_failure=True)
+        if entry_cls is None:
+            continue  # unknown model / missing package: already noted
+        if failing_cls is not None and entry_cls is failing_cls:
+            continue  # same provider class: the transport seam already chased this hop
+        try:
+            model = LLMRegistry.new_llm(entry)
+        except Exception:
+            _note_model_fallback_skip(entry)
+            continue
+        response = None
+        try:
+            async for resp in model.generate_content_async(llm_request, stream=False):
+                response = resp  # keep only the FINAL response of this hop's stream
+        except Exception:
+            continue  # this hop failed too: try the next chain entry
+        if response is not None:
+            return response
+    return None  # every chain entry skipped/failed/exhausted: the original error propagates
+
+
+_noted_model_fallback_skips: set[str] = set()
+
+
+def _note_model_fallback_skip(name: str) -> None:
+    """Note (once per model name, ``KEEL_QUIET``-aware — mirrors
+    ``_note_skip``/``_note_fallback``) a fallback-chain entry
+    ``LLMRegistry`` could not resolve or construct (an unrecognized model
+    name, or its provider's package is not installed) — the hop is skipped,
+    not fatal; the next chain entry is tried."""
+    if name in _noted_model_fallback_skips:
+        return
+    _noted_model_fallback_skips.add(name)
+    if os.environ.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return
+    sys.stderr.write(
+        f"keel ▸ adk: model fallback entry {name!r} could not be resolved via "
+        "LLMRegistry (unknown model name, or its provider package is not "
+        "installed) — skipped; the next chain entry is tried\n"
+    )
 
 
 class _McpErrorDict(Exception):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import io
 import os
 import sqlite3
@@ -31,8 +32,13 @@ from fake_adk import (
     FakeAdkModules,
     FakeApp,
     FakeBasePlugin,
+    FakeClaude,
     FakeEvent,
+    FakeGemini,
     FakeInMemoryRunner,
+    FakeLLMRegistry,
+    FakeLlmRequest,
+    FakeLlmResponse,
     FakeRunner,
     FakeTool,
     FakeSlottedTool,
@@ -52,8 +58,10 @@ class AdkTestBase(unittest.TestCase):
     def setUp(self) -> None:
         adk_pack._noted_skips.clear()
         adk_pack._noted_fallbacks.clear()
+        adk_pack._noted_model_fallback_skips.clear()
         adk_pack._rebound.clear()
         adk_pack._noted_busy = False
+        FakeLLMRegistry.reset()
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
         self._discoveries: list[Discovery] = []
@@ -124,6 +132,12 @@ class ContractShapeTest(unittest.TestCase):
         self.assertIn("non-idempotent by default", decls["tool"].idempotency_rule)
         self.assertEqual(decls["llm"].pattern, "llm:google-genai")
         self.assertIn("httpx_pack", decls["llm"].idempotency_rule)
+        # Task 4 (5b): the transport seam's own text is preserved verbatim
+        # above (still asserted), but the target's idempotency_rule now ALSO
+        # documents the plugin-level cross-provider fallback hop this task
+        # added (on_model_error_callback) — updated deliberately in the same
+        # commit that added the behavior, not a stale doc drifting behind it.
+        self.assertIn("on_model_error_callback", decls["llm"].idempotency_rule)
 
     def test_defaults_empty(self) -> None:
         # No [defaults.adk] in the frozen pack (tool:/mcp: pattern).
@@ -1020,6 +1034,207 @@ class RunnerFlowWrapTest(AdkTestBase):
             self.assertIsNot(Runner.run_async, pristine)
             adk_pack.uninstall()
             self.assertIs(Runner.run_async, pristine)
+
+
+class ModelFallbackTest(AdkTestBase):
+    """`_KeelPlugin.on_model_error_callback` (Task 4 / decision 7): true
+    cross-model fallback via ADK's own plugin hook — the one Python call
+    site that CAN construct a request for a genuinely different provider,
+    unlike the transport seam (which can only rewrite a model name on the
+    SAME host). Every branch runs against `FakeLLMRegistry`
+    (`fixtures/fake_adk.py`): a per-test dict of model name -> fake model
+    instance/class, reset in `AdkTestBase.setUp`."""
+
+    def plugin(self) -> Any:
+        with FakeAdkModules():
+            return adk_pack._plugin()
+
+    def fire(self, plugin: Any, llm_request: Any, error: Exception) -> Any:
+        """Drive one `on_model_error_callback` invocation inside
+        `FakeAdkModules()` — the callback's function-local `from
+        google.adk.models.registry import LLMRegistry` (adapter-pack rule 1:
+        no top-level import of a library not present/in use) resolves
+        against the fake only while that context manager is active."""
+        with FakeAdkModules():
+            return asyncio.run(
+                plugin.on_model_error_callback(
+                    callback_context=object(), llm_request=llm_request, error=error
+                )
+            )
+
+    # -- chain / no-chase gates ------------------------------------------------
+
+    def test_empty_chain_returns_none_immediately(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {}}})  # no `fallback` configured
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIsNone(result)
+
+    def test_e012_breaker_open_never_chases(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-fallback"]}}})
+        fallback_model = FakeClaude(responses=[FakeLlmResponse("should never be seen")])
+        FakeLLMRegistry.configure("claude-fallback", fallback_model)
+        error = RuntimeError("breaker open")
+        error.keel_outcome = {"error": {"code": "KEEL-E012"}}
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), error)
+        self.assertIsNone(result)
+        self.assertEqual(fallback_model.calls, [], "E012 never chases -- the fallback model is never even driven")
+
+    def test_error_without_keel_outcome_is_chaseable(self) -> None:
+        # A failure with NO `keel_outcome` attribute at all (e.g. raised
+        # before Keel's transport seam ever saw it) has no code to
+        # disqualify it -- fed to should_fallback as {"code": None}, which
+        # is chaseable (an empty dict would wrongly read as "no error").
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-fallback"]}}})
+        response = FakeLlmResponse("cross-provider answer")
+        FakeLLMRegistry.configure("claude-fallback", FakeClaude(responses=[response]))
+        result = self.fire(
+            self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("pre-transport failure")
+        )
+        self.assertIs(result, response)
+
+    # -- same-class skip / cross-class chase (decision 7) -----------------------
+
+    def test_same_class_entry_skipped_cross_class_tried(self) -> None:
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["gemini-same", "claude-cross"]}}}
+        )
+        # The FAILING model's class is resolved from llm_request.model.
+        FakeLLMRegistry.configure("gemini-2.0-flash", FakeGemini())
+        same_provider = FakeGemini(responses=[FakeLlmResponse("should never be used")])
+        FakeLLMRegistry.configure("gemini-same", same_provider)
+        cross_response = FakeLlmResponse("claude answered")
+        cross_provider = FakeClaude(responses=[cross_response])
+        FakeLLMRegistry.configure("claude-cross", cross_provider)
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, cross_response)
+        self.assertEqual(same_provider.calls, [], "same provider class: left for the transport seam to have chased")
+        self.assertEqual(len(cross_provider.calls), 1)
+
+    # -- first success wins; the final response of a stream is kept -------------
+
+    def test_first_success_returned_second_never_tried(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-a", "claude-b"]}}})
+        first_response = FakeLlmResponse("first")
+        first = FakeClaude(responses=[first_response])
+        second = FakeClaude(responses=[FakeLlmResponse("second")])
+        FakeLLMRegistry.configure("claude-a", first)
+        FakeLLMRegistry.configure("claude-b", second)
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, first_response)
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(second.calls, [], "the second entry is never tried once the first succeeds")
+
+    def test_final_response_of_a_multi_yield_stream_is_kept(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-a"]}}})
+        partial, final = FakeLlmResponse("partial"), FakeLlmResponse("final")
+        FakeLLMRegistry.configure("claude-a", FakeClaude(responses=[partial, final]))
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, final)
+
+    # -- hop exception -> next entry ---------------------------------------------
+
+    def test_hop_exception_tries_the_next_entry(self) -> None:
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["claude-broken", "claude-ok"]}}}
+        )
+        broken = FakeClaude(error=RuntimeError("provider 500"))
+        ok_response = FakeLlmResponse("ok")
+        FakeLLMRegistry.configure("claude-broken", broken)
+        FakeLLMRegistry.configure("claude-ok", FakeClaude(responses=[ok_response]))
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, ok_response)
+        self.assertEqual(len(broken.calls), 1)
+
+    # -- registry-resolution failure: unknown name / missing package -------------
+
+    def test_unknown_model_name_skipped_and_noted_once(self) -> None:
+        # "nonexistent-model" is never registered -> LLMRegistry.resolve raises.
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["nonexistent-model", "claude-ok"]}}}
+        )
+        ok_response = FakeLlmResponse("ok")
+        FakeLLMRegistry.configure("claude-ok", FakeClaude(responses=[ok_response]))
+        plugin = self.plugin()
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            result = self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, ok_response)
+        self.assertIn("nonexistent-model", err.getvalue())
+        self.assertEqual(err.getvalue().count("could not be resolved"), 1)
+        # A second failure of the SAME entry name is noted only once, ever.
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err2:
+            self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertEqual(err2.getvalue(), "")
+
+    def test_new_llm_missing_package_skipped_and_noted(self) -> None:
+        # resolve() succeeds (a real class IS registered for the name), but
+        # new_llm() fails -- the "resolvable name, unbuildable model" shape
+        # (e.g. the provider's extras were never installed).
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["claude-uninstalled", "claude-ok"]}}}
+        )
+        FakeLLMRegistry.break_new_llm(
+            "claude-uninstalled", FakeClaude, ImportError("anthropic package not installed")
+        )
+        ok_response = FakeLlmResponse("ok")
+        FakeLLMRegistry.configure("claude-ok", FakeClaude(responses=[ok_response]))
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, ok_response)
+        self.assertIn("claude-uninstalled", err.getvalue())
+
+    def test_quiet_env_suppresses_the_skip_note(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["nonexistent-model"]}}})
+        plugin = self.plugin()
+        with mock.patch.dict(os.environ, {"KEEL_QUIET": "1"}), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as err:
+            result = self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIsNone(result)
+        self.assertEqual(err.getvalue(), "")
+
+    # -- all entries exhausted: the original error propagates (returns None) ----
+
+    def test_all_entries_exhausted_returns_none(self) -> None:
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["claude-broken", "nonexistent-model"]}}}
+        )
+        FakeLLMRegistry.configure("claude-broken", FakeClaude(error=RuntimeError("still down")))
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIsNone(result)
+
+
+class ModelFallbackPluginShapeTest(AdkTestBase):
+    """PluginManager-shape sanity: ADK's plugin callbacks are called with
+    keyword arguments only (`BasePlugin`'s documented contract), and a
+    substituted response is handed back to the agent as the IDENTICAL object
+    a fallback model produced -- `PluginManager` yields it verbatim; Keel
+    never wraps or copies it."""
+
+    def test_callback_signature_is_keyword_only(self) -> None:
+        with FakeAdkModules():
+            plugin = adk_pack._plugin()
+        sig = inspect.signature(type(plugin).on_model_error_callback)
+        params = [p for name, p in sig.parameters.items() if name != "self"]
+        self.assertEqual({p.name for p in params}, {"callback_context", "llm_request", "error"})
+        self.assertTrue(
+            all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in params),
+            "ADK's PluginManager calls every plugin callback with keyword arguments only",
+        )
+
+    def test_returns_the_response_object_itself(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-a"]}}})
+        response = FakeLlmResponse("verbatim")
+        FakeLLMRegistry.configure("claude-a", FakeClaude(responses=[response]))
+        with FakeAdkModules():
+            plugin = adk_pack._plugin()
+            result = asyncio.run(
+                plugin.on_model_error_callback(
+                    callback_context=object(),
+                    llm_request=FakeLlmRequest(model="gemini-2.0-flash"),
+                    error=RuntimeError("boom"),
+                )
+            )
+        self.assertIs(result, response, "PluginManager substitutes this object verbatim, not a copy")
 
 
 if __name__ == "__main__":
