@@ -44,19 +44,25 @@ throwaway venv, see ws3-task-1-report.md for the full certification log):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 FARM = os.environ.get("KEEL_ADAPTER_FARM") == "1"
 SKIP = "KEEL_ADAPTER_FARM=1 not set (offline fast path — see test_packs_adk.py)"
 
 if FARM:  # real imports only in farm mode — never at fast-path collection time
     from google.adk.agents import BaseAgent
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
     from google.adk.plugins.base_plugin import BasePlugin
     from google.adk.runners import InMemoryRunner, Runner
     from google.adk.tools.function_tool import FunctionTool
+    from google.genai import types
 
 from keel import _runtime
 from keel._backend import load_backend
@@ -152,6 +158,72 @@ class AdkFarmContractTest(unittest.TestCase):
         fake = type("X", (McpTool,), {})  # subclass detection via MRO name
         self.assertTrue(adk_pack._is_mcp_tool(object.__new__(fake)))
         self.assertTrue(adk_pack._is_mcp_error_dict({"error": "boom"}))
+
+    # -- WS5 Task 3: structural certs for the Runner-flow wrap (farm-only,
+    # NO native module requirement on this leg — see module docs above) -----
+
+    def test_run_async_signature_is_kw_only_and_carries_invocation_id(self) -> None:
+        """Structural cert: the REAL Runner.run_async's public signature still
+        matches what fixtures/fake_adk.py's FakeRunner (and adk_pack's own
+        `_run_async_wrapper`, which binds by keyword) assume — every one of
+        `user_id`/`session_id`/`invocation_id`/`new_message` is keyword-only,
+        and `invocation_id` exists at all. Fences the offline fake against
+        upstream ADK signature drift; this is a pure `inspect.signature` check,
+        no flow/journal ever touched, so it needs no native module."""
+        sig = inspect.signature(Runner.run_async)
+        params = sig.parameters
+        for name in ("user_id", "session_id", "invocation_id", "new_message"):
+            self.assertIn(name, params, f"Runner.run_async lost its {name!r} parameter")
+            self.assertEqual(
+                params[name].kind,
+                inspect.Parameter.KEYWORD_ONLY,
+                f"Runner.run_async.{name} must stay keyword-only",
+            )
+        self.assertIsNone(
+            params["invocation_id"].default, "invocation_id still defaults to None when omitted"
+        )
+
+    def test_run_async_is_transparent_when_undesignated_on_a_real_agent_loop(self) -> None:
+        """Patched-generator transparency: this class's `setUp` never
+        designates `RUNNER_FLOW_ENTRYPOINT` (no `[flows]` entrypoint is ever
+        set up here), so the installed `Runner.run_async` wrapper must take
+        its pass-through branch for a REAL agent turn — real ADK events flow
+        through the patched async generator unaltered, and the STUB backend
+        (which exposes no `enter_flow`/`exit_flow` at all) is never touched:
+        if the wrapper mistakenly tried to open a flow on this undesignated
+        call, `backend.enter_flow(...)` would raise `AttributeError` and this
+        test would fail loudly rather than silently pass. No native module
+        needed — this is Tier 0/pass-through, never Tier 2."""
+
+        class _ScriptedTextModel(BaseLlm):
+            model: str = "farm-transparency-model"
+            turn: int = 0
+
+            async def generate_content_async(self, llm_request: Any, stream: bool = False):
+                self.turn += 1
+                part = types.Part(text=f"turn-{self.turn}")
+                yield LlmResponse(content=types.Content(role="model", parts=[part]), partial=False)
+
+        model = _ScriptedTextModel()
+        agent = LlmAgent(name="transparent_agent", model=model)
+        runner = InMemoryRunner(agent=agent, app_name="farm-transparent")
+
+        async def drive() -> list[Any]:
+            session = await runner.session_service.create_session(
+                app_name="farm-transparent", user_id="u1"
+            )
+            return [
+                event
+                async for event in runner.run_async(
+                    user_id="u1",
+                    session_id=session.id,
+                    new_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+                )
+            ]
+
+        events = asyncio.run(asyncio.wait_for(drive(), timeout=15))
+        self.assertTrue(events, "the undesignated real agent loop still produced events")
+        self.assertEqual(model.turn, 1, "exactly one real model turn, undisturbed by the patch")
 
 
 if __name__ == "__main__":
