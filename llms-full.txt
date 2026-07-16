@@ -122,6 +122,13 @@ provider-aware backoff, rate limiting, dev cache). Framework adapter packs are
 auto-detected from dependencies (AI SDK middleware, `mcp:` transports, etc.) and
 wrap tool/LLM calls with zero agent-code changes. See dx-spec §4.
 
+Google ADK + `agents-cli` quickstart: README's "Keel for Google ADK +
+agents-cli" section (`uv add keelrun` or the `agents-cli create my-agent -a
+MisterTK/keel/packaging/agents-cli-template` template, `KEEL_ENABLE=1`, `keel
+init` into the agent directory). `demos/adk-demo` runs a real `LlmAgent`
+riding out a 429 storm below the agent loop, and `skills/keel/` (`npx skills
+add MisterTK/keel`) is the coding-agent skill.
+
 ## CLI reference
 
 Global: `--json` on any command emits deterministic JSON (sorted keys, no

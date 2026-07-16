@@ -236,6 +236,25 @@ that doesn't launch from the project directory) needs an explicit `cwd`:
 No `keel` on PATH (only installed via `uvx`)? Swap in
 `"command": "uvx", "args": ["--from", "keelrun-cli", "keel", "mcp"]`.
 
+### Keel for Google ADK + agents-cli
+
+Three steps, no code changes:
+
+1. **Dependency** — `uv add keelrun` (or start from the keel-enabled
+   template: `agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`).
+2. **Activate** — `KEEL_ENABLE=1` in your project `.env` (agents-cli
+   propagates it to local runs, eval, and every deploy target).
+3. **Policy** — `keel init` writes `keel.toml` into your agent directory
+   (inside the Dockerfile's COPY set, so it ships in the container —
+   `keel doctor` warns if it ever ends up at the repo root instead).
+
+Every Gemini call (`llm:google-genai`), tool call (`tool:<name>`), and MCP
+server round trip (`mcp:<server>`) becomes a policy-governed Keel target —
+certified weekly against the real `google-adk` and `mcp` packages in CI,
+including a full agent-over-MCP composition test. See `demos/adk-demo` for
+a runnable 429-survival demo, and `skills/keel/` (`npx skills add
+MisterTK/keel`) for the coding-agent skill.
+
 ## Status
 
 Keel is pre-1.0 and published on every registry (`pip`, `npm`, `cargo` — see

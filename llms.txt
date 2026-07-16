@@ -49,3 +49,4 @@ detection (tenacity/backoff, Python-first) also ship as of this release.
 - `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
 - Zero-launcher activation: pip/npm dependency + `KEEL_ENABLE=1` (`.pth` / `NODE_OPTIONS=--import keelrun/register`); `KEEL_CWD` (Python) relocates the config root.
 - Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.
+- Google ADK / `agents-cli` projects: start from `agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`, or install the coding-agent skill with `npx skills add MisterTK/keel` (`skills/keel/`).
