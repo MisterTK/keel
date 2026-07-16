@@ -85,6 +85,16 @@ class LangGraphFarmContractTest(unittest.TestCase):
         self.assertTrue(det.matched)
         self.assertEqual(det.confidence, "pinned", f"real version {det.version} fell out of range")
 
+    def test_install_uninstall_round_trips_on_the_real_state_graph(self) -> None:
+        langgraph_pack.uninstall()
+        pristine = StateGraph.add_node
+        langgraph_pack.install()
+        self.assertIsNot(StateGraph.add_node, pristine)
+        self.assertTrue(getattr(StateGraph.add_node, "__keel_wrapped__", False))
+        langgraph_pack.uninstall()
+        self.assertIs(StateGraph.add_node, pristine)
+        langgraph_pack.install()  # leave installed for tearDown symmetry
+
     def test_add_node_signature_binds_both_overloads(self) -> None:
         sig = inspect.signature(StateGraph.add_node)
         single = sig.bind(object(), _node_a)

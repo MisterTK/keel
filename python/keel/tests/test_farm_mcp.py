@@ -109,6 +109,32 @@ class McpFarmContractTest(unittest.TestCase):
         mcp_pack.uninstall()
         self.assertIs(ClientSession.send_request, pristine)
 
+    def test_raising_tool_yields_error_result_not_transport_exception(self) -> None:
+        # Pins the premise the module's fault-injection design (see module
+        # docstring above) rests on: a real MCP tool that raises its own
+        # business-logic exception must surface to the client as a
+        # *successful* CallToolResult(isError=True), never as a propagated
+        # transport exception. This was verified empirically during the
+        # original farm task but was not pinned by any test — if a future
+        # mcp SDK release changes this behavior, this module's
+        # fault-injection design rationale must be revisited.
+        server = FastMCP("farm-raising-server")
+
+        @server.tool()
+        def raising_tool() -> str:
+            raise RuntimeError("boom")
+
+        async def drive():
+            async with create_connected_server_and_client_session(server._mcp_server) as session:
+                await session.initialize()
+                return await session.call_tool("raising_tool", {})
+
+        try:
+            result = asyncio.run(drive())
+        except Exception as exc:  # noqa: BLE001 - the premise under test is that this never fires
+            self.fail(f"a raising tool must not propagate a transport exception, got {exc!r}")
+        self.assertTrue(result.isError)
+
     def test_real_round_trip_tools_call_never_retried_resources_read_retried(self) -> None:
         server = _build_server()
         true_original = ClientSession.send_request
