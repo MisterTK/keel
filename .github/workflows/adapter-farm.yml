@@ -269,3 +269,25 @@ jobs:
           cat stdout.log stderr.log
           grep -q "APP-RAN" stdout.log
           grep -q "auto-activation failed" stderr.log
+
+  # ---------------------------------------------------------------------------
+  # packaging/agents-cli-template/ certification (WS4 Task 1): installs the
+  # REAL google-agents-cli package and scaffolds a project from the template
+  # using its local path (scripts/smoke-agents-cli-template.sh), then asserts
+  # the generated project actually carries Keel's wiring — app/keel.toml,
+  # keelrun + the base template's own deps in pyproject.toml, and
+  # KEEL_ENABLE=1 in .env.example. This is the same "layer verbatim over the
+  # rendered base template" mechanism a real
+  # `agents-cli create -a MisterTK/keel/packaging/agents-cli-template` would
+  # use, just fed a local path instead of a git fetch — needs network for pip
+  # (google-agents-cli itself), not for the scaffold step.
+  # ---------------------------------------------------------------------------
+  agents-cli-template-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Certify packaging/agents-cli-template/ against the real agents-cli
+        run: scripts/smoke-agents-cli-template.sh
