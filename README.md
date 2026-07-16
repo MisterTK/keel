@@ -272,8 +272,8 @@ genuinely different provider.
 Keel is pre-1.0 and published on every registry (`pip`, `npm`, `cargo` — see
 [Quickstart](#quickstart) above; the front-end name is `keelrun`, the CLI is
 `keelrun-cli`, see `docs/naming-decision.md`). `brew install keel` is not
-available — the Homebrew tap was deliberately not created (private repo;
-`cargo`/`pip`/`npm`/`uvx` already cover every platform). Everything
+available — the Homebrew tap was deliberately not created (`cargo`/`pip`/
+`npm`/`uvx` already cover every platform). Everything
 described in this README is
 real, tested, and running on the native core in both languages today — this
 isn't a roadmap, it's what's built. What's explicitly *not* built yet: a

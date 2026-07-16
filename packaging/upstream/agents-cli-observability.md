@@ -13,12 +13,15 @@ TK's contribution to send, not a Claude Code artifact.
 
 **The Keel repo (MisterTK/keel) must be made public before sending this PR.**
 
-As of 2026-07-16 the repo is private; the Deep Dive URL
-(`https://github.com/MisterTK/keel/blob/main/llms.txt`) will return 404 for
-skill reviewers and for the skill's WebFetch consumption if the repo remains
-private. After flipping visibility to public in GitHub settings, re-verify the
-URL resolves unauthenticated before shipping. If the GitHub org or username
-changes, update both the platform-table row and Deep Dive row accordingly.
+**SATISFIED as of 2026-07-16.** The repo was flipped to public and the Deep
+Dive URL (`https://github.com/MisterTK/keel/blob/main/llms.txt`) was
+re-verified to resolve unauthenticated (`curl` returns 200) on that date —
+it no longer 404s for skill reviewers or the skill's WebFetch consumption.
+This precondition is kept below as the record of what was checked and why;
+the note it protects against — a private repo 404ing the Deep Dive link —
+no longer applies. If the GitHub org or username ever changes, update both
+the platform-table row and Deep Dive row accordingly, and re-verify the URL
+again before sending.
 
 ---
 
@@ -145,7 +148,9 @@ MisterTK/keel @ worktree-agent-first-class before this doc was written:
 - Repo URL: `MisterTK/keel` as confirmed by `git remote -v` →
   `git@github.com:MisterTK/keel.git`; `Cargo.toml` `repository =
   "https://github.com/MisterTK/keel"`; `llms.txt` exists at repo root.
-  MUST be public before PR merge for Deep Dive link to resolve.
+  Repo is public (verified 2026-07-16, `gh repo view` →
+  `isPrivate: false`); Deep Dive link resolves unauthenticated — no longer
+  a blocker for PR merge.
 - Upstream table/row formats matched against
   /Users/tk/dev/agents-cli/skills/google-agents-cli-observability/SKILL.md
   (Third-Party Integrations table, lines ~111-119; Deep Dive table,

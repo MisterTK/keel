@@ -49,9 +49,10 @@ would otherwise be silently excluded from the container image.
 
 Distribution (WS4). `packaging/agents-cli-template/` gives
 `agents-cli scaffold create` a Keel-wrapped starting point out of the box.
-A Claude Code Skill (`skills/keel/`) is installable via `npx skills add`
-(external channels — template consume path activates once the repository is
-public; see the Status section in README.md). A live demo (`demos/adk-demo`)
+A Claude Code Skill (`skills/keel/`) is installable via `npx skills add
+MisterTK/keel` — the repository is public, so both this and the
+`agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template` template
+consume path work today. A live demo (`demos/adk-demo`)
 is certified against the real ADK stack. README and the `llms.txt`/`llms-full.txt`
 surface now lead with the agent story.
 
@@ -84,12 +85,12 @@ effect.
 - Pre-existing-resilience-library detection is Python-first.
   `keel doctor` detects co-occurring `tenacity`/`backoff`/`retrying`/
   `stamina` usage in Python projects; the equivalent Node-side detection is
-  deferred (pre-existing gap, not new in this release).
+  deferred (pre-existing gap, not new in this release; tracked as issue #21).
 - `keelrun-cli-win32-x64` is still not live on npm. Blocked by npm's
-  own anti-spam system, not a code or retry issue — pending an npm support
-  request (not yet filed) from the package owner; cargo/pip/uvx installs
-  work on Windows today (pre-existing since v0.1.1; every other platform
-  package and every other registry is unaffected).
+  own anti-spam system, not a code or retry issue — tracked as issue #20,
+  pending an npm support request (not yet filed) from the package owner;
+  cargo/pip/uvx installs work on Windows today (pre-existing since v0.1.1;
+  every other platform package and every other registry is unaffected).
 
 ## Upgrade notes
 
