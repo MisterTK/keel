@@ -31,6 +31,7 @@ from fake_adk import (
     FakeAdkModules,
     FakeApp,
     FakeBasePlugin,
+    FakeEvent,
     FakeInMemoryRunner,
     FakeRunner,
     FakeTool,
@@ -52,6 +53,7 @@ class AdkTestBase(unittest.TestCase):
         adk_pack._noted_skips.clear()
         adk_pack._noted_fallbacks.clear()
         adk_pack._rebound.clear()
+        adk_pack._noted_busy = False
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
         self._discoveries: list[Discovery] = []
@@ -107,9 +109,14 @@ class DetectTest(unittest.TestCase):
 
 class ContractShapeTest(unittest.TestCase):
     def test_seams_documents_runner_init(self) -> None:
+        # Task 2 added a second seam entry for the run_async patch point
+        # (WS5 core: designated Runner.run_async invocations become Tier 2
+        # flows) — this count is intentionally bumped from 1 to 2.
         seams = adk_pack.seams()
-        self.assertEqual(len(seams), 1)
-        self.assertIn("Runner.__init__", seams[0].patch_point)
+        self.assertEqual(len(seams), 2)
+        patch_points = {s.patch_point for s in seams}
+        self.assertIn("google.adk.runners.Runner.__init__", patch_points)
+        self.assertIn("google.adk.runners.Runner.run_async", patch_points)
 
     def test_targets_declares_tool_and_llm(self) -> None:
         decls = {d.kind: d for d in adk_pack.targets()}
@@ -631,6 +638,299 @@ class RunnerFlowDesignationTest(unittest.TestCase):
         parts = ["u1", "s1", "inv-1"]
         expected = hashlib.sha256(repr(list(parts)).encode()).hexdigest()[:16]
         self.assertEqual(adk_pack._runner_args_hash(parts), expected)
+
+
+class _FakeAdkFlowBackend:
+    """A native-shaped double for the run_async flow wrap: mirrors
+    `test_flows.py`'s `_FakeFlowBackend` (enter/exit recorded, `persistent`
+    toggles journal presence — both gates `_flow_gates_or_raise` checks pass
+    by default here) plus `journal_random`, which echoes back the FIRST
+    value ever recorded for a key on every later call — modeling the native
+    core's replay behavior (a resumed flow gets the recorded value back, not
+    a fresh one) well enough to assert correlation without the compiled
+    core."""
+
+    def __init__(self, replay: bool = False, persistent: bool = True) -> None:
+        self.entered: list[tuple[Any, ...]] = []
+        self.exited: list[str] = []
+        self.random: dict[str, bytes] = {}
+        self._replay = replay
+        self.persistent = persistent
+
+    def enter_flow(
+        self,
+        entrypoint: str,
+        args_hash: str,
+        code_hash: str | None = None,
+        explicit_key: str | None = None,
+        lease_ms: int | None = None,
+    ) -> dict[str, Any]:
+        self.entered.append((entrypoint, args_hash, code_hash, explicit_key, lease_ms))
+        return {
+            "flow_id": "fid-1",
+            "status": "completed" if self._replay else "running",
+            "replay": self._replay,
+        }
+
+    def exit_flow(self, status: str) -> None:
+        self.exited.append(status)
+
+    def journal_random(self, key: str, data: bytes) -> bytes:
+        return self.random.setdefault(key, data)
+
+
+class RunnerFlowWrapTest(AdkTestBase):
+    """WS5 core: a DESIGNATED `Runner.run_async` invocation becomes a Tier 2
+    journaled flow (`adk_pack._run_async_wrapper`'s async-generator patch);
+    every other call stays byte-transparent. Runs entirely against
+    `_FakeAdkFlowBackend` — no compiled core, no real `google.adk`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._prior_state = bootstrap._STATE.state
+        self._prior_installed = bootstrap._STATE.installed
+
+    def tearDown(self) -> None:
+        bootstrap._STATE.state = self._prior_state
+        bootstrap._STATE.installed = self._prior_installed
+        super().tearDown()
+
+    def designate(self) -> None:
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT,
+            module="google.adk.runners",
+            function="Runner.run_async",
+        )
+        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
+        bootstrap._STATE.installed = True
+
+    def undesignate(self) -> None:
+        bootstrap._STATE.state = None
+        bootstrap._STATE.installed = False
+
+    def use_backend(self, backend: Any) -> None:
+        discovery = Discovery(self.cwd)
+        self._discoveries.append(discovery)
+        _runtime.set_runtime(backend, discovery)
+
+    async def _drain(self, agen: Any) -> list[Any]:
+        return [event async for event in agen]
+
+    # -- full lifecycle ----------------------------------------------------
+
+    def test_full_lifecycle_enters_correlates_and_completes(self) -> None:
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(
+                app_name="app",
+                events=[FakeEvent(invocation_id="inv-1"), FakeEvent(invocation_id="inv-1")],
+            )
+            events = asyncio.run(
+                self._drain(
+                    runner.run_async(
+                        user_id="u1", session_id="s1", invocation_id="inv-1", new_message={"text": "hi"}
+                    )
+                )
+            )
+            adk_pack.uninstall()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(len(backend.entered), 1)
+        entrypoint, args_hash, code_hash, explicit_key, lease_ms = backend.entered[0]
+        self.assertEqual(entrypoint, adk_pack.RUNNER_FLOW_ENTRYPOINT)
+        self.assertIsNone(code_hash)
+        self.assertEqual(explicit_key, "inv-1", "explicit_key is the raw invocation_id")
+        _, expected_hash = adk_pack._runner_flow_identity("u1", "s1", "inv-1", {"text": "hi"})
+        self.assertEqual(args_hash, expected_hash)
+        self.assertEqual(backend.exited, ["completed"])
+        self.assertEqual(backend.random["adk:invocation_id"], b"inv-1")
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a clean completion")
+
+    def test_lease_ms_env_forwarded(self) -> None:
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        with FakeAdkModules(), mock.patch.dict(os.environ, {"KEEL_FLOW_LEASE_MS": "5000"}):
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            asyncio.run(
+                self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+        self.assertEqual(backend.entered[0][4], 5000)
+
+    # -- failure mid-stream --------------------------------------------------
+
+    def test_failure_mid_stream_marks_failed_and_reraises_original(self) -> None:
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = RuntimeError("boom")
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
+
+    # -- abandonment (GeneratorExit) -----------------------------------------
+
+    def test_abandonment_leaves_flow_running_and_active(self) -> None:
+        # Test-adjudicated (brief NOTE): breaking out of the async-for and
+        # closing the generator must NOT call exit_flow, and must leave
+        # _flow_active True — the crash shape (decision 8). set_flow_active
+        # is therefore NOT in a finally in the wrapper; this test is what
+        # proves that placement correct.
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(
+                app_name="app",
+                events=[
+                    FakeEvent(invocation_id="inv-1"),
+                    FakeEvent(invocation_id="inv-1"),
+                    FakeEvent(invocation_id="inv-1"),
+                ],
+            )
+
+            async def abandon() -> Any:
+                gen = runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                first = await gen.__anext__()
+                await gen.aclose()
+                return first
+
+            first = asyncio.run(abandon())
+            adk_pack.uninstall()
+        self.assertIsNotNone(first)
+        self.assertEqual(len(backend.entered), 1)
+        self.assertEqual(backend.exited, [], "abandonment must never call exit_flow")
+        self.assertTrue(_runtime.in_active_flow(), "GeneratorExit leaves the flow running (decision 8)")
+
+    # -- busy path (another flow already open) -------------------------------
+
+    def test_busy_path_notes_once_and_passes_through_unwrapped(self) -> None:
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        _runtime.set_flow_active(True)  # another flow is already open on this backend
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                events1 = asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+                events2 = asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertEqual(len(events1), 1)
+        self.assertEqual(len(events2), 1)
+        self.assertEqual(backend.entered, [], "busy path never opens a flow")
+        self.assertEqual(err.getvalue().count("already active"), 1, "noted once, not per-call")
+
+    # -- undesignated path: byte-transparent, never touches the backend -----
+
+    def test_undesignated_path_never_touches_backend(self) -> None:
+        self.undesignate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            event = FakeEvent(invocation_id="inv-1")
+            runner = Runner(app_name="app", events=[event])
+            events = asyncio.run(
+                self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+        self.assertEqual(events, [event])
+        self.assertEqual(backend.entered, [])
+        self.assertEqual(backend.exited, [])
+
+    def test_no_backend_at_all_is_also_byte_transparent(self) -> None:
+        # Designated, but Keel was never bootstrapped on this process
+        # (get_backend() is None): also passes straight through.
+        self.designate()
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            event = FakeEvent(invocation_id="inv-1")
+            runner = Runner(app_name="app", events=[event])
+            events = asyncio.run(
+                self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+            )
+            adk_pack.uninstall()
+        self.assertEqual(events, [event])
+
+    # -- gates ----------------------------------------------------------------
+
+    def test_designated_but_ungated_backend_raises_e005(self) -> None:
+        self.designate()
+        _runtime.set_runtime(_NoFlowSurfaceBackend(), None)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            with self.assertRaises(KeelError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+
+    # -- Runner.run (sync bridge) is never itself patched --------------------
+
+    def test_runner_run_sync_bridges_through_the_same_wrap_not_double_wrapped(self) -> None:
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        with FakeAdkModules():
+            from google.adk.runners import Runner
+
+            pristine_run = Runner.run
+            adk_pack.install()
+            self.assertIs(Runner.run, pristine_run, "install() never patches Runner.run itself")
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            events = runner.run(user_id="u1", session_id="s1", invocation_id="inv-1")
+            adk_pack.uninstall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(backend.entered), 1, "exactly one flow entered via the sync bridge")
+        self.assertEqual(backend.exited, ["completed"])
+
+    # -- uninstall restores ----------------------------------------------------
+
+    def test_uninstall_restores_run_async(self) -> None:
+        with FakeAdkModules():
+            from google.adk.runners import Runner
+
+            pristine = Runner.run_async
+            adk_pack.install()
+            self.assertIsNot(Runner.run_async, pristine)
+            adk_pack.uninstall()
+            self.assertIs(Runner.run_async, pristine)
 
 
 if __name__ == "__main__":

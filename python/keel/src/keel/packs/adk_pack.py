@@ -78,6 +78,7 @@ import sys
 import weakref
 from typing import Any, Callable
 
+from .. import _runtime
 from ..adapters._pack import Detection, Seam, TargetDecl
 from .._errors import KeelError
 from .._flow import backend_has_journal, backend_supports_flows
@@ -165,7 +166,25 @@ def seams() -> list[Seam]:
                 "itself always returns None for rebindable tools, preserving "
                 "ADK's own callback and error sequence."
             ),
-        )
+        ),
+        Seam(
+            patch_point="google.adk.runners.Runner.run_async",
+            upstream_api=(
+                "ADK Runner: run_async(self, *, user_id, session_id, "
+                "invocation_id=None, new_message=None, ...) -> "
+                "AsyncGenerator[Event, None]"
+            ),
+            why_stable=(
+                "A class-level method patch on the same documented Runner "
+                "surface as __init__ above — active only under explicit "
+                "[flows] designation (RUNNER_FLOW_ENTRYPOINT in [flows] "
+                "entrypoints). An undesignated Runner, or one built while "
+                "Keel has no backend, sees the original async generator "
+                "byte-for-byte via functools.wraps; a designated call opens "
+                "a Tier 2 durable flow around the underlying event stream "
+                "without altering the events ADK itself yields."
+            ),
+        ),
     ]
 
 
@@ -209,13 +228,14 @@ def defaults() -> dict[str, Any]:
     return {}
 
 
-# --- Tier 2 Runner-flow designation (WS5 foundation) ------------------------
+# --- Tier 2 Runner-flow designation and wrap (WS5 core) ---------------------
 #
 # A user opts a specific ADK `Runner.run_async` invocation into Tier 2 by
 # adding `RUNNER_FLOW_ENTRYPOINT` to `[flows] entrypoints` in `keel.toml`.
-# This section is FOUNDATION ONLY: the designation matcher, the Tier-2 gates,
-# and the flow-identity helpers a generator wrap (a later task) will consume
-# via `backend.enter_flow(*_runner_flow_identity(...))`. No wrap lives here.
+# This section holds the designation matcher, the Tier-2 gates, the
+# flow-identity helpers, AND the async-generator wrap itself
+# (`_run_async_wrapper`) that consumes them via
+# `backend.enter_flow(*_runner_flow_identity(...))`.
 
 
 def _flow_entrypoint_designated() -> str | None:
@@ -327,13 +347,125 @@ def _runner_flow_identity(
     return RUNNER_FLOW_ENTRYPOINT, _runner_args_hash([user_id, session_id, ident])
 
 
+def _lease_ms() -> int | None:
+    """`KEEL_FLOW_LEASE_MS`, read the same way `_flow.py:279-281` reads it for
+    `keel run` — absent/empty means "let the backend pick its own default
+    lease"."""
+    raw = os.environ.get("KEEL_FLOW_LEASE_MS")
+    return int(raw) if raw else None
+
+
+_noted_busy = False
+
+
+def _note_flow_busy() -> None:
+    """Note (once per process, `KEEL_QUIET`-aware — mirrors `_note_skip`/
+    `_note_fallback`) that a designated `Runner.run_async` call landed while
+    another Tier 2 flow is already active on this backend. Keel's flow
+    handle is a process-wide singleton (`_runtime.in_active_flow`), so a
+    nested/concurrent designated call cannot open a second flow; it proceeds
+    unwrapped rather than erroring."""
+    global _noted_busy
+    if _noted_busy:
+        return
+    _noted_busy = True
+    if os.environ.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return
+    sys.stderr.write(
+        f"keel ▸ adk: {RUNNER_FLOW_ENTRYPOINT!r} invoked while another Tier 2 "
+        "flow is already active on this backend — this call proceeds "
+        "unwrapped (nested/concurrent designated Runner flows are not "
+        "supported)\n"
+    )
+
+
+def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
+    """Patch factory for `Runner.run_async` (installed by `install()`, stored
+    as `_orig["run_async"]`, restored by `uninstall()`). Produces
+    `_run_async_flow_wrapper`: an async-generator-aware wrap that opens a
+    Tier 2 durable flow around a DESIGNATED call's event stream, and is
+    byte-transparent (via `functools.wraps` over `orig`) for every other
+    call — undesignated Runners, or any Runner built while Keel has no
+    backend at all."""
+
+    @functools.wraps(orig)
+    async def _run_async_flow_wrapper(
+        self: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        entry_raw = _flow_entrypoint_designated()
+        backend = _runtime.get_backend()
+        inner = lambda: orig(
+            self,
+            user_id=user_id,
+            session_id=session_id,
+            invocation_id=invocation_id,
+            new_message=new_message,
+            **kwargs,
+        )
+        if entry_raw is None or backend is None:
+            async for event in inner():
+                yield event
+            return
+        _flow_gates_or_raise(backend)  # loud KEEL-E005 (decision 5): never a silent un-journaled downgrade
+        if _runtime.in_active_flow():  # singleton handle (decision 2): only one open flow per process
+            _note_flow_busy()
+            async for event in inner():
+                yield event
+            return
+        _, args_hash = _runner_flow_identity(user_id, session_id, invocation_id, new_message)
+        info = backend.enter_flow(
+            entry_raw, args_hash, code_hash=None, explicit_key=invocation_id, lease_ms=_lease_ms()
+        )
+        replayed = bool(info.get("replay"))
+        _runtime.set_flow_active(True)
+        correlated = False
+        try:
+            gen = inner()
+            async for event in gen:
+                if not correlated:
+                    inv = getattr(event, "invocation_id", "") or ""
+                    backend.journal_random("adk:invocation_id", inv.encode("utf-8"))
+                    correlated = True
+                yield event
+        except GeneratorExit:  # abandonment -> flow stays running (decision 8)
+            raise
+        except BaseException:
+            if not replayed:  # never demote an already-completed (replayed) flow
+                backend.exit_flow("failed")
+            _runtime.set_flow_active(False)
+            raise
+        else:
+            backend.exit_flow("completed")
+            _runtime.set_flow_active(False)
+        # NOTE: set_flow_active(False) deliberately NOT in a finally — on
+        # GeneratorExit the flow stays open-and-running only until process
+        # exit anyway (abandonment is the crash shape); a finally would also
+        # fire on it and mask the running-flow semantics. This mirrors
+        # `_flow.py`'s own asymmetric handling (its final `exit_flow(
+        # "completed")` is unconditional on success, while every failure
+        # branch guards on `replayed`). Test-adjudicated: see
+        # `RunnerFlowWrapTest.test_abandonment_leaves_flow_running_and_active`
+        # in `test_packs_adk.py`, which asserts `in_active_flow()` stays True
+        # and NO `exit_flow` call is recorded after an `aclose()`.
+
+    return _run_async_flow_wrapper
+
+
 # --- install / uninstall -----------------------------------------------------
 
 
 def install() -> None:
     """Patch ``Runner.__init__`` so every constructed Runner (any of
-    ``agent=``/``node=``/``app=``) gets Keel's plugin auto-registered.
-    Idempotent; a no-op if ``google.adk`` is not importable."""
+    ``agent=``/``node=``/``app=``) gets Keel's plugin auto-registered, AND
+    ``Runner.run_async`` so a DESIGNATED invocation becomes a Tier 2 durable
+    flow (``_run_async_wrapper``). Idempotent; a no-op if ``google.adk`` is
+    not importable."""
     global _installed
     if _installed:
         return
@@ -343,14 +475,17 @@ def install() -> None:
         return
     _orig["init"] = Runner.__init__
     Runner.__init__ = _init_wrapper(_orig["init"])  # type: ignore[method-assign]
+    _orig["run_async"] = Runner.run_async
+    Runner.run_async = _run_async_wrapper(_orig["run_async"])  # type: ignore[method-assign]
     _installed = True
 
 
 def uninstall() -> None:
-    """Restore the original ``Runner.__init__`` and un-shadow every rebound
-    tool instance still alive (weak registry — collected tools need nothing).
-    Runners already constructed keep whatever plugins they were given
-    (mirrors httpx_pack: uninstall un-arms future construction)."""
+    """Restore the original ``Runner.__init__``/``Runner.run_async`` and
+    un-shadow every rebound tool instance still alive (weak registry — a
+    collected tool needs nothing). Runners already constructed keep whatever
+    plugins they were given (mirrors httpx_pack: uninstall un-arms future
+    construction)."""
     global _installed
     _restore_rebound()
     if not _installed:
@@ -362,6 +497,7 @@ def uninstall() -> None:
         _installed = False
         return
     Runner.__init__ = _orig["init"]  # type: ignore[method-assign]
+    Runner.run_async = _orig["run_async"]  # type: ignore[method-assign]
     _orig.clear()
     _installed = False
 

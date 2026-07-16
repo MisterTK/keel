@@ -17,6 +17,10 @@ package:
   agent=None, *, app_name=None, plugins=None, app=None, ...)`` forwards to it
   via ``super().__init__(...)``.
 * ``BaseTool.run_async(self, *, args: dict, tool_context) -> Any``.
+* ``Runner.run_async(self, *, user_id: str, session_id: str, invocation_id:
+  Optional[str] = None, new_message=None, ...) -> AsyncGenerator[Event,
+  None]``; ``Runner.run(...)`` is the synchronous bridge, draining
+  ``run_async`` over its own event loop.
 """
 
 from __future__ import annotations
@@ -98,6 +102,26 @@ class FakePluginManager:
         return next((p for p in self.plugins if p.name == name), None)
 
 
+class FakeEvent:
+    """Structural twin of ``google.adk.events.event.Event``: adk_pack's
+    Runner-flow wrap reads only ``.invocation_id`` off an event (to
+    correlate the flow via ``backend.journal_random``), so that is the only
+    attribute this fake sets by default — any other keyword becomes an
+    attribute too, for tests that want to assert byte-transparency of
+    richer event shapes."""
+
+    def __init__(self, invocation_id: str | None = None, **extra: Any) -> None:
+        self.invocation_id = invocation_id
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeEvent) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeEvent({vars(self)!r})"
+
+
 class FakeRunner:
     """Structural twin of ``google.adk.runners.Runner``: real ADK resolves
     ``agent=``/``node=``/``app=`` into one ``App`` before building
@@ -105,7 +129,19 @@ class FakeRunner:
     fake skips the App indirection (irrelevant to the pack under test) but
     preserves the externally-observable contract: after construction,
     ``self.plugin_manager`` holds every plugin passed via ``plugins=`` (or via
-    a fake ``app.plugins``, if supplied instead)."""
+    a fake ``app.plugins``, if supplied instead).
+
+    ``run_async`` is an async generator yielding ``events`` in order (queued
+    at construction via ``events=``) — matching the real ``Runner.run_async``
+    keyword-only signature (``user_id``, ``session_id``, ``invocation_id=
+    None``, ``new_message=None``, plus ``**kwargs`` tolerance for forward
+    compatibility). An item that is a ``BaseException`` instance is raised
+    instead of yielded, modeling a mid-stream failure. ``run`` is the
+    synchronous bridge real ADK provides: it drains ``self.run_async(...)``
+    over a fresh event loop — i.e. it calls through whatever ``run_async``
+    PRESENTLY resolves to (patched or not), exactly like the real bridge, so
+    a class-level ``Runner.run_async`` patch covers ``run()`` callers too
+    without ``run`` itself ever needing a separate patch."""
 
     def __init__(
         self,
@@ -115,6 +151,7 @@ class FakeRunner:
         agent: Any = None,
         node: Any = None,
         plugins: list[Any] | None = None,
+        events: list[Any] | None = None,
         **_: Any,
     ) -> None:
         self.app = app
@@ -124,6 +161,46 @@ class FakeRunner:
         if app is not None:
             resolved.extend(getattr(app, "plugins", None) or [])
         self.plugin_manager = FakePluginManager(plugins=resolved)
+        self.events = list(events or [])
+
+    async def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        for item in self.events:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def run(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        import asyncio
+
+        async def _drain() -> list[Any]:
+            return [
+                event
+                async for event in self.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    new_message=new_message,
+                    **kwargs,
+                )
+            ]
+
+        return asyncio.run(_drain())
 
 
 class FakeInMemoryRunner(FakeRunner):
@@ -272,6 +349,7 @@ __all__ = [
     "FakeAdkModules",
     "FakeApp",
     "FakeBasePlugin",
+    "FakeEvent",
     "FakeInMemoryRunner",
     "FakePluginManager",
     "FakeRunner",
