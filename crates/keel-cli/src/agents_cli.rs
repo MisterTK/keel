@@ -53,6 +53,20 @@ pub fn find_agents_cli_layout(project: &Path) -> Option<AgentsCliLayout> {
         if candidate.is_file() {
             let text = std::fs::read_to_string(&candidate).ok()?;
             let agent_directory = parse_agent_directory(&text)?;
+            // A legitimate agents-cli manifest only ever names the agent's own
+            // subdirectory, so a `..` component is either a corrupted manifest
+            // or an attempt to walk `keel init`/`keel doctor` outside the
+            // project via `Path::join` — reject it here rather than let it
+            // through to be checked (syntactically, and therefore
+            // unreliably — see `init::agents_cli_toml_path`) against
+            // `project` later. This is layer one of two; layer two
+            // canonicalizes both sides before ever writing a file.
+            if Path::new(&agent_directory)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return None;
+            }
             let agent_dir = dir.join(agent_directory);
             return agent_dir.is_dir().then(|| AgentsCliLayout {
                 manifest_dir: dir.to_owned(),
@@ -66,9 +80,10 @@ pub fn find_agents_cli_layout(project: &Path) -> Option<AgentsCliLayout> {
 
 /// Hand-parse the `agent_directory: <value>` line out of an
 /// `agents-cli-manifest.yaml` document: the first line matching
-/// `^agent_directory:\s*(\S+)`, with the value trimmed of a wrapping pair of
-/// single or double quotes. `None` when no such line exists. Deliberately not
-/// a YAML parser — see the module docs.
+/// `^agent_directory:\s*(.+)$`, then [`extract_scalar`] pulls the actual value
+/// out of the remainder. `None` when no such line exists, or its value is
+/// empty, or an opened quote is never closed. Deliberately not a YAML parser —
+/// see the module docs.
 fn parse_agent_directory(text: &str) -> Option<String> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("agent_directory:") else {
@@ -77,28 +92,33 @@ fn parse_agent_directory(text: &str) -> Option<String> {
             // a `schema_version:` line preceding `agent_directory:`).
             continue;
         };
-        let value = rest.trim();
-        if value.is_empty() {
+        let rest = rest.trim_start();
+        if rest.is_empty() {
             return None;
         }
-        return Some(unquote(value).to_owned());
+        let value = extract_scalar(rest)?;
+        return (!value.is_empty()).then_some(value);
     }
     None
 }
 
-/// Strip one matching pair of wrapping quotes (`'...'` or `"..."`), else return
-/// the input unchanged.
-fn unquote(value: &str) -> &str {
+/// Extract the manifest scalar value starting at `rest` (already trimmed of
+/// leading whitespace, but not trailing). Two forms, matching what
+/// `agents-cli scaffold create` itself emits:
+///
+/// - **Quoted** (`'...'` / `"..."`): captures everything up to the matching
+///   closing quote, spaces included, and discards anything after it (e.g. a
+///   trailing `# comment`). `None` if the opening quote is never closed.
+/// - **Unquoted**: captures only the first whitespace-delimited token, so a
+///   trailing inline comment (`agent_directory: app  # ships in prod`) is
+///   discarded rather than folded into the value.
+fn extract_scalar(rest: &str) -> Option<String> {
     for quote in ['\'', '"'] {
-        if let Some(inner) = value
-            .strip_prefix(quote)
-            .and_then(|s| s.strip_suffix(quote))
-            && inner.len() + 2 == value.len()
-        {
-            return inner;
+        if let Some(inner) = rest.strip_prefix(quote) {
+            return inner.find(quote).map(|end| inner[..end].to_owned());
         }
     }
-    value
+    rest.split_whitespace().next().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -175,18 +195,81 @@ mod tests {
         assert!(find_agents_cli_layout(dir.path()).is_none());
     }
 
+    /// A manifest sitting exactly `MAX_WALK_LEVELS` parents above the starting
+    /// directory is still within the bound (the walk checks the starting
+    /// directory itself, then `MAX_WALK_LEVELS` ancestors above it) and must
+    /// be found.
     #[test]
-    fn walk_is_bounded_and_stops_before_the_filesystem_root() {
-        // A manifest sitting far enough above `project` that it exceeds
-        // MAX_WALK_LEVELS must not be found. We simulate this by walking from a
-        // directory nested deeper than the bound under a project that has no
-        // manifest anywhere in its ancestry within TempDir.
+    fn manifest_within_the_walk_bound_is_found() {
         let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        write_manifest(dir.path(), "agent_directory: app\n");
         let mut nested = dir.path().to_owned();
-        for i in 0..(MAX_WALK_LEVELS + 2) {
+        for i in 0..MAX_WALK_LEVELS {
             nested = nested.join(format!("d{i}"));
         }
         std::fs::create_dir_all(&nested).unwrap();
+
+        let layout =
+            find_agents_cli_layout(&nested).expect("manifest exactly at the bound is found");
+        assert_eq!(layout.manifest_dir, dir.path());
+    }
+
+    /// A manifest sitting one level *beyond* `MAX_WALK_LEVELS` parents above
+    /// the starting directory must not be found — the walk gives up first.
+    #[test]
+    fn manifest_beyond_the_walk_bound_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        write_manifest(dir.path(), "agent_directory: app\n");
+        let mut nested = dir.path().to_owned();
+        for i in 0..=MAX_WALK_LEVELS {
+            nested = nested.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+
         assert!(find_agents_cli_layout(&nested).is_none());
+    }
+
+    #[test]
+    fn inline_comment_after_an_unquoted_value_is_discarded() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        write_manifest(dir.path(), "agent_directory: app  # ships in prod\n");
+
+        let layout = find_agents_cli_layout(dir.path()).expect("layout found");
+        assert_eq!(layout.agent_dir, dir.path().join("app"));
+    }
+
+    /// Documented rule (see `extract_scalar`): a quoted value captures up to
+    /// its closing quote, spaces included — unlike the unquoted form, which
+    /// stops at the first whitespace.
+    #[test]
+    fn quoted_value_may_contain_spaces() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("my app")).unwrap();
+        write_manifest(dir.path(), "agent_directory: \"my app\"\n");
+
+        let layout = find_agents_cli_layout(dir.path()).expect("layout found");
+        assert_eq!(layout.agent_dir, dir.path().join("my app"));
+    }
+
+    /// CRITICAL regression: `agent_directory: ../elsewhere` must never escape
+    /// the project, even though the sibling directory it names genuinely
+    /// exists on disk. `Path::starts_with` is purely component-syntactic, so
+    /// without the `..`-rejection layer `<project>/../elsewhere` would
+    /// lexically "start with" `<project>` despite resolving outside it.
+    #[test]
+    fn parent_dir_component_in_agent_directory_yields_none() {
+        // `elsewhere` and `project` are real *siblings* on disk — both live
+        // under the same TempDir root so the fixture is self-contained and
+        // gets cleaned up, but `elsewhere` is genuinely outside `project`.
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+        write_manifest(&project, "agent_directory: ../elsewhere\n");
+
+        assert!(find_agents_cli_layout(&project).is_none());
     }
 }
