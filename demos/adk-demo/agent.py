@@ -15,7 +15,7 @@ function-call turn, then a final-text turn quoting the tool's real, retried
 result) so the demo is deterministic and needs no credentials — same
 approach as the farm's ``ScriptedModel`` (see
 ``python/keel/tests/test_farm_adk_composition.py``), adapted here to run
-standalone against a scripted fake instead of a live googe-adk farm venv.
+standalone against a scripted fake instead of a live google-adk farm venv.
 """
 
 from __future__ import annotations

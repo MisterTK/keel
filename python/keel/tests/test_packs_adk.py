@@ -396,6 +396,36 @@ class RebindLifecycleTest(AdkTestBase):
             self.assertNotIn("run_async", tool.__dict__, "shadow removed: class method restored")
             self.assertEqual(asyncio.run(tool.run_async(args={"city": "x"}, tool_context=object())), "x")
 
+    def test_restore_rebound_setattr_branch_restores_prior_instance_attribute(self) -> None:
+        # When a tool ALREADY carries its own instance-level run_async (some
+        # pre-existing shadow, not the class method) at the moment Keel first
+        # sees it, `_rebind_tool` captures that as `prior` — not `_ABSENT`.
+        # `_restore_rebound`'s `prior is not _ABSENT` branch must setattr
+        # that ORIGINAL instance attribute back on uninstall, not delattr it
+        # (delattr would wrongly fall through to the class method instead of
+        # restoring what the tool actually had before Keel touched it).
+        self.install_runtime({"target": {"tool:get_weather": {}}})
+        with FakeAdkModules():
+            adk_pack.install()
+            tool = FakeTool("get_weather", lambda city: city)
+
+            async def prior_run_async(*, args: dict[str, Any], tool_context: Any) -> Any:
+                return "prior-instance-value"
+
+            tool.run_async = prior_run_async  # instance-level shadow, pre-existing
+            asyncio.run(
+                adk_pack._plugin().before_tool_callback(
+                    tool=tool, tool_args={}, tool_context=object()
+                )
+            )
+            self.assertIsNot(tool.run_async, prior_run_async, "Keel rebinds over the prior shadow")
+            adk_pack.uninstall()
+            self.assertIn("run_async", tool.__dict__, "instance attribute restored, not deleted")
+            self.assertIs(tool.run_async, prior_run_async, "the ORIGINAL instance attribute is restored")
+        self.assertEqual(
+            asyncio.run(tool.run_async(args={}, tool_context=object())), "prior-instance-value"
+        )
+
 
 class SetattrFallbackTest(AdkTestBase):
     """A tool instance that rejects rebinding still gets full Keel coverage
@@ -499,6 +529,17 @@ class McpErrorDictTest(AdkTestBase):
         self.assertFalse(adk_pack._is_mcp_error_dict({"error": 500}))
         self.assertFalse(adk_pack._is_mcp_error_dict(["error"]))
         self.assertTrue(adk_pack._is_mcp_error_dict({"error": "x"}))
+
+    def test_is_mcp_tool_true_for_deprecated_mcptool_alias_by_name_alone(self) -> None:
+        # ADK's deprecated alias `class MCPTool(McpTool)` (mcp_tool.py line
+        # 602) is matched by _is_mcp_tool's MRO-name check purely on the
+        # class NAME "MCPTool" — not by inheriting from this fixture's
+        # McpTool. Construct a class named "MCPTool" with no relation to the
+        # fixture at all to prove the check fires on the name, not the type.
+        class MCPTool:
+            pass
+
+        self.assertTrue(adk_pack._is_mcp_tool(MCPTool()))
 
 
 class _NoFlowSurfaceBackend:

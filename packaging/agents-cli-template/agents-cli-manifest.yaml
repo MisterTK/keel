@@ -9,4 +9,4 @@ settings:
     - "google-adk[gcp]>=2.0.0,<3.0.0"
     - "a2a-sdk[http-server]~=0.3.22"
     - "aiohttp>=3.13.4"
-    - "keelrun>=0.1.1"
+    - "keelrun>=0.2.0"
