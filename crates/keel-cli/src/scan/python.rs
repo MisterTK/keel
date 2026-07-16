@@ -473,6 +473,8 @@ mod tests {
         fs::write(
             dir.path().join("app.py"),
             "import google\n\
+             import google.protobuf\n\
+             from google import protobuf\n\
              import google.adk\n\
              from google.genai import types\n\
              from google import genai, adk\n\
@@ -508,7 +510,17 @@ mod tests {
         );
         // Bare `google` (the namespace package) must record NOTHING — it
         // also hosts unrelated distributions (google-protobuf and friends).
-        assert!(!scan.findings.libs.contains("google"));
+        // Neither must `import google.protobuf` nor `from google import
+        // protobuf`: `protobuf` isn't one of Keel's two adapted submodules
+        // (`GOOGLE_SUBMODULES = {"adk", "genai"}`), so both forms must fall
+        // through to the same "namespace package, not evidence" handling —
+        // never surfacing as `google`, `google.protobuf`, or `protobuf`.
+        for leaked in ["google", "google.protobuf", "protobuf"] {
+            assert!(
+                !scan.findings.libs.contains(leaked),
+                "google.protobuf import must not record {leaked}"
+            );
+        }
     }
 
     #[test]

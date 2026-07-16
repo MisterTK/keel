@@ -115,12 +115,6 @@
       "target": "llm:*"
     },
     {
-      "detected": true,
-      "lib": "mcp",
-      "status": "best-effort",
-      "target": "mcp:*"
-    },
-    {
       "detected": false,
       "lib": "ioredis",
       "status": "best-effort",

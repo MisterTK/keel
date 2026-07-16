@@ -92,12 +92,19 @@ const REGISTRY: &[Adapter] = &[
         best_effort: false,
     },
     // The six agent-framework packs (dx-spec agent-first-class work) plus the
-    // google-genai LLM provider pack — all contract-tested against real
-    // libraries by the adapter farm (see .github/workflows/adapter-farm.yml),
-    // so pinned like httpx/openai rather than best-effort. `target` mirrors
-    // each pack's own declared `TargetDecl.pattern` exactly (adk_pack.py,
-    // pydantic_ai_pack.py, openai_agents_pack.py, crewai_pack.py,
-    // langgraph_pack.py: `"tool:<name>"`; mcp_pack.py: `"mcp:<server>"`).
+    // google-genai LLM provider pack. Farm-certification alone isn't the
+    // `best_effort` discriminator — aiohttp/boto3 below are farm-tested too,
+    // yet stay best-effort because each carries a documented fidelity gap
+    // (aiohttp's cache-hit replay is a duck-typed stand-in response, not a
+    // real `aiohttp.ClientResponse`; boto3 infers retry-safety from an
+    // operation-name-prefix heuristic, not a guaranteed contract). These
+    // packs instead wrap official, stable extension points with no such gap
+    // (ADK's plugin API, AI-SDK-style documented seams) and are ALSO
+    // farm-certified (.github/workflows/adapter-farm.yml) — so pinned like
+    // httpx/openai. `target` mirrors each pack's own declared
+    // `TargetDecl.pattern` exactly (adk_pack.py, pydantic_ai_pack.py,
+    // openai_agents_pack.py, crewai_pack.py, langgraph_pack.py:
+    // `"tool:<name>"`; mcp_pack.py / mcp.mjs: `"mcp:<server>"`).
     Adapter {
         lib: "google-adk",
         lang: "python",
@@ -134,12 +141,15 @@ const REGISTRY: &[Adapter] = &[
         target: "tool:<name>",
         best_effort: false,
     },
-    // A second `mcp` row: the Python client SDK (mcp_pack), distinct from the
-    // Node `mcp` client below — same import/package name, different runtime,
-    // different (per-server) target grammar.
+    // The `mcp` client SDK — one row shared by Python (mcp_pack) and Node
+    // (mcp.mjs), like the openai/anthropic rows above: same import/package
+    // name in both runtimes, and both packs declare the identical
+    // per-server target grammar (`TargetDecl.pattern == "mcp:<server>"` in
+    // both mcp_pack.py and mcp.mjs). Farm-certified in both languages
+    // (tests/test_farm_mcp.py, node/keel/test/mcp-farm.test.mjs).
     Adapter {
         lib: "mcp",
-        lang: "python",
+        lang: "python+node",
         target: "mcp:<server>",
         best_effort: false,
     },
@@ -166,12 +176,6 @@ const REGISTRY: &[Adapter] = &[
         lang: "node",
         target: "llm:*",
         best_effort: false,
-    },
-    Adapter {
-        lib: "mcp",
-        lang: "node",
-        target: "mcp:*",
-        best_effort: true,
     },
     Adapter {
         lib: "ioredis",
@@ -775,6 +779,11 @@ mod tests {
             ("openai-agents", "tool:<name>"),
             ("crewai", "tool:<name>"),
             ("langgraph", "tool:<name>"),
+            // `mcp` is a single REGISTRY row shared by Python and Node (like
+            // openai/anthropic above): one flat `scan.libs` detection covers
+            // both, so it belongs in this same table-driven loop rather than
+            // a separate assertion block.
+            ("mcp", "mcp:<server>"),
         ] {
             let a = r
                 .adapters
@@ -784,15 +793,6 @@ mod tests {
             assert!(a.detected, "{lib} should be detected");
             assert_eq!(a.status, "pinned");
         }
-        // `mcp` has two REGISTRY rows (Node client, Python client) sharing a
-        // lib name — the Python one's target is the per-server grammar.
-        let mcp_py = r
-            .adapters
-            .iter()
-            .find(|a| a.lib == "mcp" && a.target == "mcp:<server>")
-            .expect("python mcp REGISTRY row");
-        assert!(mcp_py.detected);
-        assert_eq!(mcp_py.status, "pinned");
     }
 
     fn default_policy() -> PolicyValidation {
