@@ -217,7 +217,16 @@ class DoubleActivationEndToEndTest(unittest.TestCase):
         # the discriminating observable: it proves dispatch was attempted.
         self.write_policy('[flows]\nentrypoints = ["py:flow_target:main"]\n')
         code = _DOUBLE_ACTIVATE_THEN_RUN.format(target=FLOW_TARGET)
-        proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_QUIET="1"), cwd=self.cwd)
+        # Pin the stub backend explicitly: `child_env` pops any inherited
+        # KEEL_BACKEND, so under the native-conformance CI leg (or any dev
+        # venv with `keel_core` built/installed) `load_backend`'s "auto"
+        # default would detect and use the REAL native core, the flow would
+        # actually run, and this test's whole premise — that dispatch is
+        # observable only via the stub's loud "no Tier 2 surface" refusal —
+        # would be gone (rc 0, no KEEL-E005). The assertion is about state
+        # preservation across the double `install_keel()` call, not about
+        # which backend is present, so pin it.
+        proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_QUIET="1", KEEL_BACKEND="stub"), cwd=self.cwd)
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn(b"KEEL-E005", proc.stderr)
         self.assertIn(b"needs the native core", proc.stderr)
