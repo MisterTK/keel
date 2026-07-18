@@ -1,0 +1,41 @@
+{
+  "name": "poll-pending-to-terminal",
+  "description": "Poll (CCR-3): two pending responses then a terminal one. attempts accumulates across iterations, waits_ms stays retry-only, intervals advance the clock, one call/one success in the report.",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "retry": { "attempts": 3, "schedule": "fixed(200ms)", "on": ["conn", "timeout", "429", "5xx"] },
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed", "failed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": "running", "id": "j1" } },
+          { "status": "ok", "payload": { "status": "running", "id": "j1" } },
+          { "status": "ok", "payload": { "status": "completed", "result": 42 } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "status": "completed", "result": 42 },
+          "attempts": 3,
+          "from_cache": false,
+          "waits_ms": [],
+          "throttled": false
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "clock_ms": 20000,
+        "targets": {
+          "api.jobs.example": { "calls": 1, "attempts": 3, "retries": 0, "successes": 1, "failures": 0 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "name": "poll-with-timeout-class",
+  "description": "Poll x timeout (CCR-3): a timeout-class attempt error inside a poll iteration is a normal error for retry to consider (scenarios inject timeout as an error class).",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "retry": { "attempts": 3, "schedule": "fixed(200ms)", "on": ["conn", "timeout", "429", "5xx"] },
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "error", "class": "timeout", "message": "no response" },
+          { "status": "ok", "payload": { "status": "completed" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "attempts": 3,
+          "waits_ms": [200]
+        }
+      }
+    },
+    { "report_expect": { "clock_ms": 10200 } }
+  ]
+}

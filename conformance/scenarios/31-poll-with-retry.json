@@ -1,0 +1,40 @@
+{
+  "name": "poll-with-retry",
+  "description": "Poll x retry (CCR-3): each poll iteration is a fully-retried call. A 503 inside an iteration backs off per the schedule (waits_ms records it); the pending wait advances the clock separately.",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "retry": { "attempts": 3, "schedule": "exp(200ms, x2, max 30s)", "on": ["conn", "timeout", "429", "5xx"] },
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "error", "class": "http", "http_status": 503, "message": "unavailable" },
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "error", "class": "http", "http_status": 503, "message": "unavailable" },
+          { "status": "ok", "payload": { "status": "completed" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "status": "completed" },
+          "attempts": 4,
+          "waits_ms": [200, 200]
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "clock_ms": 10400,
+        "targets": {
+          "api.jobs.example": { "calls": 1, "attempts": 4, "retries": 2, "successes": 1, "failures": 0 }
+        }
+      }
+    }
+  ]
+}
