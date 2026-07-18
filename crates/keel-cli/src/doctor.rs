@@ -197,6 +197,13 @@ const REGISTRY: &[Adapter] = &[
     },
 ];
 
+/// The registry's library names, for cross-module gates that must not drift
+/// from doctor's own (init's pre-existing-resilience annotation uses the
+/// same "imports at least one lib Keel wraps" test as [`resilience_finding`]).
+pub(crate) fn registry_libs() -> BTreeSet<&'static str> {
+    REGISTRY.iter().map(|a| a.lib).collect()
+}
+
 /// One line in the adapter section: a registry entry plus whether this project
 /// uses it.
 #[derive(Debug, Serialize)]
