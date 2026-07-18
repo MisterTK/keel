@@ -177,7 +177,18 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
 
     req = fullurl if isinstance(fullurl, ur.Request) else None
     url: str = req.full_url if req is not None else fullurl
-    method = req.get_method() if req is not None else ("POST" if data is not None else "GET")
+    if req is not None:
+        # OpenerDirector.open folds a non-None `data` kwarg into the Request
+        # (`req.data = data`) BEFORE dispatching — but that fold happens
+        # inside `orig`, which we haven't called yet. Judge as if it already
+        # happened, or `urlopen(Request(url), data=b"...")` misreads as GET
+        # (req.data is still None here) instead of POST.
+        body = data if data is not None else req.data
+        explicit_method = getattr(req, "method", None)
+        method = explicit_method if explicit_method is not None else ("POST" if body is not None else "GET")
+    else:
+        body = data
+        method = "POST" if data is not None else "GET"
     parts = urlsplit(url)
     host = parts.hostname or ""
     target = _http.resolve_policy_target(
@@ -185,7 +196,6 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
     )
     op = f"{method} {host}{parts.path}"
     idem_header = _http.idempotency_header(target)
-    body = req.data if req is not None else data
     hash_ = _http.derive_args_hash(
         target, method, url, body if isinstance(body, (bytes, str)) else None
     )

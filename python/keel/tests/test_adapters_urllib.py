@@ -195,6 +195,20 @@ class HardRulesTest(UrllibBase):
             self.assertEqual(ctx.exception.keel_outcome["error"]["code"], "KEEL-E014")
             self.assertEqual(srv.served, 1)
 
+    def test_request_object_with_separate_data_kwarg_is_judged_as_post(self) -> None:
+        # OpenerDirector.open folds a non-None `data` kwarg into a passed
+        # Request (`req.data = data`) before dispatch — a call built as
+        # `urlopen(Request(url), data=b"...")` must be judged POST (and
+        # therefore hit the no-idempotency-key hard rule), not misread as
+        # GET because `req.data` is still None at judgment time.
+        with FaultServer([fail(503), ok(b"unreached")]) as srv:
+            req = urllib.request.Request(srv.url())
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, data=b"x")
+            self.assertEqual(ctx.exception.code, 503)
+            self.assertEqual(ctx.exception.keel_outcome["error"]["code"], "KEEL-E014")
+            self.assertEqual(srv.served, 1)
+
     def test_post_with_idempotency_key_is_retried(self) -> None:
         with FaultServer([fail(503), ok(b"posted")]) as srv:
             req = urllib.request.Request(
