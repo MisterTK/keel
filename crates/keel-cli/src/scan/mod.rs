@@ -29,6 +29,25 @@ pub enum TargetClass {
     Llm,
 }
 
+/// How a sighted host's traffic is dispatched, best-known across sightings.
+/// Ordering is meaningful: `Tracked < UntrackedKnown < Unknown`, so merging
+/// (`min`) always keeps the most favorable class seen for a host across every
+/// file/language that sighted it. This is what `keel doctor` (a later
+/// program task) uses to say honestly what Keel can and cannot see: a host
+/// is `Tracked` if some sighting reached it through a registry-adapted
+/// library, `UntrackedKnown` if the best reach was a known-but-unadapted
+/// transport (stdlib `urllib`/`http.client`), and `Unknown` if no transport
+/// evidence was found near any sighting at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransportClass {
+    /// A registry-adapted library is in reach — Keel can wrap this.
+    Tracked,
+    /// A known transport Keel does not adapt (stdlib urllib/http.client).
+    UntrackedKnown,
+    /// A URL literal with no recognizable transport nearby.
+    Unknown,
+}
+
 /// One effect call site with enclosing-function attribution — an internal
 /// detail of the JS/TS pass ([`js`]), which uses it to verify its real
 /// scope-chain tracking (dotted paths like `Class.method`) independently of
@@ -136,6 +155,11 @@ pub struct ScanResult {
     /// Known resilience-library names detected (Python-only as of this
     /// build — see [`LangFindings::resilience_libs`]).
     pub resilience_libs: BTreeSet<String>,
+    /// Best-known [`TransportClass`] per sighted host, merged across every
+    /// file and language that sighted it (minimum = best class wins). Unlike
+    /// `targets`, this is never gated on `http_in_use` — it exists precisely
+    /// to let `keel doctor` report on hosts Keel cannot see at all.
+    pub host_transports: BTreeMap<String, TransportClass>,
 }
 
 impl ScanResult {
@@ -194,6 +218,11 @@ pub struct LangFindings {
     /// `libs`: these are libraries Keel never adapts, so merging them in
     /// would misclassify them as an "invisible" coverage gap.
     pub resilience_libs: BTreeSet<String>,
+    /// Per-sighting [`TransportClass`] for every host this language pass saw,
+    /// keyed by host. Never gated on `http_in_use` — a bare URL literal with
+    /// no reachable transport is exactly the `Unknown` case `keel doctor`
+    /// needs to report honestly.
+    pub host_transports: BTreeMap<String, TransportClass>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -215,6 +244,13 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
     }
     for lib in &f.resilience_libs {
         result.resilience_libs.insert(lib.clone());
+    }
+    for (host, class) in &f.host_transports {
+        result
+            .host_transports
+            .entry(host.clone())
+            .and_modify(|c| *c = (*c).min(*class))
+            .or_insert(*class);
     }
 }
 

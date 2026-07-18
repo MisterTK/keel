@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use super::{FunctionFacts, LangFindings, Sighting};
+use super::{FunctionFacts, LangFindings, Sighting, TransportClass};
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
 /// in sorted order, output keys are sorted. Finds imports of the known effect
@@ -39,7 +39,13 @@ RESILIENCE_LIBS = {"tenacity", "backoff", "retrying", "stamina"}
 TIME_LIBS = {"time", "datetime"}
 RANDOM_LIBS = {"random", "uuid", "secrets"}
 UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
-TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | {"os"}
+# Transport classification for `keel doctor`: a URL sighting is "tracked" when
+# a registry-adapted library is in reach in the same file, "untracked-known"
+# when only a known-but-unadapted stdlib transport is (urllib.request /
+# http.client), and otherwise "unknown" — no reachable transport at all.
+STDLIB_TRANSPORTS = {"urllib", "http"}  # urllib.request / http.client
+TRACKED_TRANSPORTS = HTTP_LIBS | {"psycopg", "boto3"}
+TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | STDLIB_TRANSPORTS | {"os"}
 TIME_NAMES = {"time", "time_ns", "monotonic", "monotonic_ns",
               "perf_counter", "perf_counter_ns", "gmtime", "localtime"}
 DT_NAMES = {"now", "utcnow", "today"}
@@ -192,6 +198,9 @@ for dirpath, dirnames, filenames in os.walk(root):
         except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
             continue
         files += 1
+        file_tracked = set()
+        file_stdlib = set()
+        file_urls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -200,16 +209,32 @@ for dirpath, dirnames, filenames in os.walk(root):
                         imports.append({"lib": t, "file": rel, "line": node.lineno})
                     elif t in RESILIENCE_LIBS:
                         resilience_libs.add(t)
+                    if t in TRACKED_TRANSPORTS:
+                        file_tracked.add(t)
+                    elif t in STDLIB_TRANSPORTS:
+                        file_stdlib.add(t)
             elif isinstance(node, ast.ImportFrom):
                 t = top(node.module or "")
                 if t in KNOWN:
                     imports.append({"lib": t, "file": rel, "line": node.lineno})
                 elif t in RESILIENCE_LIBS:
                     resilience_libs.add(t)
+                if t in TRACKED_TRANSPORTS:
+                    file_tracked.add(t)
+                elif t in STDLIB_TRANSPORTS:
+                    file_stdlib.add(t)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 h = host(node.value)
                 if h:
-                    urls.append({"host": h, "file": rel, "line": node.lineno})
+                    file_urls.append({"host": h, "file": rel, "line": node.lineno})
+        for u in file_urls:
+            if file_tracked:
+                u["transport"], u["via"] = "tracked", sorted(file_tracked)[0]
+            elif file_stdlib:
+                u["transport"], u["via"] = "untracked-known", sorted(file_stdlib)[0]
+            else:
+                u["transport"], u["via"] = "unknown", None
+            urls.append(u)
         mod = rel[:-3].replace("/", ".")
         if mod.endswith(".__init__"):
             mod = mod[: -len(".__init__")]
@@ -238,6 +263,13 @@ struct Url {
     host: String,
     file: String,
     line: u32,
+    /// `"tracked"` / `"untracked-known"` / absent-or-anything-else = unknown.
+    /// The walker's `via` (which stdlib/tracked lib classified it) is not
+    /// consumed on the Rust side yet — only the class matters for
+    /// `host_transports` — so it is left for serde to ignore rather than
+    /// carried as an unread field.
+    #[serde(default)]
+    transport: Option<String>,
 }
 
 /// One module-level function's facts from the walker.
@@ -315,13 +347,24 @@ pub fn scan(project: &Path) -> PyScan {
     for url in &output.urls {
         // The walker already returned a bare hostname (urlsplit.hostname), so it
         // is lowercased and port-stripped; normalize defensively.
+        let host = url.host.to_ascii_lowercase();
         findings.hosts.push((
-            url.host.to_ascii_lowercase(),
+            host.clone(),
             Sighting {
                 file: url.file.clone(),
                 line: url.line,
             },
         ));
+        let class = match url.transport.as_deref() {
+            Some("tracked") => TransportClass::Tracked,
+            Some("untracked-known") => TransportClass::UntrackedKnown,
+            _ => TransportClass::Unknown,
+        };
+        findings
+            .host_transports
+            .entry(host)
+            .and_modify(|c| *c = (*c).min(class))
+            .or_insert(class);
     }
     let functions = output
         .functions
@@ -407,6 +450,38 @@ mod tests {
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
         );
+    }
+
+    #[test]
+    fn urls_are_classified_by_transport() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // tracked: httpx imported in the same file.
+        fs::write(
+            dir.path().join("a.py"),
+            "import httpx\nU = \"https://api.tracked.com/v1\"\n",
+        )
+        .unwrap();
+        // untracked-known: only stdlib urllib in reach.
+        fs::write(
+            dir.path().join("b.py"),
+            "import urllib.request\nU = \"https://api.stdlib.com/v1\"\n",
+        )
+        .unwrap();
+        // unknown: bare URL, no transport at all.
+        fs::write(
+            dir.path().join("c.py"),
+            "U = \"https://api.mystery.com/v1\"\n",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let t = |h: &str| s.findings.host_transports.get(h).copied();
+        assert_eq!(t("api.tracked.com"), Some(TransportClass::Tracked));
+        assert_eq!(t("api.stdlib.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.mystery.com"), Some(TransportClass::Unknown));
     }
 
     #[test]
