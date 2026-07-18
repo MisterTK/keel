@@ -7,7 +7,8 @@
  *
  * Simplifications (deliberate, documented): virtual clock (waits recorded,
  * not slept), no jitter, exact-match target resolution with defaults.llm /
- * defaults.outbound fallback, `timeout` validated but not enforced.
+ * defaults.outbound fallback, `timeout` validated but not enforced. Poll is
+ * implemented on the virtual clock too (pending waits advance the clock).
  *
  * Bit-identical to the real core (parity rule, not a simplification): the
  * breaker's count mode *and* rate mode (window + failure_rate + min_calls),
@@ -155,6 +156,31 @@ function conditionMatches(cond, cls, httpStatus) {
   return /^\d{3}$/.test(cond) && Number(cond) === httpStatus;
 }
 
+/** Judge one successful poll iteration's payload: "terminal" | "pending" |
+ *  "fail_open". Parity with keel-core's `poll_verdict`
+ *  (conformance/README.md "Poll"). */
+function pollVerdict(poll, payload) {
+  if (!isTable(payload)) return "fail_open";
+  let doc = payload;
+  if ("body_b64" in payload || ("status" in payload && "headers" in payload)) {
+    if (typeof payload.body_b64 !== "string") return "fail_open";
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.from(payload.body_b64, "base64").toString("utf8"));
+    } catch {
+      return "fail_open";
+    }
+    if (!isTable(parsed)) return "fail_open";
+    doc = parsed;
+  }
+  const field = poll.until.field;
+  if (!(field in doc)) return "fail_open";
+  const value = doc[field];
+  return typeof value === "string" && poll.until.terminal.includes(value)
+    ? "terminal"
+    : "pending";
+}
+
 function invalid(path, msg) {
   return new KeelError("KEEL-E001", `policy invalid at ${path}: ${msg}`);
 }
@@ -184,6 +210,7 @@ function validateTargetPolicy(path, v) {
     "idempotency",
     "fallback",
     "budget",
+    "poll",
   ]);
   if (v.timeout !== undefined && parseDuration(v.timeout) === null)
     throw invalid(path, "bad timeout duration");
@@ -265,6 +292,19 @@ function validateTargetPolicy(path, v) {
     rejectUnknownKeys(`${path}.idempotency`, v.idempotency, ["header"]);
     if (typeof v.idempotency.header !== "string")
       throw invalid(`${path}.idempotency.header`, "header must be a string");
+  }
+  if (v.poll !== undefined) {
+    if (!isTable(v.poll)) throw invalid(path, "poll must be a table");
+    rejectUnknownKeys(`${path}.poll`, v.poll, ["interval", "deadline", "until"]);
+    for (const key of ["interval", "deadline"])
+      if (parseDuration(v.poll[key]) === null) throw invalid(path, `bad poll.${key} duration`);
+    if (!isTable(v.poll.until)) throw invalid(path, "poll.until must be a table");
+    rejectUnknownKeys(`${path}.poll.until`, v.poll.until, ["field", "terminal"]);
+    if (typeof v.poll.until.field !== "string" || v.poll.until.field.length === 0)
+      throw invalid(path, "poll.until.field must be a non-empty string");
+    const terminal = v.poll.until.terminal;
+    if (!Array.isArray(terminal) || terminal.length === 0 || !terminal.every((t) => typeof t === "string"))
+      throw invalid(path, "poll.until.terminal must be a non-empty array of strings");
   }
 }
 
@@ -472,7 +512,7 @@ export class KeelCoreStub {
       }
     }
 
-    // retry loop
+    // retry loop config
     let maxAttempts = 1;
     let schedule = DEFAULT_SCHEDULE;
     let on = DEFAULT_ON;
@@ -482,67 +522,107 @@ export class KeelCoreStub {
       on = retry.on ?? DEFAULT_ON;
     }
 
-    let terminal = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      out.attempts = attempt;
-      m.attempts += 1;
-      const res = effect(attempt);
-      if (res.status === "ok") {
-        m.successes += 1;
-        if (isTable(breakerCfg)) {
-          const b = this.#breakers.get(target);
-          // A live success is only reached while closed or half-open;
-          // `openUntil` set here means a probe just closed the breaker.
-          const closedAProbe = b.openUntil !== null;
-          b.consecutive = 0;
-          b.openUntil = null;
-          if (closedAProbe) {
-            // A closing probe resets the window: the pre-open failure
-            // history must not instantly re-trip a freshly-recovered target.
-            b.outcomes = [];
-          } else {
-            const resolved = breakerMode(breakerCfg);
-            if (resolved.mode === "rate") breakerObserve(b, this.#nowMs, resolved.windowMs, false);
-          }
+    const runAttempts = () => {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        out.attempts += 1;
+        m.attempts += 1;
+        const res = effect(attempt);
+        if (res.status === "ok") return { status: "ok", value: res.payload };
+        const cls = res.class ?? "other";
+        const httpStatus = res.http_status;
+        const message = res.message ?? "";
+        const retryable = on.some((c) => conditionMatches(c, cls, httpStatus));
+        let code = null;
+        if (!retryable) code = "KEEL-E015";
+        else if (attempt === maxAttempts) code = "KEEL-E010";
+        else if (!request.idempotent) code = "KEEL-E014";
+        if (code) {
+          const detail = httpStatus != null ? `${cls} ${httpStatus}` : cls;
+          let msg;
+          if (code === "KEEL-E010")
+            msg = `${op} failed ${attempt}/${maxAttempts} attempts (last: ${detail}). ${message}`;
+          else if (code === "KEEL-E014")
+            msg = `${op} failed (${detail}). Not retried: call is not idempotent — observed, not retried. ${message}`;
+          else
+            msg = `${op} failed (${detail}); error class is not retryable per policy. ${message}`;
+          const terminal = { code, class: cls, message: msg.trimEnd() };
+          if (httpStatus != null) terminal.http_status = httpStatus;
+          if (res.original !== undefined) terminal.original = res.original;
+          return { status: "error", value: terminal };
         }
-        if (cacheKey && cacheTtl !== null)
-          this.#cache.set(cacheKey, { expires: this.#nowMs + cacheTtl, payload: res.payload });
-        out.result = "ok";
-        out.payload = res.payload;
-        out.breaker = this.#breakerState(target);
-        return out;
+        let wait = scheduleWait(schedule, attempt);
+        if (res.retry_after_ms != null) wait = Math.max(wait, res.retry_after_ms);
+        out.waits_ms.push(wait);
+        this.#nowMs += wait;
+        m.retries += 1;
       }
+      throw new Error("loop always returns by the final attempt");
+    };
 
-      const cls = res.class ?? "other";
-      const httpStatus = res.http_status;
-      const message = res.message ?? "";
-      const retryable = on.some((c) => conditionMatches(c, cls, httpStatus));
-      let code = null;
-      if (!retryable) code = "KEEL-E015";
-      else if (attempt === maxAttempts) code = "KEEL-E010";
-      else if (!request.idempotent) code = "KEEL-E014";
-      if (code) {
-        const detail = httpStatus != null ? `${cls} ${httpStatus}` : cls;
-        let msg;
-        if (code === "KEEL-E010")
-          msg = `${op} failed ${attempt}/${maxAttempts} attempts (last: ${detail}). ${message}`;
-        else if (code === "KEEL-E014")
-          msg = `${op} failed (${detail}). Not retried: call is not idempotent — observed, not retried. ${message}`;
-        else
-          msg = `${op} failed (${detail}); error class is not retryable per policy. ${message}`;
-        terminal = { code, class: cls, message: msg.trimEnd() };
-        if (httpStatus != null) terminal.http_status = httpStatus;
-        if (res.original !== undefined) terminal.original = res.original;
-        break;
+    // poll layer (CCR-3): wraps the retry loop; gate = resolved poll table
+    // + idempotent GET/HEAD op (conformance/README.md "Poll").
+    const pollCfg = this.#layer(target, "poll");
+    const pollActive =
+      isTable(pollCfg) &&
+      request.idempotent === true &&
+      (op.startsWith("GET ") || op.startsWith("HEAD "));
+    const pollStartedMs = this.#nowMs;
+    let result;
+    for (;;) {
+      result = runAttempts();
+      if (result.status === "ok" && pollActive) {
+        const verdict = pollVerdict(pollCfg, result.value);
+        if (verdict === "pending") {
+          const interval = parseDuration(pollCfg.interval);
+          const deadline = parseDuration(pollCfg.deadline);
+          const elapsed = this.#nowMs - pollStartedMs;
+          if (elapsed + interval > deadline) {
+            result = {
+              status: "error",
+              value: {
+                code: "KEEL-E016",
+                class: "other",
+                message: `${op} poll deadline exceeded: '${pollCfg.until.field}' not terminal after ${deadline}ms`,
+              },
+            };
+            break;
+          }
+          this.#nowMs += interval;
+          continue;
+        }
       }
-      let wait = scheduleWait(schedule, attempt);
-      if (res.retry_after_ms != null) wait = Math.max(wait, res.retry_after_ms);
-      out.waits_ms.push(wait);
-      this.#nowMs += wait;
-      m.retries += 1;
+      break;
+    }
+
+    if (result.status === "ok") {
+      const payload = result.value;
+      m.successes += 1;
+      if (isTable(breakerCfg)) {
+        const b = this.#breakers.get(target);
+        // A live success is only reached while closed or half-open;
+        // `openUntil` set here means a probe just closed the breaker.
+        const closedAProbe = b.openUntil !== null;
+        b.consecutive = 0;
+        b.openUntil = null;
+        if (closedAProbe) {
+          // A closing probe resets the window: the pre-open failure
+          // history must not instantly re-trip a freshly-recovered target.
+          b.outcomes = [];
+        } else {
+          const resolved = breakerMode(breakerCfg);
+          if (resolved.mode === "rate") breakerObserve(b, this.#nowMs, resolved.windowMs, false);
+        }
+      }
+      if (cacheKey && cacheTtl !== null)
+        this.#cache.set(cacheKey, { expires: this.#nowMs + cacheTtl, payload });
+      out.result = "ok";
+      out.payload = payload;
+      out.breaker = this.#breakerState(target);
+      return out;
     }
 
     // terminal failure
+    const terminal = result.value;
     m.failures += 1;
     if (isTable(breakerCfg)) {
       const cooldown =
