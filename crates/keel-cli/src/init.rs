@@ -163,12 +163,13 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
         Err(e) => return config_error(&e),
     };
 
-    let content = render_keel_toml(&scan, &discovery, opts.stamp.then(today_utc).as_deref());
+    let stamp = opts.stamp.then(today_utc);
+    let content = render_keel_toml(&scan, &discovery, stamp.as_deref());
     let targets = merged_targets(&scan, &discovery);
 
     let toml_path = evidence::keel_toml(project);
     if opts.diff {
-        return diff(&toml_path, &scan, &discovery, &targets, &content);
+        return diff(&toml_path, &scan, &discovery, &targets, stamp.as_deref());
     }
     if toml_path.exists() {
         return config_error(&format!(
@@ -232,6 +233,21 @@ pub fn render_keel_toml(
     discovery: &[TargetStats],
     stamp: Option<&str>,
 ) -> String {
+    render_keel_toml_for_targets(scan, discovery, &merged_targets(scan, discovery), stamp)
+}
+
+/// Render `keel.toml` text restricted to exactly `targets` (header + one
+/// block per target, in the given order). [`render_keel_toml`] is this called
+/// with every merged target; `--diff`'s no-file-yet case ([`diff`]) calls it
+/// directly with the excluded-bucket hosts already dropped, so the created
+/// file it proposes is byte-identical to a fresh `keel init` minus those
+/// blocks — never a truncated re-render of the full generated text.
+fn render_keel_toml_for_targets(
+    scan: &ScanResult,
+    discovery: &[TargetStats],
+    targets: &[String],
+    stamp: Option<&str>,
+) -> String {
     let by_target: BTreeMap<&str, &TargetStats> =
         discovery.iter().map(|s| (s.target.as_str(), s)).collect();
     let observed_runs = u32::from(!discovery.is_empty());
@@ -251,11 +267,11 @@ pub fn render_keel_toml(
         "# Every entry below was found in YOUR code. Delete anything; defaults still apply.\n",
     );
 
-    for target in merged_targets(scan, discovery) {
+    for target in targets {
         out.push('\n');
-        let evidence = scan.targets.get(&target);
+        let evidence = scan.targets.get(target);
         let stats = by_target.get(target.as_str()).copied();
-        out.push_str(&render_target_block(&target, evidence, stats));
+        out.push_str(&render_target_block(target, evidence, stats));
     }
     out
 }
@@ -475,12 +491,20 @@ fn pad_comment(line: &str, comment: &str) -> String {
 /// tuning and comments outside the changed blocks survive byte-for-byte. With
 /// no existing file the patch creates the whole generated keel.toml
 /// (`--- /dev/null`).
+///
+/// Never proposes a NEW policy block for a host [`doctor::classify_topology`]
+/// puts in the excluded (dependency-averse) bucket — the same classification
+/// `keel doctor` reports, reused directly so the two surfaces never disagree
+/// about which hosts get policy proposed (dx-spec §2's honesty triad). An
+/// excluded host the user already declared in their own `keel.toml` is left
+/// alone (neither added nor removed); the diff's human text explains every
+/// exclusion, sorted by host.
 fn diff(
     toml_path: &Path,
     scan: &ScanResult,
     discovery: &[TargetStats],
     generated: &[String],
-    content: &str,
+    stamp: Option<&str>,
 ) -> Rendered {
     let existing_text = match read_existing(toml_path) {
         Ok(t) => t,
@@ -494,10 +518,16 @@ fn diff(
         Ok(set) => set.unwrap_or_default(),
         Err(e) => return config_error(&e),
     };
+
+    let wrapped_targets: BTreeSet<String> = discovery.iter().map(|s| s.target.clone()).collect();
+    let topology = crate::doctor::classify_topology(scan, &wrapped_targets);
+    let excluded_hosts: BTreeSet<&str> =
+        topology.excluded.iter().map(|e| e.host.as_str()).collect();
+
     let generated_set: BTreeSet<&str> = generated.iter().map(String::as_str).collect();
     let added: Vec<String> = generated_set
         .iter()
-        .filter(|t| !existing.contains(**t))
+        .filter(|t| !existing.contains(**t) && !excluded_hosts.contains(**t))
         .map(|t| (*t).to_owned())
         .collect();
     let removed: Vec<String> = existing
@@ -512,10 +542,11 @@ fn diff(
         .collect();
 
     let ops = if existing_text.is_none() {
-        // No file yet: the patch creates the whole generated keel.toml, header
-        // comments included.
+        // No file yet: the patch creates the generated keel.toml (header
+        // comments included), restricted to `added` — which already excludes
+        // dependency-averse-only hosts.
         vec![PolicyOp::AppendBlock {
-            text: content.to_owned(),
+            text: render_keel_toml_for_targets(scan, discovery, &added, stamp),
         }]
     } else {
         let by_target: BTreeMap<&str, &TargetStats> =
@@ -538,7 +569,13 @@ fn diff(
 
     let mut human = String::from("keel \u{25b8} keel init --diff\n");
     if added.is_empty() && removed.is_empty() {
-        human.push_str("  no changes: every discovered target is already in keel.toml.\n");
+        if topology.excluded.is_empty() {
+            human.push_str("  no changes: every discovered target is already in keel.toml.\n");
+        } else {
+            human.push_str(
+                "  no policy changes: every discovered target is already in keel.toml or excluded below.\n",
+            );
+        }
     } else {
         for t in &added {
             let line = format!("  + [target.\"{t}\"]   (found in code, not in keel.toml)\n");
@@ -552,6 +589,22 @@ fn diff(
     if !proposal.patch.is_empty() {
         human.push_str("\napply with `git apply` (or `patch -p1`):\n\n");
         human.push_str(&proposal.patch);
+    }
+    if !topology.excluded.is_empty() {
+        // Sorted by host: `TopologyEntry`s already arrive in host order
+        // (`classify_topology` iterates `scan.targets`, a `BTreeMap`), but
+        // sort explicitly so this stays correct even if that internal detail
+        // ever changes.
+        let mut excluded: Vec<_> = topology.excluded.iter().collect();
+        excluded.sort_by(|a, b| a.host.cmp(&b.host));
+        human.push('\n');
+        for entry in excluded {
+            let line = format!(
+                "# excluded (dependency-averse): {} — {}\n",
+                entry.host, entry.reason
+            );
+            human.push_str(&line);
+        }
     }
     let report = DiffReport {
         added,
@@ -682,11 +735,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::{Command, Stdio};
 
     use keel_journal::ErrorClass;
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Whether `python3` is on PATH — gates the Python-scan end-to-end tests,
+    /// mirroring `scan::python`'s test helper (private to that module, so
+    /// duplicated here rather than shared across crates).
+    fn python3_present() -> bool {
+        Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 
     /// A `TargetStats` for `llm:openai` with the given call count and observation
     /// window; every other counter is inert (irrelevant to rate derivation).
@@ -1068,6 +1134,58 @@ timeout = \"5s\"
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             old
         );
+    }
+
+    /// dx-spec's honesty triad, `--diff` leg: a host seen only inside a
+    /// dependency-averse file (Task 7's `keel doctor` bucket, reused here via
+    /// `classify_topology`) must never get a proposed policy block, and the
+    /// diff must say why — so `keel doctor` and `keel init --diff` never
+    /// disagree about which hosts get policy proposed.
+    #[test]
+    fn diff_skips_dependency_averse_only_hosts_and_says_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"risk gate. stdlib only.\"\"\"\nimport urllib.request\nU = \"https://api.broker.com/v2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\n",
+        )
+        .unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let text = &r.human;
+        assert!(
+            text.contains("api.normal.com"),
+            "normal host proposed: {text}"
+        );
+        assert!(
+            !text.contains("[target.\"api.broker.com\"]"),
+            "no policy for the gate-file host: {text}"
+        );
+        assert!(
+            text.contains("excluded (dependency-averse): api.broker.com"),
+            "{text}"
+        );
+        // The structured `added` list must agree with the human text.
+        let added = r.json["added"].as_array().unwrap();
+        assert!(added.iter().any(|v| v == "api.normal.com"));
+        assert!(!added.iter().any(|v| v == "api.broker.com"));
     }
 
     /// With no keel.toml the patch creates the whole generated file from
