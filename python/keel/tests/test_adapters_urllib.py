@@ -290,6 +290,48 @@ class CacheReplayTest(UrllibBase):
         self.assertEqual(srv.served, 1)
 
 
+class PollTest(UrllibBase):
+    """CCR-3 end-to-end at the seam: the claude-trader fetch_short_metrics
+    loop shape (submit-then-poll against a status field) collapses into one
+    urlopen call. The stub backend advances a virtual clock, so 10s/90s
+    policies run instantly offline."""
+
+    def _configure_poll(self, deadline: str = "90s") -> None:
+        poll = {
+            "interval": "10s",
+            "deadline": deadline,
+            "until": {"field": "status", "terminal": ["completed", "failed"]},
+        }
+        self.backend.configure({**level0_defaults(), "target": {"127.0.0.1": {"poll": poll}}})
+
+    def test_pending_then_terminal_is_one_call(self) -> None:
+        self._configure_poll()
+        running = ok(b'{"status": "running"}', {"Content-Type": "application/json"})
+        done = ok(b'{"status": "completed", "value": 7}', {"Content-Type": "application/json"})
+        with FaultServer([running, running, done]) as srv:
+            with urllib.request.urlopen(srv.url("/research")) as r:
+                self.assertEqual(r.status, 200)
+                self.assertEqual(r.read(), b'{"status": "completed", "value": 7}')
+                self.assertEqual(r.keel_outcome["attempts"], 3)
+            self.assertEqual(srv.served, 3)
+
+    def test_deadline_raises_keel_e016(self) -> None:
+        self._configure_poll(deadline="25s")
+        running = ok(b'{"status": "running"}', {"Content-Type": "application/json"})
+        with FaultServer([running, running, running]) as srv:
+            with self.assertRaises(KeelError) as ctx:
+                urllib.request.urlopen(srv.url("/research"))
+            self.assertIn("KEEL-E016", str(ctx.exception))
+            self.assertEqual(srv.served, 3)
+
+    def test_non_json_body_fails_open(self) -> None:
+        self._configure_poll()
+        with FaultServer([ok(b"plain text", {"Content-Type": "text/plain"})]) as srv:
+            with urllib.request.urlopen(srv.url("/research")) as r:
+                self.assertEqual(r.read(), b"plain text")
+                self.assertEqual(r.keel_outcome["attempts"], 1)
+
+
 class InstallLifecycleTest(UrllibBase):
     def test_uninstall_restores_and_reinstall_is_idempotent(self) -> None:
         from urllib.request import OpenerDirector

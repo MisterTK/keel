@@ -345,11 +345,11 @@ async def _run(self: Any, orig: Callable[..., Any], method: str, str_or_url: Any
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(self, method, str_or_url, kwargs)
     env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl is actually configured for the
-    # target (mirrors Node's fetch gate and the sibling HTTP packs): with no
-    # cache there is nothing to store, so a streaming/SSE GET passes through
-    # unbuffered at Level 0.
-    cacheable = hash_ is not None and _http.cache_configured(target)
+    # Buffer the body ONLY when a cache ttl OR a poll table is actually
+    # configured for the target (mirrors Node's fetch gate and the sibling
+    # HTTP packs): with neither, there is nothing to store or judge, so a
+    # streaming/SSE GET passes through unbuffered at Level 0.
+    cacheable = hash_ is not None and _http.buffer_body_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
     exec_async = getattr(backend, "execute_async", None)
 

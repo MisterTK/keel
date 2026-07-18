@@ -1,15 +1,16 @@
 ---
 name: keel
-description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project — or when working in a repo that already uses Keel (a `keel.toml` file, or an AGENTS.md "Keel" section, is present). Covers installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server for agent-driven diagnosis, and reading `keel status`/`keel trace` output. Do not use for building a workflow-engine/queue-based system from scratch, for languages Keel does not support yet (only Python/Node/Rust), or for one-off retry logic in a codebase that has no interest in adopting Keel as a dependency.
+description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project — or when working in a repo that already uses Keel (a `keel.toml` file, or an AGENTS.md "Keel" section, is present). Covers installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server for agent-driven diagnosis, and reading `keel status`/`keel trace` output. Do not use for building a workflow-engine/queue-based system from scratch, for languages Keel does not support yet (only Python/Node/Rust), or for one-off retry logic in a codebase that has no interest in adopting Keel as a dependency.
 ---
 
 # Keel
 
 Keel is "the SQLite of durable execution": resilience (retry, backoff,
-timeout, circuit breaker, rate limit, cache) and opt-in crash-resumable
-durable flows, applied at the call sites a target project already makes —
-**zero code changes**. Policy lives in one file, `keel.toml`. There is no
-service to run, no database to provision, and no daemon.
+timeout, circuit breaker, rate limit, cache, poll-until-terminal) and
+opt-in crash-resumable durable flows, applied at the call sites a target
+project already makes — **zero code changes**. Policy lives in one file,
+`keel.toml`. There is no service to run, no database to provision, and no
+daemon.
 
 ## Is this project already using Keel?
 

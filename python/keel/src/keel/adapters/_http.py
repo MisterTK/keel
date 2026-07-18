@@ -142,6 +142,19 @@ def cache_configured(target: str) -> bool:
     return isinstance(cache, dict) and cache.get("ttl") is not None
 
 
+def poll_configured(target: str) -> bool:
+    """True iff a ``poll`` table resolves for ``target`` (CCR-3). Polling
+    judges the response BODY, so a poll-configured call must buffer it into
+    the envelope (``body_b64``) exactly as a cache ttl does."""
+    return isinstance(resolve_layer(target, "poll"), dict)
+
+
+def buffer_body_configured(target: str) -> bool:
+    """The body-buffering gate at the seam: cache ttl OR poll table. Mirrors
+    Node's fetch gate."""
+    return cache_configured(target) or poll_configured(target)
+
+
 def resolve_target(host: str) -> str:
     """The policy target for a host: ``llm:<provider>`` for a known provider
     host (exact match, or a Vertex AI regional endpoint via the suffix rule),
@@ -506,6 +519,8 @@ __all__ = [
     "resolve_layer",
     "idempotency_header",
     "cache_configured",
+    "poll_configured",
+    "buffer_body_configured",
     "resolve_policy_target",
     "resolve_target",
     "is_idempotent",

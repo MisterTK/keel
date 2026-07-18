@@ -300,7 +300,7 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
     current, pass_data, url, target, op, idempotent, hash_, injected = _judge(fullurl, data)
     effective_timeout = _compose_timeout(target, timeout)
     env = _http.build_request(target, op, idempotent, hash_)
-    cacheable = hash_ is not None and _http.cache_configured(target)
+    cacheable = hash_ is not None and _http.buffer_body_configured(target)
     live: dict[str, Any] = {"ok": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:
