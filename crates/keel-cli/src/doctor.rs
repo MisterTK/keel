@@ -237,6 +237,20 @@ struct Finding {
     topic: &'static str,
 }
 
+/// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
+/// agent/human reading the report to work top-down. `code` is a CLOSED set —
+/// url-no-transport | subprocess-blind-spot | dependency-averse-excluded |
+/// preexisting-resilience | code-hash-stale — ranked lowest-Keel-confidence
+/// first (rank 1 = Keel knows least, investigate first). Text is entirely
+/// keel-authored; only hostnames, file paths, and lib names are interpolated.
+#[derive(Debug, Serialize)]
+struct FollowUp {
+    code: &'static str,
+    detail: String,
+    rank: u32,
+    subject: String,
+}
+
 /// Where the journal lives, as resolved for this project — the same selection
 /// the engine makes at configure time.
 #[derive(Debug, Serialize)]
@@ -315,6 +329,7 @@ struct DoctorReport {
     adapters: Vec<AdapterStatus>,
     coverage: Coverage,
     findings: Vec<Finding>,
+    follow_ups: Vec<FollowUp>,
     journal: JournalReport,
     ok: bool,
     policy: PolicyCheck,
@@ -464,6 +479,91 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
         });
     }
     findings
+}
+
+/// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
+/// the claim Keel knows least about — it saw a URL but cannot even name the
+/// dispatch path — so it is investigated first; rank 5 (code-hash-stale,
+/// reserved for the WS6 emitter) is a mechanical, fully-verified fact that
+/// merely awaits a human decision.
+fn follow_up_rank(code: &str) -> u32 {
+    match code {
+        "url-no-transport" => 1,
+        "subprocess-blind-spot" => 2,
+        "dependency-averse-excluded" => 3,
+        "preexisting-resilience" => 4,
+        _ => 5, // code-hash-stale (WS6)
+    }
+}
+
+/// The ranked follow-up list (WS2): computed from the same structured
+/// evidence as the findings — never by parsing finding text — then sorted by
+/// the stable key (rank, code, subject).
+fn build_follow_ups(
+    topology: &Topology,
+    resilience: Option<&Finding>,
+    scan: &ScanResult,
+) -> Vec<FollowUp> {
+    let mut ups = Vec::new();
+    for entry in &topology.unreachable {
+        ups.push(FollowUp {
+            code: "url-no-transport",
+            detail: format!(
+                "Trace how requests to `{}` are actually dispatched — {}.",
+                entry.host, entry.reason
+            ),
+            rank: follow_up_rank("url-no-transport"),
+            subject: entry.host.clone(),
+        });
+    }
+    if !topology.external_processes.is_empty() {
+        let cmds: Vec<String> = topology
+            .external_processes
+            .iter()
+            .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
+            .collect();
+        ups.push(FollowUp {
+            code: "subprocess-blind-spot",
+            detail: format!(
+                "Keel cannot see traffic inside externally-launched processes; confirm none of \
+                 these carry traffic you care about: {}.",
+                cmds.join(", ")
+            ),
+            rank: follow_up_rank("subprocess-blind-spot"),
+            subject: format!(
+                "{} externally-launched process(es)",
+                topology.external_processes.len()
+            ),
+        });
+    }
+    for entry in &topology.excluded {
+        ups.push(FollowUp {
+            code: "dependency-averse-excluded",
+            detail: format!(
+                "`{}` was excluded from proposed policy — {}. Confirm the exclusion is intended.",
+                entry.host, entry.reason
+            ),
+            rank: follow_up_rank("dependency-averse-excluded"),
+            subject: entry.host.clone(),
+        });
+    }
+    if resilience.is_some() {
+        let libs: Vec<&str> = scan.resilience_libs.iter().map(String::as_str).collect();
+        ups.push(FollowUp {
+            code: "preexisting-resilience",
+            detail: format!(
+                "Decide whether {} still needs its own retry/backoff now that Keel wraps the \
+                 same calls — delete the old code or scope Keel's policy, not both.",
+                libs.join(", ")
+            ),
+            rank: follow_up_rank("preexisting-resilience"),
+            subject: libs.join(", "),
+        });
+    }
+    ups.sort_by(|a, b| {
+        (a.rank, a.code, a.subject.as_str()).cmp(&(b.rank, b.code, b.subject.as_str()))
+    });
+    ups
 }
 
 /// A root `keel.toml` in a Google `agents-cli` project (an
@@ -629,7 +729,9 @@ fn build_report(
             topic: "policy",
         });
     }
-    findings.extend(resilience_finding(scan, &registry_libs));
+    let resilience = resilience_finding(scan, &registry_libs);
+    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan);
+    findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
 
@@ -642,6 +744,7 @@ fn build_report(
             wrapped,
         },
         findings,
+        follow_ups,
         journal,
         ok,
         policy,
@@ -898,6 +1001,13 @@ fn human(r: &DoctorReport) -> String {
             }
         }
     }
+    if !r.follow_ups.is_empty() {
+        out.push_str("\nfollow-ups (work top-down; 1 = Keel knows least)\n");
+        for f in &r.follow_ups {
+            let line = format!("  {}. [{}] {} — {}\n", f.rank, f.code, f.subject, f.detail);
+            out.push_str(&line);
+        }
+    }
     let tail = format!(
         "\n{}\n",
         if r.ok {
@@ -1086,6 +1196,119 @@ mod tests {
         );
         // ok is unaffected: honesty findings are not configuration errors.
         assert!(r.ok);
+    }
+
+    /// The ranked follow-up list (WS2): every honesty signal that needs a human/
+    /// agent to chase becomes one entry in a closed vocabulary, sorted by
+    /// (rank, code, subject) with rank = ascending Keel-confidence.
+    #[test]
+    fn follow_ups_are_ranked_closed_vocabulary_and_sorted() {
+        use crate::scan::{DepAverseFile, SubprocessSighting, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 4,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Two unreachable hosts (rank 1) — inserted in reverse order to prove
+        // the sort, not the insertion order, decides.
+        for (host, file) in [("api.zeta.com", "z.py"), ("api.alpha.com", "a.py")] {
+            scan.targets.insert(
+                host.into(),
+                TargetEvidence {
+                    class: TargetClass::Host,
+                    sightings: [Sighting {
+                        file: file.into(),
+                        line: 1,
+                    }]
+                    .into_iter()
+                    .collect(),
+                },
+            );
+            scan.host_transports
+                .insert(host.into(), TransportClass::UntrackedKnown);
+        }
+        // One external process (rank 2).
+        scan.subprocesses.push(SubprocessSighting {
+            file: "launch.py".into(),
+            line: 12,
+            launcher: "subprocess.run".into(),
+            command: "uvx alpaca-mcp-server".into(),
+        });
+        // One excluded host (rank 3).
+        scan.targets.insert(
+            "api.broker.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "risk_gate.py".into(),
+                    line: 20,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.dependency_averse.push(DepAverseFile {
+            file: "risk_gate.py".into(),
+            reason: "stdlib-only + name/docstring signal: risk".into(),
+        });
+        // Pre-existing resilience alongside a wrapped lib (rank 4).
+        scan.libs.insert("httpx".to_owned());
+        scan.resilience_libs.insert("tenacity".to_owned());
+
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+
+        let got: Vec<(u32, &str, &str)> = r
+            .follow_ups
+            .iter()
+            .map(|f| (f.rank, f.code, f.subject.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "url-no-transport", "api.alpha.com"),
+                (1, "url-no-transport", "api.zeta.com"),
+                (
+                    2,
+                    "subprocess-blind-spot",
+                    "1 externally-launched process(es)"
+                ),
+                (3, "dependency-averse-excluded", "api.broker.com"),
+                (4, "preexisting-resilience", "tenacity"),
+            ]
+        );
+        // Every detail is non-empty keel-authored text.
+        assert!(r.follow_ups.iter().all(|f| !f.detail.is_empty()));
+        // follow_ups never affect ok.
+        assert!(r.ok);
+        // The human view carries the section, ranked.
+        let text = human(&r);
+        assert!(text.contains("follow-ups"));
+        assert!(text.contains("[url-no-transport] api.alpha.com"));
+    }
+
+    /// No signals → the field is present and empty (agents can rely on the key).
+    #[test]
+    fn no_signals_means_empty_follow_ups() {
+        use crate::scan::TransportClass;
+        let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        // httpx is a tracked transport for this host.
+        let mut scan = scan;
+        scan.host_transports
+            .insert("api.example.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+        assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
     }
 
     /// The override precedence documented on [`classify_topology`]: a

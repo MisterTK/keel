@@ -154,6 +154,7 @@
       "topic": "invisible"
     }
   ],
+  "follow_ups": [],
   "journal": {
     "backend": "sqlite",
     "location": ".keel/journal.db",

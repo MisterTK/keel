@@ -41,7 +41,9 @@ get_status = `keel status --json`, get_doctor_report = `keel doctor --json`, \
 propose_policy = `keel init --diff --json` (an applyable keel.toml patch — never writes), \
 list_flows = `keel flows --json`, get_trace = `keel trace <flow> --json`, \
 explain_error = `keel explain <code> --json`. Outputs are deterministic \
-(sorted keys, no timestamps), so two calls can be diffed to see real change.";
+(sorted keys, no timestamps), so two calls can be diffed to see real change. \
+get_doctor_report also returns a ranked follow_ups list (rank 1 = least Keel-verifiable, \
+investigate first) — work it top-down before proposing policy.";
 
 // JSON-RPC 2.0 error codes.
 const PARSE_ERROR: i64 = -32700;

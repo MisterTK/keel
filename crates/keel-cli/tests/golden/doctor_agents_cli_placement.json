@@ -160,6 +160,7 @@
       "topic": "agents-cli-config-placement"
     }
   ],
+  "follow_ups": [],
   "journal": {
     "backend": "sqlite",
     "location": ".keel/journal.db",
