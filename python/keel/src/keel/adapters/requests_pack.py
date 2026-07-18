@@ -286,10 +286,30 @@ def _next_hop_request(request: Any, next_model: str) -> Any | None:
 
 # --- seam --------------------------------------------------------------------
 
-def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
+def _compose_requests_timeout(policy_s: float | None, caller_timeout: Any) -> Any:
+    """Tighter wins, in requests' own ``timeout=`` shape: ``None`` (block
+    forever, requests' default) or a bare float apply to both connect+read;
+    a ``(connect, read)`` tuple composes per leg. A configured policy timeout
+    always wins over "no caller timeout"; two real numbers take the min."""
+    if policy_s is None:
+        return caller_timeout
+    if isinstance(caller_timeout, tuple) and len(caller_timeout) == 2:
+        connect, read = caller_timeout
+        return (
+            policy_s if connect is None else min(float(connect), policy_s),
+            policy_s if read is None else min(float(read), policy_s),
+        )
+    if isinstance(caller_timeout, (int, float)):
+        return min(float(caller_timeout), policy_s)
+    return policy_s  # None, or an unrecognized shape: policy wins
+
+
+def _run_send(
+    orig: Callable[..., Any], self: Any, request: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
     backend = _runtime.get_backend()
     if backend is None:
-        return call_with(request)  # disabled / uninstalled: transparent
+        return orig(self, request, *args, **kwargs)  # disabled / uninstalled: transparent
     discovery = _runtime.get_discovery()
 
     current = request
@@ -311,13 +331,28 @@ def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 
-        def effect(_attempt: int, _current: Any = current, _buffer: bool = buffer_body) -> dict[str, Any]:
+        # requests' timeout is a `send()` kwarg, not part of the PreparedRequest
+        # (issue #32) — compose the resolved policy timeout into a per-attempt
+        # effective kwargs dict rather than baking a fixed call_with closure.
+        effective_kwargs = dict(kwargs)
+        policy_timeout_s = _http.resolve_timeout_s(target)
+        if policy_timeout_s is not None:
+            effective_kwargs["timeout"] = _compose_requests_timeout(
+                policy_timeout_s, kwargs.get("timeout")
+            )
+
+        def effect(
+            _attempt: int,
+            _current: Any = current,
+            _buffer: bool = buffer_body,
+            _kwargs: dict[str, Any] = effective_kwargs,
+        ) -> dict[str, Any]:
             try:
                 # requests dispatches through urllib3 under the hood (its vendored
                 # connection pools); `run_owned` marks this attempt so the urllib3
                 # pack's own seam sees `seam_owned()` and passes straight through
                 # instead of judging (and retrying) the same call a second time.
-                resp = _http.run_owned(lambda: call_with(_current))
+                resp = _http.run_owned(lambda: orig(self, _current, *args, **_kwargs))
             except Exception as err:
                 live["exc"] = err
                 return _http.thrown_error(err, _classify(err))
@@ -370,7 +405,7 @@ def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
 def _send_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(orig)
     def send(self: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-        return _run_send(lambda req: orig(self, req, *args, **kwargs), request)
+        return _run_send(orig, self, request, args, kwargs)
 
     send.__keel_wrapped__ = True  # type: ignore[attr-defined]
     return send

@@ -16,17 +16,18 @@ use std::process::{Command, Stdio};
 
 use keel_cli::render::json_string;
 use keel_cli::{doctor, explain, flows, init, mcp, status};
-use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
+use keel_journal::{Clock, DiscoveryStore, ManualClock, SystemClock, TargetStats};
 
-/// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
+/// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base;
+/// the SQL rows' own timestamps, unrelated to `t0` below — flows::trace
+/// never takes a `now_ms`, and flows::flows only uses one for its `.human`
+/// text, never `.json`, so this base never needs to track live time).
 const JOURNAL_SCHEMA: &str = include_str!("../../../contracts/journal.sql");
 const COMPLETED_FLOW: &str =
     include_str!("../../../conformance/fixtures/journal/completed-flow.sql");
 const INTERRUPTED_FLOW: &str =
     include_str!("../../../conformance/fixtures/journal/interrupted-flow.sql");
 const DEAD_FLOW: &str = include_str!("../../../conformance/fixtures/journal/dead-flow.sql");
-
-const T0: i64 = 1_783_728_000_000;
 
 /// The scripted session: one JSON-RPC message per line, ids 1–13. Covers the
 /// handshake, the catalog, every tool (including a failing tool call), and the
@@ -73,8 +74,10 @@ fn check_golden(name: &str, actual: &str) {
 /// The fixture project every session runs against: a fetch call the JS scan
 /// sees, a valid keel.toml, the three golden flows, and a discovery store with
 /// two observed targets (`llm:openai` is discovery-only, so `propose_policy`
-/// emits a nontrivial add hunk).
-fn fixture_project() -> tempfile::TempDir {
+/// emits a nontrivial add hunk). Discovery rows are dated relative to `t0`
+/// (the test's live-captured "now" — see `mcp_subprocess_transcript_matches_in_process`'s
+/// doc comment for why this must track real time rather than a frozen date).
+fn fixture_project(t0: i64) -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::copy(
         manifest_dir().join("tests/fixtures/node_fetch/app.mjs"),
@@ -96,7 +99,7 @@ fn fixture_project() -> tempfile::TempDir {
     conn.execute_batch(DEAD_FLOW).unwrap();
     drop(conn);
 
-    let store = DiscoveryStore::open(keel.join("discovery.db"), ManualClock::new(T0)).unwrap();
+    let store = DiscoveryStore::open(keel.join("discovery.db"), ManualClock::new(t0)).unwrap();
     store
         .merge_report(&[
             // Honors the discovery invariant calls == successes+failures+cache_hits.
@@ -112,8 +115,8 @@ fn fixture_project() -> tempfile::TempDir {
                 breaker_opens: 1,
                 total_latency_ms: 12_000,
                 max_latency_ms: 300,
-                first_seen_ms: T0,
-                last_seen_ms: T0 + 120_000,
+                first_seen_ms: t0,
+                last_seen_ms: t0 + 120_000,
                 last_error_class: Some(keel_journal::ErrorClass::Http),
                 last_error_status: Some(503),
                 not_retried: 1,
@@ -131,8 +134,8 @@ fn fixture_project() -> tempfile::TempDir {
                 breaker_opens: 0,
                 total_latency_ms: 8_000,
                 max_latency_ms: 400,
-                first_seen_ms: T0,
-                last_seen_ms: T0 + 60_000,
+                first_seen_ms: t0,
+                last_seen_ms: t0 + 60_000,
                 last_error_class: None,
                 last_error_status: None,
                 not_retried: 0,
@@ -144,9 +147,11 @@ fn fixture_project() -> tempfile::TempDir {
 }
 
 /// Run the scripted session in-process against `project` and return the
-/// response lines.
-fn run_session(project: &Path, script: &str) -> Vec<String> {
-    let server = mcp::Server::new(project.to_path_buf(), || T0);
+/// response lines. `t0` is threaded through to the server's injected clock
+/// (see `fixture_project`) so the in-process path's "now" tracks the same
+/// live reading the fixture data was dated against.
+fn run_session(project: &Path, script: &str, t0: i64) -> Vec<String> {
+    let server = mcp::Server::new(project.to_path_buf(), move || t0);
     let mut out = Vec::new();
     let code = server.serve(Cursor::new(script), &mut out);
     assert_eq!(code, keel_cli::EXIT_OK, "clean EOF exits 0");
@@ -186,8 +191,9 @@ fn tool_text(lines: &[String], id: i64) -> String {
 /// tool result, the failing tool, and both protocol errors.
 #[test]
 fn mcp_session_transcript_matches_golden() {
-    let dir = fixture_project();
-    let lines = run_session(dir.path(), SESSION_SCRIPT);
+    let t0 = SystemClock.now_ms();
+    let dir = fixture_project(t0);
+    let lines = run_session(dir.path(), SESSION_SCRIPT, t0);
     assert_eq!(lines.len(), 13, "13 requests → 13 responses");
     let transcript: String = lines.iter().map(|l| normalize_version(l) + "\n").collect();
     check_golden("mcp_session.jsonl", &transcript);
@@ -198,12 +204,13 @@ fn mcp_session_transcript_matches_golden() {
 /// same-named CLI command.
 #[test]
 fn mcp_tool_outputs_are_byte_identical_to_the_json_twins() {
-    let dir = fixture_project();
+    let t0 = SystemClock.now_ms();
+    let dir = fixture_project(t0);
     let p = dir.path();
-    let lines = run_session(p, SESSION_SCRIPT);
+    let lines = run_session(p, SESSION_SCRIPT, t0);
 
     // get_status ↔ `keel status --json`
-    assert_eq!(tool_text(&lines, 3), json_string(&status::run(p, T0).json));
+    assert_eq!(tool_text(&lines, 3), json_string(&status::run(p, t0).json));
     // get_doctor_report ↔ `keel doctor --json`
     assert_eq!(tool_text(&lines, 4), json_string(&doctor::run(p).json));
     // propose_policy ↔ `keel init --diff --json`
@@ -219,11 +226,11 @@ fn mcp_tool_outputs_are_byte_identical_to_the_json_twins() {
     // list_flows ↔ `keel flows --json` (and --dead)
     assert_eq!(
         tool_text(&lines, 6),
-        json_string(&flows::flows(p, false, T0).json)
+        json_string(&flows::flows(p, false, t0).json)
     );
     assert_eq!(
         tool_text(&lines, 7),
-        json_string(&flows::flows(p, true, T0).json)
+        json_string(&flows::flows(p, true, t0).json)
     );
     // get_trace ↔ `keel trace <flow> --json`
     assert_eq!(
@@ -255,8 +262,9 @@ fn mcp_tool_outputs_are_byte_identical_to_the_json_twins() {
 /// patch — diffs as the lingua franca reach MCP unchanged.
 #[test]
 fn propose_policy_carries_the_applyable_diff() {
-    let dir = fixture_project();
-    let lines = run_session(dir.path(), SESSION_SCRIPT);
+    let t0 = SystemClock.now_ms();
+    let dir = fixture_project(t0);
+    let lines = run_session(dir.path(), SESSION_SCRIPT, t0);
     let report: serde_json::Value = serde_json::from_str(&tool_text(&lines, 5)).unwrap();
     assert_eq!(report["added"], serde_json::json!(["llm:openai"]));
     assert_eq!(report["unchanged"], serde_json::json!(["api.example.com"]));
@@ -272,8 +280,9 @@ fn propose_policy_carries_the_applyable_diff() {
 /// unknown method answer JSON-RPC errors, never tool results.
 #[test]
 fn protocol_errors_answer_json_rpc_errors() {
-    let dir = fixture_project();
-    let lines = run_session(dir.path(), SESSION_SCRIPT);
+    let t0 = SystemClock.now_ms();
+    let dir = fixture_project(t0);
+    let lines = run_session(dir.path(), SESSION_SCRIPT, t0);
     let unknown_tool: serde_json::Value = serde_json::from_str(
         lines
             .iter()
@@ -317,7 +326,7 @@ fn get_doctor_report_surfaces_a_real_preexisting_resilience_finding() {
     .unwrap();
 
     let script = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_doctor_report\",\"arguments\":{}}}\n";
-    let lines = run_session(dir.path(), script);
+    let lines = run_session(dir.path(), script, SystemClock.now_ms());
     let text = tool_text(&lines, 1);
 
     assert_eq!(text, json_string(&doctor::run(dir.path()).json));
@@ -356,7 +365,7 @@ fn get_doctor_report_surfaces_a_real_agents_cli_placement_finding() {
     .unwrap();
 
     let script = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_doctor_report\",\"arguments\":{}}}\n";
-    let lines = run_session(dir.path(), script);
+    let lines = run_session(dir.path(), script, SystemClock.now_ms());
     let text = tool_text(&lines, 1);
 
     assert_eq!(text, json_string(&doctor::run(dir.path()).json));
@@ -372,12 +381,19 @@ fn get_doctor_report_surfaces_a_real_agents_cli_placement_finding() {
 }
 
 /// The real binary (`keel mcp`, project = cwd) replays the same session with a
-/// byte-identical transcript: no wall-clock value reaches any response, so the
-/// in-process fixture clock and the binary's system clock cannot diverge.
+/// byte-identical transcript. The binary always dates itself off the real
+/// `SystemClock` (it has no way to receive an injected clock), so the
+/// in-process harness must too — `t0` is captured live, once, right before
+/// both paths run, so the two `now` readings land within milliseconds of each
+/// other and the `get_status` week-window computation (which buckets by UTC
+/// day relative to "now") can't straddle a day boundary between them. A
+/// frozen historical constant would drift out of the subprocess's real
+/// trailing-7-day window as wall-clock time passed (issue #30).
 #[test]
 fn mcp_subprocess_transcript_matches_in_process() {
-    let dir = fixture_project();
-    let expected = run_session(dir.path(), SESSION_SCRIPT).join("\n") + "\n";
+    let t0 = SystemClock.now_ms();
+    let dir = fixture_project(t0);
+    let expected = run_session(dir.path(), SESSION_SCRIPT, t0).join("\n") + "\n";
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_keel"))
         .arg("mcp")

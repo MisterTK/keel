@@ -32,6 +32,7 @@ import base64
 import contextvars
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -42,6 +43,9 @@ from .. import _runtime, _targets
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
+
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h)\s*$")
+_DURATION_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
 #: Marker key identifying a serialized HTTP response envelope (the JSON the core
 #: carries as `payload`; see `response_envelope`).
@@ -121,6 +125,22 @@ def resolve_layer(target: str, key: str) -> Any:
     backend = _runtime.get_backend()
     layer = getattr(backend, "layer", None)
     return layer(target, key) if callable(layer) else None
+
+
+def resolve_timeout_s(target: str) -> float | None:
+    """The resolved policy ``timeout`` for ``target``, in seconds, or
+    ``None`` if unconfigured/unparseable. Shared by every SYNC HTTP pack
+    (httpx, requests, urllib.request): ``engine.rs``'s policy-layer timer
+    (``run_one_attempt``) races the awaited future to enforce ``timeout``,
+    which cannot preempt a blocking call on a sync binding — so a sync pack
+    must inject this value as a call-level deadline into its own library's
+    timeout mechanism, or a configured ``timeout`` is silently inert for
+    every synchronous caller (issue #32)."""
+    value = resolve_layer(target, "timeout")
+    if not isinstance(value, str):
+        return None
+    m = _DURATION_RE.match(value)
+    return int(m.group(1)) * _DURATION_S[m.group(2)] if m else None
 
 
 def idempotency_header(target: str) -> str | None:
@@ -517,6 +537,7 @@ __all__ = [
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
     "resolve_layer",
+    "resolve_timeout_s",
     "idempotency_header",
     "cache_configured",
     "poll_configured",

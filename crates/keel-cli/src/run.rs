@@ -57,6 +57,11 @@ pub enum RunError {
         target: String,
         candidates: Vec<String>,
     },
+    /// A Node target's `node_modules` (walked up to the filesystem root) has
+    /// no `keelrun` — `node --import keelrun/hook` would spawn fine and then
+    /// die inside Node's own ESM loader with a raw, unbranded
+    /// `ERR_MODULE_NOT_FOUND`, so this is caught before exec'ing at all.
+    MissingKeelrun { target: String },
 }
 
 impl RunError {
@@ -90,6 +95,15 @@ impl RunError {
                 ),
                 "Pass the entry script directly, e.g. `keel run <path-to-script>`.".to_owned(),
                 "ambiguous-entry",
+            ),
+            Self::MissingKeelrun { target } => (
+                format!("Cannot run `{target}`: the `keelrun` package is not installed."),
+                "Node targets are dispatched via `node --import keelrun/hook`, which needs the \
+                 `keelrun` package in `node_modules` for runtime interception — only \
+                 `keelrun-cli` (the binary) was found."
+                    .to_owned(),
+                "Run `npm install keelrun` alongside `keelrun-cli` in this project.".to_owned(),
+                "missing-keelrun",
             ),
         };
         let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
@@ -144,7 +158,7 @@ pub fn plan(target: &str, args: &[String], disable: bool) -> Result<RunPlan, Run
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("py") => Ok(python_plan(target, args, disable)),
-        Some(ext) if NODE_EXTS.contains(&ext) => Ok(node_plan(target, args, disable)),
+        Some(ext) if NODE_EXTS.contains(&ext) => node_plan(target, args, disable),
         _ => Err(RunError::UnknownKind {
             target: target.to_owned(),
         }),
@@ -182,17 +196,47 @@ fn as_script_operand(target: &str) -> String {
     }
 }
 
-fn node_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
+fn node_plan(target: &str, extra: &[String], disable: bool) -> Result<RunPlan, RunError> {
+    if !keelrun_resolvable(Path::new(target)) {
+        return Err(RunError::MissingKeelrun {
+            target: target.to_owned(),
+        });
+    }
     let mut argv = vec![
         "--import".to_owned(),
         NODE_HOOK.to_owned(),
         as_script_operand(target),
     ];
     argv.extend_from_slice(extra);
-    RunPlan {
+    Ok(RunPlan {
         program: "node".to_owned(),
         argv,
         disable,
+    })
+}
+
+/// Whether `keelrun` would resolve from `target`, mirroring Node's own
+/// `node_modules` walk-up: starting at `target`'s containing directory
+/// (canonicalized, so a bare relative filename resolves against the real
+/// current directory), check `<dir>/node_modules/keelrun`, then each parent
+/// in turn up to and including the filesystem root.
+fn keelrun_resolvable(target: &Path) -> bool {
+    let start = if target.is_dir() {
+        target.to_path_buf()
+    } else {
+        match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    };
+    let mut dir = std::fs::canonicalize(&start).unwrap_or(start);
+    loop {
+        if dir.join("node_modules").join("keelrun").is_dir() {
+            return true;
+        }
+        if !dir.pop() {
+            return false;
+        }
     }
 }
 
@@ -213,7 +257,7 @@ fn node_package(manifest: &Path, args: &[String], disable: bool) -> Result<RunPl
             target: manifest.display().to_string(),
         });
     }
-    Ok(node_plan(&entry.to_string_lossy(), args, disable))
+    node_plan(&entry.to_string_lossy(), args, disable)
 }
 
 /// Conventional entry file names tried, in order, before falling back to a
@@ -248,7 +292,7 @@ fn resolve_directory(
     for name in NODE_CONVENTIONAL_ENTRIES {
         let candidate = dir.join(name);
         if candidate.is_file() {
-            return Ok(node_plan(&candidate.to_string_lossy(), args, disable));
+            return node_plan(&candidate.to_string_lossy(), args, disable);
         }
     }
 
@@ -265,7 +309,7 @@ fn resolve_directory(
             if py_files.contains(only) {
                 Ok(python_plan(&only.to_string_lossy(), args, disable))
             } else {
-                Ok(node_plan(&only.to_string_lossy(), args, disable))
+                node_plan(&only.to_string_lossy(), args, disable)
             }
         }
         many => Err(RunError::AmbiguousEntry {
@@ -397,11 +441,47 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let script = dir.path().join("app.mjs");
         fs::write(&script, "console.log('hi')\n").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules").join("keelrun")).unwrap();
         let plan = plan(&script.to_string_lossy(), &[], true).unwrap();
         assert_eq!(plan.program, "node");
         assert_eq!(plan.argv[0], "--import");
         assert_eq!(plan.argv[1], "keelrun/hook");
         assert!(plan.disable);
+    }
+
+    #[test]
+    fn node_target_without_keelrun_installed_is_a_precise_error() {
+        // keelrun-cli alone (no `node_modules/keelrun`) — the documented
+        // CLI-only install gap (issue #33): node would spawn fine and then
+        // die inside its own ESM loader with a raw, unbranded error.
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("app.mjs");
+        fs::write(&script, "console.log('hi')\n").unwrap();
+        let err = plan(&script.to_string_lossy(), &[], false).unwrap_err();
+        assert_eq!(
+            err,
+            RunError::MissingKeelrun {
+                target: script.to_string_lossy().into_owned()
+            }
+        );
+        let rendered = err.render();
+        assert_eq!(rendered.exit, EXIT_USAGE);
+        assert!(rendered.human.contains("npm install keelrun"));
+        assert_eq!(rendered.json["error"], "missing-keelrun");
+    }
+
+    #[test]
+    fn node_target_finds_keelrun_in_an_ancestor_node_modules() {
+        // Mirrors Node's own walk-up resolution: `node_modules/keelrun` one
+        // level above the script's directory still resolves.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules").join("keelrun")).unwrap();
+        let sub = dir.path().join("src");
+        fs::create_dir_all(&sub).unwrap();
+        let script = sub.join("app.mjs");
+        fs::write(&script, "console.log('hi')\n").unwrap();
+        let plan = plan(&script.to_string_lossy(), &[], false).unwrap();
+        assert_eq!(plan.program, "node");
     }
 
     #[test]
@@ -428,6 +508,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("start.mjs"), "// entry\n").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules").join("keelrun")).unwrap();
         let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
         assert_eq!(plan.program, "node");
         assert!(plan.argv[2].ends_with("start.mjs"));
@@ -438,6 +519,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         fs::write(dir.path().join("index.js"), "// entry\n").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules").join("keelrun")).unwrap();
         let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
         assert!(plan.argv[2].ends_with("index.js"));
     }
@@ -495,6 +577,7 @@ mod tests {
     fn dir_with_conventional_node_entry_resolves_without_package_json() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("index.mjs"), "// entry\n").unwrap();
+        fs::create_dir_all(dir.path().join("node_modules").join("keelrun")).unwrap();
         let plan = plan(&dir.path().to_string_lossy(), &[], false).unwrap();
         assert_eq!(plan.program, "node");
         assert!(plan.argv[2].ends_with("index.mjs"));

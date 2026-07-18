@@ -106,6 +106,23 @@ class ResilienceTest(RequestsBase):
         self.assertEqual(r.content, b"fast")
         self.assertEqual(r.keel_outcome["attempts"], 2)
 
+    def test_policy_timeout_wins_when_tighter(self) -> None:
+        # issue #32: a configured policy `timeout` was completely inert for
+        # sync callers — requests' `timeout` is a `send()` kwarg, not part of
+        # the request object, and nothing overrode it with the resolved
+        # policy value. Policy 100ms beats a loose caller timeout of 5s:
+        # attempt 1 must abort client-side in ~100ms (well under the 400ms
+        # delayed response), then attempt 2 succeeds fast.
+        self.backend.configure(
+            {**level0_defaults(), "target": {"127.0.0.1": {"timeout": "100ms"}}}
+        )
+        with FaultServer([slow(0.4, ok(b"slow")), ok(b"fast")]) as srv:
+            with requests.Session() as s:
+                r = s.get(srv.url(), timeout=5)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"fast")
+        self.assertEqual(r.keel_outcome["attempts"], 2)
+
     def test_non_429_4xx_passes_through_unretried(self) -> None:
         with FaultServer([status(404, b"missing")]) as srv:
             with requests.Session() as s:

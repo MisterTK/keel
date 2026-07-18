@@ -58,7 +58,6 @@ import functools
 import http.client
 import io
 import platform
-import re
 import socket
 import time
 import urllib.error
@@ -81,9 +80,6 @@ _PINNED = ("3.11", "3.12", "3.13", "3.14")
 
 _installed = False
 _orig: dict[str, Any] = {}
-
-_DURATION_RE = re.compile(r"^\s*(\d+)\s*(ms|s|m|h)\s*$")
-_DURATION_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
 
 # --- contract operations -----------------------------------------------------
@@ -229,20 +225,12 @@ def _classify(err: BaseException) -> str:
 # --- timeout composition -----------------------------------------------------
 
 
-def _policy_timeout_s(target: str) -> float | None:
-    value = _http.resolve_layer(target, "timeout")
-    if not isinstance(value, str):
-        return None
-    m = _DURATION_RE.match(value)
-    return int(m.group(1)) * _DURATION_S[m.group(2)] if m else None
-
-
 def _compose_timeout(target: str, caller_timeout: Any) -> Any:
     """Tighter wins. ``open``'s default is the module sentinel (= no explicit
     caller timeout), and ``None`` means block forever — both yield to a
     configured policy timeout; two real numbers take the min. urllib's
     ``timeout`` is per attempt, matching the policy layer's semantics."""
-    policy_s = _policy_timeout_s(target)
+    policy_s = _http.resolve_timeout_s(target)
     if policy_s is None:
         return caller_timeout
     if caller_timeout is socket._GLOBAL_DEFAULT_TIMEOUT or not isinstance(

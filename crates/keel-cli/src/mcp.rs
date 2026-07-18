@@ -67,19 +67,30 @@ fn rpc_error(code: i64, message: impl Into<String>) -> RpcError {
 }
 
 /// The stdio MCP server: the project it reports on plus an injected clock
-/// (a fn pointer so tests stay deterministic; only human-facing views consume
-/// it — no wall-clock value ever reaches a JSON response).
-#[derive(Debug)]
+/// (boxed so tests can capture a per-test reading; only human-facing views
+/// consume it — no wall-clock value ever reaches a JSON response).
 pub struct Server {
     project: PathBuf,
-    now_ms: fn() -> i64,
+    now_ms: Box<dyn Fn() -> i64>,
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("project", &self.project)
+            .field("now_ms", &"<fn>")
+            .finish()
+    }
 }
 
 impl Server {
     /// A server for `project`, dating any age computations via `now_ms`.
     #[must_use]
-    pub fn new(project: PathBuf, now_ms: fn() -> i64) -> Self {
-        Self { project, now_ms }
+    pub fn new(project: PathBuf, now_ms: impl Fn() -> i64 + 'static) -> Self {
+        Self {
+            project,
+            now_ms: Box::new(now_ms),
+        }
     }
 
     /// Run the loop: one JSON-RPC message per line in, one per line out
