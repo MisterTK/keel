@@ -67,6 +67,18 @@ const REGISTRY: &[Adapter] = &[
         target: "host",
         best_effort: true,
     },
+    // The stdlib urllib.request pack (WS4). Convention exception, documented
+    // here on the registry itself: stdlib has no pip version to pin, so this
+    // row is keyed to the PYTHON RUNTIME version — the pack's detect()
+    // reports platform.python_version() and certifies the interpreter lines
+    // in urllib_pack._PINNED (CI pins 3.11). "pinned", not best-effort: the
+    // seam is a stable stdlib API certified per interpreter line by the farm.
+    Adapter {
+        lib: "urllib.request",
+        lang: "python",
+        target: "host",
+        best_effort: false,
+    },
     Adapter {
         lib: "boto3",
         lang: "python",
@@ -445,8 +457,9 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in &topology.unreachable {
         findings.push(Finding {
-            action: "Trace how this request is actually dispatched before proposing policy; if \
-                      it is stdlib urllib, adapter support is tracked."
+            action: "Trace how this request is actually dispatched before proposing policy; \
+                      Python's stdlib `urllib.request` is adapted — importing it directly in \
+                      that file makes the host wrappable."
                 .to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
@@ -876,7 +889,9 @@ pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<St
             TransportClass::Tracked => wrappable.push(target.clone()),
             TransportClass::UntrackedKnown => unreachable.push(TopologyEntry {
                 host: target.clone(),
-                reason: "reached via a transport Keel does not adapt (stdlib urllib/http.client)"
+                reason: "reached via a stdlib transport Keel does not adapt (http.client, or \
+                         urllib without urllib.request; Python's urllib.request itself is \
+                         adapted)"
                     .to_owned(),
             }),
             TransportClass::Unknown => unreachable.push(TopologyEntry {
@@ -1657,6 +1672,43 @@ mod tests {
             },
             fix: None,
         }
+    }
+
+    /// WS4: the stdlib urllib.request pack has a REGISTRY row (keyed to the
+    /// Python runtime version — the documented convention exception), a
+    /// scanned `urllib.request` import counts as detected/not-invisible, and
+    /// its hosts are wrappable, not unreachable.
+    #[test]
+    fn urllib_request_is_a_registered_tracked_adapter() {
+        let mut scan = scan_with("api.tavily.com", TargetClass::Host, &["urllib.request"]);
+        scan.host_transports
+            .insert("api.tavily.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+        let row = r
+            .adapters
+            .iter()
+            .find(|a| a.lib == "urllib.request")
+            .expect("REGISTRY row for urllib.request");
+        assert!(row.detected);
+        assert_eq!(row.status, "pinned");
+        assert_eq!(row.target, "host");
+        assert!(
+            r.coverage.invisible.is_empty(),
+            "{:?}",
+            r.coverage.invisible
+        );
+        assert!(r.topology.wrappable.contains(&"api.tavily.com".to_owned()));
+        assert!(
+            r.topology.unreachable.is_empty(),
+            "{:?}",
+            r.topology.unreachable
+        );
     }
 
     #[test]

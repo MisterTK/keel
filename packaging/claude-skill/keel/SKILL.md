@@ -96,9 +96,10 @@ the four phases in order; the static scan is evidence, not the verdict.
    process is a coverage boundary, not a detail.
 2. **Explore.** For each URL/host the code touches, trace how the request is
    *actually dispatched* — which library sends the bytes (an SDK may wrap a
-   transport Keel adapts, or hide one it doesn't). Note stdlib transports
-   (`urllib.request`, `http.client`, raw `http`/`https` on Node): Keel sees
-   them in the scan but may not adapt them yet.
+   transport Keel adapts, or hide one it doesn't). Note stdlib transports:
+   Python's `urllib.request` is adapted (wrapped like any registry library);
+   `http.client` and raw `http`/`https` on Node are seen in the scan but not
+   adapted yet.
 3. **Collect.** Run `keel doctor --json` (or the `get_doctor_report` MCP
    tool). Read `topology` first — every sighted host lands in exactly one of
    `wrappable` ("wrap it"), `unreachable` ("can't reach it, here's why"), or

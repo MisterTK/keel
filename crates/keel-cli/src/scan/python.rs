@@ -30,7 +30,7 @@ const AST_WALKER: &str = r#"
 import ast, json, os, re, sys
 from urllib.parse import urlsplit
 
-HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
+HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3", "urllib.request"}
 LLM_LIBS = {"openai", "anthropic", "google.genai"}
 OTHER_LIBS = {"psycopg", "boto3"}
 # The agent-framework packs (dx-spec agent-first-class work). pydantic_ai,
@@ -52,10 +52,12 @@ TIME_LIBS = {"time", "datetime"}
 RANDOM_LIBS = {"random", "uuid", "secrets"}
 UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
 # Transport classification for `keel doctor`: a URL sighting is "tracked" when
-# a registry-adapted library is in reach in the same file, "untracked-known"
-# when only a known-but-unadapted stdlib transport is (urllib.request /
-# http.client), and otherwise "unknown" — no reachable transport at all.
-STDLIB_TRANSPORTS = {"urllib", "http"}  # urllib.request / http.client
+# a registry-adapted library is in reach in the same file — including stdlib
+# `urllib.request`, adapted since v0.3.0 (its dotted key lives in HTTP_LIBS;
+# see import_entries) — "untracked-known" when only an unadapted stdlib
+# transport is (http.client, or urllib without the request submodule), and
+# otherwise "unknown" — no reachable transport at all.
+STDLIB_TRANSPORTS = {"urllib", "http"}  # http.client / non-request urllib
 TRACKED_TRANSPORTS = HTTP_LIBS | {"psycopg", "boto3"}
 TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | STDLIB_TRANSPORTS | {"os", "asyncio"}
 TIME_NAMES = {"time", "time_ns", "monotonic", "monotonic_ns",
@@ -93,17 +95,19 @@ def top(mod):
 
 def import_entries(node):
     """Yield (module_key, bound_name) for each name an Import/ImportFrom node
-    binds. Handles the `google.adk` / `google.genai` dotted-prefix special
-    case: `import google.adk`, `from google.adk import ...`, and
-    `from google import genai, adk` all resolve to `google.<name>`; a bare
-    `google` import (or `from google import <something else>`) yields
-    nothing — the google namespace package alone is not evidence of either
-    library."""
+    binds. Two dotted-prefix special cases resolve to a dotted key instead of
+    the top-level name: `google.adk`/`google.genai` (bare `google` is a
+    namespace package and records nothing) and `urllib.request` (the adapted
+    stdlib transport — `import urllib.request`, `from urllib import request`,
+    and `from urllib.request import ...` all resolve to `urllib.request`;
+    other urllib submodules keep the plain `urllib` key)."""
     if isinstance(node, ast.Import):
         for alias in node.names:
             parts = alias.name.split(".")
             if len(parts) >= 2 and parts[0] == "google" and parts[1] in GOOGLE_SUBMODULES:
                 key = "google." + parts[1]
+            elif len(parts) >= 2 and parts[0] == "urllib" and parts[1] == "request":
+                key = "urllib.request"
             else:
                 key = parts[0]
             yield key, (alias.asname or alias.name).split(".", 1)[0]
@@ -118,6 +122,13 @@ def import_entries(node):
             for alias in node.names:
                 if alias.name in GOOGLE_SUBMODULES:
                     yield "google." + alias.name, alias.asname or alias.name
+        elif len(mparts) >= 2 and mparts[0] == "urllib" and mparts[1] == "request":
+            for alias in node.names:
+                yield "urllib.request", alias.asname or alias.name
+        elif mod == "urllib":
+            for alias in node.names:
+                key = "urllib.request" if alias.name == "request" else "urllib"
+                yield key, alias.asname or alias.name
         else:
             key = top(mod)
             for alias in node.names:
@@ -557,7 +568,7 @@ pub struct PyScan {
     pub functions: Vec<FunctionFacts>,
 }
 
-const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3"];
+const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3", "urllib.request"];
 
 /// Normalize a walker-reported import key to the name `keel doctor`'s
 /// `REGISTRY` (see `crate::doctor`) keys its adapters by. The walker emits
@@ -753,7 +764,7 @@ mod tests {
             "import httpx\nU = \"https://api.tracked.com/v1\"\n",
         )
         .unwrap();
-        // untracked-known: only stdlib urllib in reach.
+        // tracked since WS4: urllib.request is an adapted transport.
         fs::write(
             dir.path().join("b.py"),
             "import urllib.request\nU = \"https://api.stdlib.com/v1\"\n",
@@ -765,11 +776,67 @@ mod tests {
             "U = \"https://api.mystery.com/v1\"\n",
         )
         .unwrap();
+        // untracked-known: http.client is still unadapted.
+        fs::write(
+            dir.path().join("d.py"),
+            "import http.client\nU = \"https://api.lowlevel.com/v1\"\n",
+        )
+        .unwrap();
+        // untracked-known: bare urllib (parse only) is not the adapted
+        // submodule — still just "stdlib urllib in reach".
+        fs::write(
+            dir.path().join("e.py"),
+            "from urllib import parse\nU = \"https://api.parseonly.com/v1\"\n",
+        )
+        .unwrap();
         let s = scan(dir.path());
         let t = |h: &str| s.findings.host_transports.get(h).copied();
         assert_eq!(t("api.tracked.com"), Some(TransportClass::Tracked));
-        assert_eq!(t("api.stdlib.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.stdlib.com"), Some(TransportClass::Tracked));
         assert_eq!(t("api.mystery.com"), Some(TransportClass::Unknown));
+        assert_eq!(t("api.lowlevel.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.parseonly.com"), Some(TransportClass::UntrackedKnown));
+    }
+
+    /// WS4: every import form that puts `urllib.request` in reach resolves to
+    /// the dotted lib key `urllib.request` (the google.adk precedent) — it
+    /// lands in `libs` (so doctor's REGISTRY row reports detected) and makes
+    /// same-file URL sightings tracked.
+    #[test]
+    fn urllib_request_import_forms_resolve_to_the_dotted_key() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("f1.py"),
+            "import urllib.request\nU = \"https://one.example.com/v\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f2.py"),
+            "from urllib import request\nU = \"https://two.example.com/v\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f3.py"),
+            "from urllib.request import urlopen\nU = \"https://three.example.com/v\"\n",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        assert!(
+            s.findings.libs.contains("urllib.request"),
+            "{:?}",
+            s.findings.libs
+        );
+        for host in ["one.example.com", "two.example.com", "three.example.com"] {
+            assert_eq!(
+                s.findings.host_transports.get(host).copied(),
+                Some(TransportClass::Tracked),
+                "{host}"
+            );
+        }
     }
 
     #[test]

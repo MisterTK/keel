@@ -36,13 +36,15 @@ pub enum TargetClass {
 /// program task) uses to say honestly what Keel can and cannot see: a host
 /// is `Tracked` if some sighting reached it through a registry-adapted
 /// library, `UntrackedKnown` if the best reach was a known-but-unadapted
-/// transport (stdlib `urllib`/`http.client`), and `Unknown` if no transport
+/// transport (`http.client`, or urllib without `urllib.request`; Python's
+/// `urllib.request` itself is adapted), and `Unknown` if no transport
 /// evidence was found near any sighting at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TransportClass {
     /// A registry-adapted library is in reach — Keel can wrap this.
     Tracked,
-    /// A known transport Keel does not adapt (stdlib urllib/http.client).
+    /// A known transport Keel does not adapt (http.client, or urllib without
+    /// `urllib.request`; Python's `urllib.request` itself is adapted).
     UntrackedKnown,
     /// A URL literal with no recognizable transport nearby.
     Unknown,
