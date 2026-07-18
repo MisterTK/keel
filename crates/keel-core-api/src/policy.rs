@@ -701,12 +701,42 @@ impl TryFrom<PollUntilRaw> for PollUntil {
 
 /// `poll = { interval, deadline, until }` — poll-until-terminal (CCR-3).
 /// GET/HEAD at Level 0 only; semantics in conformance/README.md ("Poll").
+/// `interval` must be nonzero: on a virtual clock a zero interval never
+/// approaches `deadline`, looping forever, so it is rejected at deserialize
+/// (KEEL-E001) rather than left to hang at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PollPolicyRaw")]
 pub struct PollPolicy {
     pub interval: DurationMs,
     pub deadline: DurationMs,
     pub until: PollUntil,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollPolicyRaw {
+    interval: DurationMs,
+    deadline: DurationMs,
+    until: PollUntil,
+}
+
+impl TryFrom<PollPolicyRaw> for PollPolicy {
+    type Error = ParseError;
+
+    fn try_from(raw: PollPolicyRaw) -> Result<Self, Self::Error> {
+        if raw.interval.0 == 0 {
+            return Err(ParseError::with_note(
+                "poll.interval",
+                "0",
+                "must be a nonzero duration",
+            ));
+        }
+        Ok(Self {
+            interval: raw.interval,
+            deadline: raw.deadline,
+            until: raw.until,
+        })
+    }
 }
 
 /// One target's policy table. Every layer is optional; a layer set at a more
@@ -1288,6 +1318,21 @@ mod tests {
             let doc = serde_json::json!({ "target": { "x": { "poll": bad } } });
             assert!(serde_json::from_value::<Policy>(doc).is_err());
         }
+    }
+
+    #[test]
+    fn poll_rejects_zero_interval() {
+        let doc = serde_json::json!({ "target": { "x": { "poll": {
+            "interval": "0ms", "deadline": "90s",
+            "until": { "field": "status", "terminal": ["done"] }
+        } } } });
+        assert!(serde_json::from_value::<Policy>(doc).is_err());
+
+        let doc = serde_json::json!({ "target": { "x": { "poll": {
+            "interval": "1ms", "deadline": "90s",
+            "until": { "field": "status", "terminal": ["done"] }
+        } } } });
+        assert!(serde_json::from_value::<Policy>(doc).is_ok());
     }
 
     #[test]

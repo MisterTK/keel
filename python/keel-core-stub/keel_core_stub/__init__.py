@@ -520,6 +520,8 @@ class KeelCoreStub:
             for key in ("interval", "deadline"):
                 if not isinstance(poll.get(key), str) or _parse_duration(poll[key]) is None:
                     raise cls._invalid(path, f"bad poll.{key} duration")
+            if _parse_duration(poll["interval"]) == 0:
+                raise cls._invalid(path, "poll.interval must be a nonzero duration")
             until = poll.get("until")
             if not isinstance(until, dict):
                 raise cls._invalid(path, "poll.until must be a table")

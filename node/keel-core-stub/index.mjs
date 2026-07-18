@@ -298,6 +298,8 @@ function validateTargetPolicy(path, v) {
     rejectUnknownKeys(`${path}.poll`, v.poll, ["interval", "deadline", "until"]);
     for (const key of ["interval", "deadline"])
       if (parseDuration(v.poll[key]) === null) throw invalid(path, `bad poll.${key} duration`);
+    if (parseDuration(v.poll.interval) === 0)
+      throw invalid(path, "poll.interval must be a nonzero duration");
     if (!isTable(v.poll.until)) throw invalid(path, "poll.until must be a table");
     rejectUnknownKeys(`${path}.poll.until`, v.poll.until, ["field", "terminal"]);
     if (typeof v.poll.until.field !== "string" || v.poll.until.field.length === 0)

@@ -166,7 +166,11 @@
       "additionalProperties": false,
       "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3). Applies to GET/HEAD at Level 0 only. A JSON response whose `until.field` is not in `until.terminal` is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
       "properties": {
-        "interval": { "$ref": "#/$defs/duration" },
+        "interval": {
+          "type": "string",
+          "description": "Poll re-issue interval; must be a nonzero duration.",
+          "pattern": "^0*[1-9][0-9]*(ms|s|m|h)$"
+        },
         "deadline": { "$ref": "#/$defs/duration" },
         "until": {
           "type": "object",
