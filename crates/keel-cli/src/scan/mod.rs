@@ -86,6 +86,23 @@ pub struct SubprocessSighting {
     pub command: String,
 }
 
+/// One file the scan judged dependency-averse: stdlib-only imports plus a
+/// risk/gate/guard/auth/valid/safety/kill name or docstring signal, or an
+/// explicit `# keel: exclude` marker. Markers win in both directions: an
+/// exclude marker forces this classification regardless of imports, and an
+/// include marker defeats the heuristic even where it would otherwise match.
+/// `keel doctor`/`keel init` (a later program task) use this to honestly
+/// exclude hosts seen only in such files from proposed policy. Field order
+/// is the sort order (by file).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DepAverseFile {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// `"marker"` for an explicit `# keel: exclude`, or
+    /// `"stdlib-only + name/docstring signal: <word>"`.
+    pub reason: String,
+}
+
 /// One place a target was seen: a project-relative path and 1-based line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sighting {
@@ -182,6 +199,10 @@ pub struct ScanResult {
     /// `(file, line)` — deterministic across runs. `keel doctor` uses this to
     /// call out where Keel's visibility ends at a process boundary.
     pub subprocesses: Vec<SubprocessSighting>,
+    /// Files judged dependency-averse across the project, sorted by file —
+    /// see [`DepAverseFile`]. Python-only as of this build (see
+    /// [`LangFindings::dependency_averse`]).
+    pub dependency_averse: Vec<DepAverseFile>,
 }
 
 impl ScanResult {
@@ -219,6 +240,7 @@ pub fn scan(project: &Path) -> ScanResult {
         .functions
         .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
     result.subprocesses.sort();
+    result.dependency_averse.sort();
     result
 }
 
@@ -249,6 +271,9 @@ pub struct LangFindings {
     /// Externally-launched processes this language pass saw (see
     /// [`SubprocessSighting`]).
     pub subprocesses: Vec<SubprocessSighting>,
+    /// Files this language pass judged dependency-averse (see
+    /// [`DepAverseFile`]).
+    pub dependency_averse: Vec<DepAverseFile>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -279,6 +304,9 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
             .or_insert(*class);
     }
     result.subprocesses.extend(f.subprocesses.iter().cloned());
+    result
+        .dependency_averse
+        .extend(f.dependency_averse.iter().cloned());
 }
 
 /// Directory names never descended into during a filesystem walk — scans,

@@ -14,7 +14,9 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use super::{FunctionFacts, LangFindings, Sighting, SubprocessSighting, TransportClass};
+use super::{
+    DepAverseFile, FunctionFacts, LangFindings, Sighting, SubprocessSighting, TransportClass,
+};
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
 /// in sorted order, output keys are sorted. Finds imports of the known effect
@@ -24,7 +26,7 @@ use super::{FunctionFacts, LangFindings, Sighting, SubprocessSighting, Transport
 /// containment: nested defs and lambdas inside a function count toward it;
 /// class methods are not flow entrypoints and are not attributed).
 const AST_WALKER: &str = r#"
-import ast, json, os, sys
+import ast, json, os, re, sys
 from urllib.parse import urlsplit
 
 HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
@@ -56,6 +58,11 @@ OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
 # extractable) as their own finer-grained signal, separate from the coarse
 # `unsafe_reasons` UNSAFE_LIBS/OS_UNSAFE already feed.
 SUBPROC_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
+# `sys.stdlib_module_names` exists on Python 3.10+ (keel's floor); the
+# `getattr` default degrades older interpreters to "never stdlib-only"
+# (an empty STDLIB) rather than crashing or false-positiving.
+STDLIB = set(getattr(sys, "stdlib_module_names", ()))
+DEP_AVERSE_RE = re.compile(r"(gate|guard|auth|valid|safety|risk|kill)", re.I)
 SKIP = {".keel", ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", "dist", "build", "target"}
 
@@ -203,6 +210,7 @@ root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
 subprocesses = []
+dependency_averse = []
 functions = []
 resilience_libs = set()
 files = 0
@@ -215,7 +223,8 @@ for dirpath, dirnames, filenames in os.walk(root):
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                tree = ast.parse(fh.read())
+                src = fh.read()
+            tree = ast.parse(src)
         except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
             continue
         files += 1
@@ -278,9 +287,38 @@ for dirpath, dirnames, filenames in os.walk(root):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 functions.append(fn_facts(node, rel, mod, aliases, consts))
 
+        # Dependency-averse detection: stdlib-only files with a risk/gate/
+        # guard/auth/valid/safety/kill name or docstring signal, or an
+        # explicit marker. Markers win in both directions: `# keel: exclude`
+        # forces the classification regardless of imports; `# keel: include`
+        # defeats the heuristic even if it would otherwise match. `node.level
+        # == 0` excludes relative imports (`from .x import y`) from counting
+        # as third-party — they are always project-internal.
+        third_party = False
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [top(a.name) for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                mods = [top(node.module or "")]
+            if any(m and m not in STDLIB for m in mods):
+                third_party = True
+                break
+        if '# keel: exclude' in src:
+            dependency_averse.append({"file": rel, "reason": "marker"})
+        elif '# keel: include' not in src and not third_party and STDLIB:
+            doc = ast.get_docstring(tree) or ""
+            m = DEP_AVERSE_RE.search(rel.rsplit("/", 1)[-1]) or DEP_AVERSE_RE.search(doc)
+            if m:
+                dependency_averse.append(
+                    {"file": rel,
+                     "reason": "stdlib-only + name/docstring signal: " + m.group(1).lower()})
+
 subprocesses.sort(key=lambda x: (x["file"], x["line"]))
-print(json.dumps({"files_scanned": files, "functions": functions,
-                  "imports": imports, "resilience_libs": sorted(resilience_libs),
+dependency_averse.sort(key=lambda x: x["file"])
+print(json.dumps({"dependency_averse": dependency_averse, "files_scanned": files,
+                  "functions": functions, "imports": imports,
+                  "resilience_libs": sorted(resilience_libs),
                   "subprocesses": subprocesses, "urls": urls}, sort_keys=True))
 "#;
 
@@ -331,9 +369,18 @@ struct WalkerSubprocess {
     command: String,
 }
 
+/// One dependency-averse file from the walker (see [`DepAverseFile`]).
+#[derive(Debug, Deserialize)]
+struct WalkerDepAverse {
+    file: String,
+    reason: String,
+}
+
 /// The walker's JSON output, typed.
 #[derive(Debug, Deserialize)]
 struct WalkerOutput {
+    #[serde(default)]
+    dependency_averse: Vec<WalkerDepAverse>,
     files_scanned: usize,
     #[serde(default)]
     functions: Vec<PyFunction>,
@@ -396,6 +443,12 @@ pub fn scan(project: &Path) -> PyScan {
             line: sub.line,
             launcher: sub.launcher,
             command: sub.command,
+        });
+    }
+    for d in output.dependency_averse {
+        findings.dependency_averse.push(DepAverseFile {
+            file: d.file,
+            reason: d.reason,
         });
     }
     for url in &output.urls {
@@ -696,6 +749,47 @@ def go(cmd):
                 .subprocesses
                 .iter()
                 .all(|x| x.file == "launch.py")
+        );
+    }
+
+    #[test]
+    fn dependency_averse_files_are_detected_and_markers_win() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // stdlib-only + docstring signal -> detected.
+        fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"Deterministic risk gate. stdlib only.\"\"\"\nimport json, urllib.request\n",
+        )
+        .unwrap();
+        // stdlib-only + name signal, but explicit include marker -> NOT detected.
+        fs::write(
+            dir.path().join("validate.py"),
+            "# keel: include\nimport json\n",
+        )
+        .unwrap();
+        // third-party import + no signal, but explicit exclude marker -> detected.
+        fs::write(dir.path().join("app.py"), "# keel: exclude\nimport httpx\n").unwrap();
+        // plain file -> not detected.
+        fs::write(dir.path().join("util.py"), "import json\n").unwrap();
+        let s = scan(dir.path());
+        let files: Vec<&str> = s
+            .findings
+            .dependency_averse
+            .iter()
+            .map(|d| d.file.as_str())
+            .collect();
+        assert_eq!(files, vec!["app.py", "risk_gate.py"]);
+        let app = &s.findings.dependency_averse[0];
+        assert_eq!(app.reason, "marker");
+        let gate = &s.findings.dependency_averse[1];
+        assert!(
+            gate.reason.contains("risk") || gate.reason.contains("gate"),
+            "{}",
+            gate.reason
         );
     }
 
