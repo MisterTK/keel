@@ -29,6 +29,14 @@ use crate::{EXIT_FAILURE, Rendered, evidence};
 /// One flow row for `keel flows`.
 #[derive(Debug, Serialize)]
 struct FlowRow {
+    /// The code hash recorded at first entry (fences replay across deploys).
+    code_hash: Option<String>,
+    /// WS6 staleness surfacing: `Some(true)` = this resumable flow's current
+    /// script hashes differently (resume would replay against changed code;
+    /// the core downgrades nondeterminism fail->warn); `Some(false)` = hash
+    /// verified current; `None` = not derivable (completed/dead flows,
+    /// non-`py:` entrypoints, NULL recorded hash, unresolvable script).
+    code_hash_stale: Option<bool>,
     created_at: i64,
     entrypoint: String,
     flow_id: String,
@@ -64,7 +72,7 @@ pub fn flows(project: &Path, dead_only: bool, now_ms: i64) -> Rendered {
             }),
         );
     }
-    let rows = match read_flows(&path, dead_only) {
+    let rows = match read_flows(project, &path, dead_only) {
         Ok(r) => r,
         Err(e) => return soft_error(&e),
     };
@@ -79,13 +87,15 @@ pub fn flows(project: &Path, dead_only: bool, now_ms: i64) -> Rendered {
 }
 
 /// Read the flows table (and per-flow step counts), newest-updated first.
-fn read_flows(path: &Path, dead_only: bool) -> Result<Vec<FlowRow>, String> {
+/// `project` is needed only to compute WS6 code-hash staleness (a resumable
+/// flow's current script vs. its recorded `code_hash`).
+fn read_flows(project: &Path, path: &Path, dead_only: bool) -> Result<Vec<FlowRow>, String> {
     let conn = open_ro(path)?;
     let sql = if dead_only {
-        "SELECT flow_id, entrypoint, status, created_at, updated_at FROM flows \
+        "SELECT flow_id, entrypoint, status, created_at, updated_at, code_hash FROM flows \
          WHERE status = 'dead' ORDER BY updated_at DESC, flow_id"
     } else {
-        "SELECT flow_id, entrypoint, status, created_at, updated_at FROM flows \
+        "SELECT flow_id, entrypoint, status, created_at, updated_at, code_hash FROM flows \
          ORDER BY updated_at DESC, flow_id"
     };
     let mut stmt = conn.prepare(sql).map_err(|e| q(&e))?;
@@ -97,6 +107,7 @@ fn read_flows(path: &Path, dead_only: bool) -> Result<Vec<FlowRow>, String> {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|e| q(&e))?
@@ -104,9 +115,12 @@ fn read_flows(path: &Path, dead_only: bool) -> Result<Vec<FlowRow>, String> {
         .map_err(|e| q(&e))?;
 
     let mut out = Vec::with_capacity(raw.len());
-    for (flow_id, entrypoint, status, created_at, updated_at) in raw {
+    for (flow_id, entrypoint, status, created_at, updated_at, code_hash) in raw {
         let (steps_total, steps_done) = step_counts(&conn, &flow_id)?;
+        let code_hash_stale = staleness(project, &status, &entrypoint, code_hash.as_deref());
         out.push(FlowRow {
+            code_hash,
+            code_hash_stale,
             created_at,
             entrypoint,
             flow_id,
@@ -117,6 +131,69 @@ fn read_flows(path: &Path, dead_only: bool) -> Result<Vec<FlowRow>, String> {
         });
     }
     Ok(out)
+}
+
+/// The Python front end's exact flow-hash convention
+/// (`python/keel/src/keel/_flow.py::_code_hash`): sha256 of the script
+/// bytes, first 16 hex chars. Byte-for-byte the same derivation or the
+/// staleness verdict is noise.
+fn current_code_hash(script: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(script).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize())[..16].to_owned())
+}
+
+/// Apply the WS6 staleness rule (module docs): resumable + recorded hash +
+/// resolvable `py:` script, else `None`.
+fn staleness(
+    project: &Path,
+    status: &str,
+    entrypoint: &str,
+    recorded: Option<&str>,
+) -> Option<bool> {
+    if !matches!(status, "running" | "failed") {
+        return None;
+    }
+    let recorded = recorded?;
+    let (lang, module, _function) = crate::resume::parse_entrypoint(entrypoint)?;
+    if lang != "py" {
+        return None;
+    }
+    match crate::resume::locate_script(project, module) {
+        crate::resume::ScriptLookup::Found(path) => Some(current_code_hash(&path)? != recorded),
+        _ => None,
+    }
+}
+
+/// A resumable flow whose recorded code hash no longer matches its script —
+/// doctor's `code-hash-stale` follow-up input (WS6).
+pub(crate) struct StaleFlow {
+    pub(crate) flow_id: String,
+    pub(crate) entrypoint: String,
+}
+
+/// Stale resumable flows for `project`, sorted by flow_id; empty on any read
+/// problem (doctor never fails on journal trouble — it reports what it can).
+pub(crate) fn stale_code_hash_flows(project: &Path) -> Vec<StaleFlow> {
+    let path = evidence::resolved_journal(project).path;
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(rows) = read_flows(project, &path, false) else {
+        return Vec::new();
+    };
+    let mut out: Vec<StaleFlow> = rows
+        .into_iter()
+        .filter(|r| r.code_hash_stale == Some(true))
+        .map(|r| StaleFlow {
+            flow_id: r.flow_id,
+            entrypoint: r.entrypoint,
+        })
+        .collect();
+    out.sort_by(|a, b| a.flow_id.cmp(&b.flow_id));
+    out
 }
 
 /// `(total, done)` real steps for a flow — excluding internal `marker` rows (the
@@ -148,8 +225,13 @@ fn flows_human(report: &FlowsReport, now_ms: i64) -> String {
         report.count
     )];
     for f in &report.flows {
+        let stale_marker = if f.code_hash_stale == Some(true) {
+            "  code changed"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "  {}  {}  {}  steps {}/{}  {}\n",
+            "  {}  {}  {}  steps {}/{}  {}{stale_marker}\n",
             f.flow_id,
             f.entrypoint,
             f.status,
@@ -447,6 +529,69 @@ mod tests {
         assert_eq!(r.exit, crate::EXIT_OK);
         assert_eq!(r.json["journal_present"], false);
         assert_eq!(r.json["count"], 0);
+    }
+
+    /// WS6: a resumable flow whose current script hashes differently from the
+    /// recorded code_hash is flagged; a completed flow reports null; a flow
+    /// whose script cannot be located reports null (honesty over coverage).
+    #[test]
+    fn flows_reports_code_hash_staleness_tristate() {
+        let (_d, project) = project_with_fixture("interrupted-flow.sql");
+        // interrupted-flow.sql: running flow, entrypoint py:pipeline.ingest:main.
+        // Read its recorded code_hash from the DB rather than assuming the
+        // fixture value:
+        let conn = Connection::open(project.join(".keel/journal.db")).unwrap();
+        let recorded: Option<String> = conn
+            .query_row("SELECT code_hash FROM flows", [], |r| r.get(0))
+            .unwrap();
+        // Case 1: no script on disk -> null.
+        let r = flows(&project, false, T0 + 60_000);
+        assert!(r.json["flows"][0]["code_hash_stale"].is_null());
+        assert_eq!(r.json["flows"][0]["code_hash"], serde_json::json!(recorded));
+        // Case 2: script present, content that CANNOT hash to the recorded
+        // value's 16-hex prefix (recorded fixture hashes are synthetic) -> stale.
+        let script = project.join("pipeline").join("ingest.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "def main():\n    pass\n").unwrap();
+        let r = flows(&project, false, T0 + 60_000);
+        if recorded.is_some() {
+            assert_eq!(r.json["flows"][0]["code_hash_stale"], true);
+            assert!(r.human.contains("code changed"));
+        } else {
+            // Fixture stores NULL code_hash: tri-state stays null; Case 3
+            // below covers the non-null path with a synthetic row.
+            assert!(r.json["flows"][0]["code_hash_stale"].is_null());
+        }
+        // Case 3: synthetic running flow whose recorded hash MATCHES the file.
+        let bytes = std::fs::read(&script).unwrap();
+        let fresh = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            format!("{:x}", h.finalize())[..16].to_owned()
+        };
+        conn.execute(
+            "INSERT INTO flows (flow_id, entrypoint, args_hash, code_hash, status, created_at, updated_at) \
+             VALUES ('01FRESHFLOW', 'py:pipeline.ingest:main', 'ah-x', ?1, 'failed', ?2, ?2)",
+            rusqlite::params![fresh, T0],
+        )
+        .unwrap();
+        let r = flows(&project, false, T0 + 60_000);
+        let fresh_row = r.json["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["flow_id"] == "01FRESHFLOW")
+            .unwrap()
+            .clone();
+        assert_eq!(fresh_row["code_hash_stale"], false);
+    }
+
+    #[test]
+    fn completed_flows_never_report_staleness() {
+        let (_d, project) = project_with_fixture("completed-flow.sql");
+        let r = flows(&project, false, T0);
+        assert!(r.json["flows"][0]["code_hash_stale"].is_null());
     }
 
     #[test]

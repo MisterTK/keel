@@ -402,7 +402,15 @@ pub fn run(project: &Path) -> Rendered {
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
     let agents_cli_finding = agents_cli_placement_finding(project);
-    let report = build_report(&scan, &discovery, policy, journal, agents_cli_finding);
+    let stale_flows = crate::flows::stale_code_hash_flows(project);
+    let report = build_report(
+        &scan,
+        &discovery,
+        policy,
+        journal,
+        agents_cli_finding,
+        &stale_flows,
+    );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
     Rendered::ok(human, to_json(&report)).with_exit(exit)
@@ -588,6 +596,7 @@ fn build_follow_ups(
     topology: &Topology,
     resilience: Option<&Finding>,
     scan: &ScanResult,
+    stale_flows: &[crate::flows::StaleFlow],
 ) -> Vec<FollowUp> {
     let mut ups = Vec::new();
     for entry in &topology.unreachable {
@@ -643,6 +652,20 @@ fn build_follow_ups(
             ),
             rank: follow_up_rank("preexisting-resilience"),
             subject: libs.join(", "),
+        });
+    }
+    for flow in stale_flows {
+        ups.push(FollowUp {
+            code: "code-hash-stale",
+            detail: format!(
+                "Flow `{}` ({}) was recorded under a different code hash than its current \
+                 script; resuming would replay recorded steps against changed code (the resume \
+                 fence downgrades nondeterminism fail->warn). Inspect with `keel replay {}` \
+                 before resuming.",
+                flow.flow_id, flow.entrypoint, flow.flow_id
+            ),
+            rank: follow_up_rank("code-hash-stale"),
+            subject: flow.flow_id.clone(),
         });
     }
     ups.sort_by(|a, b| {
@@ -712,17 +735,20 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the five evidence inputs. Pure, so the golden test
-/// pins it without a filesystem or `python3` — the one filesystem-dependent
-/// input (`agents_cli_finding`, since it needs to walk for a manifest and
-/// check for a root `keel.toml`) is computed by the caller and passed in
-/// already resolved, the same pattern `policy`/`journal` already use.
+/// Assemble the report from the six evidence inputs. Pure, so the golden test
+/// pins it without a filesystem or `python3` — the filesystem-dependent
+/// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
+/// check for a root `keel.toml`; `stale_flows`, since it needs to read
+/// `.keel/journal.db` and stat scripts on disk) are computed by the caller
+/// and passed in already resolved, the same pattern `policy`/`journal`
+/// already use.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
     policy: PolicyValidation,
     journal: JournalReport,
     agents_cli_finding: Option<Finding>,
+    stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
     let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
@@ -816,7 +842,7 @@ fn build_report(
         });
     }
     let resilience = resilience_finding(scan, &registry_libs);
-    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan);
+    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan, stale_flows);
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
@@ -1170,7 +1196,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
@@ -1256,6 +1282,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -1350,6 +1377,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         let retry = r
             .findings
@@ -1443,6 +1471,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -1489,6 +1518,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
     }
@@ -1499,6 +1529,8 @@ mod tests {
     /// dependency-averse check would otherwise conclude. Runtime evidence (or
     /// the LLM pack's own wrapping) beats static doubt.
     #[test]
+    #[allow(clippy::too_many_lines)] // WS6 added a `build_report` arg; the fixture setup is
+    // already the longest legitimate part of this test, not the new plumbing.
     fn wrapped_and_llm_targets_are_always_wrappable() {
         use crate::scan::{DepAverseFile, TransportClass};
         let mut scan = ScanResult {
@@ -1565,7 +1597,14 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let r = build_report(&scan, &wrapped, default_policy(), default_journal(), None);
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            &[],
+        );
 
         assert!(
             r.topology
@@ -1632,7 +1671,14 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &BTreeSet::new(), policy, default_journal(), None);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            &[],
+        );
 
         assert!(
             r.coverage.invisible.is_empty(),
@@ -1689,6 +1735,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         let row = r
             .adapters
@@ -1721,6 +1768,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         let finding = r
             .findings
@@ -1748,6 +1796,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(
             !r.findings
@@ -1765,6 +1814,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(
             !r.findings
@@ -1786,7 +1836,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
         assert!(!r.ok);
         assert!(
             r.findings
@@ -1817,7 +1867,7 @@ mod tests {
             source: "keel.toml",
             supported: false,
         };
-        let r = build_report(&scan, &wrapped, policy, journal, None);
+        let r = build_report(&scan, &wrapped, policy, journal, None, &[]);
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
             .findings
@@ -2065,6 +2115,42 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
+    }
+
+    /// WS6: a resumable flow recorded under a different code hash surfaces as
+    /// the rank-5 `code-hash-stale` follow-up.
+    #[test]
+    fn code_hash_stale_flow_emits_the_rank5_follow_up() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema = std::fs::read_to_string(root.join("contracts/journal.sql")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let keel = dir.path().join(".keel");
+        std::fs::create_dir_all(&keel).unwrap();
+        let conn = rusqlite::Connection::open(keel.join("journal.db")).unwrap();
+        conn.execute_batch(&schema).unwrap();
+        let t0: i64 = 1_783_728_000_000;
+        conn.execute(
+            "INSERT INTO flows (flow_id, entrypoint, args_hash, code_hash, status, created_at, \
+             updated_at) VALUES ('01STALEFLOW', 'py:pipeline.ingest:main', 'ah-1', \
+             'deadbeefdeadbeef', 'running', ?1, ?1)",
+            rusqlite::params![t0],
+        )
+        .unwrap();
+        // A script on disk whose hash will never match the synthetic recorded
+        // value above.
+        let script_dir = dir.path().join("pipeline");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(script_dir.join("ingest.py"), "def main():\n    pass\n").unwrap();
+
+        let r = run(dir.path());
+        let f = r.json["follow_ups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["code"] == "code-hash-stale")
+            .expect("code-hash-stale emitted");
+        assert_eq!(f["rank"], 5);
+        assert!(f["detail"].as_str().unwrap().contains("keel replay"));
     }
 
     /// WS2 hardening: doctor and init --diff (the two MCP-exposed report

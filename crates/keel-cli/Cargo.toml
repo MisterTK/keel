@@ -37,6 +37,9 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 # Parse the user's keel.toml for `doctor` validation and `init --diff`.
 toml = "0.8"
+# The Python front end's exact flow-hash convention (`_flow.py::_code_hash`):
+# re-derived to detect resumable flows whose script changed since entry (WS6).
+sha2 = { workspace = true }
 # JS/TS/JSX parsing for the static scan (dx-spec §2) — pure Rust, so
 # `keel init` needs no Node toolchain. Pinned exactly: oxc's AST/visit API
 # churns between minors; bump all six crates together.
