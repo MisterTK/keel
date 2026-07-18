@@ -354,6 +354,30 @@ def _next_hop_request(request: Any, next_model: str) -> Any | None:
 
 # --- sync seam ---------------------------------------------------------------
 
+_TIMEOUT_KEYS = ("connect", "read", "write", "pool")
+
+
+def _inject_policy_timeout(request: Any, target: str) -> None:
+    """Inject the resolved policy ``timeout`` (issue #32) as a per-request
+    deadline into ``request.extensions["timeout"]`` — the dict httpx's own
+    ``Client`` already populates there (``{"connect", "read", "write",
+    "pool"}``, each a float or ``None`` for no timeout) and that the
+    transport seam we patch (``HTTPTransport.handle_request``) passes
+    straight through to httpcore, which is what actually enforces it. A
+    Transport has no other way to preempt a blocking call — the async seam
+    needs no equivalent because the core's own timer can preempt an awaited
+    future. Tighter wins per sub-key, same philosophy as urllib_pack's
+    ``_compose_timeout``."""
+    policy_s = _http.resolve_timeout_s(target)
+    if policy_s is None:
+        return
+    existing = request.extensions.get("timeout") or {}
+    request.extensions["timeout"] = {
+        key: policy_s if existing.get(key) is None else min(existing[key], policy_s)
+        for key in _TIMEOUT_KEYS
+    }
+
+
 def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
     backend = _runtime.get_backend()
     if backend is None:
@@ -368,6 +392,7 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
     while True:
         target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
+        _inject_policy_timeout(current, target)
         # Buffer the body ONLY when a cache ttl or a poll table is actually
         # configured for the target (mirrors Node's fetch gate), OR a budget
         # is configured (usage accounting needs the response body — see

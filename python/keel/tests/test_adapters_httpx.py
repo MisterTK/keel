@@ -112,6 +112,23 @@ class SyncResilienceTest(HttpxBase):
         self.assertEqual(r.content, b"fast")
         self.assertEqual(r.keel_outcome["attempts"], 2)
 
+    def test_policy_timeout_wins_when_tighter(self) -> None:
+        # issue #32: a configured policy `timeout` was completely inert for
+        # sync callers — the policy-layer timer cannot preempt a blocking
+        # call, and nothing injected it into httpx's own timeout mechanism.
+        # Policy 100ms beats a loose client-level timeout of 5s: attempt 1
+        # must abort client-side in ~100ms (well under the 400ms delayed
+        # response), then attempt 2 succeeds fast.
+        self.backend.configure(
+            {**level0_defaults(), "target": {"127.0.0.1": {"timeout": "100ms"}}}
+        )
+        with FaultServer([slow(0.4, ok(b"slow")), ok(b"fast")]) as srv:
+            with httpx.Client(timeout=5) as c:
+                r = c.get(srv.url())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"fast")
+        self.assertEqual(r.keel_outcome["attempts"], 2)
+
     def test_non_429_4xx_passes_through_unretried(self) -> None:
         with FaultServer([status(404, b"missing")]) as srv:
             with httpx.Client() as c:
