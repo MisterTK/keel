@@ -14,6 +14,7 @@ readme.workspace = true
 autobenches = false
 
 [dependencies]
+base64.workspace = true
 fastrand = "2.3"
 keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
 keel-journal = { path = "../keel-journal", version = "0.2.0" }

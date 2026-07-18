@@ -394,6 +394,59 @@ fn terminal_code(
     }
 }
 
+/// What judging one successful poll iteration's payload decided
+/// (conformance/README.md "Poll", verdict rules — parity-critical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollVerdict {
+    Terminal,
+    Pending,
+    FailOpen,
+}
+
+/// Judge `payload` against the poll predicate. An adapter HTTP envelope
+/// (`body_b64`, or `status`+`headers`) is judged by its decoded JSON body;
+/// a plain object is judged directly; everything else fails open.
+fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> PollVerdict {
+    use base64::Engine as _;
+    let Some(obj) = payload.as_object() else {
+        return PollVerdict::FailOpen;
+    };
+    let doc_owned;
+    let doc = if obj.contains_key("body_b64")
+        || (obj.contains_key("status") && obj.contains_key("headers"))
+    {
+        let Some(b64) = obj.get("body_b64").and_then(Value::as_str) else {
+            return PollVerdict::FailOpen;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return PollVerdict::FailOpen;
+        };
+        let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else {
+            return PollVerdict::FailOpen;
+        };
+        if !parsed.is_object() {
+            return PollVerdict::FailOpen;
+        }
+        doc_owned = parsed;
+        doc_owned.as_object().expect("checked object")
+    } else {
+        obj
+    };
+    match doc.get(&poll.until.field) {
+        None => PollVerdict::FailOpen,
+        Some(Value::String(s)) if poll.until.terminal.iter().any(|t| t == s) => {
+            PollVerdict::Terminal
+        }
+        Some(_) => PollVerdict::Pending,
+    }
+}
+
+/// The poll gate: a resolved poll table applies only to idempotent GET/HEAD
+/// ops (re-issuing a GET is as safe as retrying it — CCR-3).
+fn poll_applies(request: &Request) -> bool {
+    request.idempotent && (request.op.starts_with("GET ") || request.op.starts_with("HEAD "))
+}
+
 fn class_str(class: ErrorClass) -> &'static str {
     match class {
         ErrorClass::Conn => "conn",
@@ -996,9 +1049,24 @@ impl Engine {
             attempts: core::num::NonZeroU32::MIN,
             ..RetryPolicy::default()
         });
-        let result = self
-            .run_attempts(request, &resolved, &retry, effect, &mut out, trace.as_ref())
-            .await;
+        let result = match resolved.poll.as_ref().filter(|_| poll_applies(request)) {
+            Some(poll) => {
+                self.run_poll(
+                    request,
+                    &resolved,
+                    &retry,
+                    poll,
+                    effect,
+                    &mut out,
+                    trace.as_ref(),
+                )
+                .await
+            }
+            None => {
+                self.run_attempts(request, &resolved, &retry, effect, &mut out, trace.as_ref())
+                    .await
+            }
+        };
         // Only the memory scope writes through under the state lock; the
         // persistent scope writes after the lock drops (journal I/O off-lock).
         let memory_key = match &cache_plan {
@@ -1423,6 +1491,60 @@ impl Engine {
         }
     }
 
+    /// The poll layer (CCR-3): wraps the retry loop, so each iteration is one
+    /// fully-retried call and a failed iteration is a normal terminal error.
+    /// cache/rate/breaker sit outside (one admission, one settled outcome).
+    #[expect(clippy::too_many_arguments, reason = "mirrors run_attempts' signature")]
+    async fn run_poll<F>(
+        &self,
+        request: &Request,
+        resolved: &ResolvedPolicy,
+        retry: &RetryPolicy,
+        poll: &keel_core_api::policy::PollPolicy,
+        effect: &mut F,
+        out: &mut Outcome,
+        trace: Option<&TraceRef>,
+    ) -> Result<Value, OutcomeError>
+    where
+        F: AsyncFnMut(u32) -> AttemptResult,
+    {
+        let started = Instant::now();
+        loop {
+            let payload = self
+                .run_attempts(request, resolved, retry, effect, out, trace)
+                .await?;
+            match poll_verdict(poll, &payload) {
+                PollVerdict::Terminal => return Ok(payload),
+                PollVerdict::FailOpen => {
+                    debug!(
+                        target = %request.target, field = %poll.until.field,
+                        "poll fail-open: response not judgeable; returned as-is"
+                    );
+                    return Ok(payload);
+                }
+                PollVerdict::Pending => {
+                    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if elapsed.saturating_add(poll.interval.0) > poll.deadline.0 {
+                        return Err(OutcomeError {
+                            code: ErrorCode::PollDeadlineExceeded,
+                            class: ErrorClass::Other,
+                            http_status: None,
+                            message: with_trace_ref(
+                                format!(
+                                    "{} poll deadline exceeded: '{}' not terminal after {}ms",
+                                    request.op, poll.until.field, poll.deadline.0
+                                ),
+                                trace,
+                            ),
+                            original: None,
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(poll.interval.0)).await;
+                }
+            }
+        }
+    }
+
     /// The timeout-wrapped retry loop. `Ok(payload)` or the terminal error
     /// (whose message carries the call's trace ref when a sink is live).
     async fn run_attempts<F>(
@@ -1447,7 +1569,7 @@ impl Engine {
         // same reason; the core must not defeat that guard.
         let attempt_timeout = resolved.timeout.filter(|_| request.idempotent);
         for attempt in 1..=max_attempts {
-            out.attempts = attempt;
+            out.attempts += 1;
             self.state().metrics_for(target).attempts += 1;
             crate::metrics::record_attempt(target);
             self.emit_event(|| EventKind::AttemptStart {
@@ -1710,5 +1832,142 @@ mod tests {
             })
             .await;
         assert!(!out.from_cache, "expired/evicted key re-runs live");
+    }
+
+    fn poll_policy_json(interval: &str, deadline: &str) -> serde_json::Value {
+        json!({ "target": { "api.jobs.internal": {
+            "retry": { "attempts": 3, "schedule": "fixed(200ms)", "on": ["conn", "timeout", "429", "5xx"] },
+            "poll": { "interval": interval, "deadline": deadline,
+                       "until": { "field": "status", "terminal": ["completed", "failed"] } }
+        } } })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_reissues_until_terminal_and_accumulates_attempts() {
+        let engine = Engine::new();
+        engine.configure(&poll_policy_json("10s", "90s")).unwrap();
+        let mut script = vec![
+            json!({"status": "running"}),
+            json!({"status": "running"}),
+            json!({"status": "completed", "result": 42}),
+        ]
+        .into_iter();
+        let out = engine
+            .execute(&req("api.jobs.internal", "h1"), async |_a| {
+                AttemptResult::Ok {
+                    payload: script.next().expect("script exhausted"),
+                }
+            })
+            .await;
+        assert_eq!(out.result, "ok");
+        assert_eq!(
+            out.payload,
+            Some(json!({"status": "completed", "result": 42}))
+        );
+        assert_eq!(
+            out.attempts, 3,
+            "attempts accumulate across poll iterations"
+        );
+        assert!(
+            out.waits_ms.is_empty(),
+            "poll intervals are not retry waits"
+        );
+        let report = engine.report();
+        assert_eq!(report["targets"]["api.jobs.internal"]["calls"], 1);
+        assert_eq!(report["targets"]["api.jobs.internal"]["successes"], 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_deadline_is_e016_and_breaker_countable() {
+        let engine = Engine::new();
+        let mut policy = poll_policy_json("10s", "25s");
+        policy["target"]["api.jobs.internal"]["breaker"] = json!({ "failures": 1 });
+        engine.configure(&policy).unwrap();
+        let out = engine
+            .execute(&req("api.jobs.internal", "h1"), async |_a| {
+                AttemptResult::Ok {
+                    payload: json!({"status": "running"}),
+                }
+            })
+            .await;
+        assert_eq!(out.result, "error");
+        let err = out.error.expect("terminal error");
+        assert_eq!(err.code.as_str(), "KEEL-E016");
+        assert_eq!(
+            err.message,
+            "GET api.jobs.internal poll deadline exceeded: 'status' not terminal after 25000ms"
+        );
+        // pendings at 0ms and 10ms and 20ms; at 20ms, 20+10 > 25 → 3 attempts.
+        assert_eq!(out.attempts, 3);
+        assert_eq!(
+            out.breaker,
+            keel_core_api::BreakerState::Open,
+            "breaker-countable"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_fails_open_on_missing_field_and_skips_non_get() {
+        let engine = Engine::new();
+        engine.configure(&poll_policy_json("10s", "90s")).unwrap();
+        // Missing field: returned as-is, one attempt.
+        let out = engine
+            .execute(&req("api.jobs.internal", "h2"), async |_a| {
+                AttemptResult::Ok {
+                    payload: json!({"progress": 0.5}),
+                }
+            })
+            .await;
+        assert_eq!(out.result, "ok");
+        assert_eq!(out.attempts, 1);
+        // POST op: poll layer inert even with a pending-looking payload.
+        let mut post = req("api.jobs.internal", "h3");
+        post.op = String::from("POST api.jobs.internal");
+        let out = engine
+            .execute(&post, async |_a| AttemptResult::Ok {
+                payload: json!({"status": "running"}),
+            })
+            .await;
+        assert_eq!(out.attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_judges_http_envelope_bodies() {
+        use base64::Engine as _;
+        let engine = Engine::new();
+        engine.configure(&poll_policy_json("10s", "90s")).unwrap();
+        let b64 =
+            |v: &serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+        let envelope = |body: &serde_json::Value| {
+            json!({ "status": 200, "headers": [["content-type", "application/json"]],
+                    "body_b64": b64(body) })
+        };
+        let mut script = vec![
+            envelope(&json!({"status": "running"})),
+            envelope(&json!({"status": "completed"})),
+        ]
+        .into_iter();
+        let out = engine
+            .execute(&req("api.jobs.internal", "h4"), async |_a| {
+                AttemptResult::Ok {
+                    payload: script.next().expect("script exhausted"),
+                }
+            })
+            .await;
+        assert_eq!(out.result, "ok");
+        assert_eq!(out.attempts, 2);
+        // An envelope with a NON-JSON body fails open (returned as-is, 1 attempt).
+        let raw = json!({ "status": 200, "headers": [],
+            "body_b64": base64::engine::general_purpose::STANDARD.encode("not json") });
+        let out = engine
+            .execute(&req("api.jobs.internal", "h5"), async |_a| {
+                AttemptResult::Ok {
+                    payload: raw.clone(),
+                }
+            })
+            .await;
+        assert_eq!(out.result, "ok");
+        assert_eq!(out.payload, Some(raw));
+        assert_eq!(out.attempts, 1);
     }
 }

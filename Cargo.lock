@@ -1086,6 +1086,7 @@ dependencies = [
 name = "keelrun-core"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "criterion",
  "fastrand",
  "keel-conformance",
