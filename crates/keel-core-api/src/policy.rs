@@ -665,6 +665,50 @@ pub struct IdempotencyPolicy {
     pub header: String,
 }
 
+/// `until = { field, terminal }` — the poll's terminal predicate (CCR-3).
+/// Non-emptiness is enforced at deserialize so an unpollable predicate is
+/// KEEL-E001 at configure, never a silent never-terminal loop.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "PollUntilRaw")]
+pub struct PollUntil {
+    pub field: String,
+    pub terminal: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollUntilRaw {
+    field: String,
+    terminal: Vec<String>,
+}
+
+impl TryFrom<PollUntilRaw> for PollUntil {
+    type Error = ParseError;
+
+    fn try_from(raw: PollUntilRaw) -> Result<Self, Self::Error> {
+        if raw.field.is_empty() {
+            return Err(ParseError::new("poll until.field", "(empty)"));
+        }
+        if raw.terminal.is_empty() {
+            return Err(ParseError::new("poll until.terminal", "(empty array)"));
+        }
+        Ok(Self {
+            field: raw.field,
+            terminal: raw.terminal,
+        })
+    }
+}
+
+/// `poll = { interval, deadline, until }` — poll-until-terminal (CCR-3).
+/// GET/HEAD at Level 0 only; semantics in conformance/README.md ("Poll").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollPolicy {
+    pub interval: DurationMs,
+    pub deadline: DurationMs,
+    pub until: PollUntil,
+}
+
 /// One target's policy table. Every layer is optional; a layer set at a more
 /// specific level replaces the whole layer table (no deep merge).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -676,6 +720,7 @@ pub struct TargetPolicy {
     pub rate: Option<Rate>,
     pub cache: Option<CachePolicy>,
     pub idempotency: Option<IdempotencyPolicy>,
+    pub poll: Option<PollPolicy>,
     pub fallback: Option<Vec<String>>,
     pub budget: Option<String>,
 }
@@ -799,6 +844,8 @@ pub struct ResolvedPolicy {
     /// caller-supplied one). The core itself never injects; injection lives in
     /// the adapter per contracts/adapter-pack.md ("Idempotency-key injection").
     pub idempotency: Option<IdempotencyPolicy>,
+    /// `poll = { interval, deadline, until }` — poll-until-terminal (CCR-3).
+    pub poll: Option<PollPolicy>,
 }
 
 impl Policy {
@@ -810,6 +857,7 @@ impl Policy {
             rate: self.layer(target, |t| t.rate.as_ref()).copied(),
             cache: self.layer(target, |t| t.cache.as_ref()).cloned(),
             idempotency: self.layer(target, |t| t.idempotency.as_ref()).cloned(),
+            poll: self.layer(target, |t| t.poll.as_ref()).cloned(),
         }
     }
 
@@ -1196,6 +1244,38 @@ mod tests {
         // No idempotency anywhere: resolves to None.
         let empty: Policy = serde_path_to_error::deserialize(&json!({})).unwrap();
         assert!(empty.resolve("api.stripe.com").idempotency.is_none());
+    }
+
+    #[test]
+    fn poll_policy_parses_and_resolves() {
+        let policy: Policy = serde_json::from_value(serde_json::json!({
+            "target": { "api.jobs.example": { "poll": {
+                "interval": "10s", "deadline": "90s",
+                "until": { "field": "status", "terminal": ["completed", "failed"] }
+            } } }
+        }))
+        .expect("valid poll policy");
+        let resolved = policy.resolve("api.jobs.example");
+        let poll = resolved.poll.expect("poll resolved");
+        assert_eq!(poll.interval.0, 10_000);
+        assert_eq!(poll.deadline.0, 90_000);
+        assert_eq!(poll.until.field, "status");
+        assert_eq!(poll.until.terminal, vec!["completed", "failed"]);
+    }
+
+    #[test]
+    fn poll_rejects_empty_terminal_and_empty_field() {
+        for bad in [
+            serde_json::json!({ "interval": "10s", "deadline": "90s",
+                "until": { "field": "status", "terminal": [] } }),
+            serde_json::json!({ "interval": "10s", "deadline": "90s",
+                "until": { "field": "", "terminal": ["done"] } }),
+            serde_json::json!({ "interval": "10s",
+                "until": { "field": "status", "terminal": ["done"] } }),
+        ] {
+            let doc = serde_json::json!({ "target": { "x": { "poll": bad } } });
+            assert!(serde_json::from_value::<Policy>(doc).is_err());
+        }
     }
 
     #[test]
