@@ -140,5 +140,11 @@
     "message": "invalid value: integer `0`, expected a nonzero u32",
     "present": true,
     "valid": false
+  },
+  "topology": {
+    "excluded": [],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": []
   }
 }

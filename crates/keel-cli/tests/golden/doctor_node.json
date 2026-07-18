@@ -130,5 +130,13 @@
     "message": null,
     "present": true,
     "valid": true
+  },
+  "topology": {
+    "excluded": [],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": [
+      "api.example.com"
+    ]
   }
 }
