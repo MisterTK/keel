@@ -158,7 +158,17 @@ mod tests {
         assert!(t.codes.contains_key("KEEL-E001"));
         assert!(t.codes.contains_key("KEEL-E005"));
         assert!(t.codes.contains_key("KEEL-E014"));
+        assert!(t.codes.contains_key("KEEL-E016"));
         assert!(t.codes.contains_key("KEEL-E040"));
+    }
+
+    #[test]
+    fn explain_e016_names_poll_deadline() {
+        let r = run("KEEL-E016");
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(r.human.contains("poll-deadline-exceeded"));
+        assert!(r.human.contains("breaker-countable"));
+        assert_eq!(r.json["name"], "poll-deadline-exceeded");
     }
 
     #[test]

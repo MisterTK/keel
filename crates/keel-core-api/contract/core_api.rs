@@ -46,6 +46,8 @@ pub enum ErrorCode {
     NonIdempotentNotRetried,
     #[serde(rename = "KEEL-E015")]
     NonRetryableError,
+    #[serde(rename = "KEEL-E016")]
+    PollDeadlineExceeded,
     #[serde(rename = "KEEL-E020")]
     CacheCodec,
     #[serde(rename = "KEEL-E030")]
@@ -72,6 +74,7 @@ impl ErrorCode {
             ErrorCode::RateBudgetExceeded => "KEEL-E013",
             ErrorCode::NonIdempotentNotRetried => "KEEL-E014",
             ErrorCode::NonRetryableError => "KEEL-E015",
+            ErrorCode::PollDeadlineExceeded => "KEEL-E016",
             ErrorCode::CacheCodec => "KEEL-E020",
             ErrorCode::FlowLeaseHeld => "KEEL-E030",
             ErrorCode::FlowNondeterminism => "KEEL-E031",

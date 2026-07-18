@@ -68,6 +68,12 @@
       "why": "The error class (e.g. a 4xx client error) is not listed in retry.on — retrying would not help.",
       "next": "This is usually a bug in the request itself. Add the class to retry.on only if the target is known to return it transiently."
     },
+    "KEEL-E016": {
+      "name": "poll-deadline-exceeded",
+      "what": "A poll-until-terminal call kept returning a pending status and its poll deadline elapsed before `until.field` reached a terminal value.",
+      "why": "The target's `poll` policy re-issues a GET/HEAD while the response's `until.field` is not in `until.terminal`, bounded by `deadline`. The job never finished inside that bound. This is breaker-countable like any terminal failure.",
+      "next": "Check the job service's own status view; if the job legitimately needs longer, raise `poll.deadline` (and consider a longer `interval`)."
+    },
     "KEEL-E020": {
       "name": "cache-codec",
       "what": "A response could not be serialized into (or out of) the cache.",

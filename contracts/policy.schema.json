@@ -155,6 +155,33 @@
       },
       "required": ["header"]
     },
+    "poll": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3). Applies to GET/HEAD at Level 0 only. A JSON response whose `until.field` is not in `until.terminal` is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
+      "properties": {
+        "interval": { "$ref": "#/$defs/duration" },
+        "deadline": { "$ref": "#/$defs/duration" },
+        "until": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "field": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Top-level JSON key to judge (v1: no path expressions)."
+            },
+            "terminal": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            }
+          },
+          "required": ["field", "terminal"]
+        }
+      },
+      "required": ["interval", "deadline", "until"]
+    },
     "budget": {
       "type": "string",
       "description": "Per-run spend/token budget for llm: targets, e.g. `$5/run`. Exceeding it trips the breaker.",
@@ -170,6 +197,7 @@
         "rate": { "$ref": "#/$defs/rate" },
         "cache": { "$ref": "#/$defs/cache" },
         "idempotency": { "$ref": "#/$defs/idempotency" },
+        "poll": { "$ref": "#/$defs/poll" },
         "fallback": {
           "type": "array",
           "items": { "type": "string" },
