@@ -118,7 +118,19 @@ the four phases in order; the static scan is evidence, not the verdict.
    is either replaced by policy (note which `keel.toml` key) or explicitly
    out of Keel's reach (say so honestly). Respect dependency-averse files —
    a stdlib-only gate/validator was built that way on purpose; never propose
-   adding Keel as a dependency inside one. Finish with
+   adding Keel as a dependency inside one. A shell-script orchestrator that
+   builds its own at-most-once dispatch — `mkdir`/lockfile mutexes, guard
+   files gating a retry, hand-rolled dead-PID checks around a launcher
+   script — is out of the static scan's reach (it isn't Python/Node/Rust
+   source) but is exactly what `keel exec --flow <name> [--journal-file
+   <path>...] -- <command>` replaces: at-most-once dispatch per identity,
+   crash-safe retry gating, and (with `--journal-file`) a declared-
+   side-effect gate (KEEL-E033) before a failed run is retried. Before
+   resuming or trusting a durable flow's replay, check `code_hash_stale` in
+   `keel flows --json` / `keel doctor --json` — `true` means the
+   entrypoint's resolved code changed since the flow's last run, so a
+   replay would substitute steps recorded against a different program;
+   confirm the flow should still resume before doing so. Finish with
    `keel init --diff --json` / `propose_policy` and present the diff, never
    a hand-written policy guess.
 

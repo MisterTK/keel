@@ -175,6 +175,23 @@ Two tiers, one policy file:
   replays completed steps from the journal instead of re-firing their side
   effects, then resumes live from wherever it left off.
 
+### `keel exec` — durable external commands (CCR-4)
+
+Wrap any command as a journaled durable flow — at-most-once dispatch per
+identity, crash-safe retry gating, and a declared-side-effect gate:
+
+    keel exec --flow autonomous-run \
+      --journal-file logs/trades.jsonl \
+      -- ./run_autonomous.sh
+
+Honest scope: Keel gives you **at-most-once dispatch + crash-safe retry
+gating**, not exactly-once execution inside an opaque child. A concurrent
+same-identity invocation follows `[flows] on_busy = "skip" | "wait" |
+"fail"` (default `skip` — the mkdir-mutex pattern this replaces). If a
+failed run's declared journal files changed, a retry is refused with
+KEEL-E033 (`--force` overrides). A completed flow re-invoked with the same
+identity replays instantly without respawning the child.
+
 Both tiers run on the same native Rust core via a C ABI, so the Python and
 Node front ends share identical semantics — verified by a shared
 [conformance suite](conformance/README.md) that every implementation must
