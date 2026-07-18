@@ -23,12 +23,12 @@ name = "keel"
 path = "src/main.rs"
 
 [dependencies]
-keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
-keel-journal = { path = "../keel-journal", version = "0.2.0" }
+keel-core-api = { path = "../keel-core-api", version = "0.3.0" }
+keel-journal = { path = "../keel-journal", version = "0.3.0" }
 # The real Tier-2 flow manager: `keel exec` (WS6, CCR-4) drives a `cmd:` flow
 # through `FlowManager` (identity/lease/attempts/completion) over the same
 # journal instance, so the CLI now links the engine, not just reads its files.
-keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.2.0" }
+keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.3.0" }
 clap = { version = "4", features = ["derive"] }
 # Read `.keel/journal.db` for `keel status` directly. The schema is frozen
 # (contracts/journal.sql); keel-journal owns writes, the CLI only reads.

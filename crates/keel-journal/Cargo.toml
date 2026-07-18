@@ -11,7 +11,7 @@ readme.workspace = true
 # contract/, drift-checked by build.rs). Publishing is a release-workflow step.
 
 [dependencies]
-keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
+keel-core-api = { path = "../keel-core-api", version = "0.3.0" }
 postgres = "0.19.14"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true }
