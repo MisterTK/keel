@@ -37,6 +37,12 @@
           "type": "string",
           "enum": ["fail", "warn", "branch"],
           "default": "fail"
+        },
+        "on_busy": {
+          "type": "string",
+          "enum": ["skip", "wait", "fail"],
+          "default": "skip",
+          "description": "What a concurrent same-identity `keel exec` invocation does while the flow's lease is held by a live process: skip (exit 0, matching the mkdir-mutex pattern it replaces), wait (poll until the lease frees), or fail (nonzero exit). CCR-4."
         }
       }
     },
@@ -83,8 +89,8 @@
     },
     "entrypointRef": {
       "type": "string",
-      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`.",
-      "pattern": "^(py|ts|rs):[^\\s]+$"
+      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`, or `cmd:<name>` (CCR-4) — an external command wrapped as a Tier-2 flow by `keel exec --flow <name>` (and, in a named fast-follow, by in-process subprocess interception).",
+      "pattern": "^(py|ts|rs):[^\\s]+$|^cmd:[a-z0-9][a-z0-9-]*$"
     },
     "retry": {
       "type": "object",

@@ -56,6 +56,8 @@ pub enum ErrorCode {
     FlowNondeterminism,
     #[serde(rename = "KEEL-E032")]
     FlowDead,
+    #[serde(rename = "KEEL-E033")]
+    SideEffectsRecorded,
     #[serde(rename = "KEEL-E040")]
     Internal,
 }
@@ -79,6 +81,7 @@ impl ErrorCode {
             ErrorCode::FlowLeaseHeld => "KEEL-E030",
             ErrorCode::FlowNondeterminism => "KEEL-E031",
             ErrorCode::FlowDead => "KEEL-E032",
+            ErrorCode::SideEffectsRecorded => "KEEL-E033",
             ErrorCode::Internal => "KEEL-E040",
         }
     }

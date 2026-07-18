@@ -741,12 +741,24 @@ pub enum NondeterminismResponse {
     Branch,
 }
 
+/// What a concurrent same-identity `keel exec` does while the lease is held
+/// by a live process (CCR-4). Default `skip` — the mkdir-mutex pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnBusy {
+    #[default]
+    Skip,
+    Wait,
+    Fail,
+}
+
 /// Tier 2 flow designation — parsed and carried, enforced by the real core.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlowsPolicy {
     pub entrypoints: Vec<String>,
     pub on_nondeterminism: NondeterminismResponse,
+    pub on_busy: OnBusy,
 }
 
 /// A journal location literal (`policy.journal`), validated against the frozen
@@ -1300,5 +1312,16 @@ mod tests {
         let plain = policy.resolve("api.example.com");
         assert_eq!(plain.retry.unwrap().attempts.get(), 3);
         assert!(plain.cache.is_none());
+    }
+
+    #[test]
+    fn flows_on_busy_parses_with_skip_default() {
+        let p: Policy = serde_json::from_value(serde_json::json!({
+            "flows": { "entrypoints": ["cmd:autonomous-run"], "on_busy": "wait" }
+        }))
+        .unwrap();
+        assert_eq!(p.flows.as_ref().unwrap().on_busy, OnBusy::Wait);
+        let p: Policy = serde_json::from_value(serde_json::json!({ "flows": {} })).unwrap();
+        assert_eq!(p.flows.unwrap().on_busy, OnBusy::Skip);
     }
 }

@@ -61,7 +61,7 @@ _ALLOWED_TARGET = ("timeout", "retry", "breaker", "rate", "cache", "idempotency"
 _ALLOWED_RETRY = ("attempts", "schedule", "on")
 _ALLOWED_BREAKER = ("failures", "cooldown", "window", "failure_rate", "min_calls")
 _ALLOWED_CACHE = ("ttl", "scope", "mode", "key")
-_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism")
+_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism", "on_busy")
 _ALLOWED_TELEMETRY = ("otlp_endpoint", "console")
 
 
@@ -364,6 +364,9 @@ class KeelCoreStub:
         on = flows.get("on_nondeterminism")
         if on is not None and on not in ("fail", "warn", "branch"):
             raise self._invalid("flows.on_nondeterminism", "must be fail|warn|branch")
+        on_busy = flows.get("on_busy")
+        if on_busy is not None and on_busy not in ("skip", "wait", "fail"):
+            raise self._invalid("flows.on_busy", "must be skip|wait|fail")
 
     def _validate_journal(self, journal: Any) -> None:
         if journal is None:

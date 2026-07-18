@@ -172,6 +172,15 @@ mod tests {
     }
 
     #[test]
+    fn explain_e033_names_side_effects() {
+        let r = run("KEEL-E033");
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(r.human.contains("side-effects-recorded"));
+        assert!(r.human.contains("--force"));
+        assert_eq!(r.json["name"], "side-effects-recorded");
+    }
+
+    #[test]
     fn explain_e014_carries_the_contract_copy_verbatim() {
         let r = run("KEEL-E014");
         assert_eq!(r.exit, crate::EXIT_OK);
