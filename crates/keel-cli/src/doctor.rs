@@ -2036,10 +2036,25 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("app.py"),
-            "import urllib.request\n\
-             # CANARY_COMMENT_9f31 must never appear in any report\n\
-             TOKEN = \"CANARY_SECRET_9f31\"\n\
-             U = \"https://api.leak.example/v1?key=CANARY_QUERY_9f31\"\n",
+            r#"import time
+import urllib.request
+import httpx
+import tenacity
+# CANARY_COMMENT_9f31 must never appear in any report
+TOKEN = "CANARY_SECRET_9f31"
+U = "https://api.leak.example/v1?key=CANARY_QUERY_9f31"
+
+def caller():
+    attempt = 0
+    while True:
+        try:
+            return httpx.get(U)
+        except Exception:
+            # CANARY_COMMENT_9f31 must never appear in any report
+            local_secret = "CANARY_QUERY2_9f31"
+            attempt += 1
+            time.sleep(1)
+"#,
         )
         .unwrap();
         std::fs::write(
@@ -2078,5 +2093,13 @@ mod tests {
         // Sanity: the report DID see the project (hosts present) — the canaries
         // are absent because of scoping, not because the scan saw nothing.
         assert!(doctor_json.contains("api.leak.example"));
+        // Sanity: the fixture's hand-rolled retry loop (Task 3.3's `--diff`
+        // notes path) actually fired — proving the canary-absence assertions
+        // above exercised the new note-rendering code, not an empty notes
+        // list that would trivially satisfy them.
+        assert!(
+            init_json.contains("hand-rolled-retry"),
+            "init --diff notes should surface the hand-rolled retry loop: {init_json}"
+        );
     }
 }

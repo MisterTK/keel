@@ -544,21 +544,6 @@ fn pad_comment(line: &str, comment: &str) -> String {
     format!("{line:<width$}{comment}")
 }
 
-/// `--diff`: what `keel init` would add/remove, as a target-name summary *and*
-/// an applyable patch (dx-spec §5, diffs as the lingua franca). Adds append
-/// whole evidence-cited blocks; removes drop `[target."…"]` tables no longer
-/// found in code; targets present on both sides are never touched, so user
-/// tuning and comments outside the changed blocks survive byte-for-byte. With
-/// no existing file the patch creates the whole generated keel.toml
-/// (`--- /dev/null`).
-///
-/// Never proposes a NEW policy block for a host [`doctor::classify_topology`]
-/// puts in the excluded (dependency-averse) bucket — the same classification
-/// `keel doctor` reports, reused directly so the two surfaces never disagree
-/// about which hosts get policy proposed (dx-spec §2's honesty triad). An
-/// excluded host the user already declared in their own `keel.toml` is left
-/// alone (neither added nor removed); the diff's human text explains every
-/// exclusion, sorted by host.
 /// WS3 proposal annotations: what becomes deletable once the proposed
 /// targets are wrapped. One note per simplification sighting attributed to a
 /// target this diff proposes (already sorted — `scan.simplifications` is
@@ -626,6 +611,21 @@ fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[Strin
     out
 }
 
+/// `--diff`: what `keel init` would add/remove, as a target-name summary *and*
+/// an applyable patch (dx-spec §5, diffs as the lingua franca). Adds append
+/// whole evidence-cited blocks; removes drop `[target."…"]` tables no longer
+/// found in code; targets present on both sides are never touched, so user
+/// tuning and comments outside the changed blocks survive byte-for-byte. With
+/// no existing file the patch creates the whole generated keel.toml
+/// (`--- /dev/null`).
+///
+/// Never proposes a NEW policy block for a host [`doctor::classify_topology`]
+/// puts in the excluded (dependency-averse) bucket — the same classification
+/// `keel doctor` reports, reused directly so the two surfaces never disagree
+/// about which hosts get policy proposed (dx-spec §2's honesty triad). An
+/// excluded host the user already declared in their own `keel.toml` is left
+/// alone (neither added nor removed); the diff's human text explains every
+/// exclusion, sorted by host.
 fn diff(
     toml_path: &Path,
     scan: &ScanResult,
