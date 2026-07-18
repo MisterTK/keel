@@ -68,6 +68,24 @@ pub struct CallSite {
     pub function: Option<String>,
 }
 
+/// One externally-launched process the scan saw — traffic inside it is
+/// outside Keel's visibility regardless of policy. Field order is the sort
+/// order (file, then line).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubprocessSighting {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// 1-based line of the launching call.
+    pub line: u32,
+    /// The launching call, e.g. `subprocess.run`, `os.system`,
+    /// `child_process.spawn`.
+    pub launcher: String,
+    /// The literal argv/command line when statically extractable
+    /// (a bare string, or a list/tuple of string-literal elements); otherwise
+    /// `"<dynamic>"`.
+    pub command: String,
+}
+
 /// One place a target was seen: a project-relative path and 1-based line.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sighting {
@@ -160,6 +178,10 @@ pub struct ScanResult {
     /// `targets`, this is never gated on `http_in_use` — it exists precisely
     /// to let `keel doctor` report on hosts Keel cannot see at all.
     pub host_transports: BTreeMap<String, TransportClass>,
+    /// Every externally-launched process the scan saw, sorted by
+    /// `(file, line)` — deterministic across runs. `keel doctor` uses this to
+    /// call out where Keel's visibility ends at a process boundary.
+    pub subprocesses: Vec<SubprocessSighting>,
 }
 
 impl ScanResult {
@@ -196,6 +218,7 @@ pub fn scan(project: &Path) -> ScanResult {
     result
         .functions
         .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
+    result.subprocesses.sort();
     result
 }
 
@@ -223,6 +246,9 @@ pub struct LangFindings {
     /// no reachable transport is exactly the `Unknown` case `keel doctor`
     /// needs to report honestly.
     pub host_transports: BTreeMap<String, TransportClass>,
+    /// Externally-launched processes this language pass saw (see
+    /// [`SubprocessSighting`]).
+    pub subprocesses: Vec<SubprocessSighting>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -252,6 +278,7 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
             .and_modify(|c| *c = (*c).min(*class))
             .or_insert(*class);
     }
+    result.subprocesses.extend(f.subprocesses.iter().cloned());
 }
 
 /// Directory names never descended into during a filesystem walk — scans,

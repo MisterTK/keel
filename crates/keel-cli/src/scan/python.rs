@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use super::{FunctionFacts, LangFindings, Sighting, TransportClass};
+use super::{FunctionFacts, LangFindings, Sighting, SubprocessSighting, TransportClass};
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
 /// in sorted order, output keys are sorted. Finds imports of the known effect
@@ -52,6 +52,10 @@ DT_NAMES = {"now", "utcnow", "today"}
 UUID_NAMES = {"uuid1", "uuid3", "uuid4", "uuid5"}
 OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
              "execvp", "execvpe", "spawnl", "spawnv", "spawnvp"}
+# Subprocess-launching call names itemized (with literal argv where
+# extractable) as their own finer-grained signal, separate from the coarse
+# `unsafe_reasons` UNSAFE_LIBS/OS_UNSAFE already feed.
+SUBPROC_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
 SKIP = {".keel", ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", "dist", "build", "target"}
 
@@ -132,6 +136,22 @@ def url_consts_of(tree):
     return consts
 
 
+def argv_text(call):
+    """The launched command as literal text, when statically extractable: a
+    bare string arg, or a list/tuple of string-literal elements (the argv
+    shape). Anything else (a variable, an f-string, a partial list) is
+    genuinely dynamic — report it as such rather than guessing."""
+    if call.args:
+        a = call.args[0]
+        if isinstance(a, ast.Constant) and isinstance(a.value, str):
+            return a.value
+        if isinstance(a, (ast.List, ast.Tuple)) and a.elts and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str)
+                for e in a.elts):
+            return " ".join(e.value for e in a.elts)
+    return "<dynamic>"
+
+
 def fn_facts(fn, rel, mod, aliases, url_consts):
     effects = unsafe_idem = t_reads = r_reads = 0
     targets = set()
@@ -182,6 +202,7 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
 root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
+subprocesses = []
 functions = []
 resilience_libs = set()
 files = 0
@@ -239,14 +260,28 @@ for dirpath, dirnames, filenames in os.walk(root):
         if mod.endswith(".__init__"):
             mod = mod[: -len(".__init__")]
         aliases = aliases_of(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lib = aliases.get(call_root(node.func))
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else call_root(node.func)
+            if lib == "subprocess" and name in SUBPROC_NAMES:
+                subprocesses.append({"file": rel, "line": node.lineno,
+                                     "launcher": "subprocess." + name,
+                                     "command": argv_text(node)})
+            elif lib == "os" and name in ("system", "popen"):
+                subprocesses.append({"file": rel, "line": node.lineno,
+                                     "launcher": "os." + name,
+                                     "command": argv_text(node)})
         consts = url_consts_of(tree)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 functions.append(fn_facts(node, rel, mod, aliases, consts))
 
+subprocesses.sort(key=lambda x: (x["file"], x["line"]))
 print(json.dumps({"files_scanned": files, "functions": functions,
                   "imports": imports, "resilience_libs": sorted(resilience_libs),
-                  "urls": urls}, sort_keys=True))
+                  "subprocesses": subprocesses, "urls": urls}, sort_keys=True))
 "#;
 
 /// One import finding from the walker.
@@ -287,6 +322,15 @@ struct PyFunction {
     unsafe_reasons: Vec<String>,
 }
 
+/// One subprocess/external-process launch from the walker.
+#[derive(Debug, Deserialize)]
+struct WalkerSubprocess {
+    file: String,
+    line: u32,
+    launcher: String,
+    command: String,
+}
+
 /// The walker's JSON output, typed.
 #[derive(Debug, Deserialize)]
 struct WalkerOutput {
@@ -296,6 +340,8 @@ struct WalkerOutput {
     imports: Vec<Import>,
     #[serde(default)]
     resilience_libs: Vec<String>,
+    #[serde(default)]
+    subprocesses: Vec<WalkerSubprocess>,
     urls: Vec<Url>,
 }
 
@@ -343,6 +389,14 @@ pub fn scan(project: &Path) -> PyScan {
     }
     for lib in &output.resilience_libs {
         findings.resilience_libs.insert(lib.clone());
+    }
+    for sub in output.subprocesses {
+        findings.subprocesses.push(SubprocessSighting {
+            file: sub.file,
+            line: sub.line,
+            launcher: sub.launcher,
+            command: sub.command,
+        });
     }
     for url in &output.urls {
         // The walker already returned a bare hostname (urlsplit.hostname), so it
@@ -600,6 +654,48 @@ def risky():
                 "threading use at jobs.py:8".to_owned(),
                 "subprocess use at jobs.py:9".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn subprocess_launches_are_itemized_with_literal_argv() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("launch.py"),
+            r#"import subprocess
+import os
+
+def go(cmd):
+    subprocess.run(["uvx", "alpaca-mcp-server"])
+    subprocess.Popen(cmd)
+    os.system("./scripts/kill_switch.sh")
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let items: Vec<(&str, &str)> = s
+            .findings
+            .subprocesses
+            .iter()
+            .map(|x| (x.launcher.as_str(), x.command.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("subprocess.run", "uvx alpaca-mcp-server"),
+                ("subprocess.Popen", "<dynamic>"),
+                ("os.system", "./scripts/kill_switch.sh"),
+            ]
+        );
+        assert!(
+            s.findings
+                .subprocesses
+                .iter()
+                .all(|x| x.file == "launch.py")
         );
     }
 

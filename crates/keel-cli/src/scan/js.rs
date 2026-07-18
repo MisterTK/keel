@@ -608,6 +608,40 @@ export function shellOut() {
     }
 
     #[test]
+    fn subprocess_launches_are_itemized_with_literal_argv() {
+        let src = "\
+import { spawn, exec } from \"child_process\";
+import * as cp from \"child_process\";
+
+export function launch(cmd) {
+  spawn(\"uvx\");
+  exec(cmd);
+  cp.spawn(\"./scripts/kill_switch.sh\");
+}
+";
+        let f = findings_named(src, "launch.ts");
+        let items: Vec<(&str, &str)> = f
+            .subprocesses
+            .iter()
+            .map(|x| (x.launcher.as_str(), x.command.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("child_process.spawn", "uvx"),
+                ("child_process.exec", "<dynamic>"),
+                ("child_process.spawn", "./scripts/kill_switch.sh"),
+            ]
+        );
+        assert!(f.subprocesses.iter().all(|x| x.file == "launch.ts"));
+        // child_process is not an effect library: no call sites, no
+        // http_in_use, no libs entry — a process boundary, not a network one.
+        assert!(f.call_sites.is_empty());
+        assert!(!f.http_in_use);
+        assert!(!f.libs.contains("child_process"));
+    }
+
+    #[test]
     fn class_methods_and_plain_calls_are_not_tracked_as_functions() {
         let src = "\
 class Api {
