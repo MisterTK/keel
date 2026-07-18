@@ -19,9 +19,9 @@ readme = "README.md"
 name = "keel"
 
 [dependencies]
-keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.2.0" }
-keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
-keel-macros = { path = "../keel-macros", version = "0.2.0" }
+keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.3.0" }
+keel-core-api = { path = "../keel-core-api", version = "0.3.0" }
+keel-macros = { path = "../keel-macros", version = "0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Parse keel.toml at runtime (mirrors python/keel's `tomllib.loads` /
