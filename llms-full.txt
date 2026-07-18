@@ -122,6 +122,22 @@ provider-aware backoff, rate limiting, dev cache). Framework adapter packs are
 auto-detected from dependencies (AI SDK middleware, `mcp:` transports, etc.) and
 wrap tool/LLM calls with zero agent-code changes. See dx-spec §4.
 
+Google ADK + `agents-cli` quickstart: README's "Keel for Google ADK +
+agents-cli" section (`uv add keelrun` or the `agents-cli create my-agent -a
+MisterTK/keel/packaging/agents-cli-template` template, `KEEL_ENABLE=1`, `keel
+init` into the agent directory). `demos/adk-demo` runs a real `LlmAgent`
+riding out a 429 storm below the agent loop, and `skills/keel/` (`npx skills
+add MisterTK/keel`) is the coding-agent skill.
+
+Two more ADK-specific capabilities, both farm-certified against the real
+`google-adk` package: durable, crash-resumable agent turns — designate
+`py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` (one
+flow per process in v1; see `docs/targeting.md` for the full limitations
+list) — and cross-model fallback that survives a provider switch — set
+`fallback = [...]` on `llm:google-genai`; the plugin's `on_model_error` hook
+resolves and constructs the fallback model via ADK's own `LLMRegistry`,
+unlike the generic host/fetch seam's same-provider-only model rewrite.
+
 ## CLI reference
 
 Global: `--json` on any command emits deterministic JSON (sorted keys, no
@@ -143,6 +159,14 @@ timestamps) instead of prose. Same command, two audiences.
 - `keel mcp` — serve this project over MCP on stdio (JSON-RPC 2.0; no daemon, exits on EOF). Six tools: `get_status`, `get_doctor_report`, `propose_policy` (returns a keel.toml diff), `get_trace`, `list_flows`, `explain_error`. Each tool's text result is byte-identical to the matching command's `--json` output.
 - `keel record run <target> [args...]` / `keel record list` / `keel record test <recording>` — capture every intercepted effect during a run into `.keel/recordings/`, then turn a recording into a replayable offline test fixture (a pytest fixture or `node:test` file) that fails loudly on any unmatched effect.
 - `keel sim <plan>` — replay a declarative fault plan (injected errors, latency, crash-restart points) against a script or a recording, asserting the policy holds (retries within budget, breaker opens as configured, flows resume). Adapter-level fault injection, not hermetic simulation.
+
+## Dependency activation (without `keel run`)
+
+When another tool owns the process (test runners, `agents-cli`, `adk api_server`, uvicorn), activate Keel via environment variables:
+
+- **Python**: the `keelrun` wheel ships a `.pth` shim gated on `KEEL_ENABLE=1`. Set it in your `.env` and every Python process boots with the same policy engine as `keel run` — loading `keel.toml` from the working directory, or from `KEEL_CWD=<dir>` when config lives in the deployable app. `KEEL_DISABLE=1` always wins.
+- **Node**: add `NODE_OPTIONS="--import keelrun/register"` alongside `KEEL_ENABLE=1`. Same `KEEL_ENABLE` gate as Python; `KEEL_CWD` is Python-only — Node always uses the process working directory.
+- Activation is fail-open: a broken install or invalid `keel.toml` prints one `keel ▸` warning line; your app runs unwrapped. The preflight resilience advisory stays a `keel run`-only, CLI-side feature in both languages. Python's `.pth` shim additionally skips `keel record` / `keel sim` wiring and flow-entrypoint dispatch (designated via `[flows] entrypoints`, not auto-detected). Node's `keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload `keel run` uses — flow-entrypoint dispatch and `KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
 
 ## Error codes (frozen taxonomy)
 

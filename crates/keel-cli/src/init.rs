@@ -17,6 +17,7 @@ use std::path::Path;
 use keel_journal::TargetStats;
 use serde::Serialize;
 
+use crate::agents_cli;
 use crate::diff::{ChangeHunk, PolicyOp, PolicyPath, propose};
 use crate::render::to_json;
 use crate::scan::{ScanResult, TargetClass, TargetEvidence};
@@ -167,7 +168,10 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     let content = render_keel_toml(&scan, &discovery, stamp.as_deref());
     let targets = merged_targets(&scan, &discovery);
 
-    let toml_path = evidence::keel_toml(project);
+    let agents_cli_path = agents_cli_toml_path(project);
+    let toml_path = agents_cli_path
+        .clone()
+        .unwrap_or_else(|| evidence::keel_toml(project));
     if opts.diff {
         return diff(&toml_path, &scan, &discovery, &targets, stamp.as_deref());
     }
@@ -180,6 +184,17 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
 
     if let Err(e) = std::fs::write(&toml_path, &content) {
         return config_error(&format!("could not write {}: {e}", toml_path.display()));
+    }
+    // Only note the agents-cli redirection once the write has actually
+    // happened — not on the `--diff` preview path above, and not on the
+    // refuse-if-exists error path just above that (neither one modifies
+    // anything, so neither should print a note about what would be written).
+    if agents_cli_path.is_some() {
+        eprintln!(
+            "keel \u{25b8} agents-cli project detected \u{2014} writing {} so it ships in the \
+             container image",
+            relative_display(project, &toml_path)
+        );
     }
     let gitignore_updated = update_gitignore(project).unwrap_or(false);
 
@@ -214,6 +229,50 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
         wrote: toml_path.display().to_string(),
     };
     Rendered::ok(human, to_json(&report))
+}
+
+/// When `project` is inside a Google `agents-cli` layout (an
+/// `agents-cli-manifest.yaml` naming an `agent_directory`) and that agent
+/// directory is itself inside `project`, redirect the generated `keel.toml`
+/// there instead of the project root — the generated Dockerfile only `COPY`s
+/// `pyproject.toml`, `README.md`, `uv.lock*`, and the agent directory into the
+/// image, so a root `keel.toml` would never ship. Pure (no I/O side effects
+/// beyond the two `canonicalize` calls) — the caller decides whether and when
+/// to print a redirection note; see `run`. Returns `None` for a non-agents-cli
+/// project, or one whose agent directory resolves outside `project`.
+///
+/// The containment check canonicalizes both sides before comparing rather
+/// than using `Path::starts_with` directly: `starts_with` is purely
+/// component-syntactic, so `<project>/../elsewhere` lexically "starts with"
+/// `<project>` even though it resolves outside it. `agents_cli::
+/// find_agents_cli_layout` already rejects any `agent_directory` containing a
+/// `..` component (layer one), so this canonicalizing check (layer two) is
+/// defense in depth against anything that reaches `starts_with` unsanitized —
+/// e.g. an agent directory that is itself a symlink pointing outside
+/// `project`. Both paths are guaranteed to exist by this point (`project` is
+/// the directory `keel init` is running against; `find_agents_cli_layout`
+/// already checked `agent_dir` is a directory), so `canonicalize` failing
+/// here would itself indicate something adversarial (e.g. a TOCTOU removal)
+/// and correctly falls through to `None`.
+fn agents_cli_toml_path(project: &Path) -> Option<std::path::PathBuf> {
+    let layout = agents_cli::find_agents_cli_layout(project)?;
+    let canonical_project = std::fs::canonicalize(project).ok()?;
+    let canonical_agent_dir = std::fs::canonicalize(&layout.agent_dir).ok()?;
+    if !canonical_agent_dir.starts_with(&canonical_project) {
+        return None;
+    }
+    Some(layout.agent_dir.join("keel.toml"))
+}
+
+/// `target` relative to `base` when it is actually nested under `base`, else
+/// the absolute path unchanged. Mirrors `doctor::relative_display`: keeps the
+/// agents-cli redirection note reproducible across checkouts instead of
+/// embedding wherever this particular clone happens to sit on disk.
+fn relative_display(base: &Path, target: &Path) -> String {
+    target.strip_prefix(base).map_or_else(
+        |_| target.display().to_string(),
+        |rel| rel.display().to_string(),
+    )
 }
 
 /// The set of targets the generated file will contain: static findings unioned
@@ -1020,6 +1079,112 @@ mod tests {
         );
     }
 
+    // ---- agents-cli layout redirection ----
+
+    /// An `agents-cli` project (manifest + agent dir at the root) gets its
+    /// generated `keel.toml` written into the agent directory, not the
+    /// project root — the generated Dockerfile only COPYs the agent dir.
+    #[test]
+    fn agents_cli_project_writes_keel_toml_into_the_agent_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("app")).unwrap();
+        fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "schema_version: 1\nagent_directory: app\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(!dir.path().join("keel.toml").exists(), "no root keel.toml");
+        assert!(
+            dir.path().join("app").join("keel.toml").exists(),
+            "keel.toml lands in the agent directory"
+        );
+        assert_eq!(
+            r.json["wrote"].as_str().unwrap(),
+            dir.path()
+                .join("app")
+                .join("keel.toml")
+                .display()
+                .to_string()
+        );
+    }
+
+    /// A project with no `agents-cli-manifest.yaml` is unaffected: `keel.toml`
+    /// still lands at the project root, byte-identical to the non-agents-cli
+    /// goldens.
+    #[test]
+    fn non_agents_cli_project_writes_keel_toml_at_the_root() {
+        let dir = TempDir::new().unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(dir.path().join("keel.toml").exists());
+    }
+
+    /// The refuse-if-exists guard applies to the redirected path: an existing
+    /// `keel.toml` inside the agent directory blocks the write even though the
+    /// project root has none.
+    #[test]
+    fn agents_cli_refuses_when_the_redirected_path_already_exists() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("app")).unwrap();
+        fs::write(
+            dir.path().join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("app").join("keel.toml"), "# hand-written\n").unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.human.contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("app").join("keel.toml")).unwrap(),
+            "# hand-written\n"
+        );
+    }
+
+    /// `agents_cli_toml_path` itself: `None` for a non-agents-cli project.
+    #[test]
+    fn agents_cli_toml_path_is_none_without_a_manifest() {
+        let dir = TempDir::new().unwrap();
+        assert!(agents_cli_toml_path(dir.path()).is_none());
+    }
+
+    /// CRITICAL regression: `agent_directory: ../elsewhere` must never escape
+    /// `project`, even though the sibling directory it names genuinely exists
+    /// on disk (the reviewer's exact repro). Both layers of the fix apply
+    /// here — `agents_cli::find_agents_cli_layout` already rejects the `..`
+    /// component, so `agents_cli_toml_path` sees no layout at all and returns
+    /// `None` via `?`; this test pins that end-to-end outcome from `init`'s
+    /// side rather than re-testing `agents_cli`'s parser directly.
+    #[test]
+    fn agents_cli_toml_path_is_none_when_agent_directory_escapes_the_project() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(root.path().join("elsewhere")).unwrap();
+        fs::write(
+            project.join("agents-cli-manifest.yaml"),
+            "agent_directory: ../elsewhere\n",
+        )
+        .unwrap();
+
+        assert!(agents_cli_toml_path(&project).is_none());
+
+        // And the same repro through the full `run` path never writes
+        // outside `project`.
+        let r = run(&project, InitOptions::default());
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(project.join("keel.toml").exists());
+        assert!(!root.path().join("elsewhere").join("keel.toml").exists());
+    }
+
     #[test]
     fn diff_reports_added_and_removed_targets_precisely() {
         let dir = TempDir::new().unwrap();
@@ -1301,5 +1466,79 @@ timeout = \"5s\"
             fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
             original
         );
+    }
+
+    /// CRITICAL containment test: `agents_cli_toml_path` rejects an absolute
+    /// agent directory using canonicalization (layer 2), not Path::starts_with
+    /// (which is purely syntactic). This is defense in depth: even though a
+    /// manifest with `agent_directory: /etc` contains no `..` component (so
+    /// layer 1 in agents_cli.rs does not reject it), `canonicalize` resolves it
+    /// to the actual `/etc` on disk, which fails the starts_with check and
+    /// returns None. If layer 2 were removed and only layer 1 remained, this
+    /// would escape the project.
+    #[test]
+    fn agents_cli_toml_path_rejects_absolute_path_agent_directory() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        fs::write(
+            project.join("agents-cli-manifest.yaml"),
+            // Using the actual outside TempDir path (absolute, no ..) — layer 1
+            // does NOT reject this because there's no ParentDir component.
+            format!("agent_directory: {}\n", outside.display()),
+        )
+        .unwrap();
+
+        // agents_cli_toml_path should return None because canonicalization
+        // resolves the absolute path and discovers it's outside project.
+        assert!(agents_cli_toml_path(&project).is_none());
+
+        // End-to-end through run: writes to project root, never to outside.
+        let r = run(&project, InitOptions::default());
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(project.join("keel.toml").exists());
+        assert!(!outside.join("keel.toml").exists());
+    }
+
+    /// CRITICAL containment test: `agents_cli_toml_path` rejects a symlink
+    /// agent directory that points outside the project. This is defense in
+    /// depth: the manifest's `agent_directory` is a valid relative path inside
+    /// `project`, but if it's a symlink pointing outside, `canonicalize` will
+    /// resolve it to the actual target and fail the starts_with check. Layer 1
+    /// (agents_cli.rs rejecting `..`) does not catch this — only canonicalization
+    /// (layer 2) does.
+    #[cfg(unix)]
+    #[test]
+    fn agents_cli_toml_path_rejects_symlink_escape_to_outside_project() {
+        use std::os::unix::fs as unix_fs;
+
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        // Create a symlink inside project that points to outside.
+        let symlink = project.join("app");
+        unix_fs::symlink(&outside, &symlink).unwrap();
+
+        fs::write(
+            project.join("agents-cli-manifest.yaml"),
+            "agent_directory: app\n",
+        )
+        .unwrap();
+
+        // agents_cli_toml_path should return None because canonicalize resolves
+        // the symlink to outside and fails the starts_with check.
+        assert!(agents_cli_toml_path(&project).is_none());
+
+        // End-to-end through run: writes to project root, never to outside.
+        let r = run(&project, InitOptions::default());
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(project.join("keel.toml").exists());
+        assert!(!outside.join("keel.toml").exists());
     }
 }

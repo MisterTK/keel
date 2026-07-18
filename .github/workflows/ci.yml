@@ -250,7 +250,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit $status
 
-  # DX invariant 8 (Node half): `node --import keel/hook` adds <100ms to
+  # DX invariant 8 (Node half): `node --import keelrun/hook` adds <100ms to
   # process startup at p50. Mirrors the Python `startup-budget` job above
   # exactly: run the guard test, echo the measured deltas into the job
   # summary, same generous 250ms budget / NON-REQUIRED reasoning (shared
@@ -262,14 +262,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Measure `node --import keel/hook` startup overhead (no addon → native leg skips)
+      - name: Measure `node --import keelrun/hook` startup overhead (no addon → native leg skips)
         working-directory: node/keel
         run: |
           status=0
           node --test test/startup-budget.test.mjs > budget.log 2>&1 || status=$?
           cat budget.log
           {
-            echo "### \`node --import keel/hook\` startup budget (DX invariant 8)"
+            echo "### \`node --import keelrun/hook\` startup budget (DX invariant 8)"
             echo ""
             echo '```'
             grep -F "[startup budget]" budget.log || echo "(no measurement line captured)"

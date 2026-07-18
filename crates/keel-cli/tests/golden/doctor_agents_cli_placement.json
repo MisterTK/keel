@@ -1,0 +1,184 @@
+{
+  "adapters": [
+    {
+      "detected": false,
+      "lib": "httpx",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "requests",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "aiohttp",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib3",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "openai",
+      "status": "pinned",
+      "target": "llm:openai"
+    },
+    {
+      "detected": false,
+      "lib": "anthropic",
+      "status": "pinned",
+      "target": "llm:anthropic"
+    },
+    {
+      "detected": false,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": false,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
+      "detected": true,
+      "lib": "fetch",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "undici",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "http",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "ai-sdk",
+      "status": "pinned",
+      "target": "llm:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
+    }
+  ],
+  "coverage": {
+    "invisible": [],
+    "visible_unwrapped": [
+      "api.example.com"
+    ],
+    "wrapped": []
+  },
+  "findings": [
+    {
+      "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
+      "detail": "`api.example.com` is visible in your code but has no observed runtime evidence.",
+      "level": "warn",
+      "topic": "visible-unwrapped"
+    },
+    {
+      "action": "If a dependency makes calls Keel never reports, file an adapter request.",
+      "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
+      "level": "info",
+      "topic": "invisible"
+    },
+    {
+      "action": "Move keel.toml to app/keel.toml (or add a `COPY keel.toml` line to the Dockerfile).",
+      "detail": "This is an agents-cli project — its generated Dockerfile only COPYs pyproject.toml, README.md, uv.lock*, and app into the image, so the keel.toml at the project root never ships to the container.",
+      "level": "warn",
+      "topic": "agents-cli-config-placement"
+    }
+  ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
+  "ok": true,
+  "policy": {
+    "field": null,
+    "message": null,
+    "present": true,
+    "valid": true
+  },
+  "topology": {
+    "excluded": [],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": [
+      "api.example.com"
+    ]
+  }
+}

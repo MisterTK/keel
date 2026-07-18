@@ -20,6 +20,7 @@ listed here and checked byte-for-byte:
   - node/keel-cli/package.json             version + 5 optionalDependencies pins
   - node/keel-cli/npm/*/package.json       version (per-platform prebuilds)
   - python/keel/pyproject.toml            keelrun-core==<version> dependency pin
+  - crates/*/Cargo.toml                   intra-workspace path-dep version pins
 
 Usage: check-versions.py [--tag vX.Y.Z]
 `--tag` additionally asserts a release tag matches (for the release workflow:
@@ -82,6 +83,21 @@ def declarations() -> list[tuple[str, str]]:
     for pkg in sorted((REPO / "node/keel-cli/npm").glob("*/package.json")):
         rel = pkg.relative_to(REPO).as_posix()
         found.append((f"{rel} version", json.loads(pkg.read_text())["version"]))
+
+    # Publishable crates' intra-workspace path dependencies each carry their
+    # own literal "version" pin alongside the path (crates.io strips path
+    # deps and re-resolves by version against the registry) — swept
+    # unconditionally by scripts/bump-version.sh (lines ~50-56). Mirror that
+    # script's detection regex here so the two stay in lockstep as pins are
+    # added or removed, rather than hard-coding today's count of 8.
+    path_dep_pin = re.compile(
+        r'^([A-Za-z0-9_-]+) = \{[^\n]*path = "\.\./[A-Za-z0-9_-]+", version = "([^"]+)"',
+        re.MULTILINE,
+    )
+    for manifest in sorted((REPO / "crates").glob("*/Cargo.toml")):
+        rel = manifest.relative_to(REPO).as_posix()
+        for name, pinned in path_dep_pin.findall(manifest.read_text()):
+            found.append((f"{rel} path-dependency version pin[{name}]", pinned))
 
     init = (REPO / "python/keel/src/keel/__init__.py").read_text()
     m = re.search(r'^__version__ = "([^"]+)"$', init, re.MULTILINE)

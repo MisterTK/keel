@@ -135,7 +135,7 @@ durable flows.
 
 ## See it work
 
-Four runnable, deterministic demos — no real network involved
+Five runnable, deterministic demos — no real network involved
 ([`tools/faultproxy`](tools/faultproxy) serves scripted faults). See the
 40-second [storyboard](demos/STORYBOARD.md) for the shooting script.
 
@@ -144,6 +144,7 @@ Four runnable, deterministic demos — no real network involved
 | [flaky-python](demos/flaky-python) | A bare script dies on a 503; `keel run` survives it | Python |
 | [node-service](demos/node-service) | Same story, Node: a bare script dies on a 500; `keel run` survives it | Node |
 | [agent-demo](demos/agent-demo) | An LLM call survives a 429 storm; a second run costs ~0 API calls (dev cache) | Python |
+| [adk-demo](demos/adk-demo) | A real `google-adk` agent's tool call survives a 429 storm below the agent loop — zero extra LLM tokens | Python |
 | [durable-pipeline](demos/durable-pipeline) | `kill -9` mid-flow, rerun, and it resumes 10/10 steps — each firing exactly once | Python |
 
 ## How it works
@@ -175,6 +176,29 @@ Two ways a coding agent picks up Keel:
 - **`keel init --agents`** drops a concise, deterministic section into
   `AGENTS.md` so every future agent session in an already-Keel-adopted repo
   inherits the ground rules without installing anything extra.
+
+### Activation without `keel run`
+
+When another tool owns the process launch (`agents-cli run`, `adk api_server`,
+uvicorn, a test runner), Keel can activate as a plain dependency:
+
+- **Python** — the `keelrun` wheel ships a site-packages `.pth` shim gated on
+  one env var. Set `KEEL_ENABLE=1` (e.g. in your project `.env`) and every
+  Python process in that environment boots with the same policy engine
+  `keel run` uses — `keel.toml` from the working directory, or from
+  `KEEL_CWD=<dir>` when your config lives in the deployable app directory.
+- **Node** — add `NODE_OPTIONS="--import keelrun/register"` alongside
+  `KEEL_ENABLE=1`.
+
+Activation is fail-open by design: a broken install or invalid `keel.toml`
+prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
+always wins. The preflight resilience advisory stays a `keel run`-only,
+CLI-side feature in both languages. Python's `.pth` shim additionally does
+not wire `keel record`/`keel sim` or dispatch flow entrypoints — a `.pth` has
+no target script to match `[flows] entrypoints` against. Node's
+`keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload
+`keel run` uses — flow-entrypoint dispatch and
+`KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
 
 `keel mcp` serves the CLI itself as an MCP server over stdio — six tools,
 each byte-identical to its `--json` CLI twin (`get_status`,
@@ -212,13 +236,44 @@ that doesn't launch from the project directory) needs an explicit `cwd`:
 No `keel` on PATH (only installed via `uvx`)? Swap in
 `"command": "uvx", "args": ["--from", "keelrun-cli", "keel", "mcp"]`.
 
+### Keel for Google ADK + agents-cli
+
+Three steps, no code changes:
+
+1. **Dependency** — `uv add keelrun` (or start from the keel-enabled
+   template: `agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`).
+2. **Activate** — `KEEL_ENABLE=1` in your project `.env` (agents-cli
+   propagates it to local runs, eval, and every deploy target).
+3. **Policy** — `keel init` writes `keel.toml` into your agent directory
+   (inside the Dockerfile's COPY set, so it ships in the container —
+   `keel doctor` warns if it ever ends up at the repo root instead).
+
+Every Gemini call (`llm:google-genai`), tool call (`tool:<name>`), and MCP
+server round trip (`mcp:<server>`) becomes a policy-governed Keel target —
+certified weekly against the real `google-adk` and `mcp` packages in CI,
+including a full agent-over-MCP composition test. See `demos/adk-demo` for
+a runnable 429-survival demo, and `skills/keel/` (`npx skills add
+MisterTK/keel`) for the coding-agent skill.
+
+Two ADK-specific capabilities beyond the target list above, both
+farm-certified against the real `google-adk` package: list
+`py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` for
+durable, crash-resumable agent turns (a designated `Runner.run_async` call
+becomes a Tier 2 flow — see `docs/targeting.md` for the v1 limitations,
+notably one flow per process); and set `fallback = [...]` on the
+`llm:google-genai` target for cross-model fallback that survives a
+provider switch, not just a same-provider retry — the plugin's
+`on_model_error` hook resolves and constructs a real fallback model via
+ADK's own `LLMRegistry`, the one seam that can build a request for a
+genuinely different provider.
+
 ## Status
 
 Keel is pre-1.0 and published on every registry (`pip`, `npm`, `cargo` — see
 [Quickstart](#quickstart) above; the front-end name is `keelrun`, the CLI is
 `keelrun-cli`, see `docs/naming-decision.md`). `brew install keel` is not
-available — the Homebrew tap was deliberately not created (private repo;
-`cargo`/`pip`/`npm`/`uvx` already cover every platform). Everything
+available — the Homebrew tap was deliberately not created (`cargo`/`pip`/
+`npm`/`uvx` already cover every platform). Everything
 described in this README is
 real, tested, and running on the native core in both languages today — this
 isn't a roadmap, it's what's built. What's explicitly *not* built yet: a

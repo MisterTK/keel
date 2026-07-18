@@ -10,16 +10,24 @@ Keel intercepts a program's outbound calls (httpx/requests/fetch, LLM SDKs,
 it is `keel run app.py` / `keel run app.mjs` — no imports, no context objects, no
 base classes. Uninstalling the package removes the behavior and nothing else.
 
-Status (2026-07-15): Tier 1 and Tier 2 (including async flows) work end-to-end
-in both Python and Node on the real Rust core, with `kill -9` resume, a
-Postgres journal backend for fleet durability, `keel record`/`keel sim`, and a
-scoped Rust front end (`#[keel::wrap]` + reqwest-middleware). Wrapped-call
-overhead ~0.8 µs vs a 10 µs budget. Published: `pip install keelrun
-keelrun-cli`, `npm install keelrun keelrun-cli`, `cargo add keelrun --rename
-keel` + `cargo install keelrun-cli`, or zero-install via `uvx --from
-keelrun-cli keel run app.py`. A Claude Code Skill
-(`packaging/claude-skill/keel/`) and `keel doctor`'s pre-existing-resilience
-detection (tenacity/backoff, Python-first) also ship as of this release.
+Status (v0.2.0, 2026-07-16): Tier 1 and Tier 2 (including async flows) work
+end-to-end in both Python and Node on the real Rust core, with `kill -9`
+resume, a Postgres journal backend for fleet durability, `keel
+record`/`keel sim`, and a scoped Rust front end (`#[keel::wrap]` +
+reqwest-middleware). Agent frameworks are first-class as of this release:
+Google ADK Runner flows and cross-model fallback, zero-launcher activation
+(`KEEL_ENABLE=1`), and a CI adapter farm certified against six real
+frameworks (ADK, pydantic-ai, openai-agents, crewai, langgraph, MCP) — see
+"Keel for Google ADK + agents-cli" below. Wrapped-call overhead ~0.8 µs vs a
+10 µs budget. Published: `pip install keelrun keelrun-cli`, `npm install
+keelrun keelrun-cli`, `cargo add keelrun --rename keel` + `cargo install
+keelrun-cli`, or zero-install via `uvx --from keelrun-cli keel run app.py`.
+Every registry is live except one npm platform package,
+`keelrun-cli-win32-x64` (blocked by npm's own anti-spam system, not a code
+issue; cargo/pip/uvx cover Windows in the meantime). A Claude Code Skill
+(`packaging/claude-skill/keel/`, also `npx skills add MisterTK/keel`) and
+`keel doctor`'s pre-existing-resilience detection (tenacity/backoff,
+Python-first) ship too.
 
 ## Start here
 
@@ -34,6 +42,7 @@ detection (tenacity/backoff, Python-first) also ship as of this release.
 - [Level 2 — durable flows](demos/durable-pipeline/README.md): list `py:mod:fn` (Python) or `ts:mod#fn` (Node) under `[flows]`; a crashed run resumes and replays completed steps without re-firing effects, including concurrent async effects inside one flow.
 - [Targets](contracts/policy.schema.json): `host` (e.g. `api.stripe.com`), `py:`/`ts:` functions, and semantic `llm:<provider>` / `tool:<name>` / `mcp:<server>`.
 - [LLM dev-cache](demos/agent-demo/README.md): `cache = { mode = "dev" }` replays identical prompts off `KEEL_ENV=prod`; with the native core it persists across runs (~0 API calls on a repeat).
+- [ADK Runner flows + cross-model fallback](README.md): designate `py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` for durable, crash-resumable agent turns, and set `fallback = [...]` on `llm:google-genai` for real cross-provider fallback via the plugin's `on_model_error` hook — both farm-certified against real `google-adk`.
 
 ## Reference
 
@@ -47,4 +56,6 @@ detection (tenacity/backoff, Python-first) also ship as of this release.
 - Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
 - `keel init --agents` drops a Keel section into `AGENTS.md`.
 - `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
+- Zero-launcher activation: pip/npm dependency + `KEEL_ENABLE=1` (`.pth` / `NODE_OPTIONS=--import keelrun/register`); `KEEL_CWD` (Python) relocates the config root.
 - Output is deterministic (sorted keys, no timestamps unless asked) so `--json` is diffable.
+- Google ADK / `agents-cli` projects: start from `agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`, or install the coding-agent skill with `npx skills add MisterTK/keel` (`skills/keel/`).

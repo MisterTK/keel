@@ -569,7 +569,7 @@ mod bindings {
         /// disk. A no-op when no sink is attached. The writer thread already
         /// flushes whenever its queue drains, so a long-lived process (a
         /// `keel tail`'d server) needs this for nothing — but a short-lived
-        /// script (`--import keel/hook`, `keel sim`) can exit before its last
+        /// script (`--import keelrun/hook`, `keel sim`) can exit before its last
         /// few events drain on their own; the front end calls this once at
         /// process exit (`installExitFlush`) so a one-shot run's feed is
         /// always complete for `keel tail`/`keel sim` to read afterward.

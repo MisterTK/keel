@@ -26,7 +26,7 @@ require "json"
 class Keel < Formula
   desc "SQLite of durable execution: resilience as a library, zero code changes"
   homepage "https://github.com/MisterTK/keel"
-  url "https://github.com/MisterTK/keel/archive/refs/tags/v0.1.1.tar.gz"
+  url "https://github.com/MisterTK/keel/archive/refs/tags/v0.2.0.tar.gz"
   # Placeholder — the release workflow substitutes the real tarball digest
   # (`shasum -a 256`) for the tag being released. See
   # scripts/render-homebrew-formula.sh.
