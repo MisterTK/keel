@@ -86,6 +86,22 @@ pub struct SubprocessSighting {
     pub command: String,
 }
 
+/// One hand-rolled resilience pattern sighted inside a function that also
+/// reaches a Keel-relevant target — a simplification lead: once the target
+/// is wrapped, the pattern becomes redundant. `kind` is a closed set:
+/// "hand-rolled-retry" | "hand-rolled-poll" | "silent-swallow". `line`
+/// anchors the construct to delete (the loop / the `except` line), not the
+/// sleep call inside it. Python-only as of this build (JS pattern parity is
+/// a spec'd follow-on program).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SimplificationSighting {
+    pub file: String,
+    pub line: u32,
+    pub kind: String,
+    pub function: String,
+    pub targets: Vec<String>,
+}
+
 /// One file the scan judged dependency-averse: stdlib-only imports plus a
 /// risk/gate/guard/auth/valid/safety/kill name or docstring signal, or an
 /// explicit `# keel: exclude` marker. Markers win in both directions: an
@@ -203,6 +219,10 @@ pub struct ScanResult {
     /// see [`DepAverseFile`]. Python-only as of this build (see
     /// [`LangFindings::dependency_averse`]).
     pub dependency_averse: Vec<DepAverseFile>,
+    /// Hand-rolled resilience patterns sighted in functions with target
+    /// attribution, sorted by (file, line, kind) — deterministic across
+    /// runs.
+    pub simplifications: Vec<SimplificationSighting>,
 }
 
 impl ScanResult {
@@ -241,6 +261,7 @@ pub fn scan(project: &Path) -> ScanResult {
         .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
     result.subprocesses.sort();
     result.dependency_averse.sort();
+    result.simplifications.sort();
     result
 }
 
@@ -274,6 +295,9 @@ pub struct LangFindings {
     /// Files this language pass judged dependency-averse (see
     /// [`DepAverseFile`]).
     pub dependency_averse: Vec<DepAverseFile>,
+    /// Hand-rolled resilience patterns this language pass saw (see
+    /// [`SimplificationSighting`]). Python-only as of this build.
+    pub simplifications: Vec<SimplificationSighting>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -307,6 +331,9 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
     result
         .dependency_averse
         .extend(f.dependency_averse.iter().cloned());
+    result
+        .simplifications
+        .extend(f.simplifications.iter().cloned());
 }
 
 /// Directory names never descended into during a filesystem walk — scans,
