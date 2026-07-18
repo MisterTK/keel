@@ -967,6 +967,7 @@ dependencies = [
 name = "keel-core-stub"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "keel-conformance",
  "keel-core-api",
  "serde",
