@@ -24,7 +24,7 @@
 # verbatim):
 #
 #   actionlint .github/workflows/release.yml
-#   PATH="$HOME/.rustup/toolchains/1.97.0-aarch64-apple-darwin/bin:$PATH" \
+#   PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH" \
 #     maturin build --release -m crates/keel-py/Cargo.toml -o dist   # native wheel
 #   maturin build --release -m crates/keel-cli/Cargo.toml -o dist    # CLI wheel
 #   uvx --from ./dist/keelrun_cli-*.whl keel --help                 # uvx entrypoint
@@ -80,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # `rustup toolchain install` only makes 1.97.1 the override for THIS
         # directory (rust-toolchain.toml). That's not enough for any cargo
         # invocation that happens outside the checked-out repo tree — e.g.
         # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
@@ -334,7 +334,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # `rustup toolchain install` only makes 1.97.1 the override for THIS
         # directory (rust-toolchain.toml). That's not enough for any cargo
         # invocation that happens outside the checked-out repo tree — e.g.
         # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
@@ -473,7 +473,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # `rustup toolchain install` only makes 1.97.1 the override for THIS
         # directory (rust-toolchain.toml). That's not enough for any cargo
         # invocation that happens outside the checked-out repo tree — e.g.
         # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
@@ -557,7 +557,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # `rustup toolchain install` only makes 1.97.1 the override for THIS
         # directory (rust-toolchain.toml). That's not enough for any cargo
         # invocation that happens outside the checked-out repo tree — e.g.
         # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
@@ -692,7 +692,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
-        # `rustup toolchain install` only makes 1.97.0 the override for THIS
+        # `rustup toolchain install` only makes 1.97.1 the override for THIS
         # directory (rust-toolchain.toml). That's not enough for any cargo
         # invocation that happens outside the checked-out repo tree — e.g.
         # npm-pack-root's `check-release-metadata.sh --full` pip-installs a
