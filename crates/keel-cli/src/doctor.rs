@@ -481,6 +481,71 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
     findings
 }
 
+/// The WS3 simplification findings: each hand-rolled pattern the scan
+/// sighted inside a target-reaching function becomes one paired finding —
+/// "here is the target; once Keel wraps it, the code at file:line is
+/// redundant". The level pairs with the topology bucket: `warn` when any of
+/// the sighting's targets is already wrappable (deleting the pattern is
+/// actionable now), `info` when wrapping itself is still pending (e.g. a
+/// stdlib-urllib transport before the urllib pack lands). Never affects
+/// `ok`. Interpolates only hosts, file paths, line numbers, and function
+/// names (the no-raw-source hardening rule).
+fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Finding> {
+    let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
+    let mut findings = Vec::new();
+    for s in &scan.simplifications {
+        let targets = s.targets.join(", ");
+        let actionable_now = s.targets.iter().any(|t| wrappable.contains(t.as_str()));
+        let (level, when) = if actionable_now {
+            ("warn", "Keel can wrap this target now")
+        } else {
+            ("info", "once Keel can wrap this target")
+        };
+        let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
+            "hand-rolled-poll" => (
+                "hand-rolled-poll",
+                format!(
+                    "`{}` ({}:{}) hand-rolls poll-until-terminal against `{}` — {}, a `poll` \
+                     policy (interval / deadline / until) replaces the whole loop",
+                    s.function, s.file, s.line, targets, when
+                ),
+                "Wrap the target, then replace the loop with a `poll` policy — the poll \
+                 primitive (CCR-3) is the designated replacement for submit-then-poll loops."
+                    .to_owned(),
+            ),
+            "silent-swallow" => (
+                "silent-swallow",
+                format!(
+                    "`{}` ({}:{}) silences failures from `{}` with a broad `except` returning a \
+                     default — Keel replaces silence with retry + observability",
+                    s.function, s.file, s.line, targets
+                ),
+                "Wrap the target so Keel's policy owns the failure (retry, breaker, journal), \
+                 then narrow or remove the broad except."
+                    .to_owned(),
+            ),
+            _ => (
+                "hand-rolled-retry",
+                format!(
+                    "`{}` ({}:{}) hand-rolls retry around `{}` — {}, this loop becomes redundant",
+                    s.function, s.file, s.line, targets, when
+                ),
+                "Wrap the target with Keel retry/backoff policy, then delete the hand-rolled \
+                 loop — don't run both."
+                    .to_owned(),
+            ),
+        };
+        findings.push(Finding {
+            action,
+            detail: format!("{what}."),
+            fix: None,
+            level,
+            topic,
+        });
+    }
+    findings
+}
+
 /// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
 /// the claim Keel knows least about — it saw a URL but cannot even name the
 /// dispatch path — so it is investigated first; rank 5 (code-hash-stale,
@@ -710,6 +775,7 @@ fn build_report(
         topic: "invisible",
     });
     findings.extend(topology_findings(&topology));
+    findings.extend(simplification_findings(scan, &topology));
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
         let mut action = "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json.".to_owned();
@@ -1195,6 +1261,100 @@ mod tests {
                 .any(|f| f.topic == "dependency-averse-excluded" && f.level == "info")
         );
         // ok is unaffected: honesty findings are not configuration errors.
+        assert!(r.ok);
+    }
+
+    /// WS3: each hand-rolled pattern the scan sighted becomes ONE paired
+    /// finding. The pairing is with the topology bucket: a wrappable target
+    /// makes the finding actionable now (warn); an unreachable one is a
+    /// once-wrapped lead (info). The poll finding names the `poll` primitive
+    /// as the replacement (WS5 pairing).
+    #[test]
+    fn simplification_findings_pair_with_topology_buckets() {
+        use crate::scan::{SimplificationSighting, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Wrappable target (tracked transport) with a hand-rolled retry.
+        scan.targets.insert(
+            "api.ok.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 3,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.ok.com".into(), TransportClass::Tracked);
+        scan.simplifications.push(SimplificationSighting {
+            file: "app.py".into(),
+            line: 12,
+            kind: "hand-rolled-retry".into(),
+            function: "caller".into(),
+            targets: vec!["api.ok.com".into()],
+        });
+        // Unreachable target (stdlib urllib) with a hand-rolled poll — the
+        // claude-trader shape until WS4 flips urllib to tracked.
+        scan.targets.insert(
+            "api.tavily.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "fetch_short_metrics.py".into(),
+                    line: 39,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.tavily.com".into(), TransportClass::UntrackedKnown);
+        scan.simplifications.push(SimplificationSighting {
+            file: "fetch_short_metrics.py".into(),
+            line: 83,
+            kind: "hand-rolled-poll".into(),
+            function: "_poll_research".into(),
+            targets: vec!["api.tavily.com".into()],
+        });
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+        let retry = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "hand-rolled-retry")
+            .expect("retry finding");
+        assert_eq!(retry.level, "warn", "wrappable target → actionable now");
+        assert!(retry.detail.contains("api.ok.com"));
+        assert!(retry.detail.contains("app.py:12"));
+        assert!(retry.detail.contains("caller"));
+        let poll = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "hand-rolled-poll")
+            .expect("poll finding");
+        assert_eq!(poll.level, "info", "unreachable target → once-wrapped lead");
+        assert!(poll.detail.contains("fetch_short_metrics.py:83"));
+        assert!(poll.action.contains("poll"), "names the poll primitive");
+        // The WS2 closed follow-up vocabulary is NOT extended by WS3.
+        assert!(
+            r.follow_ups
+                .iter()
+                .all(|f| !f.code.starts_with("hand-rolled") && f.code != "silent-swallow"),
+            "{:?}",
+            r.follow_ups
+        );
+        // Simplification findings are honesty leads, never configuration errors.
         assert!(r.ok);
     }
 
