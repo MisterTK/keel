@@ -83,6 +83,43 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
 - Uninstalling Keel (removing the package) restores the original behavior
   exactly — there is nothing else to revert.
 
+## Evaluating Keel against a codebase (the protocol)
+
+When asked whether/how Keel should cover a project — a fresh adoption or an
+audit of an existing one — do NOT stop at grepping for HTTP libraries. Work
+the four phases in order; the static scan is evidence, not the verdict.
+
+1. **Scope.** Enumerate every process that does I/O, not just the entrypoint:
+   the main app, MCP servers in `.mcp.json`, shell-script launchers, cron
+   entries, anything reached via `subprocess`/`child_process`/`exec`. Keel
+   must be installed *inside* a process to see its traffic — a sibling
+   process is a coverage boundary, not a detail.
+2. **Explore.** For each URL/host the code touches, trace how the request is
+   *actually dispatched* — which library sends the bytes (an SDK may wrap a
+   transport Keel adapts, or hide one it doesn't). Note stdlib transports
+   (`urllib.request`, `http.client`, raw `http`/`https` on Node): Keel sees
+   them in the scan but may not adapt them yet.
+3. **Collect.** Run `keel doctor --json` (or the `get_doctor_report` MCP
+   tool). Read `topology` first — every sighted host lands in exactly one of
+   `wrappable` ("wrap it"), `unreachable` ("can't reach it, here's why"), or
+   `excluded` ("shouldn't reach it — seen only in a dependency-averse gate
+   file; the exclusion is deliberate and overridable with `# keel: include`"),
+   plus `external_processes` for the sibling-process blind spots. Then work
+   `follow_ups` strictly top-down: it is ranked with rank 1 = the claim Keel
+   is least able to verify itself (an unattributed URL) down to mechanical
+   facts awaiting a decision. Codes are a closed set: `url-no-transport`,
+   `subprocess-blind-spot`, `dependency-averse-excluded`,
+   `preexisting-resilience`, `code-hash-stale`.
+4. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
+   yet: retry loops with sleeps, poll-until-status loops, `mkdir`-style
+   mutexes, per-day guard files, broad `except: return None` swallows. Each
+   is either replaced by policy (note which `keel.toml` key) or explicitly
+   out of Keel's reach (say so honestly). Respect dependency-averse files —
+   a stdlib-only gate/validator was built that way on purpose; never propose
+   adding Keel as a dependency inside one. Finish with
+   `keel init --diff --json` / `propose_policy` and present the diff, never
+   a hand-written policy guess.
+
 ## Driving Keel via MCP
 
 `keel mcp` starts a stdio JSON-RPC MCP server exposing six tools, each
@@ -96,6 +133,10 @@ byte-identical to its CLI `--json` twin:
 | `get_trace` | `keel trace <flow> --json` |
 | `list_flows` | `keel flows --json` |
 | `explain_error` | `keel explain <code> --json` |
+
+`get_doctor_report` includes `topology` (the three honesty buckets) and a
+ranked `follow_ups` list — work follow-ups top-down; rank 1 means Keel is
+least able to verify the claim itself.
 
 **`keel mcp` has no `--project` flag** — it always reports on its own
 current working directory, so whatever launches it must set `cwd` to the
