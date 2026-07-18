@@ -1,0 +1,43 @@
+{
+  "name": "poll-deadline-exceeded",
+  "description": "Poll (CCR-3): still pending when the next re-issue would land past the deadline -> KEEL-E016, message pinned verbatim across implementations, breaker-countable (failures:1 opens it).",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "breaker": { "failures": 1, "cooldown": "15s" },
+        "poll": { "interval": "10s", "deadline": "25s", "until": { "field": "status", "terminal": ["completed", "failed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "running" } }
+        ],
+        "expect": {
+          "result": "error",
+          "attempts": 3,
+          "error": {
+            "code": "KEEL-E016",
+            "class": "other",
+            "message": "GET api.jobs.example/research poll deadline exceeded: 'status' not terminal after 25000ms"
+          },
+          "breaker": "open"
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "clock_ms": 20000,
+        "targets": {
+          "api.jobs.example": { "calls": 1, "attempts": 3, "successes": 0, "failures": 1, "breaker_opens": 1 }
+        }
+      }
+    }
+  ]
+}

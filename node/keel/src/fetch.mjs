@@ -150,10 +150,13 @@ export function installFetch(
     // non-idempotent success path.
     const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
 
-    // Only a call the core may actually cache needs its body buffered into the
-    // payload envelope (for a cross-call / cross-run replay). Everything else
-    // sends a cheap status/headers envelope and hands back the LIVE response.
+    // Only a call the core may actually cache OR poll-judge needs its body
+    // buffered into the payload envelope (for a cross-call / cross-run
+    // replay, or for the poll-until-terminal `until.field` check — CCR-3).
+    // Everything else sends a cheap status/headers envelope and hands back
+    // the LIVE response.
     const cacheCfg = backend.layer(target, "cache");
+    const pollCfg = backend.layer(target, "poll");
 
     // --- LLM budget + fallback (llm-policy.mjs) — llm:* POST targets only ---
     const isLlmGenerate = target.startsWith("llm:") && method === "POST";
@@ -187,7 +190,9 @@ export function installFetch(
       const op = `${method} ${hostname}${hopParsed.pathname}`;
       const hash = deriveArgsHash(target, method, hopParsed.href, hopBody);
       const request = { v: 1, target, op, idempotent, args_hash: hash };
-      const cacheable = hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined;
+      const cacheable =
+        hash != null &&
+        ((isTable(cacheCfg) && cacheCfg.ttl !== undefined) || isTable(pollCfg));
 
       heldOk = null;
       heldTransient = null;

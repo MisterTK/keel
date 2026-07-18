@@ -32,6 +32,7 @@
       "path": "target.\"api.new.example\""
     }
   ],
+  "notes": [],
   "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -3,5 +3,7 @@\n [target.\"api.example.com\"]\n timeout = \"9s\"   # user tuning survives\n \n-[target.\"api.gone.example\"]  # stale\n-timeout = \"5s\"\n+[target.\"api.new.example\"]           # seen in: app.mjs:3\n+timeout = \"30s\"\n+retry   = { attempts = 3, schedule = \"exp(200ms, x2, max 30s, jitter)\", on = [\"conn\", \"timeout\", \"429\", \"5xx\"] }\n+breaker = { failures = 5, cooldown = \"15s\" }\n",
   "removed": [
     "api.gone.example"

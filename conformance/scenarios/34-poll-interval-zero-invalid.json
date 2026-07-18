@@ -1,0 +1,13 @@
+{
+  "name": "poll-interval-zero-invalid",
+  "description": "A zero poll.interval would never approach the deadline on a virtual clock; rejected at configure (KEEL-E001) by schema and every implementation alike.",
+  "expect_configure_error": "KEEL-E001",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "poll": { "interval": "0ms", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": []
+}

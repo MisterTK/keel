@@ -46,6 +46,8 @@ pub enum ErrorCode {
     NonIdempotentNotRetried,
     #[serde(rename = "KEEL-E015")]
     NonRetryableError,
+    #[serde(rename = "KEEL-E016")]
+    PollDeadlineExceeded,
     #[serde(rename = "KEEL-E020")]
     CacheCodec,
     #[serde(rename = "KEEL-E030")]
@@ -54,6 +56,8 @@ pub enum ErrorCode {
     FlowNondeterminism,
     #[serde(rename = "KEEL-E032")]
     FlowDead,
+    #[serde(rename = "KEEL-E033")]
+    SideEffectsRecorded,
     #[serde(rename = "KEEL-E040")]
     Internal,
 }
@@ -72,10 +76,12 @@ impl ErrorCode {
             ErrorCode::RateBudgetExceeded => "KEEL-E013",
             ErrorCode::NonIdempotentNotRetried => "KEEL-E014",
             ErrorCode::NonRetryableError => "KEEL-E015",
+            ErrorCode::PollDeadlineExceeded => "KEEL-E016",
             ErrorCode::CacheCodec => "KEEL-E020",
             ErrorCode::FlowLeaseHeld => "KEEL-E030",
             ErrorCode::FlowNondeterminism => "KEEL-E031",
             ErrorCode::FlowDead => "KEEL-E032",
+            ErrorCode::SideEffectsRecorded => "KEEL-E033",
             ErrorCode::Internal => "KEEL-E040",
         }
     }

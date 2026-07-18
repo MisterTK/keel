@@ -368,14 +368,15 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
     while True:
         target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
-        # Buffer the body ONLY when a cache ttl is actually configured for the
-        # target (mirrors Node's fetch gate), OR a budget is configured (usage
-        # accounting needs the response body — see `_llm_policy`).
+        # Buffer the body ONLY when a cache ttl or a poll table is actually
+        # configured for the target (mirrors Node's fetch gate), OR a budget
+        # is configured (usage accounting needs the response body — see
+        # `_llm_policy`).
         is_llm, cap_cents = _llm_generate_gate(target, current.method)
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        cacheable = hash_ is not None and _http.cache_configured(target)
+        cacheable = hash_ is not None and _http.buffer_body_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 
@@ -476,7 +477,7 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        cacheable = hash_ is not None and _http.cache_configured(target)
+        cacheable = hash_ is not None and _http.buffer_body_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 

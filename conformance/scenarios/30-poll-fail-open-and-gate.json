@@ -1,0 +1,46 @@
+{
+  "name": "poll-fail-open-and-gate",
+  "description": "Poll (CCR-3) fail-open + gate: a JSON object without until.field, an HTTP envelope with a non-JSON body, and a non-object payload are all returned as-is with one attempt; a POST op never polls even with a pending-shaped payload.",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/a", "idempotent": true, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "progress": 0.5 } } ],
+        "expect": { "result": "ok", "payload": { "progress": 0.5 }, "attempts": 1 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/b", "idempotent": true, "args_hash": "h2" },
+        "effect": [ { "status": "ok", "payload": { "status": 200, "headers": [["content-type", "text/plain"]], "body_b64": "bm90IGpzb24=" } } ],
+        "expect": { "result": "ok", "attempts": 1 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/c", "idempotent": true, "args_hash": "h3" },
+        "effect": [ { "status": "ok", "payload": "plain-string" } ],
+        "expect": { "result": "ok", "payload": "plain-string", "attempts": 1 }
+      }
+    },
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "POST api.jobs.example/submit", "idempotent": true, "args_hash": "h4" },
+        "effect": [ { "status": "ok", "payload": { "status": "running" } } ],
+        "expect": { "result": "ok", "payload": { "status": "running" }, "attempts": 1 }
+      }
+    },
+    { "report_expect": { "clock_ms": 0 } }
+  ]
+}

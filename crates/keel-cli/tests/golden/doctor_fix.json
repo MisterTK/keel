@@ -26,6 +26,12 @@
     },
     {
       "detected": false,
+      "lib": "urllib.request",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
       "lib": "boto3",
       "status": "best-effort",
       "target": "tool:aws.*"

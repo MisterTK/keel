@@ -52,9 +52,11 @@ every stub harness skips them. Tier 1 scenarios carry no `tier` field.
 
 ## Execution semantics (normative for every implementation)
 
-Layer order per call: **cache → rate → breaker → retry** (timeout and
-journal layers sit inside this order in the real core; scenarios inject
-`timeout` as an error class instead of enforcing wall-clock timeouts).
+Layer order per call: **cache → rate → breaker → poll → retry** (timeout sits
+per-attempt inside retry, and poll wraps retry — a failed poll attempt is a
+normal error for retry to consider; journal layers sit inside this order in
+the real core; scenarios inject `timeout` as an error class instead of
+enforcing wall-clock timeouts).
 
 1. **Resolution.** Per-layer: `target."<id>"` entry, else `defaults.llm` when
    the target starts with `llm:`, else `defaults.outbound`. A layer set at a
@@ -116,11 +118,32 @@ journal layers sit inside this order in the real core; scenarios inject
      single `exp` waits `min(base·factor^(n−1), cap)`, composition per
      "Schedule algebra" below), overridden upward by the error's
      `retry_after_ms` (`wait = max(schedule, retry_after)`), and try again.
-6. **Outcome.** Terminal errors carry the original error (class,
+6. **Poll (poll-until-terminal).** When the resolved policy has a `poll`
+   table AND the request is idempotent AND its `op` starts with `"GET "` or
+   `"HEAD "`, each retry-loop completion that returns `ok` is judged:
+   - Document: a payload object carrying `body_b64` (or both `status` and
+     `headers`) is an adapter HTTP envelope — `body_b64` must be a string
+     that base64-decodes and JSON-parses to an object, which becomes the
+     document; any other payload object is the document itself; anything
+     else (non-object payload, undecodable/non-object body) is **fail-open**:
+     the payload is returned as-is.
+   - Verdict: document lacks `until.field` → fail-open; field's value is a
+     JSON string equal to one of `until.terminal` → terminal (returned
+     unchanged); any other value → pending.
+   - Pending at `elapsed` ms since the poll's first attempt: if
+     `elapsed + interval > deadline` → terminal `KEEL-E016` with message
+     exactly `"{op} poll deadline exceeded: '{field}' not terminal after
+     {deadline}ms"` (breaker-countable); else wait `interval` (stubs advance
+     the virtual clock) and re-issue a fresh fully-retried call.
+   - `attempts` accumulates across iterations; `waits_ms` records retry
+     backoffs only (poll intervals appear in the clock, not the envelope);
+     metrics count the whole poll as one call and one success/failure;
+     cache/rate/breaker wrap the whole poll.
+7. **Outcome.** Terminal errors carry the original error (class,
    http_status, `original` token) so front ends re-raise it unchanged.
    `attempts` counts effect invocations (0 for cache hits and breaker
    rejections). `waits_ms` lists retry backoffs only.
-7. **Report.** Deterministic JSON: `{v, clock_ms, targets}` with per-target
+8. **Report.** Deterministic JSON: `{v, clock_ms, targets}` with per-target
    `attempts, breaker_opens, breaker_state, cache_hits, calls, failures,
    retries, successes, throttled` (sorted target keys). `successes` includes
    cache hits; `failures` includes breaker rejections.

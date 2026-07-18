@@ -54,12 +54,14 @@ typedef enum KeelErrorCode {
   KEEL_E014_NON_IDEMPOTENT_NOT_RETRIED = 14, /* retryable error, unsafe call:
                                           observed, not retried (Level 0 rule) */
   KEEL_E015_NON_RETRYABLE_ERROR = 15,  /* error class not in retry.on         */
+  KEEL_E016_POLL_DEADLINE_EXCEEDED = 16, /* poll-until-terminal deadline elapsed */
   KEEL_E020_CACHE_CODEC = 20,          /* reserved: unserializable cache value */
 
   /* flow / journal (Tier 2; reserved in v0.1) */
   KEEL_E030_FLOW_LEASE_HELD = 30,
   KEEL_E031_FLOW_NONDETERMINISM = 31,
   KEEL_E032_FLOW_DEAD = 32,
+  KEEL_E033_SIDE_EFFECTS_RECORDED = 33,
 
   KEEL_E040_INTERNAL = 40
 } KeelErrorCode;

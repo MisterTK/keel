@@ -148,6 +148,7 @@ struct WroteReport {
 struct DiffReport {
     added: Vec<String>,
     changes: Vec<ChangeHunk>,
+    notes: Vec<String>,
     patch: String,
     removed: Vec<String>,
     unchanged: Vec<String>,
@@ -543,6 +544,73 @@ fn pad_comment(line: &str, comment: &str) -> String {
     format!("{line:<width$}{comment}")
 }
 
+/// WS3 proposal annotations: what becomes deletable once the proposed
+/// targets are wrapped. One note per simplification sighting attributed to a
+/// target this diff proposes (already sorted — `scan.simplifications` is
+/// (file, line, kind)-ordered), plus one pre-existing-resilience note when
+/// the project imports a resilience library alongside at least one lib Keel
+/// wraps (the same compounding gate as doctor's `preexisting-resilience`
+/// finding, via [`crate::doctor::registry_libs`]).
+fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let added_set: BTreeSet<&str> = added.iter().map(String::as_str).collect();
+    for s in &scan.simplifications {
+        if s.targets.iter().any(|t| added_set.contains(t.as_str())) {
+            notes.push(format!(
+                "once wrapped: {} in `{}` at {}:{} becomes redundant (target {})",
+                s.kind,
+                s.function,
+                s.file,
+                s.line,
+                s.targets.join(", ")
+            ));
+        }
+    }
+    let registry_libs = crate::doctor::registry_libs();
+    if !scan.resilience_libs.is_empty()
+        && scan.libs.iter().any(|l| registry_libs.contains(l.as_str()))
+    {
+        let libs: Vec<&str> = scan.resilience_libs.iter().map(String::as_str).collect();
+        notes.push(format!(
+            "pre-existing resilience: this project imports {} — once Keel wraps the same calls, \
+             delete the old retry/backoff or scope Keel's policy (see `keel doctor`)",
+            libs.join(", ")
+        ));
+    }
+    notes
+}
+
+/// The trailing `# excluded (dependency-averse): …` and `# note: …` sections
+/// of the `--diff` human text — split out of [`diff`] to keep that function
+/// under clippy's line-count gate.
+fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[String]) -> String {
+    let mut out = String::new();
+    if !excluded.is_empty() {
+        // Sorted by host: `TopologyEntry`s already arrive in host order
+        // (`classify_topology` iterates `scan.targets`, a `BTreeMap`), but
+        // sort explicitly so this stays correct even if that internal detail
+        // ever changes.
+        let mut excluded: Vec<_> = excluded.iter().collect();
+        excluded.sort_by(|a, b| a.host.cmp(&b.host));
+        out.push('\n');
+        for entry in excluded {
+            let line = format!(
+                "# excluded (dependency-averse): {} — {}\n",
+                entry.host, entry.reason
+            );
+            out.push_str(&line);
+        }
+    }
+    if !notes.is_empty() {
+        out.push('\n');
+        for note in notes {
+            let line = format!("# note: {note}\n");
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
 /// `--diff`: what `keel init` would add/remove, as a target-name summary *and*
 /// an applyable patch (dx-spec §5, diffs as the lingua franca). Adds append
 /// whole evidence-cited blocks; removes drop `[target."…"]` tables no longer
@@ -599,6 +667,7 @@ fn diff(
         .filter(|t| existing.contains(**t))
         .map(|t| (*t).to_owned())
         .collect();
+    let notes = diff_notes(scan, &added);
 
     let ops = if existing_text.is_none() {
         // No file yet: the patch creates the generated keel.toml (header
@@ -649,25 +718,11 @@ fn diff(
         human.push_str("\napply with `git apply` (or `patch -p1`):\n\n");
         human.push_str(&proposal.patch);
     }
-    if !topology.excluded.is_empty() {
-        // Sorted by host: `TopologyEntry`s already arrive in host order
-        // (`classify_topology` iterates `scan.targets`, a `BTreeMap`), but
-        // sort explicitly so this stays correct even if that internal detail
-        // ever changes.
-        let mut excluded: Vec<_> = topology.excluded.iter().collect();
-        excluded.sort_by(|a, b| a.host.cmp(&b.host));
-        human.push('\n');
-        for entry in excluded {
-            let line = format!(
-                "# excluded (dependency-averse): {} — {}\n",
-                entry.host, entry.reason
-            );
-            human.push_str(&line);
-        }
-    }
+    human.push_str(&render_diff_trailer(&topology.excluded, &notes));
     let report = DiffReport {
         added,
         changes: proposal.changes,
+        notes,
         patch: proposal.patch,
         removed,
         unchanged,
@@ -1351,6 +1406,60 @@ timeout = \"5s\"
         let added = r.json["added"].as_array().unwrap();
         assert!(added.iter().any(|v| v == "api.normal.com"));
         assert!(!added.iter().any(|v| v == "api.broker.com"));
+    }
+
+    /// WS3: `keel init --diff` annotates proposals with what becomes deletable —
+    /// hand-rolled patterns attributed to a proposed target, and the
+    /// pre-existing-resilience signal (today doctor-only) — in both the JSON
+    /// (`notes`) and the human text (`# note:` lines).
+    #[test]
+    fn init_diff_annotates_simplifications_and_preexisting_resilience() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            r#"import time
+import httpx
+import tenacity
+
+API = "https://api.normal.com/v1"
+
+def caller():
+    n = 0
+    while True:
+        try:
+            return httpx.get(API)
+        except Exception:
+            n += 1
+            time.sleep(1)
+"#,
+        )
+        .unwrap();
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+        let json = serde_json::to_string(&r.json).unwrap();
+        assert!(
+            json.contains("\"notes\""),
+            "DiffReport carries notes: {json}"
+        );
+        assert!(json.contains("hand-rolled-retry"));
+        assert!(
+            json.contains("app.py:9"),
+            "anchored at the while loop: {json}"
+        );
+        assert!(json.contains("tenacity"));
+        assert!(r.human.contains("# note:"));
+        assert!(r.human.contains("hand-rolled-retry"));
+        assert!(r.human.contains("tenacity"));
     }
 
     /// With no keel.toml the patch creates the whole generated file from

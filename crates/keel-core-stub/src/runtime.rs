@@ -324,6 +324,59 @@ fn terminal_message(
     text.trim_end().to_owned()
 }
 
+/// What judging one successful poll iteration's payload decided
+/// (conformance/README.md "Poll", verdict rules — parity-critical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollVerdict {
+    Terminal,
+    Pending,
+    FailOpen,
+}
+
+/// Judge `payload` against the poll predicate. An adapter HTTP envelope
+/// (`body_b64`, or `status`+`headers`) is judged by its decoded JSON body;
+/// a plain object is judged directly; everything else fails open.
+fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> PollVerdict {
+    use base64::Engine as _;
+    let Some(obj) = payload.as_object() else {
+        return PollVerdict::FailOpen;
+    };
+    let doc_owned;
+    let doc = if obj.contains_key("body_b64")
+        || (obj.contains_key("status") && obj.contains_key("headers"))
+    {
+        let Some(b64) = obj.get("body_b64").and_then(Value::as_str) else {
+            return PollVerdict::FailOpen;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return PollVerdict::FailOpen;
+        };
+        let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) else {
+            return PollVerdict::FailOpen;
+        };
+        if !parsed.is_object() {
+            return PollVerdict::FailOpen;
+        }
+        doc_owned = parsed;
+        doc_owned.as_object().expect("checked object")
+    } else {
+        obj
+    };
+    match doc.get(&poll.until.field) {
+        None => PollVerdict::FailOpen,
+        Some(Value::String(s)) if poll.until.terminal.iter().any(|t| t == s) => {
+            PollVerdict::Terminal
+        }
+        Some(_) => PollVerdict::Pending,
+    }
+}
+
+/// The poll gate: a resolved poll table applies only to idempotent GET/HEAD
+/// ops (re-issuing a GET is as safe as retrying it — CCR-3).
+fn poll_applies(request: &Request) -> bool {
+    request.idempotent && (request.op.starts_with("GET ") || request.op.starts_with("HEAD "))
+}
+
 impl KeelCoreStub {
     #[must_use]
     pub fn new() -> Self {
@@ -383,7 +436,7 @@ impl KeelCoreStub {
     ) -> Result<Value, OutcomeError> {
         let max_attempts = retry.attempts.get();
         for attempt in 1..=max_attempts {
-            out.attempts = attempt;
+            out.attempts += 1;
             self.metrics_for(&request.target).attempts += 1;
             match effect(attempt) {
                 AttemptResult::Ok { payload } => return Ok(payload),
@@ -425,6 +478,42 @@ impl KeelCoreStub {
             }
         }
         unreachable!("loop always returns by the final attempt");
+    }
+
+    /// The poll layer (CCR-3): wraps the retry loop on the virtual clock —
+    /// pending waits advance the clock instead of sleeping. Parity with
+    /// `crates/keel-core/src/engine.rs::run_poll`.
+    fn run_poll(
+        &mut self,
+        request: &Request,
+        retry: &RetryPolicy,
+        poll: &keel_core_api::policy::PollPolicy,
+        effect: &mut dyn FnMut(u32) -> AttemptResult,
+        out: &mut Outcome,
+    ) -> Result<Value, OutcomeError> {
+        let started_ms = self.clock.now_ms;
+        loop {
+            let payload = self.run_attempts(request, retry, effect, out)?;
+            match poll_verdict(poll, &payload) {
+                PollVerdict::Terminal | PollVerdict::FailOpen => return Ok(payload),
+                PollVerdict::Pending => {
+                    let elapsed = self.clock.now_ms.saturating_sub(started_ms);
+                    if elapsed.saturating_add(poll.interval.0) > poll.deadline.0 {
+                        return Err(OutcomeError {
+                            code: ErrorCode::PollDeadlineExceeded,
+                            class: ErrorClass::Other,
+                            http_status: None,
+                            message: format!(
+                                "{} poll deadline exceeded: '{}' not terminal after {}ms",
+                                request.op, poll.until.field, poll.deadline.0
+                            ),
+                            original: None,
+                        });
+                    }
+                    self.clock.advance(poll.interval.0);
+                }
+            }
+        }
     }
 
     fn execute_inner(
@@ -488,7 +577,11 @@ impl KeelCoreStub {
             attempts: core::num::NonZeroU32::MIN,
             ..RetryPolicy::default()
         });
-        match self.run_attempts(request, &retry, effect, out) {
+        let result = match resolved.poll.as_ref().filter(|_| poll_applies(request)) {
+            Some(poll) => self.run_poll(request, &retry, poll, effect, out),
+            None => self.run_attempts(request, &retry, effect, out),
+        };
+        match result {
             Ok(payload) => {
                 self.metrics_for(target).successes += 1;
                 if let Some(config) = &resolved.breaker

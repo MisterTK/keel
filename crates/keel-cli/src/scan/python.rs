@@ -15,7 +15,8 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use super::{
-    DepAverseFile, FunctionFacts, LangFindings, Sighting, SubprocessSighting, TransportClass,
+    DepAverseFile, FunctionFacts, LangFindings, Sighting, SimplificationSighting,
+    SubprocessSighting, TransportClass,
 };
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
@@ -29,7 +30,7 @@ const AST_WALKER: &str = r#"
 import ast, json, os, re, sys
 from urllib.parse import urlsplit
 
-HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
+HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3", "urllib.request"}
 LLM_LIBS = {"openai", "anthropic", "google.genai"}
 OTHER_LIBS = {"psycopg", "boto3"}
 # The agent-framework packs (dx-spec agent-first-class work). pydantic_ai,
@@ -51,12 +52,14 @@ TIME_LIBS = {"time", "datetime"}
 RANDOM_LIBS = {"random", "uuid", "secrets"}
 UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
 # Transport classification for `keel doctor`: a URL sighting is "tracked" when
-# a registry-adapted library is in reach in the same file, "untracked-known"
-# when only a known-but-unadapted stdlib transport is (urllib.request /
-# http.client), and otherwise "unknown" — no reachable transport at all.
-STDLIB_TRANSPORTS = {"urllib", "http"}  # urllib.request / http.client
+# a registry-adapted library is in reach in the same file — including stdlib
+# `urllib.request`, adapted since v0.3.0 (its dotted key lives in HTTP_LIBS;
+# see import_entries) — "untracked-known" when only an unadapted stdlib
+# transport is (http.client, or urllib without the request submodule), and
+# otherwise "unknown" — no reachable transport at all.
+STDLIB_TRANSPORTS = {"urllib", "http"}  # http.client / non-request urllib
 TRACKED_TRANSPORTS = HTTP_LIBS | {"psycopg", "boto3"}
-TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | STDLIB_TRANSPORTS | {"os"}
+TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | STDLIB_TRANSPORTS | {"os", "asyncio"}
 TIME_NAMES = {"time", "time_ns", "monotonic", "monotonic_ns",
               "perf_counter", "perf_counter_ns", "gmtime", "localtime"}
 DT_NAMES = {"now", "utcnow", "today"}
@@ -67,6 +70,12 @@ OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
 # extractable) as their own finer-grained signal, separate from the coarse
 # `unsafe_reasons` UNSAFE_LIBS/OS_UNSAFE already feed.
 SUBPROC_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
+# Hand-rolled-resilience pattern detection (simplification leads). Sleep is
+# the common denominator: time.sleep / asyncio.sleep. BROAD_EXC is the
+# silent-swallow trigger — `except:` bare or Exception/BaseException; a
+# narrow exception tuple is deliberate error handling, not a swallow.
+SLEEP_LIBS = {"time", "asyncio"}
+BROAD_EXC = {"Exception", "BaseException"}
 # `sys.stdlib_module_names` exists on Python 3.10+ (keel's floor); the
 # `getattr` default degrades older interpreters to "never stdlib-only"
 # (an empty STDLIB) rather than crashing or false-positiving.
@@ -86,17 +95,19 @@ def top(mod):
 
 def import_entries(node):
     """Yield (module_key, bound_name) for each name an Import/ImportFrom node
-    binds. Handles the `google.adk` / `google.genai` dotted-prefix special
-    case: `import google.adk`, `from google.adk import ...`, and
-    `from google import genai, adk` all resolve to `google.<name>`; a bare
-    `google` import (or `from google import <something else>`) yields
-    nothing — the google namespace package alone is not evidence of either
-    library."""
+    binds. Two dotted-prefix special cases resolve to a dotted key instead of
+    the top-level name: `google.adk`/`google.genai` (bare `google` is a
+    namespace package and records nothing) and `urllib.request` (the adapted
+    stdlib transport — `import urllib.request`, `from urllib import request`,
+    and `from urllib.request import ...` all resolve to `urllib.request`;
+    other urllib submodules keep the plain `urllib` key)."""
     if isinstance(node, ast.Import):
         for alias in node.names:
             parts = alias.name.split(".")
             if len(parts) >= 2 and parts[0] == "google" and parts[1] in GOOGLE_SUBMODULES:
                 key = "google." + parts[1]
+            elif len(parts) >= 2 and parts[0] == "urllib" and parts[1] == "request":
+                key = "urllib.request"
             else:
                 key = parts[0]
             yield key, (alias.asname or alias.name).split(".", 1)[0]
@@ -111,6 +122,13 @@ def import_entries(node):
             for alias in node.names:
                 if alias.name in GOOGLE_SUBMODULES:
                     yield "google." + alias.name, alias.asname or alias.name
+        elif len(mparts) >= 2 and mparts[0] == "urllib" and mparts[1] == "request":
+            for alias in node.names:
+                yield "urllib.request", alias.asname or alias.name
+        elif mod == "urllib":
+            for alias in node.names:
+                key = "urllib.request" if alias.name == "request" else "urllib"
+                yield key, alias.asname or alias.name
         else:
             key = top(mod)
             for alias in node.names:
@@ -200,6 +218,94 @@ def argv_text(call):
     return "<dynamic>"
 
 
+def is_sleep(node, aliases):
+    if not isinstance(node, ast.Call):
+        return False
+    lib = aliases.get(call_root(node.func))
+    name = node.func.attr if isinstance(node.func, ast.Attribute) else call_root(node.func)
+    return lib in SLEEP_LIBS and name == "sleep"
+
+
+def is_broad_handler(h):
+    if h.type is None:
+        return True
+    names = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+    return any(isinstance(n, ast.Name) and n.id in BROAD_EXC for n in names)
+
+
+def is_default_return(stmt):
+    """`return`, `return None/<constant>`, or `return {}/[]/()` — the shapes
+    that silently substitute a default for a failure."""
+    if not isinstance(stmt, ast.Return):
+        return False
+    v = stmt.value
+    if v is None or isinstance(v, ast.Constant):
+        return True
+    if isinstance(v, ast.Dict):
+        return not v.keys
+    if isinstance(v, (ast.List, ast.Tuple)):
+        return not v.elts
+    return False
+
+
+def detect_simplifications(fn, aliases):
+    """The three WS3 patterns inside one function def, each anchored at the
+    construct to delete. Precedence inside a loop: a status-string comparison
+    makes it a poll (the stronger, WS5-pairing signal) even if an attempt
+    counter is also present. An except-handler sleep inside an
+    already-matched loop is the same construct, not a second finding."""
+    found = []
+    covered = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
+            continue
+        has_sleep = has_status_cmp = has_counter = False
+        for sub in ast.walk(node):
+            if is_sleep(sub, aliases):
+                has_sleep = True
+            elif isinstance(sub, ast.Compare) and any(
+                    isinstance(c, ast.Constant) and isinstance(c.value, str)
+                    for c in [sub.left] + list(sub.comparators)):
+                has_status_cmp = True
+            elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.Add):
+                has_counter = True
+            elif (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.BinOp)
+                    and isinstance(sub.value.op, ast.Add)
+                    and isinstance(sub.value.left, ast.Name)
+                    and len(sub.targets) == 1
+                    and isinstance(sub.targets[0], ast.Name)
+                    and sub.targets[0].id == sub.value.left.id):
+                has_counter = True
+        if not has_sleep:
+            continue
+        if has_status_cmp:
+            kind = "hand-rolled-poll"
+        elif has_counter:
+            kind = "hand-rolled-retry"
+        else:
+            continue
+        found.append({"kind": kind, "line": node.lineno})
+        covered.update(id(sub) for sub in ast.walk(node))
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.ExceptHandler) and id(node) not in covered
+                and any(is_sleep(sub, aliases) for sub in ast.walk(node))):
+            found.append({"kind": "hand-rolled-retry", "line": node.lineno})
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Try):
+            continue
+        calls_target = any(
+            isinstance(sub, ast.Call)
+            and aliases.get(call_root(sub.func)) in KNOWN | STDLIB_TRANSPORTS
+            for stmt in node.body for sub in ast.walk(stmt))
+        if not calls_target:
+            continue
+        for h in node.handlers:
+            if (is_broad_handler(h) and len(h.body) == 1
+                    and is_default_return(h.body[0])):
+                found.append({"kind": "silent-swallow", "line": h.lineno})
+    return found
+
+
 def fn_facts(fn, rel, mod, aliases, url_consts):
     effects = unsafe_idem = t_reads = r_reads = 0
     targets = set()
@@ -251,6 +357,7 @@ root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
 subprocesses = []
+simplifications = []
 dependency_averse = []
 functions = []
 resilience_libs = set()
@@ -315,7 +422,18 @@ for dirpath, dirnames, filenames in os.walk(root):
         consts = url_consts_of(tree)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                functions.append(fn_facts(node, rel, mod, aliases, consts))
+                facts = fn_facts(node, rel, mod, aliases, consts)
+                functions.append(facts)
+                # Conservative emission gate (WS3 spec): only functions that
+                # also reach a Keel-relevant target get simplification
+                # sightings — a sleep loop around purely local work is none
+                # of Keel's business.
+                if facts["targets"]:
+                    for hit in detect_simplifications(node, aliases):
+                        simplifications.append({
+                            "file": rel, "function": node.name,
+                            "kind": hit["kind"], "line": hit["line"],
+                            "targets": facts["targets"]})
 
         # Dependency-averse detection: stdlib-only files with a risk/gate/
         # guard/auth/valid/safety/kill name or docstring signal, or an
@@ -345,10 +463,12 @@ for dirpath, dirnames, filenames in os.walk(root):
                      "reason": "stdlib-only + name/docstring signal: " + m.group(1).lower()})
 
 subprocesses.sort(key=lambda x: (x["file"], x["line"]))
+simplifications.sort(key=lambda x: (x["file"], x["line"], x["kind"]))
 dependency_averse.sort(key=lambda x: x["file"])
 print(json.dumps({"dependency_averse": dependency_averse, "files_scanned": files,
                   "functions": functions, "imports": imports,
                   "resilience_libs": sorted(resilience_libs),
+                  "simplifications": simplifications,
                   "subprocesses": subprocesses, "urls": urls}, sort_keys=True))
 "#;
 
@@ -399,6 +519,17 @@ struct WalkerSubprocess {
     command: String,
 }
 
+/// One simplification sighting from the walker (see
+/// [`SimplificationSighting`]).
+#[derive(Debug, Deserialize)]
+struct WalkerSimplification {
+    file: String,
+    function: String,
+    kind: String,
+    line: u32,
+    targets: Vec<String>,
+}
+
 /// One dependency-averse file from the walker (see [`DepAverseFile`]).
 #[derive(Debug, Deserialize)]
 struct WalkerDepAverse {
@@ -418,6 +549,8 @@ struct WalkerOutput {
     #[serde(default)]
     resilience_libs: Vec<String>,
     #[serde(default)]
+    simplifications: Vec<WalkerSimplification>,
+    #[serde(default)]
     subprocesses: Vec<WalkerSubprocess>,
     urls: Vec<Url>,
 }
@@ -435,7 +568,7 @@ pub struct PyScan {
     pub functions: Vec<FunctionFacts>,
 }
 
-const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3"];
+const HTTP_LIBS: &[&str] = &["httpx", "requests", "aiohttp", "urllib3", "urllib.request"];
 
 /// Normalize a walker-reported import key to the name `keel doctor`'s
 /// `REGISTRY` (see `crate::doctor`) keys its adapters by. The walker emits
@@ -493,6 +626,15 @@ pub fn scan(project: &Path) -> PyScan {
             line: sub.line,
             launcher: sub.launcher,
             command: sub.command,
+        });
+    }
+    for s in output.simplifications {
+        findings.simplifications.push(SimplificationSighting {
+            file: s.file,
+            line: s.line,
+            kind: s.kind,
+            function: s.function,
+            targets: s.targets,
         });
     }
     for d in output.dependency_averse {
@@ -622,7 +764,7 @@ mod tests {
             "import httpx\nU = \"https://api.tracked.com/v1\"\n",
         )
         .unwrap();
-        // untracked-known: only stdlib urllib in reach.
+        // tracked since WS4: urllib.request is an adapted transport.
         fs::write(
             dir.path().join("b.py"),
             "import urllib.request\nU = \"https://api.stdlib.com/v1\"\n",
@@ -634,11 +776,67 @@ mod tests {
             "U = \"https://api.mystery.com/v1\"\n",
         )
         .unwrap();
+        // untracked-known: http.client is still unadapted.
+        fs::write(
+            dir.path().join("d.py"),
+            "import http.client\nU = \"https://api.lowlevel.com/v1\"\n",
+        )
+        .unwrap();
+        // untracked-known: bare urllib (parse only) is not the adapted
+        // submodule — still just "stdlib urllib in reach".
+        fs::write(
+            dir.path().join("e.py"),
+            "from urllib import parse\nU = \"https://api.parseonly.com/v1\"\n",
+        )
+        .unwrap();
         let s = scan(dir.path());
         let t = |h: &str| s.findings.host_transports.get(h).copied();
         assert_eq!(t("api.tracked.com"), Some(TransportClass::Tracked));
-        assert_eq!(t("api.stdlib.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.stdlib.com"), Some(TransportClass::Tracked));
         assert_eq!(t("api.mystery.com"), Some(TransportClass::Unknown));
+        assert_eq!(t("api.lowlevel.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.parseonly.com"), Some(TransportClass::UntrackedKnown));
+    }
+
+    /// WS4: every import form that puts `urllib.request` in reach resolves to
+    /// the dotted lib key `urllib.request` (the google.adk precedent) — it
+    /// lands in `libs` (so doctor's REGISTRY row reports detected) and makes
+    /// same-file URL sightings tracked.
+    #[test]
+    fn urllib_request_import_forms_resolve_to_the_dotted_key() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("f1.py"),
+            "import urllib.request\nU = \"https://one.example.com/v\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f2.py"),
+            "from urllib import request\nU = \"https://two.example.com/v\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f3.py"),
+            "from urllib.request import urlopen\nU = \"https://three.example.com/v\"\n",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        assert!(
+            s.findings.libs.contains("urllib.request"),
+            "{:?}",
+            s.findings.libs
+        );
+        for host in ["one.example.com", "two.example.com", "three.example.com"] {
+            assert_eq!(
+                s.findings.host_transports.get(host).copied(),
+                Some(TransportClass::Tracked),
+                "{host}"
+            );
+        }
     }
 
     #[test]
@@ -859,6 +1057,142 @@ def go(cmd):
                 .subprocesses
                 .iter()
                 .all(|x| x.file == "launch.py")
+        );
+    }
+
+    #[test]
+    fn hand_rolled_retry_poll_and_swallow_are_detected() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // Poll: the fetch_short_metrics.py:79-95 shape — while + sleep +
+        // status-string comparison. The `while` is on line 7 of this file.
+        fs::write(
+            dir.path().join("poll.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(request_id):
+    while time.time() < 90:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(10)
+    return None
+"#,
+        )
+        .unwrap();
+        // Retry: loop + manually incremented attempt counter + sleep (the sleep
+        // sits in the except handler INSIDE the loop — must yield ONE sighting
+        // anchored at the loop, not a second one at the handler).
+        fs::write(
+            dir.path().join("retry.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.alpaca.example/v2"
+
+def retryer():
+    attempts = 0
+    while True:
+        try:
+            return urllib.request.urlopen(API)
+        except Exception:
+            attempts += 1
+            time.sleep(1)
+"#,
+        )
+        .unwrap();
+        // Swallow: the screen.py:376-398 shape — broad except, single default
+        // return, urlopen in the try body.
+        fs::write(
+            dir.path().join("swallow.py"),
+            r#"import urllib.request
+
+BASE = "https://data.alpaca.example"
+
+def fetcher(path):
+    try:
+        with urllib.request.urlopen(BASE) as r:
+            return r.read()
+    except Exception:
+        return None
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, &str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.file.as_str(), x.kind.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("poll.py", "hand-rolled-poll", "poller"),
+                ("retry.py", "hand-rolled-retry", "retryer"),
+                ("swallow.py", "silent-swallow", "fetcher"),
+            ]
+        );
+        // Anchor line: the poll sighting points at the `while` (line 7), the
+        // construct to delete — not the sleep inside it (line 12).
+        let poll = &s.findings.simplifications[0];
+        assert_eq!(poll.line, 7);
+        assert_eq!(poll.targets, vec!["api.tavily.com".to_owned()]);
+    }
+
+    #[test]
+    fn simplification_detection_is_gated_on_target_attribution() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // Identical retry shape, but the function reaches NO target — the
+        // conservative gate must suppress it (a sleep loop around local work is
+        // none of Keel's business).
+        fs::write(
+            dir.path().join("local.py"),
+            r"import time
+
+def churn():
+    n = 0
+    while True:
+        n += 1
+        if n > 3:
+            return n
+        time.sleep(1)
+",
+        )
+        .unwrap();
+        // Narrow except (specific exception tuple, the web_search.py shape) with
+        // a target in reach — NOT a silent swallow.
+        fs::write(
+            dir.path().join("narrow.py"),
+            r#"import urllib.request
+import urllib.error
+
+API = "https://api.tavily.com/search"
+
+def lookup():
+    try:
+        return urllib.request.urlopen(API)
+    except (urllib.error.URLError, ValueError):
+        return []
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        assert!(
+            s.findings.simplifications.is_empty(),
+            "{:?}",
+            s.findings.simplifications
         );
     }
 

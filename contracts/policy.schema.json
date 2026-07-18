@@ -37,6 +37,12 @@
           "type": "string",
           "enum": ["fail", "warn", "branch"],
           "default": "fail"
+        },
+        "on_busy": {
+          "type": "string",
+          "enum": ["skip", "wait", "fail"],
+          "default": "skip",
+          "description": "What a concurrent same-identity `keel exec` invocation does while the flow's lease is held by a live process: skip (exit 0, matching the mkdir-mutex pattern it replaces), wait (poll until the lease frees), or fail (nonzero exit). CCR-4."
         }
       }
     },
@@ -83,8 +89,8 @@
     },
     "entrypointRef": {
       "type": "string",
-      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`.",
-      "pattern": "^(py|ts|rs):[^\\s]+$"
+      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`, or `cmd:<name>` (CCR-4) — an external command wrapped as a Tier-2 flow by `keel exec --flow <name>` (and, in a named fast-follow, by in-process subprocess interception).",
+      "pattern": "^(py|ts|rs):[^\\s]+$|^cmd:[a-z0-9][a-z0-9-]*$"
     },
     "retry": {
       "type": "object",
@@ -155,6 +161,37 @@
       },
       "required": ["header"]
     },
+    "poll": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3). Applies to GET/HEAD at Level 0 only. A JSON response whose `until.field` is not in `until.terminal` is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
+      "properties": {
+        "interval": {
+          "type": "string",
+          "description": "Poll re-issue interval; must be a nonzero duration.",
+          "pattern": "^0*[1-9][0-9]*(ms|s|m|h)$"
+        },
+        "deadline": { "$ref": "#/$defs/duration" },
+        "until": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "field": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Top-level JSON key to judge (v1: no path expressions)."
+            },
+            "terminal": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            }
+          },
+          "required": ["field", "terminal"]
+        }
+      },
+      "required": ["interval", "deadline", "until"]
+    },
     "budget": {
       "type": "string",
       "description": "Per-run spend/token budget for llm: targets, e.g. `$5/run`. Exceeding it trips the breaker.",
@@ -170,6 +207,7 @@
         "rate": { "$ref": "#/$defs/rate" },
         "cache": { "$ref": "#/$defs/cache" },
         "idempotency": { "$ref": "#/$defs/idempotency" },
+        "poll": { "$ref": "#/$defs/poll" },
         "fallback": {
           "type": "array",
           "items": { "type": "string" },

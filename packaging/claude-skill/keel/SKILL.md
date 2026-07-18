@@ -1,15 +1,16 @@
 ---
 name: keel
-description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project — or when working in a repo that already uses Keel (a `keel.toml` file, or an AGENTS.md "Keel" section, is present). Covers installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server for agent-driven diagnosis, and reading `keel status`/`keel trace` output. Do not use for building a workflow-engine/queue-based system from scratch, for languages Keel does not support yet (only Python/Node/Rust), or for one-off retry logic in a codebase that has no interest in adopting Keel as a dependency.
+description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project — or when working in a repo that already uses Keel (a `keel.toml` file, or an AGENTS.md "Keel" section, is present). Covers installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server for agent-driven diagnosis, and reading `keel status`/`keel trace` output. Do not use for building a workflow-engine/queue-based system from scratch, for languages Keel does not support yet (only Python/Node/Rust), or for one-off retry logic in a codebase that has no interest in adopting Keel as a dependency.
 ---
 
 # Keel
 
 Keel is "the SQLite of durable execution": resilience (retry, backoff,
-timeout, circuit breaker, rate limit, cache) and opt-in crash-resumable
-durable flows, applied at the call sites a target project already makes —
-**zero code changes**. Policy lives in one file, `keel.toml`. There is no
-service to run, no database to provision, and no daemon.
+timeout, circuit breaker, rate limit, cache, poll-until-terminal) and
+opt-in crash-resumable durable flows, applied at the call sites a target
+project already makes — **zero code changes**. Policy lives in one file,
+`keel.toml`. There is no service to run, no database to provision, and no
+daemon.
 
 ## Is this project already using Keel?
 
@@ -96,9 +97,10 @@ the four phases in order; the static scan is evidence, not the verdict.
    process is a coverage boundary, not a detail.
 2. **Explore.** For each URL/host the code touches, trace how the request is
    *actually dispatched* — which library sends the bytes (an SDK may wrap a
-   transport Keel adapts, or hide one it doesn't). Note stdlib transports
-   (`urllib.request`, `http.client`, raw `http`/`https` on Node): Keel sees
-   them in the scan but may not adapt them yet.
+   transport Keel adapts, or hide one it doesn't). Note stdlib transports:
+   Python's `urllib.request` is adapted (wrapped like any registry library);
+   `http.client` and raw `http`/`https` on Node are seen in the scan but not
+   adapted yet.
 3. **Collect.** Run `keel doctor --json` (or the `get_doctor_report` MCP
    tool). Read `topology` first — every sighted host lands in exactly one of
    `wrappable` ("wrap it"), `unreachable` ("can't reach it, here's why"), or
@@ -116,7 +118,19 @@ the four phases in order; the static scan is evidence, not the verdict.
    is either replaced by policy (note which `keel.toml` key) or explicitly
    out of Keel's reach (say so honestly). Respect dependency-averse files —
    a stdlib-only gate/validator was built that way on purpose; never propose
-   adding Keel as a dependency inside one. Finish with
+   adding Keel as a dependency inside one. A shell-script orchestrator that
+   builds its own at-most-once dispatch — `mkdir`/lockfile mutexes, guard
+   files gating a retry, hand-rolled dead-PID checks around a launcher
+   script — is out of the static scan's reach (it isn't Python/Node/Rust
+   source) but is exactly what `keel exec --flow <name> [--journal-file
+   <path>...] -- <command>` replaces: at-most-once dispatch per identity,
+   crash-safe retry gating, and (with `--journal-file`) a declared-
+   side-effect gate (KEEL-E033) before a failed run is retried. Before
+   resuming or trusting a durable flow's replay, check `code_hash_stale` in
+   `keel flows --json` / `keel doctor --json` — `true` means the
+   entrypoint's resolved code changed since the flow's last run, so a
+   replay would substitute steps recorded against a different program;
+   confirm the flow should still resume before doing so. Finish with
    `keel init --diff --json` / `propose_policy` and present the diff, never
    a hand-written policy guess.
 

@@ -257,10 +257,10 @@ def _run(pool: Any, do_call: Callable[[], Any], method: str, url: str, headers: 
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(pool, method, url, headers, body)
     env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl is configured AND the caller did not
-    # ask for a streamed (unbuffered) response — never force-read a stream the
-    # caller explicitly opted out of buffering.
-    cacheable = hash_ is not None and preload_content and _http.cache_configured(target)
+    # Buffer the body ONLY when a cache ttl or a poll table is configured AND
+    # the caller did not ask for a streamed (unbuffered) response — never
+    # force-read a stream the caller explicitly opted out of buffering.
+    cacheable = hash_ is not None and preload_content and _http.buffer_body_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:

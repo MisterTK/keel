@@ -42,6 +42,7 @@
 #   python   | crewai                        | 1.15.2                    | python/keel/src/keel/packs/crewai_pack.py
 #   python   | langgraph                     | 1.0.10                    | python/keel/src/keel/packs/langgraph_pack.py
 #   python   | mcp                           | 1.28.1                    | python/keel/src/keel/packs/mcp_pack.py
+#   python   | urllib.request (stdlib)       | 3.11 (runtime, no pip pin)| python/keel/src/keel/adapters/urllib_pack.py
 #   python   | aiohttp                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
 #   python   | urllib3                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
 #   python   | boto3                         | (planned — no pack yet)   | not yet in the doctor REGISTRY either
@@ -177,6 +178,24 @@ jobs:
         env:
           KEEL_ADAPTER_FARM: "1"
         run: python3 -m unittest ${{ matrix.test_module }} -v
+
+  # ---------------------------------------------------------------------------
+  # Python: urllib.request (stdlib) farm contract test — no pip install needed,
+  # just the running interpreter's standard library. Certifies the pack's seam
+  # assumptions against the real stdlib in the certified interpreter line.
+  # ---------------------------------------------------------------------------
+  urllib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Certify urllib.request pack (stdlib — pinned to the runtime)
+        working-directory: python/keel
+        env:
+          KEEL_ADAPTER_FARM: "1"
+        run: python -m unittest tests.test_farm_urllib -v
 
   # ---------------------------------------------------------------------------
   # Python: an OUT-OF-RANGE install, asserting the pinned->best_effort grading

@@ -67,6 +67,18 @@ const REGISTRY: &[Adapter] = &[
         target: "host",
         best_effort: true,
     },
+    // The stdlib urllib.request pack (WS4). Convention exception, documented
+    // here on the registry itself: stdlib has no pip version to pin, so this
+    // row is keyed to the PYTHON RUNTIME version — the pack's detect()
+    // reports platform.python_version() and certifies the interpreter lines
+    // in urllib_pack._PINNED (CI pins 3.11). "pinned", not best-effort: the
+    // seam is a stable stdlib API certified per interpreter line by the farm.
+    Adapter {
+        lib: "urllib.request",
+        lang: "python",
+        target: "host",
+        best_effort: false,
+    },
     Adapter {
         lib: "boto3",
         lang: "python",
@@ -196,6 +208,13 @@ const REGISTRY: &[Adapter] = &[
         best_effort: true,
     },
 ];
+
+/// The registry's library names, for cross-module gates that must not drift
+/// from doctor's own (init's pre-existing-resilience annotation uses the
+/// same "imports at least one lib Keel wraps" test as [`resilience_finding`]).
+pub(crate) fn registry_libs() -> BTreeSet<&'static str> {
+    REGISTRY.iter().map(|a| a.lib).collect()
+}
 
 /// One line in the adapter section: a registry entry plus whether this project
 /// uses it.
@@ -383,7 +402,15 @@ pub fn run(project: &Path) -> Rendered {
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
     let agents_cli_finding = agents_cli_placement_finding(project);
-    let report = build_report(&scan, &discovery, policy, journal, agents_cli_finding);
+    let stale_flows = crate::flows::stale_code_hash_flows(project);
+    let report = build_report(
+        &scan,
+        &discovery,
+        policy,
+        journal,
+        agents_cli_finding,
+        &stale_flows,
+    );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
     Rendered::ok(human, to_json(&report)).with_exit(exit)
@@ -438,8 +465,9 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in &topology.unreachable {
         findings.push(Finding {
-            action: "Trace how this request is actually dispatched before proposing policy; if \
-                      it is stdlib urllib, adapter support is tracked."
+            action: "Trace how this request is actually dispatched before proposing policy; \
+                      Python's stdlib `urllib.request` is adapted — importing it directly in \
+                      that file makes the host wrappable."
                 .to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
@@ -481,6 +509,71 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
     findings
 }
 
+/// The WS3 simplification findings: each hand-rolled pattern the scan
+/// sighted inside a target-reaching function becomes one paired finding —
+/// "here is the target; once Keel wraps it, the code at file:line is
+/// redundant". The level pairs with the topology bucket: `warn` when any of
+/// the sighting's targets is already wrappable (deleting the pattern is
+/// actionable now), `info` when wrapping itself is still pending (e.g. a
+/// stdlib-urllib transport before the urllib pack lands). Never affects
+/// `ok`. Interpolates only hosts, file paths, line numbers, and function
+/// names (the no-raw-source hardening rule).
+fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Finding> {
+    let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
+    let mut findings = Vec::new();
+    for s in &scan.simplifications {
+        let targets = s.targets.join(", ");
+        let actionable_now = s.targets.iter().any(|t| wrappable.contains(t.as_str()));
+        let (level, when) = if actionable_now {
+            ("warn", "Keel can wrap this target now")
+        } else {
+            ("info", "once Keel can wrap this target")
+        };
+        let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
+            "hand-rolled-poll" => (
+                "hand-rolled-poll",
+                format!(
+                    "`{}` ({}:{}) hand-rolls poll-until-terminal against `{}` — {}, a `poll` \
+                     policy (interval / deadline / until) replaces the whole loop",
+                    s.function, s.file, s.line, targets, when
+                ),
+                "Wrap the target, then replace the loop with a `poll` policy — the poll \
+                 primitive (CCR-3) is the designated replacement for submit-then-poll loops."
+                    .to_owned(),
+            ),
+            "silent-swallow" => (
+                "silent-swallow",
+                format!(
+                    "`{}` ({}:{}) silences failures from `{}` with a broad `except` returning a \
+                     default — Keel replaces silence with retry + observability",
+                    s.function, s.file, s.line, targets
+                ),
+                "Wrap the target so Keel's policy owns the failure (retry, breaker, journal), \
+                 then narrow or remove the broad except."
+                    .to_owned(),
+            ),
+            _ => (
+                "hand-rolled-retry",
+                format!(
+                    "`{}` ({}:{}) hand-rolls retry around `{}` — {}, this loop becomes redundant",
+                    s.function, s.file, s.line, targets, when
+                ),
+                "Wrap the target with Keel retry/backoff policy, then delete the hand-rolled \
+                 loop — don't run both."
+                    .to_owned(),
+            ),
+        };
+        findings.push(Finding {
+            action,
+            detail: format!("{what}."),
+            fix: None,
+            level,
+            topic,
+        });
+    }
+    findings
+}
+
 /// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
 /// the claim Keel knows least about — it saw a URL but cannot even name the
 /// dispatch path — so it is investigated first; rank 5 (code-hash-stale,
@@ -503,6 +596,7 @@ fn build_follow_ups(
     topology: &Topology,
     resilience: Option<&Finding>,
     scan: &ScanResult,
+    stale_flows: &[crate::flows::StaleFlow],
 ) -> Vec<FollowUp> {
     let mut ups = Vec::new();
     for entry in &topology.unreachable {
@@ -558,6 +652,20 @@ fn build_follow_ups(
             ),
             rank: follow_up_rank("preexisting-resilience"),
             subject: libs.join(", "),
+        });
+    }
+    for flow in stale_flows {
+        ups.push(FollowUp {
+            code: "code-hash-stale",
+            detail: format!(
+                "Flow `{}` ({}) was recorded under a different code hash than its current \
+                 script; resuming would replay recorded steps against changed code (the resume \
+                 fence downgrades nondeterminism fail->warn). Inspect with `keel replay {}` \
+                 before resuming.",
+                flow.flow_id, flow.entrypoint, flow.flow_id
+            ),
+            rank: follow_up_rank("code-hash-stale"),
+            subject: flow.flow_id.clone(),
         });
     }
     ups.sort_by(|a, b| {
@@ -627,17 +735,20 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the five evidence inputs. Pure, so the golden test
-/// pins it without a filesystem or `python3` — the one filesystem-dependent
-/// input (`agents_cli_finding`, since it needs to walk for a manifest and
-/// check for a root `keel.toml`) is computed by the caller and passed in
-/// already resolved, the same pattern `policy`/`journal` already use.
+/// Assemble the report from the six evidence inputs. Pure, so the golden test
+/// pins it without a filesystem or `python3` — the filesystem-dependent
+/// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
+/// check for a root `keel.toml`; `stale_flows`, since it needs to read
+/// `.keel/journal.db` and stat scripts on disk) are computed by the caller
+/// and passed in already resolved, the same pattern `policy`/`journal`
+/// already use.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
     policy: PolicyValidation,
     journal: JournalReport,
     agents_cli_finding: Option<Finding>,
+    stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
     let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
@@ -710,6 +821,7 @@ fn build_report(
         topic: "invisible",
     });
     findings.extend(topology_findings(&topology));
+    findings.extend(simplification_findings(scan, &topology));
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
         let mut action = "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json.".to_owned();
@@ -730,7 +842,7 @@ fn build_report(
         });
     }
     let resilience = resilience_finding(scan, &registry_libs);
-    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan);
+    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan, stale_flows);
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
@@ -803,7 +915,9 @@ pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<St
             TransportClass::Tracked => wrappable.push(target.clone()),
             TransportClass::UntrackedKnown => unreachable.push(TopologyEntry {
                 host: target.clone(),
-                reason: "reached via a transport Keel does not adapt (stdlib urllib/http.client)"
+                reason: "reached via a stdlib transport Keel does not adapt (http.client, or \
+                         urllib without urllib.request; Python's urllib.request itself is \
+                         adapted)"
                     .to_owned(),
             }),
             TransportClass::Unknown => unreachable.push(TopologyEntry {
@@ -1082,7 +1196,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
@@ -1168,6 +1282,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -1195,6 +1310,101 @@ mod tests {
                 .any(|f| f.topic == "dependency-averse-excluded" && f.level == "info")
         );
         // ok is unaffected: honesty findings are not configuration errors.
+        assert!(r.ok);
+    }
+
+    /// WS3: each hand-rolled pattern the scan sighted becomes ONE paired
+    /// finding. The pairing is with the topology bucket: a wrappable target
+    /// makes the finding actionable now (warn); an unreachable one is a
+    /// once-wrapped lead (info). The poll finding names the `poll` primitive
+    /// as the replacement (WS5 pairing).
+    #[test]
+    fn simplification_findings_pair_with_topology_buckets() {
+        use crate::scan::{SimplificationSighting, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Wrappable target (tracked transport) with a hand-rolled retry.
+        scan.targets.insert(
+            "api.ok.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 3,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.ok.com".into(), TransportClass::Tracked);
+        scan.simplifications.push(SimplificationSighting {
+            file: "app.py".into(),
+            line: 12,
+            kind: "hand-rolled-retry".into(),
+            function: "caller".into(),
+            targets: vec!["api.ok.com".into()],
+        });
+        // Unreachable target (stdlib urllib) with a hand-rolled poll — the
+        // claude-trader shape until WS4 flips urllib to tracked.
+        scan.targets.insert(
+            "api.tavily.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "fetch_short_metrics.py".into(),
+                    line: 39,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.tavily.com".into(), TransportClass::UntrackedKnown);
+        scan.simplifications.push(SimplificationSighting {
+            file: "fetch_short_metrics.py".into(),
+            line: 83,
+            kind: "hand-rolled-poll".into(),
+            function: "_poll_research".into(),
+            targets: vec!["api.tavily.com".into()],
+        });
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            &[],
+        );
+        let retry = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "hand-rolled-retry")
+            .expect("retry finding");
+        assert_eq!(retry.level, "warn", "wrappable target → actionable now");
+        assert!(retry.detail.contains("api.ok.com"));
+        assert!(retry.detail.contains("app.py:12"));
+        assert!(retry.detail.contains("caller"));
+        let poll = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "hand-rolled-poll")
+            .expect("poll finding");
+        assert_eq!(poll.level, "info", "unreachable target → once-wrapped lead");
+        assert!(poll.detail.contains("fetch_short_metrics.py:83"));
+        assert!(poll.action.contains("poll"), "names the poll primitive");
+        // The WS2 closed follow-up vocabulary is NOT extended by WS3.
+        assert!(
+            r.follow_ups
+                .iter()
+                .all(|f| !f.code.starts_with("hand-rolled") && f.code != "silent-swallow"),
+            "{:?}",
+            r.follow_ups
+        );
+        // Simplification findings are honesty leads, never configuration errors.
         assert!(r.ok);
     }
 
@@ -1261,6 +1471,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -1307,6 +1518,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
     }
@@ -1317,6 +1529,8 @@ mod tests {
     /// dependency-averse check would otherwise conclude. Runtime evidence (or
     /// the LLM pack's own wrapping) beats static doubt.
     #[test]
+    #[allow(clippy::too_many_lines)] // WS6 added a `build_report` arg; the fixture setup is
+    // already the longest legitimate part of this test, not the new plumbing.
     fn wrapped_and_llm_targets_are_always_wrappable() {
         use crate::scan::{DepAverseFile, TransportClass};
         let mut scan = ScanResult {
@@ -1383,7 +1597,14 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let r = build_report(&scan, &wrapped, default_policy(), default_journal(), None);
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            &[],
+        );
 
         assert!(
             r.topology
@@ -1450,7 +1671,14 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &BTreeSet::new(), policy, default_journal(), None);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            &[],
+        );
 
         assert!(
             r.coverage.invisible.is_empty(),
@@ -1492,6 +1720,44 @@ mod tests {
         }
     }
 
+    /// WS4: the stdlib urllib.request pack has a REGISTRY row (keyed to the
+    /// Python runtime version — the documented convention exception), a
+    /// scanned `urllib.request` import counts as detected/not-invisible, and
+    /// its hosts are wrappable, not unreachable.
+    #[test]
+    fn urllib_request_is_a_registered_tracked_adapter() {
+        let mut scan = scan_with("api.tavily.com", TargetClass::Host, &["urllib.request"]);
+        scan.host_transports
+            .insert("api.tavily.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            &[],
+        );
+        let row = r
+            .adapters
+            .iter()
+            .find(|a| a.lib == "urllib.request")
+            .expect("REGISTRY row for urllib.request");
+        assert!(row.detected);
+        assert_eq!(row.status, "pinned");
+        assert_eq!(row.target, "host");
+        assert!(
+            r.coverage.invisible.is_empty(),
+            "{:?}",
+            r.coverage.invisible
+        );
+        assert!(r.topology.wrappable.contains(&"api.tavily.com".to_owned()));
+        assert!(
+            r.topology.unreachable.is_empty(),
+            "{:?}",
+            r.topology.unreachable
+        );
+    }
+
     #[test]
     fn resilience_lib_alongside_a_wrapped_effect_is_a_finding() {
         let mut scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
@@ -1502,6 +1768,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         let finding = r
             .findings
@@ -1529,6 +1796,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(
             !r.findings
@@ -1546,6 +1814,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            &[],
         );
         assert!(
             !r.findings
@@ -1567,7 +1836,7 @@ mod tests {
             },
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None);
+        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
         assert!(!r.ok);
         assert!(
             r.findings
@@ -1598,7 +1867,7 @@ mod tests {
             source: "keel.toml",
             supported: false,
         };
-        let r = build_report(&scan, &wrapped, policy, journal, None);
+        let r = build_report(&scan, &wrapped, policy, journal, None, &[]);
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
             .findings
@@ -1848,6 +2117,42 @@ mod tests {
             .is_ok_and(|s| s.success())
     }
 
+    /// WS6: a resumable flow recorded under a different code hash surfaces as
+    /// the rank-5 `code-hash-stale` follow-up.
+    #[test]
+    fn code_hash_stale_flow_emits_the_rank5_follow_up() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema = std::fs::read_to_string(root.join("contracts/journal.sql")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let keel = dir.path().join(".keel");
+        std::fs::create_dir_all(&keel).unwrap();
+        let conn = rusqlite::Connection::open(keel.join("journal.db")).unwrap();
+        conn.execute_batch(&schema).unwrap();
+        let t0: i64 = 1_783_728_000_000;
+        conn.execute(
+            "INSERT INTO flows (flow_id, entrypoint, args_hash, code_hash, status, created_at, \
+             updated_at) VALUES ('01STALEFLOW', 'py:pipeline.ingest:main', 'ah-1', \
+             'deadbeefdeadbeef', 'running', ?1, ?1)",
+            rusqlite::params![t0],
+        )
+        .unwrap();
+        // A script on disk whose hash will never match the synthetic recorded
+        // value above.
+        let script_dir = dir.path().join("pipeline");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(script_dir.join("ingest.py"), "def main():\n    pass\n").unwrap();
+
+        let r = run(dir.path());
+        let f = r.json["follow_ups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["code"] == "code-hash-stale")
+            .expect("code-hash-stale emitted");
+        assert_eq!(f["rank"], 5);
+        assert!(f["detail"].as_str().unwrap().contains("keel replay"));
+    }
+
     /// WS2 hardening: doctor and init --diff (the two MCP-exposed report
     /// producers) must never emit raw source content. Allowed interpolations
     /// are ONLY: hostnames, file paths, lib names, literal subprocess argv, and
@@ -1869,10 +2174,25 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("app.py"),
-            "import urllib.request\n\
-             # CANARY_COMMENT_9f31 must never appear in any report\n\
-             TOKEN = \"CANARY_SECRET_9f31\"\n\
-             U = \"https://api.leak.example/v1?key=CANARY_QUERY_9f31\"\n",
+            r#"import time
+import urllib.request
+import httpx
+import tenacity
+# CANARY_COMMENT_9f31 must never appear in any report
+TOKEN = "CANARY_SECRET_9f31"
+U = "https://api.leak.example/v1?key=CANARY_QUERY_9f31"
+
+def caller():
+    attempt = 0
+    while True:
+        try:
+            return httpx.get(U)
+        except Exception:
+            # CANARY_COMMENT_9f31 must never appear in any report
+            local_secret = "CANARY_QUERY2_9f31"
+            attempt += 1
+            time.sleep(1)
+"#,
         )
         .unwrap();
         std::fs::write(
@@ -1911,5 +2231,13 @@ mod tests {
         // Sanity: the report DID see the project (hosts present) — the canaries
         // are absent because of scoping, not because the scan saw nothing.
         assert!(doctor_json.contains("api.leak.example"));
+        // Sanity: the fixture's hand-rolled retry loop (Task 3.3's `--diff`
+        // notes path) actually fired — proving the canary-absence assertions
+        // above exercised the new note-rendering code, not an empty notes
+        // list that would trivially satisfy them.
+        assert!(
+            init_json.contains("hand-rolled-retry"),
+            "init --diff notes should surface the hand-rolled retry loop: {init_json}"
+        );
     }
 }

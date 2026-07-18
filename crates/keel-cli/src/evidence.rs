@@ -110,15 +110,23 @@ fn from_location(project: &Path, location: &JournalLocation) -> ResolvedJournal 
     }
 }
 
-/// Lenient read of `keel.toml`'s `journal` key: any read/parse failure is
-/// `None` (the default applies) — `doctor` reports policy validity separately,
-/// and `status`/`flows` must keep reading evidence past a broken policy.
-fn policy_journal(project: &Path) -> Option<JournalLocation> {
+/// Lenient parse of `<project>/keel.toml` into the typed [`Policy`]: any
+/// read/parse/validation failure is `None` (a caller applies its own
+/// default) rather than a loud error — `doctor` reports policy validity
+/// separately, and readers like `status`/`flows`/`exec` must keep working
+/// past a broken policy. This is the ONE `keel.toml` \u{2192} JSON \u{2192}
+/// [`Policy`] pipeline; [`policy_journal`] and `exec::flows_on_busy` both go
+/// through it so the parse behavior only needs to agree in one place.
+pub(crate) fn load_policy(project: &Path) -> Option<Policy> {
     let text = std::fs::read_to_string(keel_toml(project)).ok()?;
     let toml_value: toml::Value = text.parse().ok()?;
     let json = serde_json::to_value(&toml_value).ok()?;
-    let policy: Policy = serde_json::from_value(json).ok()?;
-    policy.journal
+    serde_json::from_value(json).ok()
+}
+
+/// Lenient read of `keel.toml`'s `journal` key (see [`load_policy`]).
+fn policy_journal(project: &Path) -> Option<JournalLocation> {
+    load_policy(project)?.journal
 }
 
 /// Drop the userinfo (credentials) from a `postgres://` URL for display —

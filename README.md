@@ -56,8 +56,9 @@ daemon. No port. No new abstractions in your code.
   transient errors, and a per-host circuit breaker — before you write a
   single line of config.
 - **One `keel.toml`, not a decorator per call site.** Retry schedules,
-  timeouts, rate limits, caching, and circuit breakers are policy, not code
-  — reviewed like infrastructure, not scattered through business logic.
+  timeouts, rate limits, caching, circuit breakers, and poll-until-terminal
+  submit-then-poll loops are policy, not code — reviewed like
+  infrastructure, not scattered through business logic.
 - **Opt-in durable execution.** Designate a function as a flow and its steps
   are journaled: `kill -9` it mid-run, and rerunning it replays completed
   steps from the journal instead of re-executing their side effects —
@@ -154,11 +155,42 @@ Two tiers, one policy file:
 - **Tier 1 — resilience.** Every intercepted call passes through a fixed
   layer chain: cache → rate limit → circuit breaker → timeout → retry.
   Stateless, works everywhere, needs nothing but the library.
+- **Poll (submit-then-poll, opt-in).** A `poll` table turns a GET/HEAD call
+  into a poll-until-terminal loop, judged on the response body instead of
+  the transport result — the shape behind "submit a job, poll its status
+  field until done":
+
+  ```toml
+  [target."api.example.com"]
+  poll = { interval = "10s", deadline = "90s", until = { field = "status", terminal = ["completed", "failed"] } }
+  ```
+
+  A non-terminal `status` past `deadline` fails terminally with
+  `KEEL-E016`; a response whose body isn't JSON (or lacks `until.field`)
+  fails OPEN and is returned unchanged on the first attempt — polling never
+  turns an ordinary response into an error.
 - **Tier 2 — durable flows (opt-in).** Designate an entrypoint in `[flows]`
   and its steps are journaled to a local SQLite file (or Postgres, for
   fleet deployments) as they run. A crash — or a deliberate restart —
   replays completed steps from the journal instead of re-firing their side
   effects, then resumes live from wherever it left off.
+
+### `keel exec` — durable external commands (CCR-4)
+
+Wrap any command as a journaled durable flow — at-most-once dispatch per
+identity, crash-safe retry gating, and a declared-side-effect gate:
+
+    keel exec --flow autonomous-run \
+      --journal-file logs/trades.jsonl \
+      -- ./run_autonomous.sh
+
+Honest scope: Keel gives you **at-most-once dispatch + crash-safe retry
+gating**, not exactly-once execution inside an opaque child. A concurrent
+same-identity invocation follows `[flows] on_busy = "skip" | "wait" |
+"fail"` (default `skip` — the mkdir-mutex pattern this replaces). If a
+failed run's declared journal files changed, a retry is refused with
+KEEL-E033 (`--force` overrides). A completed flow re-invoked with the same
+identity replays instantly without respawning the child.
 
 Both tiers run on the same native Rust core via a C ABI, so the Python and
 Node front ends share identical semantics — verified by a shared

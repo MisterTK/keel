@@ -6,7 +6,8 @@ serde types in contracts/core_api.rs.
 
 Simplifications (deliberate, documented): virtual clock (waits recorded, not
 slept), no jitter, exact-match target resolution with defaults.llm /
-defaults.outbound fallback, `timeout` validated but not enforced.
+defaults.outbound fallback, `timeout` validated but not enforced. Poll is
+implemented on the virtual clock too (pending waits advance the clock).
 
 Bit-identical to the real core (parity rule, not a simplification): the
 breaker's count mode *and* rate mode (window + failure_rate + min_calls), and
@@ -23,6 +24,8 @@ stay bit-identical to the native core (that is what the conformance suite pins).
 
 from __future__ import annotations
 
+import base64
+import json
 import math
 import re
 from typing import Any, Callable
@@ -54,11 +57,11 @@ _CLASSES = ("conn", "timeout", "http", "cancelled", "other")
 #: so an unknown/typo'd key fails loudly with KEEL-E001 on the stub too).
 _ALLOWED_TOP = ("defaults", "target", "flows", "journal", "telemetry")
 _ALLOWED_DEFAULTS = ("outbound", "llm")
-_ALLOWED_TARGET = ("timeout", "retry", "breaker", "rate", "cache", "idempotency", "fallback", "budget")
+_ALLOWED_TARGET = ("timeout", "retry", "breaker", "rate", "cache", "idempotency", "fallback", "budget", "poll")
 _ALLOWED_RETRY = ("attempts", "schedule", "on")
 _ALLOWED_BREAKER = ("failures", "cooldown", "window", "failure_rate", "min_calls")
 _ALLOWED_CACHE = ("ttl", "scope", "mode", "key")
-_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism")
+_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism", "on_busy")
 _ALLOWED_TELEMETRY = ("otlp_endpoint", "console")
 
 
@@ -270,6 +273,33 @@ def _condition_matches(cond: str, cls: str, http_status: int | None) -> bool:
     return len(cond) == 3 and cond.isdigit() and int(cond) == http_status
 
 
+def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
+    """Judge one successful iteration's payload: "terminal" | "pending" |
+    "fail_open". Parity with keel-core's ``poll_verdict``
+    (conformance/README.md "Poll")."""
+    if not isinstance(payload, dict):
+        return "fail_open"
+    doc = payload
+    if "body_b64" in payload or ("status" in payload and "headers" in payload):
+        b64 = payload.get("body_b64")
+        if not isinstance(b64, str):
+            return "fail_open"
+        try:
+            parsed = json.loads(base64.b64decode(b64))
+        except Exception:
+            return "fail_open"
+        if not isinstance(parsed, dict):
+            return "fail_open"
+        doc = parsed
+    field = poll["until"]["field"]
+    if field not in doc:
+        return "fail_open"
+    value = doc[field]
+    if isinstance(value, str) and value in poll["until"]["terminal"]:
+        return "terminal"
+    return "pending"
+
+
 class KeelCoreStub:
     def __init__(self) -> None:
         self._policy: dict[str, Any] = {}
@@ -334,6 +364,9 @@ class KeelCoreStub:
         on = flows.get("on_nondeterminism")
         if on is not None and on not in ("fail", "warn", "branch"):
             raise self._invalid("flows.on_nondeterminism", "must be fail|warn|branch")
+        on_busy = flows.get("on_busy")
+        if on_busy is not None and on_busy not in ("skip", "wait", "fail"):
+            raise self._invalid("flows.on_busy", "must be skip|wait|fail")
 
     def _validate_journal(self, journal: Any) -> None:
         if journal is None:
@@ -479,6 +512,30 @@ class KeelCoreStub:
         budget = v.get("budget")
         if budget is not None and not isinstance(budget, str):
             raise cls._invalid(path, "budget must be a string")
+        poll = v.get("poll")
+        if poll is not None:
+            if not isinstance(poll, dict):
+                raise cls._invalid(path, "poll must be a table")
+            cls._reject_unknown(f"{path}.poll", poll, ("interval", "deadline", "until"))
+            for key in ("interval", "deadline"):
+                if not isinstance(poll.get(key), str) or _parse_duration(poll[key]) is None:
+                    raise cls._invalid(path, f"bad poll.{key} duration")
+            if _parse_duration(poll["interval"]) == 0:
+                raise cls._invalid(path, "poll.interval must be a nonzero duration")
+            until = poll.get("until")
+            if not isinstance(until, dict):
+                raise cls._invalid(path, "poll.until must be a table")
+            cls._reject_unknown(f"{path}.poll.until", until, ("field", "terminal"))
+            field = until.get("field")
+            if not isinstance(field, str) or not field:
+                raise cls._invalid(path, "poll.until.field must be a non-empty string")
+            terminal = until.get("terminal")
+            if (
+                not isinstance(terminal, list)
+                or not terminal
+                or not all(isinstance(t, str) for t in terminal)
+            ):
+                raise cls._invalid(path, "poll.until.terminal must be a non-empty array of strings")
 
     # -- resolution --------------------------------------------------------
 
@@ -610,7 +667,7 @@ class KeelCoreStub:
                     return out
                 half_open = True
 
-        # retry loop
+        # retry loop config
         if isinstance(retry, dict):
             max_attempts = retry.get("attempts", _DEFAULT_ATTEMPTS)
             schedule = (
@@ -620,75 +677,103 @@ class KeelCoreStub:
         else:
             max_attempts, schedule, on = 1, _DEFAULT_SCHEDULE, _DEFAULT_ON
 
-        terminal: dict[str, Any] | None = None
-        for attempt in range(1, max_attempts + 1):
-            out["attempts"] = attempt
-            m["attempts"] += 1
-            res = effect(attempt)
-            if res.get("status") == "ok":
-                m["successes"] += 1
-                if isinstance(breaker_cfg, dict):
-                    b = self._breakers[target]
-                    # A live success is only reached while closed or half-open;
-                    # `open_until` set here means a probe just closed the
-                    # breaker.
-                    closed_a_probe = b["open_until"] is not None
-                    b["consecutive"], b["open_until"] = 0, None
-                    if closed_a_probe:
-                        # A closing probe resets the window: the pre-open
-                        # failure history must not instantly re-trip a
-                        # freshly-recovered target.
-                        b["outcomes"] = []
-                    else:
-                        mode, params = _breaker_mode(breaker_cfg)
-                        if mode == "rate":
-                            window_ms, _, _ = params
-                            _breaker_observe(b, self._now_ms, window_ms, False)
-                payload = res.get("payload")
-                if cache_key and cache_ttl is not None:
-                    self._cache[cache_key] = (self._now_ms + cache_ttl, payload)
-                out.update(
-                    result="ok", payload=payload, breaker=self._breaker_state(target)
-                )
-                return out
-
-            cls = res.get("class", "other")
-            http_status = res.get("http_status")
-            message = res.get("message", "")
-            retryable = any(_condition_matches(c, cls, http_status) for c in on)
-            if not retryable:
-                code = "KEEL-E015"
-            elif attempt == max_attempts:
-                code = "KEEL-E010"
-            elif not request.get("idempotent", False):
-                code = "KEEL-E014"
-            else:
-                code = None
-            if code:
-                detail = f"{cls} {http_status}" if http_status else cls
-                if code == "KEEL-E010":
-                    msg = f"{op} failed {attempt}/{max_attempts} attempts (last: {detail}). {message}"
-                elif code == "KEEL-E014":
-                    msg = (
-                        f"{op} failed ({detail}). Not retried: call is not idempotent "
-                        f"— observed, not retried. {message}"
-                    )
+        def run_attempts() -> tuple[str, Any]:
+            """One fully-retried call: ("ok", payload) or ("error", terminal)."""
+            for attempt in range(1, max_attempts + 1):
+                out["attempts"] += 1
+                m["attempts"] += 1
+                res = effect(attempt)
+                if res.get("status") == "ok":
+                    return ("ok", res.get("payload"))
+                cls = res.get("class", "other")
+                http_status = res.get("http_status")
+                message = res.get("message", "")
+                retryable = any(_condition_matches(c, cls, http_status) for c in on)
+                if not retryable:
+                    code = "KEEL-E015"
+                elif attempt == max_attempts:
+                    code = "KEEL-E010"
+                elif not request.get("idempotent", False):
+                    code = "KEEL-E014"
                 else:
-                    msg = f"{op} failed ({detail}); error class is not retryable per policy. {message}"
-                terminal = {"code": code, "class": cls, "message": msg.rstrip()}
-                if http_status is not None:
-                    terminal["http_status"] = http_status
-                if res.get("original") is not None:
-                    terminal["original"] = res["original"]
-                break
-            wait = _schedule_wait(schedule, attempt)
-            if res.get("retry_after_ms") is not None:
-                wait = max(wait, res["retry_after_ms"])
-            out["waits_ms"].append(wait)
-            self._now_ms += wait
-            m["retries"] += 1
+                    code = None
+                if code:
+                    detail = f"{cls} {http_status}" if http_status else cls
+                    if code == "KEEL-E010":
+                        msg = f"{op} failed {attempt}/{max_attempts} attempts (last: {detail}). {message}"
+                    elif code == "KEEL-E014":
+                        msg = (
+                            f"{op} failed ({detail}). Not retried: call is not idempotent "
+                            f"— observed, not retried. {message}"
+                        )
+                    else:
+                        msg = f"{op} failed ({detail}); error class is not retryable per policy. {message}"
+                    terminal = {"code": code, "class": cls, "message": msg.rstrip()}
+                    if http_status is not None:
+                        terminal["http_status"] = http_status
+                    if res.get("original") is not None:
+                        terminal["original"] = res["original"]
+                    return ("error", terminal)
+                wait = _schedule_wait(schedule, attempt)
+                if res.get("retry_after_ms") is not None:
+                    wait = max(wait, res["retry_after_ms"])
+                out["waits_ms"].append(wait)
+                self._now_ms += wait
+                m["retries"] += 1
+            raise AssertionError("loop always returns by the final attempt")
 
-        # terminal failure
+        # poll layer (CCR-3): wraps the retry loop; gate = resolved poll table
+        # + idempotent GET/HEAD op (conformance/README.md "Poll").
+        poll_cfg = self._layer(target, "poll")
+        poll_active = (
+            isinstance(poll_cfg, dict)
+            and request.get("idempotent", False)
+            and (op.startswith("GET ") or op.startswith("HEAD "))
+        )
+        poll_started_ms = self._now_ms
+        while True:
+            status_, value = run_attempts()
+            if status_ == "ok" and poll_active:
+                verdict = _poll_verdict(poll_cfg, value)
+                if verdict == "pending":
+                    interval = _parse_duration(poll_cfg["interval"])
+                    deadline = _parse_duration(poll_cfg["deadline"])
+                    elapsed = self._now_ms - poll_started_ms
+                    if elapsed + interval > deadline:
+                        status_, value = "error", {
+                            "code": "KEEL-E016",
+                            "class": "other",
+                            "message": (
+                                f"{op} poll deadline exceeded: "
+                                f"'{poll_cfg['until']['field']}' not terminal after {deadline}ms"
+                            ),
+                        }
+                        break
+                    self._now_ms += interval
+                    continue
+            break
+
+        if status_ == "ok":
+            payload = value
+            m["successes"] += 1
+            if isinstance(breaker_cfg, dict):
+                b = self._breakers[target]
+                closed_a_probe = b["open_until"] is not None
+                b["consecutive"], b["open_until"] = 0, None
+                if closed_a_probe:
+                    b["outcomes"] = []
+                else:
+                    mode, params = _breaker_mode(breaker_cfg)
+                    if mode == "rate":
+                        window_ms, _, _ = params
+                        _breaker_observe(b, self._now_ms, window_ms, False)
+            if cache_key and cache_ttl is not None:
+                self._cache[cache_key] = (self._now_ms + cache_ttl, payload)
+            out.update(result="ok", payload=payload, breaker=self._breaker_state(target))
+            return out
+
+        # terminal failure (unchanged bookkeeping)
+        terminal = value
         m["failures"] += 1
         if isinstance(breaker_cfg, dict):
             cooldown = (

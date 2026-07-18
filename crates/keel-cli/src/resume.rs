@@ -135,7 +135,7 @@ impl Ineligible {
 const PY_SCHEME: &str = "py";
 
 /// Split `"py:pipeline.ingest:main"` into `(lang, module, function)`.
-fn parse_entrypoint(entrypoint: &str) -> Option<(&str, &str, &str)> {
+pub(crate) fn parse_entrypoint(entrypoint: &str) -> Option<(&str, &str, &str)> {
     let mut parts = entrypoint.splitn(3, ':');
     Some((parts.next()?, parts.next()?, parts.next()?))
 }
@@ -180,13 +180,13 @@ fn dotted_module_path(project: &Path, module: &str) -> PathBuf {
 
 /// Where a module's script lives, or why that cannot be determined — see the
 /// module docs for the single-component-vs-dotted matching rule.
-enum ScriptLookup {
+pub(crate) enum ScriptLookup {
     Found(PathBuf),
     NotFound { candidate: String },
     Ambiguous { candidates: Vec<String> },
 }
 
-fn locate_script(project: &Path, module: &str) -> ScriptLookup {
+pub(crate) fn locate_script(project: &Path, module: &str) -> ScriptLookup {
     if module.contains('.') {
         let candidate = dotted_module_path(project, module);
         if candidate.is_file() {

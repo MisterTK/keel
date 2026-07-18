@@ -1,0 +1,13 @@
+{
+  "name": "poll-policy-invalid",
+  "description": "An empty poll.until.terminal is rejected at configure (KEEL-E001) by schema and every implementation alike.",
+  "expect_configure_error": "KEEL-E001",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": [] } }
+      }
+    }
+  },
+  "steps": []
+}

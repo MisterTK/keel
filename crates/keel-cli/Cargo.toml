@@ -25,6 +25,10 @@ path = "src/main.rs"
 [dependencies]
 keel-core-api = { path = "../keel-core-api", version = "0.2.0" }
 keel-journal = { path = "../keel-journal", version = "0.2.0" }
+# The real Tier-2 flow manager: `keel exec` (WS6, CCR-4) drives a `cmd:` flow
+# through `FlowManager` (identity/lease/attempts/completion) over the same
+# journal instance, so the CLI now links the engine, not just reads its files.
+keel-core = { package = "keelrun-core", path = "../keel-core", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 # Read `.keel/journal.db` for `keel status` directly. The schema is frozen
 # (contracts/journal.sql); keel-journal owns writes, the CLI only reads.
@@ -37,6 +41,9 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 # Parse the user's keel.toml for `doctor` validation and `init --diff`.
 toml = "0.8"
+# The Python front end's exact flow-hash convention (`_flow.py::_code_hash`):
+# re-derived to detect resumable flows whose script changed since entry (WS6).
+sha2 = { workspace = true }
 # JS/TS/JSX parsing for the static scan (dx-spec §2) — pure Rust, so
 # `keel init` needs no Node toolchain. Pinned exactly: oxc's AST/visit API
 # churns between minors; bump all six crates together.
@@ -51,6 +58,12 @@ oxc_syntax = "=0.139.0"
 # survive byte-for-byte. Already in-tree as toml's own backend.
 toml_edit = "0.22"
 
+# `keel exec`'s dead-holder detection (WS6): `libc::kill(pid, 0)` probes a
+# recorded holder's PID on unix; other platforms treat it as alive (the lease
+# TTL is the reuse backstop). Unix-only so Windows builds carry no libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.23"
 # Integration tests build fixture DBs the way the front ends do: the journal via
@@ -63,5 +76,25 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 keel-core = { package = "keelrun-core", path = "../keel-core" }
 tokio = { version = "1.47", features = ["macros", "rt", "test-util", "time"] }
 
-[lints]
-workspace = true
+# This crate cannot inherit `[workspace.lints]`: the workspace FORBIDS
+# unsafe_code (an absolute level no inner attribute can relax), but `keel exec`'s
+# dead-holder detection needs two libc calls — `kill(pid, 0)` to probe a recorded
+# holder's PID and `gethostname` to fence the probe to this host (WS6, CCR-4).
+# So we restate the workspace lint posture verbatim, changing only unsafe_code —
+# every other standard stays in force and CI still runs clippy pedantic
+# `-D warnings` over this crate. The two unsafe blocks (exec.rs) are narrow with
+# `// SAFETY:` notes.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"

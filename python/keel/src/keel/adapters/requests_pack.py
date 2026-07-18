@@ -304,10 +304,10 @@ def _run_send(call_with: Callable[[Any], Any], request: Any) -> Any:
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        # Buffer the body ONLY when a cache ttl is actually configured (mirrors
-        # Node's fetch gate) OR usage accounting needs it; with neither, a
-        # stream=True GET is never force-read at the seam.
-        cacheable = hash_ is not None and _http.cache_configured(target)
+        # Buffer the body ONLY when a cache ttl or a poll table is actually
+        # configured (mirrors Node's fetch gate) OR usage accounting needs it;
+        # with neither, a stream=True GET is never force-read at the seam.
+        cacheable = hash_ is not None and _http.buffer_body_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 
