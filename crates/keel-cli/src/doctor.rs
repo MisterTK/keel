@@ -213,22 +213,24 @@ impl JournalReport {
 }
 
 /// One host `keel doctor` judged excluded or unreachable, with the honest
-/// reason why — see [`Topology`].
+/// reason why — see [`Topology`]. `pub(crate)`: `init.rs` reuses
+/// [`classify_topology`] to skip proposals for excluded hosts and print why.
 #[derive(Debug, Serialize)]
-struct TopologyEntry {
-    host: String,
-    reason: String,
+pub(crate) struct TopologyEntry {
+    pub(crate) host: String,
+    pub(crate) reason: String,
 }
 
 /// One externally-launched process the scan saw — traffic inside it is
 /// outside Keel's visibility regardless of policy (dx-spec's "shouldn't/
-/// can't/wrap it" honesty triad, the "external process" leg).
+/// can't/wrap it" honesty triad, the "external process" leg). `pub(crate)`
+/// alongside [`Topology`] for the same cross-module reuse.
 #[derive(Debug, Serialize)]
-struct ExternalProcess {
-    command: String,
-    file: String,
-    launcher: String,
-    line: u32,
+pub(crate) struct ExternalProcess {
+    pub(crate) command: String,
+    pub(crate) file: String,
+    pub(crate) launcher: String,
+    pub(crate) line: u32,
 }
 
 /// The three-bucket honesty topology (dx-spec §2): every host Keel's static
@@ -240,12 +242,15 @@ struct ExternalProcess {
 /// purpose). `external_processes` is the adjacent, host-independent honesty
 /// signal: traffic inside an externally-launched process Keel cannot see at
 /// all, no matter which bucket its host would otherwise land in.
+///
+/// `pub(crate)`: `init.rs` reuses [`classify_topology`] to skip proposing
+/// policy for excluded hosts and print why.
 #[derive(Debug, Serialize)]
-struct Topology {
-    excluded: Vec<TopologyEntry>,
-    external_processes: Vec<ExternalProcess>,
-    unreachable: Vec<TopologyEntry>,
-    wrappable: Vec<String>,
+pub(crate) struct Topology {
+    pub(crate) excluded: Vec<TopologyEntry>,
+    pub(crate) external_processes: Vec<ExternalProcess>,
+    pub(crate) unreachable: Vec<TopologyEntry>,
+    pub(crate) wrappable: Vec<String>,
 }
 
 /// The whole doctor report.
@@ -544,9 +549,10 @@ fn build_report(
 /// pack's own wrapping, beats static doubt); otherwise a target seen ONLY
 /// inside a dependency-averse file is excluded (shouldn't reach it) ahead of
 /// any transport check; otherwise the transport class decides wrappable
-/// (tracked) vs. unreachable (untracked-known/unknown). Self-contained on
-/// purpose — a later task reuses it for `keel init --diff`.
-fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<String>) -> Topology {
+/// (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
+/// `init.rs` reuses this directly for `keel init --diff` to skip proposing
+/// policy for excluded hosts and print why.
+pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<String>) -> Topology {
     let dep_files: BTreeSet<&str> = scan
         .dependency_averse
         .iter()
@@ -966,6 +972,117 @@ mod tests {
         );
         // ok is unaffected: honesty findings are not configuration errors.
         assert!(r.ok);
+    }
+
+    /// The override precedence documented on [`classify_topology`]: a
+    /// wrapped-at-runtime target or an `llm:*` target is wrappable by
+    /// construction, regardless of what the transport check or the
+    /// dependency-averse check would otherwise conclude. Runtime evidence (or
+    /// the LLM pack's own wrapping) beats static doubt.
+    #[test]
+    fn wrapped_and_llm_targets_are_always_wrappable() {
+        use crate::scan::{DepAverseFile, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 3,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Would otherwise be unreachable (Unknown transport) if not wrapped.
+        scan.targets.insert(
+            "api.wrapped-but-unknown.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports.insert(
+            "api.wrapped-but-unknown.com".into(),
+            TransportClass::Unknown,
+        );
+        // Would otherwise be excluded (dependency-averse-only-sighted) if not
+        // wrapped.
+        scan.targets.insert(
+            "api.wrapped-but-excluded.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "risk_gate.py".into(),
+                    line: 5,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports.insert(
+            "api.wrapped-but-excluded.com".into(),
+            TransportClass::UntrackedKnown,
+        );
+        scan.dependency_averse.push(DepAverseFile {
+            file: "risk_gate.py".into(),
+            reason: "stdlib-only + name/docstring signal: risk".into(),
+        });
+        // An llm:* target with no transport evidence at all — wrappable by
+        // construction, not by the transport map.
+        scan.targets.insert(
+            "llm:some-model".into(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "agent.py".into(),
+                    line: 7,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let wrapped: BTreeSet<String> = [
+            "api.wrapped-but-unknown.com".to_owned(),
+            "api.wrapped-but-excluded.com".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let r = build_report(&scan, &wrapped, default_policy(), default_journal());
+
+        assert!(
+            r.topology
+                .wrappable
+                .contains(&"api.wrapped-but-unknown.com".to_owned()),
+            "a wrapped-at-runtime target must be wrappable even with an Unknown transport class: \
+             {:?}",
+            r.topology
+        );
+        assert!(
+            !r.topology
+                .unreachable
+                .iter()
+                .any(|e| e.host == "api.wrapped-but-unknown.com"),
+            "must not also land in unreachable"
+        );
+        assert!(
+            r.topology
+                .wrappable
+                .contains(&"api.wrapped-but-excluded.com".to_owned()),
+            "a wrapped-at-runtime target must be wrappable even when sighted only in a \
+             dependency-averse file: {:?}",
+            r.topology
+        );
+        assert!(
+            !r.topology
+                .excluded
+                .iter()
+                .any(|e| e.host == "api.wrapped-but-excluded.com"),
+            "must not also land in excluded"
+        );
+        assert!(
+            r.topology.wrappable.contains(&"llm:some-model".to_owned()),
+            "an llm:* target must be wrappable with zero transport evidence: {:?}",
+            r.topology
+        );
     }
 
     fn default_policy() -> PolicyValidation {
