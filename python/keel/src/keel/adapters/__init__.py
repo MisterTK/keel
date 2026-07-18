@@ -27,7 +27,7 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
-from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack
+from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack, urllib_pack
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
@@ -41,8 +41,13 @@ from ._pack import Detection, Seam, TargetDecl
 #: MODULE-import time (no init-order cycle: `langgraph_pack` learned this the
 #: hard way — importing it eagerly here pulled in `keel.packs.__init__`,
 #: which imports `mcp_pack`, which needs `_AdapterFinder` from THIS module
-#: before it finishes executing).
-PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack)
+#: before it finishes executing). `urllib_pack` wraps a stdlib module, so its
+#: `detect()` always matches and the lazy finder keys on the dotted name
+#: "urllib.request" (submodule imports pass through `sys.meta_path` with the
+#: dotted fullname, so `_AdapterFinder` intercepts them exactly like a
+#: top-level lib; when `urllib.request` is already imported at activation
+#: time, `install_adapters` patches immediately).
+PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack, urllib_pack)
 
 
 class _State:
