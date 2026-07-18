@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use keel_core::{Engine, FlowDescriptor, FlowHandle, FlowManager};
-use keel_core_api::policy::{OnBusy, Policy};
+use keel_core_api::policy::OnBusy;
 use keel_core_api::{ErrorClass, ErrorCode};
 use keel_journal::{
     Clock, FlowId, FlowStatus, Journal, ProcessId, SqliteJournal, StepKey, StepKind, StepOutcome,
@@ -617,12 +617,15 @@ fn enter_loop(
     desc: &FlowDescriptor,
     flow_id: &FlowId,
 ) -> Result<FlowHandle, (Option<Rendered>, i32)> {
+    let mut wait_iters: u32 = 0;
     loop {
         match manager.enter_flow(desc) {
             Ok(handle) => return Ok(handle),
             Err(e) => match e.code {
                 ErrorCode::FlowLeaseHeld => {
-                    if let Some(terminal) = handle_busy(journal, project, flow_id, &e.message) {
+                    if let Some(terminal) =
+                        handle_busy(journal, project, flow_id, &e.message, &mut wait_iters)
+                    {
                         return Err(terminal);
                     }
                     // Retry: an abandoned dead holder, or an `on_busy = wait`
@@ -645,13 +648,23 @@ fn enter_loop(
     }
 }
 
+/// How many `wait`-mode iterations ([`Duration::from_millis`]`(500)` apart)
+/// between "still waiting" safety prints — `60 * 500ms = 30s`. No timeout in
+/// v1 (the operator can ^C); this print is the only feedback a long wait
+/// gives, so it must actually recur, not fire once and go silent.
+const WAIT_NOTICE_EVERY: u32 = 60;
+
 /// Handle a held lease: abandon a dead same-host holder (then retry), else
 /// apply `[flows].on_busy`. `Some(terminal)` ends the run; `None` retries.
+/// `wait_iters` threads the `wait`-mode iteration count across calls (one
+/// call per [`enter_loop`] retry) so the safety print fires on a cadence
+/// instead of every 500ms or never.
 fn handle_busy(
     journal: &dyn Journal,
     project: &Path,
     flow_id: &FlowId,
     e030_message: &str,
+    wait_iters: &mut u32,
 ) -> Option<(Option<Rendered>, i32)> {
     let recorded_holder = journal
         .get_flow(flow_id)
@@ -693,6 +706,17 @@ fn handle_busy(
             Some((Some(report.render(human, false)), EXIT_OK))
         }
         OnBusy::Wait => {
+            *wait_iters += 1;
+            if (*wait_iters).is_multiple_of(WAIT_NOTICE_EVERY) {
+                let holder = recorded_holder
+                    .as_ref()
+                    .map_or("unknown", ProcessId::as_str);
+                eprintln!(
+                    "keel \u{25b8} exec: still waiting on flow {flow_id} held by {holder} \
+                     ({}s elapsed; flows.on_busy = wait; ^C to give up).",
+                    (*wait_iters / 2) // 500ms per iteration -> iters/2 = seconds
+                );
+            }
             std::thread::sleep(Duration::from_millis(500));
             None
         }
@@ -703,19 +727,11 @@ fn handle_busy(
 }
 
 /// The effective `[flows].on_busy` from the project's `keel.toml` (default
-/// `skip`). Lenient: any read/parse failure applies the default.
+/// `skip`), via the CLI's one shared `keel.toml`\u{2192}[`Policy`] loader
+/// ([`evidence::load_policy`] — the same pipeline `resolved_journal` reads).
+/// Lenient: any read/parse failure applies the default.
 fn flows_on_busy(project: &Path) -> OnBusy {
-    let Ok(text) = std::fs::read_to_string(evidence::keel_toml(project)) else {
-        return OnBusy::default();
-    };
-    let Ok(toml_value) = text.parse::<toml::Value>() else {
-        return OnBusy::default();
-    };
-    let Ok(json_value) = serde_json::to_value(&toml_value) else {
-        return OnBusy::default();
-    };
-    serde_json::from_value::<Policy>(json_value)
-        .ok()
+    evidence::load_policy(project)
         .and_then(|p| p.flows)
         .map_or_else(OnBusy::default, |f| f.on_busy)
 }
@@ -843,6 +859,47 @@ fn record_step(journal: &dyn Journal, flow_id: &FlowId, key: &StepKey, outcome: 
     if let Err(e) = journal.record_step(flow_id, STEP_SEQ, key, outcome) {
         eprintln!("keel \u{25b8} exec: step {STEP_SEQ} not journaled: {e}");
     }
+}
+
+// ---- test support ----------------------------------------------------
+//
+// `tests/exec.rs` seeds journal rows directly (the same technique
+// `resume`-style tests use to simulate a foreign holder) to exercise
+// on_busy/dead-PID paths without a second real process. A seeded row that
+// does not share the EXACT `flow_id` `run` derives collides with nothing and
+// the test passes vacuously, so the derivation (entrypoint/args_hash
+// composition, the holder-string format) is exposed here rather than
+// re-implemented (and silently drifted) in the test file.
+
+/// The `flow_id` [`run`] derives for `(flow, command, flow_id_key)` — for
+/// integration tests seeding a colliding row.
+#[doc(hidden)]
+#[must_use]
+pub fn identity_flow_id(flow: &str, command: &[String], flow_id_key: Option<&str>) -> String {
+    FlowDescriptor {
+        entrypoint: format!("cmd:{flow}"),
+        args_hash: args_hash(command),
+        explicit_key: flow_id_key.map(str::to_owned),
+        code_hash: None,
+    }
+    .flow_id()
+    .to_string()
+}
+
+/// This host's name, as [`run`] records it in a lease holder — for
+/// integration tests constructing a same-host (or foreign-host) holder.
+#[doc(hidden)]
+#[must_use]
+pub fn identity_hostname() -> String {
+    hostname()
+}
+
+/// The `"{host}:{pid}:{started_ms}"` lease holder format [`run`] writes — for
+/// integration tests seeding a foreign holder.
+#[doc(hidden)]
+#[must_use]
+pub fn identity_holder_string(host: &str, pid: u32, started_ms: i64) -> String {
+    holder_string(host, pid, started_ms)
 }
 
 #[cfg(test)]
