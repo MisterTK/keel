@@ -1835,4 +1835,81 @@ mod tests {
         assert!(!v.check.valid);
         assert!(v.fix.is_none());
     }
+
+    /// Whether `python3` is on PATH — gates the Python-scan end-to-end test
+    /// below, mirroring `scan::python`'s test helper (private to that module,
+    /// so duplicated here rather than shared across crates).
+    fn python3_present() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// WS2 hardening: doctor and init --diff (the two MCP-exposed report
+    /// producers) must never emit raw source content. Allowed interpolations
+    /// are ONLY: hostnames, file paths, lib names, literal subprocess argv, and
+    /// keel-authored sentences. Canary strings placed in every other syntactic
+    /// position must not survive into either the JSON or the human rendering.
+    #[test]
+    fn doctor_and_init_diff_never_leak_raw_source() {
+        const CANARIES: [&str; 5] = [
+            "CANARY_COMMENT_9f31",
+            "CANARY_SECRET_9f31",
+            "CANARY_QUERY_9f31",
+            "CANARY_DOCSTRING_9f31",
+            "CANARY_QUERY2_9f31",
+        ];
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("app.py"),
+            "import urllib.request\n\
+             # CANARY_COMMENT_9f31 must never appear in any report\n\
+             TOKEN = \"CANARY_SECRET_9f31\"\n\
+             U = \"https://api.leak.example/v1?key=CANARY_QUERY_9f31\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"risk gate. CANARY_DOCSTRING_9f31 stdlib only.\"\"\"\n\
+             import json\n\
+             G = \"https://api.gateonly.example/v2?tok=CANARY_QUERY2_9f31\"\n",
+        )
+        .unwrap();
+        let doctor = run(dir.path());
+        let doctor_json = crate::render::json_string(&doctor.json);
+        let init = crate::init::run(
+            dir.path(),
+            crate::init::InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+        let init_json = crate::render::json_string(&init.json);
+        for canary in CANARIES {
+            assert!(!doctor_json.contains(canary), "doctor json leaks {canary}");
+            assert!(
+                !doctor.human.contains(canary),
+                "doctor human leaks {canary}"
+            );
+            assert!(
+                !init_json.contains(canary),
+                "init --diff json leaks {canary}"
+            );
+            assert!(
+                !init.human.contains(canary),
+                "init --diff human leaks {canary}"
+            );
+        }
+        // Sanity: the report DID see the project (hosts present) — the canaries
+        // are absent because of scoping, not because the scan saw nothing.
+        assert!(doctor_json.contains("api.leak.example"));
+    }
 }
