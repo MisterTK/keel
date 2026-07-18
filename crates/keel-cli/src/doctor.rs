@@ -26,7 +26,7 @@ use serde::Serialize;
 
 use crate::diff::{PolicyOp, PolicyPath, Proposal, propose, resolve_dotted_path};
 use crate::render::to_json;
-use crate::scan::ScanResult;
+use crate::scan::{ScanResult, TransportClass};
 use crate::{EXIT_OK, EXIT_USAGE, Rendered, agents_cli, evidence, scan};
 
 /// One known adapter/pack: its library, the language(s), the semantic target
@@ -237,6 +237,20 @@ struct Finding {
     topic: &'static str,
 }
 
+/// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
+/// agent/human reading the report to work top-down. `code` is a CLOSED set —
+/// url-no-transport | subprocess-blind-spot | dependency-averse-excluded |
+/// preexisting-resilience | code-hash-stale — ranked lowest-Keel-confidence
+/// first (rank 1 = Keel knows least, investigate first). Text is entirely
+/// keel-authored; only hostnames, file paths, and lib names are interpolated.
+#[derive(Debug, Serialize)]
+struct FollowUp {
+    code: &'static str,
+    detail: String,
+    rank: u32,
+    subject: String,
+}
+
 /// Where the journal lives, as resolved for this project — the same selection
 /// the engine makes at configure time.
 #[derive(Debug, Serialize)]
@@ -268,15 +282,58 @@ impl JournalReport {
     }
 }
 
+/// One host `keel doctor` judged excluded or unreachable, with the honest
+/// reason why — see [`Topology`]. `pub(crate)`: `init.rs` reuses
+/// [`classify_topology`] to skip proposals for excluded hosts and print why.
+#[derive(Debug, Serialize)]
+pub(crate) struct TopologyEntry {
+    pub(crate) host: String,
+    pub(crate) reason: String,
+}
+
+/// One externally-launched process the scan saw — traffic inside it is
+/// outside Keel's visibility regardless of policy (dx-spec's "shouldn't/
+/// can't/wrap it" honesty triad, the "external process" leg). `pub(crate)`
+/// alongside [`Topology`] for the same cross-module reuse.
+#[derive(Debug, Serialize)]
+pub(crate) struct ExternalProcess {
+    pub(crate) command: String,
+    pub(crate) file: String,
+    pub(crate) launcher: String,
+    pub(crate) line: u32,
+}
+
+/// The three-bucket honesty topology (dx-spec §2): every host Keel's static
+/// scan saw, sorted into exactly one of "wrap it" (a tracked transport is in
+/// reach, or the target is wrapped-at-runtime/`llm:*` by construction),
+/// "can't reach it" (no adapted transport in reach — Keel is blind here
+/// regardless of policy), or "shouldn't reach it" (sighted only inside a
+/// file the scan judged dependency-averse — excluded from proposed policy on
+/// purpose). `external_processes` is the adjacent, host-independent honesty
+/// signal: traffic inside an externally-launched process Keel cannot see at
+/// all, no matter which bucket its host would otherwise land in.
+///
+/// `pub(crate)`: `init.rs` reuses [`classify_topology`] to skip proposing
+/// policy for excluded hosts and print why.
+#[derive(Debug, Serialize)]
+pub(crate) struct Topology {
+    pub(crate) excluded: Vec<TopologyEntry>,
+    pub(crate) external_processes: Vec<ExternalProcess>,
+    pub(crate) unreachable: Vec<TopologyEntry>,
+    pub(crate) wrappable: Vec<String>,
+}
+
 /// The whole doctor report.
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     adapters: Vec<AdapterStatus>,
     coverage: Coverage,
     findings: Vec<Finding>,
+    follow_ups: Vec<FollowUp>,
     journal: JournalReport,
     ok: bool,
     policy: PolicyCheck,
+    topology: Topology,
 }
 
 /// A policy validation outcome plus, when it failed on a specific field, the
@@ -372,6 +429,143 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
     })
 }
 
+/// The three honesty findings that carry [`Topology`]'s buckets into the
+/// findings list: one `url-no-transport` warning per unreachable host, one
+/// `subprocess-blind-spot` warning naming every externally-launched process
+/// (if any), and one `dependency-averse-excluded` info per excluded host.
+/// None of these are configuration errors — they never affect `ok`.
+fn topology_findings(topology: &Topology) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for entry in &topology.unreachable {
+        findings.push(Finding {
+            action: "Trace how this request is actually dispatched before proposing policy; if \
+                      it is stdlib urllib, adapter support is tracked."
+                .to_owned(),
+            detail: format!("`{}` — {}.", entry.host, entry.reason),
+            fix: None,
+            level: "warn",
+            topic: "url-no-transport",
+        });
+    }
+    if !topology.external_processes.is_empty() {
+        let cmds: Vec<String> = topology
+            .external_processes
+            .iter()
+            .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
+            .collect();
+        findings.push(Finding {
+            action: "Confirm none of these processes carry traffic you care about; Keel must be \
+                      installed inside a process to see it."
+                .to_owned(),
+            detail: format!(
+                "Keel cannot see traffic inside {} externally-launched process(es): {}.",
+                topology.external_processes.len(),
+                cmds.join(", ")
+            ),
+            fix: None,
+            level: "warn",
+            topic: "subprocess-blind-spot",
+        });
+    }
+    for entry in &topology.excluded {
+        findings.push(Finding {
+            action: "Confirm the exclusion is intended; add `# keel: include` to the file to \
+                      override."
+                .to_owned(),
+            detail: format!("`{}` — {}.", entry.host, entry.reason),
+            fix: None,
+            level: "info",
+            topic: "dependency-averse-excluded",
+        });
+    }
+    findings
+}
+
+/// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
+/// the claim Keel knows least about — it saw a URL but cannot even name the
+/// dispatch path — so it is investigated first; rank 5 (code-hash-stale,
+/// reserved for the WS6 emitter) is a mechanical, fully-verified fact that
+/// merely awaits a human decision.
+fn follow_up_rank(code: &str) -> u32 {
+    match code {
+        "url-no-transport" => 1,
+        "subprocess-blind-spot" => 2,
+        "dependency-averse-excluded" => 3,
+        "preexisting-resilience" => 4,
+        _ => 5, // code-hash-stale (WS6)
+    }
+}
+
+/// The ranked follow-up list (WS2): computed from the same structured
+/// evidence as the findings — never by parsing finding text — then sorted by
+/// the stable key (rank, code, subject).
+fn build_follow_ups(
+    topology: &Topology,
+    resilience: Option<&Finding>,
+    scan: &ScanResult,
+) -> Vec<FollowUp> {
+    let mut ups = Vec::new();
+    for entry in &topology.unreachable {
+        ups.push(FollowUp {
+            code: "url-no-transport",
+            detail: format!(
+                "Trace how requests to `{}` are actually dispatched — {}.",
+                entry.host, entry.reason
+            ),
+            rank: follow_up_rank("url-no-transport"),
+            subject: entry.host.clone(),
+        });
+    }
+    if !topology.external_processes.is_empty() {
+        let cmds: Vec<String> = topology
+            .external_processes
+            .iter()
+            .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
+            .collect();
+        ups.push(FollowUp {
+            code: "subprocess-blind-spot",
+            detail: format!(
+                "Keel cannot see traffic inside externally-launched processes; confirm none of \
+                 these carry traffic you care about: {}.",
+                cmds.join(", ")
+            ),
+            rank: follow_up_rank("subprocess-blind-spot"),
+            subject: format!(
+                "{} externally-launched process(es)",
+                topology.external_processes.len()
+            ),
+        });
+    }
+    for entry in &topology.excluded {
+        ups.push(FollowUp {
+            code: "dependency-averse-excluded",
+            detail: format!(
+                "`{}` was excluded from proposed policy — {}. Confirm the exclusion is intended.",
+                entry.host, entry.reason
+            ),
+            rank: follow_up_rank("dependency-averse-excluded"),
+            subject: entry.host.clone(),
+        });
+    }
+    if resilience.is_some() {
+        let libs: Vec<&str> = scan.resilience_libs.iter().map(String::as_str).collect();
+        ups.push(FollowUp {
+            code: "preexisting-resilience",
+            detail: format!(
+                "Decide whether {} still needs its own retry/backoff now that Keel wraps the \
+                 same calls — delete the old code or scope Keel's policy, not both.",
+                libs.join(", ")
+            ),
+            rank: follow_up_rank("preexisting-resilience"),
+            subject: libs.join(", "),
+        });
+    }
+    ups.sort_by(|a, b| {
+        (a.rank, a.code, a.subject.as_str()).cmp(&(b.rank, b.code, b.subject.as_str()))
+    });
+    ups
+}
+
 /// A root `keel.toml` in a Google `agents-cli` project (an
 /// `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches the
 /// container: the generated Dockerfile only `COPY`s `pyproject.toml`,
@@ -463,6 +657,11 @@ fn build_report(
         .cloned()
         .collect();
 
+    // Topology: sort every sighted host into exactly one of the three honesty
+    // buckets, plus the host-independent external-process signal — see
+    // [`classify_topology`].
+    let topology = classify_topology(scan, wrapped_targets);
+
     // Adapter registry annotated with detection.
     let adapters: Vec<AdapterStatus> = REGISTRY
         .iter()
@@ -510,6 +709,7 @@ fn build_report(
         level: "info",
         topic: "invisible",
     });
+    findings.extend(topology_findings(&topology));
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
         let mut action = "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json.".to_owned();
@@ -529,7 +729,9 @@ fn build_report(
             topic: "policy",
         });
     }
-    findings.extend(resilience_finding(scan, &registry_libs));
+    let resilience = resilience_finding(scan, &registry_libs);
+    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan);
+    findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
 
@@ -542,9 +744,91 @@ fn build_report(
             wrapped,
         },
         findings,
+        follow_ups,
         journal,
         ok,
         policy,
+        topology,
+    }
+}
+
+/// Sort every host the static scan saw into exactly one of the three honesty
+/// buckets (dx-spec §2 — "wrap it" / "can't reach it" / "shouldn't reach
+/// it"), plus the host-independent external-process signal. Precedence: a
+/// wrapped-at-runtime target or an `llm:*` target is wrappable by
+/// construction regardless of transport class (runtime evidence, or the LLM
+/// pack's own wrapping, beats static doubt); otherwise a target seen ONLY
+/// inside a dependency-averse file is excluded (shouldn't reach it) ahead of
+/// any transport check; otherwise the transport class decides wrappable
+/// (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
+/// `init.rs` reuses this directly for `keel init --diff` to skip proposing
+/// policy for excluded hosts and print why.
+pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<String>) -> Topology {
+    let dep_files: BTreeSet<&str> = scan
+        .dependency_averse
+        .iter()
+        .map(|d| d.file.as_str())
+        .collect();
+    let mut wrappable = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut excluded = Vec::new();
+    for (target, ev) in &scan.targets {
+        if wrapped_targets.contains(target) || target.starts_with("llm:") {
+            wrappable.push(target.clone());
+            continue;
+        }
+        let only_dep_averse = !ev.sightings.is_empty()
+            && ev
+                .sightings
+                .iter()
+                .all(|s| dep_files.contains(s.file.as_str()));
+        if only_dep_averse {
+            let files: BTreeSet<&str> = ev.sightings.iter().map(|s| s.file.as_str()).collect();
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                reason: format!(
+                    "seen only in dependency-averse file(s) {} — excluded from proposed policy; \
+                     add `# keel: include` to override",
+                    files.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            });
+            continue;
+        }
+        match scan
+            .host_transports
+            .get(target)
+            .copied()
+            .unwrap_or(TransportClass::Unknown)
+        {
+            TransportClass::Tracked => wrappable.push(target.clone()),
+            TransportClass::UntrackedKnown => unreachable.push(TopologyEntry {
+                host: target.clone(),
+                reason: "reached via a transport Keel does not adapt (stdlib urllib/http.client)"
+                    .to_owned(),
+            }),
+            TransportClass::Unknown => unreachable.push(TopologyEntry {
+                host: target.clone(),
+                reason: "URL literal with no tracked transport in reach — trace how this request \
+                          is dispatched"
+                    .to_owned(),
+            }),
+        }
+    }
+    let external_processes: Vec<ExternalProcess> = scan
+        .subprocesses
+        .iter()
+        .map(|s| ExternalProcess {
+            command: s.command.clone(),
+            file: s.file.clone(),
+            launcher: s.launcher.clone(),
+            line: s.line,
+        })
+        .collect();
+    Topology {
+        excluded,
+        external_processes,
+        unreachable,
+        wrappable,
     }
 }
 
@@ -644,6 +928,24 @@ fn human(r: &DoctorReport) -> String {
     );
     line_list(&mut out, "  invisible:        ", &r.coverage.invisible);
 
+    out.push_str("\ntopology\n");
+    line_list(&mut out, "  wrap it:          ", &r.topology.wrappable);
+    for e in &r.topology.unreachable {
+        let line = format!("  can't reach:       {} — {}\n", e.host, e.reason);
+        out.push_str(&line);
+    }
+    for e in &r.topology.excluded {
+        let line = format!("  shouldn't reach:   {} — {}\n", e.host, e.reason);
+        out.push_str(&line);
+    }
+    for p in &r.topology.external_processes {
+        let line = format!(
+            "  external process:  {} ({} at {}:{})\n",
+            p.command, p.launcher, p.file, p.line
+        );
+        out.push_str(&line);
+    }
+
     out.push_str("\nadapters\n");
     for a in &r.adapters {
         let mark = if a.detected { "\u{2713}" } else { " " };
@@ -697,6 +999,13 @@ fn human(r: &DoctorReport) -> String {
                 out.push_str("        patch (apply with `git apply`):\n");
                 out.push_str(&fix.patch);
             }
+        }
+    }
+    if !r.follow_ups.is_empty() {
+        out.push_str("\nfollow-ups (work top-down; 1 = Keel knows least)\n");
+        for f in &r.follow_ups {
+            let line = format!("  {}. [{}] {} — {}\n", f.rank, f.code, f.subject, f.detail);
+            out.push_str(&line);
         }
     }
     let tail = format!(
@@ -787,6 +1096,330 @@ mod tests {
         let openai = r.adapters.iter().find(|a| a.lib == "openai").unwrap();
         assert!(openai.detected);
         assert_eq!(openai.status, "pinned");
+    }
+
+    #[test]
+    fn topology_buckets_classify_hosts_honestly() {
+        use crate::scan::{DepAverseFile, SubprocessSighting, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 3,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // wrappable: tracked transport.
+        scan.targets.insert(
+            "api.ok.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 3,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.ok.com".into(), TransportClass::Tracked);
+        // unreachable: untracked-known transport.
+        scan.targets.insert(
+            "api.stdlib.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "screen.py".into(),
+                    line: 9,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.stdlib.com".into(), TransportClass::UntrackedKnown);
+        // excluded: sighted ONLY inside a dependency-averse file (transport
+        // class irrelevant).
+        scan.targets.insert(
+            "api.broker.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "risk_gate.py".into(),
+                    line: 20,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.broker.com".into(), TransportClass::UntrackedKnown);
+        scan.dependency_averse.push(DepAverseFile {
+            file: "risk_gate.py".into(),
+            reason: "stdlib-only + name/docstring signal: risk".into(),
+        });
+        scan.subprocesses.push(SubprocessSighting {
+            file: "mcp.sh.py".into(),
+            line: 12,
+            launcher: "subprocess.run".into(),
+            command: "uvx alpaca-mcp-server".into(),
+        });
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+        assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
+        assert_eq!(r.topology.unreachable.len(), 1);
+        assert_eq!(r.topology.unreachable[0].host, "api.stdlib.com");
+        assert_eq!(r.topology.excluded.len(), 1);
+        assert_eq!(r.topology.excluded[0].host, "api.broker.com");
+        assert!(r.topology.excluded[0].reason.contains("risk_gate.py"));
+        assert_eq!(r.topology.external_processes.len(), 1);
+        assert_eq!(
+            r.topology.external_processes[0].command,
+            "uvx alpaca-mcp-server"
+        );
+        // findings carry the honesty.
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.topic == "url-no-transport" && f.level == "warn")
+        );
+        assert!(r.findings.iter().any(|f| f.topic == "subprocess-blind-spot"
+            && f.level == "warn"
+            && f.detail.contains("uvx alpaca-mcp-server")));
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.topic == "dependency-averse-excluded" && f.level == "info")
+        );
+        // ok is unaffected: honesty findings are not configuration errors.
+        assert!(r.ok);
+    }
+
+    /// The ranked follow-up list (WS2): every honesty signal that needs a human/
+    /// agent to chase becomes one entry in a closed vocabulary, sorted by
+    /// (rank, code, subject) with rank = ascending Keel-confidence.
+    #[test]
+    fn follow_ups_are_ranked_closed_vocabulary_and_sorted() {
+        use crate::scan::{DepAverseFile, SubprocessSighting, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 4,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Two unreachable hosts (rank 1) — inserted in reverse order to prove
+        // the sort, not the insertion order, decides.
+        for (host, file) in [("api.zeta.com", "z.py"), ("api.alpha.com", "a.py")] {
+            scan.targets.insert(
+                host.into(),
+                TargetEvidence {
+                    class: TargetClass::Host,
+                    sightings: [Sighting {
+                        file: file.into(),
+                        line: 1,
+                    }]
+                    .into_iter()
+                    .collect(),
+                },
+            );
+            scan.host_transports
+                .insert(host.into(), TransportClass::UntrackedKnown);
+        }
+        // One external process (rank 2).
+        scan.subprocesses.push(SubprocessSighting {
+            file: "launch.py".into(),
+            line: 12,
+            launcher: "subprocess.run".into(),
+            command: "uvx alpaca-mcp-server".into(),
+        });
+        // One excluded host (rank 3).
+        scan.targets.insert(
+            "api.broker.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "risk_gate.py".into(),
+                    line: 20,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.dependency_averse.push(DepAverseFile {
+            file: "risk_gate.py".into(),
+            reason: "stdlib-only + name/docstring signal: risk".into(),
+        });
+        // Pre-existing resilience alongside a wrapped lib (rank 4).
+        scan.libs.insert("httpx".to_owned());
+        scan.resilience_libs.insert("tenacity".to_owned());
+
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+
+        let got: Vec<(u32, &str, &str)> = r
+            .follow_ups
+            .iter()
+            .map(|f| (f.rank, f.code, f.subject.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "url-no-transport", "api.alpha.com"),
+                (1, "url-no-transport", "api.zeta.com"),
+                (
+                    2,
+                    "subprocess-blind-spot",
+                    "1 externally-launched process(es)"
+                ),
+                (3, "dependency-averse-excluded", "api.broker.com"),
+                (4, "preexisting-resilience", "tenacity"),
+            ]
+        );
+        // Every detail is non-empty keel-authored text.
+        assert!(r.follow_ups.iter().all(|f| !f.detail.is_empty()));
+        // follow_ups never affect ok.
+        assert!(r.ok);
+        // The human view carries the section, ranked.
+        let text = human(&r);
+        assert!(text.contains("follow-ups"));
+        assert!(text.contains("[url-no-transport] api.alpha.com"));
+    }
+
+    /// No signals → the field is present and empty (agents can rely on the key).
+    #[test]
+    fn no_signals_means_empty_follow_ups() {
+        use crate::scan::TransportClass;
+        let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        // httpx is a tracked transport for this host.
+        let mut scan = scan;
+        scan.host_transports
+            .insert("api.example.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+        );
+        assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
+    }
+
+    /// The override precedence documented on [`classify_topology`]: a
+    /// wrapped-at-runtime target or an `llm:*` target is wrappable by
+    /// construction, regardless of what the transport check or the
+    /// dependency-averse check would otherwise conclude. Runtime evidence (or
+    /// the LLM pack's own wrapping) beats static doubt.
+    #[test]
+    fn wrapped_and_llm_targets_are_always_wrappable() {
+        use crate::scan::{DepAverseFile, TransportClass};
+        let mut scan = ScanResult {
+            files_scanned: 3,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        // Would otherwise be unreachable (Unknown transport) if not wrapped.
+        scan.targets.insert(
+            "api.wrapped-but-unknown.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports.insert(
+            "api.wrapped-but-unknown.com".into(),
+            TransportClass::Unknown,
+        );
+        // Would otherwise be excluded (dependency-averse-only-sighted) if not
+        // wrapped.
+        scan.targets.insert(
+            "api.wrapped-but-excluded.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "risk_gate.py".into(),
+                    line: 5,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports.insert(
+            "api.wrapped-but-excluded.com".into(),
+            TransportClass::UntrackedKnown,
+        );
+        scan.dependency_averse.push(DepAverseFile {
+            file: "risk_gate.py".into(),
+            reason: "stdlib-only + name/docstring signal: risk".into(),
+        });
+        // An llm:* target with no transport evidence at all — wrappable by
+        // construction, not by the transport map.
+        scan.targets.insert(
+            "llm:some-model".into(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "agent.py".into(),
+                    line: 7,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let wrapped: BTreeSet<String> = [
+            "api.wrapped-but-unknown.com".to_owned(),
+            "api.wrapped-but-excluded.com".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let r = build_report(&scan, &wrapped, default_policy(), default_journal(), None);
+
+        assert!(
+            r.topology
+                .wrappable
+                .contains(&"api.wrapped-but-unknown.com".to_owned()),
+            "a wrapped-at-runtime target must be wrappable even with an Unknown transport class: \
+             {:?}",
+            r.topology
+        );
+        assert!(
+            !r.topology
+                .unreachable
+                .iter()
+                .any(|e| e.host == "api.wrapped-but-unknown.com"),
+            "must not also land in unreachable"
+        );
+        assert!(
+            r.topology
+                .wrappable
+                .contains(&"api.wrapped-but-excluded.com".to_owned()),
+            "a wrapped-at-runtime target must be wrappable even when sighted only in a \
+             dependency-averse file: {:?}",
+            r.topology
+        );
+        assert!(
+            !r.topology
+                .excluded
+                .iter()
+                .any(|e| e.host == "api.wrapped-but-excluded.com"),
+            "must not also land in excluded"
+        );
+        assert!(
+            r.topology.wrappable.contains(&"llm:some-model".to_owned()),
+            "an llm:* target must be wrappable with zero transport evidence: {:?}",
+            r.topology
+        );
     }
 
     /// The six agent-framework packs + google-genai are registered adapters:
@@ -1201,5 +1834,82 @@ mod tests {
         let v = validate_policy(&path);
         assert!(!v.check.valid);
         assert!(v.fix.is_none());
+    }
+
+    /// Whether `python3` is on PATH — gates the Python-scan end-to-end test
+    /// below, mirroring `scan::python`'s test helper (private to that module,
+    /// so duplicated here rather than shared across crates).
+    fn python3_present() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// WS2 hardening: doctor and init --diff (the two MCP-exposed report
+    /// producers) must never emit raw source content. Allowed interpolations
+    /// are ONLY: hostnames, file paths, lib names, literal subprocess argv, and
+    /// keel-authored sentences. Canary strings placed in every other syntactic
+    /// position must not survive into either the JSON or the human rendering.
+    #[test]
+    fn doctor_and_init_diff_never_leak_raw_source() {
+        const CANARIES: [&str; 5] = [
+            "CANARY_COMMENT_9f31",
+            "CANARY_SECRET_9f31",
+            "CANARY_QUERY_9f31",
+            "CANARY_DOCSTRING_9f31",
+            "CANARY_QUERY2_9f31",
+        ];
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("app.py"),
+            "import urllib.request\n\
+             # CANARY_COMMENT_9f31 must never appear in any report\n\
+             TOKEN = \"CANARY_SECRET_9f31\"\n\
+             U = \"https://api.leak.example/v1?key=CANARY_QUERY_9f31\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"risk gate. CANARY_DOCSTRING_9f31 stdlib only.\"\"\"\n\
+             import json\n\
+             G = \"https://api.gateonly.example/v2?tok=CANARY_QUERY2_9f31\"\n",
+        )
+        .unwrap();
+        let doctor = run(dir.path());
+        let doctor_json = crate::render::json_string(&doctor.json);
+        let init = crate::init::run(
+            dir.path(),
+            crate::init::InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+        let init_json = crate::render::json_string(&init.json);
+        for canary in CANARIES {
+            assert!(!doctor_json.contains(canary), "doctor json leaks {canary}");
+            assert!(
+                !doctor.human.contains(canary),
+                "doctor human leaks {canary}"
+            );
+            assert!(
+                !init_json.contains(canary),
+                "init --diff json leaks {canary}"
+            );
+            assert!(
+                !init.human.contains(canary),
+                "init --diff human leaks {canary}"
+            );
+        }
+        // Sanity: the report DID see the project (hosts present) — the canaries
+        // are absent because of scoping, not because the scan saw nothing.
+        assert!(doctor_json.contains("api.leak.example"));
     }
 }

@@ -14,7 +14,9 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use super::{FunctionFacts, LangFindings, Sighting};
+use super::{
+    DepAverseFile, FunctionFacts, LangFindings, Sighting, SubprocessSighting, TransportClass,
+};
 
 /// The embedded `ast` walker. Deterministic: directories and files are visited
 /// in sorted order, output keys are sorted. Finds imports of the known effect
@@ -24,7 +26,7 @@ use super::{FunctionFacts, LangFindings, Sighting};
 /// containment: nested defs and lambdas inside a function count toward it;
 /// class methods are not flow entrypoints and are not attributed).
 const AST_WALKER: &str = r#"
-import ast, json, os, sys
+import ast, json, os, re, sys
 from urllib.parse import urlsplit
 
 HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3"}
@@ -48,13 +50,28 @@ RESILIENCE_LIBS = {"tenacity", "backoff", "retrying", "stamina"}
 TIME_LIBS = {"time", "datetime"}
 RANDOM_LIBS = {"random", "uuid", "secrets"}
 UNSAFE_LIBS = {"threading", "multiprocessing", "subprocess", "socket"}
-TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | {"os"}
+# Transport classification for `keel doctor`: a URL sighting is "tracked" when
+# a registry-adapted library is in reach in the same file, "untracked-known"
+# when only a known-but-unadapted stdlib transport is (urllib.request /
+# http.client), and otherwise "unknown" — no reachable transport at all.
+STDLIB_TRANSPORTS = {"urllib", "http"}  # urllib.request / http.client
+TRACKED_TRANSPORTS = HTTP_LIBS | {"psycopg", "boto3"}
+TRACKED = KNOWN | TIME_LIBS | RANDOM_LIBS | UNSAFE_LIBS | STDLIB_TRANSPORTS | {"os"}
 TIME_NAMES = {"time", "time_ns", "monotonic", "monotonic_ns",
               "perf_counter", "perf_counter_ns", "gmtime", "localtime"}
 DT_NAMES = {"now", "utcnow", "today"}
 UUID_NAMES = {"uuid1", "uuid3", "uuid4", "uuid5"}
 OS_UNSAFE = {"system", "popen", "fork", "forkpty", "execv", "execve",
              "execvp", "execvpe", "spawnl", "spawnv", "spawnvp"}
+# Subprocess-launching call names itemized (with literal argv where
+# extractable) as their own finer-grained signal, separate from the coarse
+# `unsafe_reasons` UNSAFE_LIBS/OS_UNSAFE already feed.
+SUBPROC_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
+# `sys.stdlib_module_names` exists on Python 3.10+ (keel's floor); the
+# `getattr` default degrades older interpreters to "never stdlib-only"
+# (an empty STDLIB) rather than crashing or false-positiving.
+STDLIB = set(getattr(sys, "stdlib_module_names", ()))
+DEP_AVERSE_RE = re.compile(r"(gate|guard|auth|valid|safety|risk|kill)", re.I)
 SKIP = {".keel", ".git", "__pycache__", "node_modules", ".venv", "venv",
         ".mypy_cache", ".pytest_cache", "dist", "build", "target"}
 # The two `google` submodules Keel adapts. Bare `import google` (the
@@ -167,6 +184,22 @@ def url_consts_of(tree):
     return consts
 
 
+def argv_text(call):
+    """The launched command as literal text, when statically extractable: a
+    bare string arg, or a list/tuple of string-literal elements (the argv
+    shape). Anything else (a variable, an f-string, a partial list) is
+    genuinely dynamic — report it as such rather than guessing."""
+    if call.args:
+        a = call.args[0]
+        if isinstance(a, ast.Constant) and isinstance(a.value, str):
+            return a.value
+        if isinstance(a, (ast.List, ast.Tuple)) and a.elts and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str)
+                for e in a.elts):
+            return " ".join(e.value for e in a.elts)
+    return "<dynamic>"
+
+
 def fn_facts(fn, rel, mod, aliases, url_consts):
     effects = unsafe_idem = t_reads = r_reads = 0
     targets = set()
@@ -217,6 +250,8 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
 root = sys.argv[1] if len(sys.argv) > 1 else "."
 imports = []
 urls = []
+subprocesses = []
+dependency_averse = []
 functions = []
 resilience_libs = set()
 files = 0
@@ -229,10 +264,14 @@ for dirpath, dirnames, filenames in os.walk(root):
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                tree = ast.parse(fh.read())
+                src = fh.read()
+            tree = ast.parse(src)
         except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
             continue
         files += 1
+        file_tracked = set()
+        file_stdlib = set()
+        file_urls = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for key, _bound in import_entries(node):
@@ -240,22 +279,77 @@ for dirpath, dirnames, filenames in os.walk(root):
                         imports.append({"lib": key, "file": rel, "line": node.lineno})
                     elif key in RESILIENCE_LIBS:
                         resilience_libs.add(key)
+                    if key in TRACKED_TRANSPORTS:
+                        file_tracked.add(key)
+                    elif key in STDLIB_TRANSPORTS:
+                        file_stdlib.add(key)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 h = host(node.value)
                 if h:
-                    urls.append({"host": h, "file": rel, "line": node.lineno})
+                    file_urls.append({"host": h, "file": rel, "line": node.lineno})
+        for u in file_urls:
+            if file_tracked:
+                u["transport"], u["via"] = "tracked", sorted(file_tracked)[0]
+            elif file_stdlib:
+                u["transport"], u["via"] = "untracked-known", sorted(file_stdlib)[0]
+            else:
+                u["transport"], u["via"] = "unknown", None
+            urls.append(u)
         mod = rel[:-3].replace("/", ".")
         if mod.endswith(".__init__"):
             mod = mod[: -len(".__init__")]
         aliases = aliases_of(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            lib = aliases.get(call_root(node.func))
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else call_root(node.func)
+            if lib == "subprocess" and name in SUBPROC_NAMES:
+                subprocesses.append({"file": rel, "line": node.lineno,
+                                     "launcher": "subprocess." + name,
+                                     "command": argv_text(node)})
+            elif lib == "os" and name in ("system", "popen"):
+                subprocesses.append({"file": rel, "line": node.lineno,
+                                     "launcher": "os." + name,
+                                     "command": argv_text(node)})
         consts = url_consts_of(tree)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 functions.append(fn_facts(node, rel, mod, aliases, consts))
 
-print(json.dumps({"files_scanned": files, "functions": functions,
-                  "imports": imports, "resilience_libs": sorted(resilience_libs),
-                  "urls": urls}, sort_keys=True))
+        # Dependency-averse detection: stdlib-only files with a risk/gate/
+        # guard/auth/valid/safety/kill name or docstring signal, or an
+        # explicit marker. Markers win in both directions: `# keel: exclude`
+        # forces the classification regardless of imports; `# keel: include`
+        # defeats the heuristic even if it would otherwise match. `node.level
+        # == 0` excludes relative imports (`from .x import y`) from counting
+        # as third-party — they are always project-internal.
+        third_party = False
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [top(a.name) for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                mods = [top(node.module or "")]
+            if any(m and m not in STDLIB for m in mods):
+                third_party = True
+                break
+        if '# keel: exclude' in src:
+            dependency_averse.append({"file": rel, "reason": "marker"})
+        elif '# keel: include' not in src and not third_party and STDLIB:
+            doc = ast.get_docstring(tree) or ""
+            m = DEP_AVERSE_RE.search(rel.rsplit("/", 1)[-1]) or DEP_AVERSE_RE.search(doc)
+            if m:
+                dependency_averse.append(
+                    {"file": rel,
+                     "reason": "stdlib-only + name/docstring signal: " + m.group(1).lower()})
+
+subprocesses.sort(key=lambda x: (x["file"], x["line"]))
+dependency_averse.sort(key=lambda x: x["file"])
+print(json.dumps({"dependency_averse": dependency_averse, "files_scanned": files,
+                  "functions": functions, "imports": imports,
+                  "resilience_libs": sorted(resilience_libs),
+                  "subprocesses": subprocesses, "urls": urls}, sort_keys=True))
 "#;
 
 /// One import finding from the walker.
@@ -272,6 +366,13 @@ struct Url {
     host: String,
     file: String,
     line: u32,
+    /// `"tracked"` / `"untracked-known"` / absent-or-anything-else = unknown.
+    /// The walker's `via` (which stdlib/tracked lib classified it) is not
+    /// consumed on the Rust side yet — only the class matters for
+    /// `host_transports` — so it is left for serde to ignore rather than
+    /// carried as an unread field.
+    #[serde(default)]
+    transport: Option<String>,
 }
 
 /// One module-level function's facts from the walker.
@@ -289,15 +390,35 @@ struct PyFunction {
     unsafe_reasons: Vec<String>,
 }
 
+/// One subprocess/external-process launch from the walker.
+#[derive(Debug, Deserialize)]
+struct WalkerSubprocess {
+    file: String,
+    line: u32,
+    launcher: String,
+    command: String,
+}
+
+/// One dependency-averse file from the walker (see [`DepAverseFile`]).
+#[derive(Debug, Deserialize)]
+struct WalkerDepAverse {
+    file: String,
+    reason: String,
+}
+
 /// The walker's JSON output, typed.
 #[derive(Debug, Deserialize)]
 struct WalkerOutput {
+    #[serde(default)]
+    dependency_averse: Vec<WalkerDepAverse>,
     files_scanned: usize,
     #[serde(default)]
     functions: Vec<PyFunction>,
     imports: Vec<Import>,
     #[serde(default)]
     resilience_libs: Vec<String>,
+    #[serde(default)]
+    subprocesses: Vec<WalkerSubprocess>,
     urls: Vec<Url>,
 }
 
@@ -366,16 +487,41 @@ pub fn scan(project: &Path) -> PyScan {
     for lib in &output.resilience_libs {
         findings.resilience_libs.insert(lib.clone());
     }
+    for sub in output.subprocesses {
+        findings.subprocesses.push(SubprocessSighting {
+            file: sub.file,
+            line: sub.line,
+            launcher: sub.launcher,
+            command: sub.command,
+        });
+    }
+    for d in output.dependency_averse {
+        findings.dependency_averse.push(DepAverseFile {
+            file: d.file,
+            reason: d.reason,
+        });
+    }
     for url in &output.urls {
         // The walker already returned a bare hostname (urlsplit.hostname), so it
         // is lowercased and port-stripped; normalize defensively.
+        let host = url.host.to_ascii_lowercase();
         findings.hosts.push((
-            url.host.to_ascii_lowercase(),
+            host.clone(),
             Sighting {
                 file: url.file.clone(),
                 line: url.line,
             },
         ));
+        let class = match url.transport.as_deref() {
+            Some("tracked") => TransportClass::Tracked,
+            Some("untracked-known") => TransportClass::UntrackedKnown,
+            _ => TransportClass::Unknown,
+        };
+        findings
+            .host_transports
+            .entry(host)
+            .and_modify(|c| *c = (*c).min(class))
+            .or_insert(class);
     }
     let functions = output
         .functions
@@ -461,6 +607,38 @@ mod tests {
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
         );
+    }
+
+    #[test]
+    fn urls_are_classified_by_transport() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // tracked: httpx imported in the same file.
+        fs::write(
+            dir.path().join("a.py"),
+            "import httpx\nU = \"https://api.tracked.com/v1\"\n",
+        )
+        .unwrap();
+        // untracked-known: only stdlib urllib in reach.
+        fs::write(
+            dir.path().join("b.py"),
+            "import urllib.request\nU = \"https://api.stdlib.com/v1\"\n",
+        )
+        .unwrap();
+        // unknown: bare URL, no transport at all.
+        fs::write(
+            dir.path().join("c.py"),
+            "U = \"https://api.mystery.com/v1\"\n",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let t = |h: &str| s.findings.host_transports.get(h).copied();
+        assert_eq!(t("api.tracked.com"), Some(TransportClass::Tracked));
+        assert_eq!(t("api.stdlib.com"), Some(TransportClass::UntrackedKnown));
+        assert_eq!(t("api.mystery.com"), Some(TransportClass::Unknown));
     }
 
     #[test]
@@ -639,6 +817,89 @@ def risky():
                 "threading use at jobs.py:8".to_owned(),
                 "subprocess use at jobs.py:9".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn subprocess_launches_are_itemized_with_literal_argv() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("launch.py"),
+            r#"import subprocess
+import os
+
+def go(cmd):
+    subprocess.run(["uvx", "alpaca-mcp-server"])
+    subprocess.Popen(cmd)
+    os.system("./scripts/kill_switch.sh")
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let items: Vec<(&str, &str)> = s
+            .findings
+            .subprocesses
+            .iter()
+            .map(|x| (x.launcher.as_str(), x.command.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("subprocess.run", "uvx alpaca-mcp-server"),
+                ("subprocess.Popen", "<dynamic>"),
+                ("os.system", "./scripts/kill_switch.sh"),
+            ]
+        );
+        assert!(
+            s.findings
+                .subprocesses
+                .iter()
+                .all(|x| x.file == "launch.py")
+        );
+    }
+
+    #[test]
+    fn dependency_averse_files_are_detected_and_markers_win() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // stdlib-only + docstring signal -> detected.
+        fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"Deterministic risk gate. stdlib only.\"\"\"\nimport json, urllib.request\n",
+        )
+        .unwrap();
+        // stdlib-only + name signal, but explicit include marker -> NOT detected.
+        fs::write(
+            dir.path().join("validate.py"),
+            "# keel: include\nimport json\n",
+        )
+        .unwrap();
+        // third-party import + no signal, but explicit exclude marker -> detected.
+        fs::write(dir.path().join("app.py"), "# keel: exclude\nimport httpx\n").unwrap();
+        // plain file -> not detected.
+        fs::write(dir.path().join("util.py"), "import json\n").unwrap();
+        let s = scan(dir.path());
+        let files: Vec<&str> = s
+            .findings
+            .dependency_averse
+            .iter()
+            .map(|d| d.file.as_str())
+            .collect();
+        assert_eq!(files, vec!["app.py", "risk_gate.py"]);
+        let app = &s.findings.dependency_averse[0];
+        assert_eq!(app.reason, "marker");
+        let gate = &s.findings.dependency_averse[1];
+        assert!(
+            gate.reason.contains("risk") || gate.reason.contains("gate"),
+            "{}",
+            gate.reason
         );
     }
 

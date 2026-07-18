@@ -154,6 +154,7 @@
       "topic": "invisible"
     }
   ],
+  "follow_ups": [],
   "journal": {
     "backend": "sqlite",
     "location": ".keel/journal.db",
@@ -166,5 +167,13 @@
     "message": null,
     "present": true,
     "valid": true
+  },
+  "topology": {
+    "excluded": [],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": [
+      "api.example.com"
+    ]
   }
 }

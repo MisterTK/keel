@@ -29,6 +29,25 @@ pub enum TargetClass {
     Llm,
 }
 
+/// How a sighted host's traffic is dispatched, best-known across sightings.
+/// Ordering is meaningful: `Tracked < UntrackedKnown < Unknown`, so merging
+/// (`min`) always keeps the most favorable class seen for a host across every
+/// file/language that sighted it. This is what `keel doctor` (a later
+/// program task) uses to say honestly what Keel can and cannot see: a host
+/// is `Tracked` if some sighting reached it through a registry-adapted
+/// library, `UntrackedKnown` if the best reach was a known-but-unadapted
+/// transport (stdlib `urllib`/`http.client`), and `Unknown` if no transport
+/// evidence was found near any sighting at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransportClass {
+    /// A registry-adapted library is in reach — Keel can wrap this.
+    Tracked,
+    /// A known transport Keel does not adapt (stdlib urllib/http.client).
+    UntrackedKnown,
+    /// A URL literal with no recognizable transport nearby.
+    Unknown,
+}
+
 /// One effect call site with enclosing-function attribution — an internal
 /// detail of the JS/TS pass ([`js`]), which uses it to verify its real
 /// scope-chain tracking (dotted paths like `Class.method`) independently of
@@ -47,6 +66,41 @@ pub struct CallSite {
     /// Dotted enclosing-scope path (`Class.method`, `outer.inner`), or `None`
     /// at module top level. Anonymous scopes inherit the nearest named scope.
     pub function: Option<String>,
+}
+
+/// One externally-launched process the scan saw — traffic inside it is
+/// outside Keel's visibility regardless of policy. Field order is the sort
+/// order (file, then line).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubprocessSighting {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// 1-based line of the launching call.
+    pub line: u32,
+    /// The launching call, e.g. `subprocess.run`, `os.system`,
+    /// `child_process.spawn`.
+    pub launcher: String,
+    /// The literal argv/command line when statically extractable
+    /// (a bare string, or a list/tuple of string-literal elements); otherwise
+    /// `"<dynamic>"`.
+    pub command: String,
+}
+
+/// One file the scan judged dependency-averse: stdlib-only imports plus a
+/// risk/gate/guard/auth/valid/safety/kill name or docstring signal, or an
+/// explicit `# keel: exclude` marker. Markers win in both directions: an
+/// exclude marker forces this classification regardless of imports, and an
+/// include marker defeats the heuristic even where it would otherwise match.
+/// `keel doctor`/`keel init` (a later program task) use this to honestly
+/// exclude hosts seen only in such files from proposed policy. Field order
+/// is the sort order (by file).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DepAverseFile {
+    /// Project-relative path with `/` separators.
+    pub file: String,
+    /// `"marker"` for an explicit `# keel: exclude`, or
+    /// `"stdlib-only + name/docstring signal: <word>"`.
+    pub reason: String,
 }
 
 /// One place a target was seen: a project-relative path and 1-based line.
@@ -136,6 +190,19 @@ pub struct ScanResult {
     /// Known resilience-library names detected (Python-only as of this
     /// build — see [`LangFindings::resilience_libs`]).
     pub resilience_libs: BTreeSet<String>,
+    /// Best-known [`TransportClass`] per sighted host, merged across every
+    /// file and language that sighted it (minimum = best class wins). Unlike
+    /// `targets`, this is never gated on `http_in_use` — it exists precisely
+    /// to let `keel doctor` report on hosts Keel cannot see at all.
+    pub host_transports: BTreeMap<String, TransportClass>,
+    /// Every externally-launched process the scan saw, sorted by
+    /// `(file, line)` — deterministic across runs. `keel doctor` uses this to
+    /// call out where Keel's visibility ends at a process boundary.
+    pub subprocesses: Vec<SubprocessSighting>,
+    /// Files judged dependency-averse across the project, sorted by file —
+    /// see [`DepAverseFile`]. Python-only as of this build (see
+    /// [`LangFindings::dependency_averse`]).
+    pub dependency_averse: Vec<DepAverseFile>,
 }
 
 impl ScanResult {
@@ -172,6 +239,8 @@ pub fn scan(project: &Path) -> ScanResult {
     result
         .functions
         .sort_by(|a, b| (&a.file, a.line, &a.entrypoint).cmp(&(&b.file, b.line, &b.entrypoint)));
+    result.subprocesses.sort();
+    result.dependency_averse.sort();
     result
 }
 
@@ -194,6 +263,17 @@ pub struct LangFindings {
     /// `libs`: these are libraries Keel never adapts, so merging them in
     /// would misclassify them as an "invisible" coverage gap.
     pub resilience_libs: BTreeSet<String>,
+    /// Per-sighting [`TransportClass`] for every host this language pass saw,
+    /// keyed by host. Never gated on `http_in_use` — a bare URL literal with
+    /// no reachable transport is exactly the `Unknown` case `keel doctor`
+    /// needs to report honestly.
+    pub host_transports: BTreeMap<String, TransportClass>,
+    /// Externally-launched processes this language pass saw (see
+    /// [`SubprocessSighting`]).
+    pub subprocesses: Vec<SubprocessSighting>,
+    /// Files this language pass judged dependency-averse (see
+    /// [`DepAverseFile`]).
+    pub dependency_averse: Vec<DepAverseFile>,
 }
 
 fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
@@ -216,6 +296,17 @@ fn merge_lang(result: &mut ScanResult, f: &LangFindings) {
     for lib in &f.resilience_libs {
         result.resilience_libs.insert(lib.clone());
     }
+    for (host, class) in &f.host_transports {
+        result
+            .host_transports
+            .entry(host.clone())
+            .and_modify(|c| *c = (*c).min(*class))
+            .or_insert(*class);
+    }
+    result.subprocesses.extend(f.subprocesses.iter().cloned());
+    result
+        .dependency_averse
+        .extend(f.dependency_averse.iter().cloned());
 }
 
 /// Directory names never descended into during a filesystem walk — scans,

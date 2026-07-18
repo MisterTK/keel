@@ -25,7 +25,7 @@
 //!   scope-open policy (class methods and nested functions roll up into the
 //!   enclosing top-level entry rather than opening their own).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -39,7 +39,9 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
 
-use super::super::{CallSite, FunctionFacts, LangFindings, Sighting, host_from_url};
+use super::super::{
+    CallSite, FunctionFacts, LangFindings, Sighting, SubprocessSighting, host_from_url,
+};
 
 /// What importing a module specifier evidences.
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +170,8 @@ pub(super) fn scan_source(src: &str, rel: &str, findings: &mut LangFindings) -> 
         pending_top_level: false,
         bindings: BTreeMap::new(),
         open_function: None,
+        cp_namespace: BTreeSet::new(),
+        cp_members: BTreeMap::new(),
     };
     visitor.visit_program(&parsed.program);
     Some(visitor.extras)
@@ -208,6 +212,16 @@ struct ScanVisitor<'s> {
     /// back to empty. Nested scopes (inner functions, class methods) keep
     /// crediting whichever top-level entry is already open.
     open_function: Option<usize>,
+    /// Local names bound to the whole `child_process` module (a namespace or
+    /// default import, or `const cp = require("child_process")`) — tracked
+    /// separately from `bindings` because `child_process` is not an effect
+    /// library (no `classify` match: see [`Self::record_import`]'s doc) and
+    /// must not feed `libs`/`http_in_use`/`call_sites`.
+    cp_namespace: BTreeSet<String>,
+    /// Local names destructured from `child_process` (`const { spawn } =
+    /// require("child_process")`, `import { spawn } from "child_process"`),
+    /// mapped to the original (possibly aliased-away) member name.
+    cp_members: BTreeMap<String, String>,
 }
 
 impl ScanVisitor<'_> {
@@ -294,6 +308,86 @@ impl ScanVisitor<'_> {
         let class = classify(specifier)?;
         self.record_lib(class, offset);
         Some(class)
+    }
+
+    /// Bind the names a static `import … from "child_process"` declaration
+    /// introduces, so a later `cp.spawn(…)`/`spawn(…)` call site can be
+    /// recognized. Deliberately separate from the effect-library `bindings`
+    /// map — see [`Self::cp_namespace`]'s doc.
+    fn bind_child_process_import(&mut self, it: &ImportDeclaration<'_>) {
+        let Some(specifiers) = &it.specifiers else {
+            return;
+        };
+        for specifier in specifiers {
+            match specifier {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    if s.import_kind.is_type() {
+                        continue;
+                    }
+                    self.cp_members.insert(
+                        s.local.name.as_str().to_owned(),
+                        s.imported.name().as_str().to_owned(),
+                    );
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    self.cp_namespace.insert(s.local.name.as_str().to_owned());
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    self.cp_namespace.insert(s.local.name.as_str().to_owned());
+                }
+            }
+        }
+    }
+
+    /// Bind the names a `require("child_process")` binding pattern introduces
+    /// (`const cp = require(…)` or `const { spawn } = require(…)`), the same
+    /// shape [`Self::bind_pattern`] handles for effect libraries.
+    fn bind_child_process_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                self.cp_namespace.insert(ident.name.as_str().to_owned());
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    let (Some(name), Some(local)) =
+                        (prop.key.static_name(), prop.value.get_binding_identifier())
+                    else {
+                        continue;
+                    };
+                    self.cp_members
+                        .insert(local.name.as_str().to_owned(), name.into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// If `chain` resolves to a `child_process.spawn`/`child_process.exec`
+    /// call — via a namespace/default/require-whole binding, or a
+    /// destructured `spawn`/`exec` name — the launcher label to record.
+    fn subprocess_launcher(&self, chain: &[String]) -> Option<&'static str> {
+        let member = match chain {
+            [ns, member] if self.cp_namespace.contains(ns) => member.as_str(),
+            [name] => self.cp_members.get(name)?.as_str(),
+            _ => return None,
+        };
+        match member {
+            "spawn" => Some("child_process.spawn"),
+            "exec" => Some("child_process.exec"),
+            _ => None,
+        }
+    }
+
+    /// Record one subprocess/external-process launch. Separate from
+    /// `call_sites`/`effects`: `child_process` is not an intercepted effect
+    /// library, just a process boundary Keel cannot see past.
+    fn record_subprocess(&mut self, launcher: &'static str, command: String, offset: u32) {
+        self.findings.subprocesses.push(SubprocessSighting {
+            file: self.rel.to_owned(),
+            line: self.line_of(offset),
+            launcher: launcher.to_owned(),
+            command,
+        });
     }
 
     /// Credit the open top-level function (if any) with one idempotent-unsafe
@@ -432,6 +526,18 @@ fn require_specifier<'a>(call: &'a CallExpression<'_>) -> Option<&'a str> {
     }
 }
 
+/// The literal command text for a `child_process.spawn`/`.exec` call: the
+/// first argument when it is a plain string literal, else `"<dynamic>"`.
+/// Unlike the Python walker's `argv_text`, a `spawn(cmd, args)` array is a
+/// separate argument (not the command itself), so only the first argument is
+/// ever consulted here.
+fn subprocess_command(call: &CallExpression<'_>) -> String {
+    match call.arguments.first() {
+        Some(Argument::StringLiteral(s)) => s.value.as_str().to_owned(),
+        _ => "<dynamic>".to_owned(),
+    }
+}
+
 /// Does `call`'s argument list contain an object literal with a static
 /// `method` property whose value is the string literal `"POST"` or
 /// `"PATCH"`? The AST-proper version of the old line heuristic's same-line
@@ -483,6 +589,9 @@ impl<'a> Visit<'a> for ScanVisitor<'_> {
         // `import type … from "openai"` is erased at runtime: not evidence.
         if it.import_kind.is_type() {
             return;
+        }
+        if it.source.value.as_str() == "child_process" {
+            self.bind_child_process_import(it);
         }
         let Some(class) = self.record_import(it.source.value.as_str(), it.span.start) else {
             return;
@@ -538,7 +647,10 @@ impl<'a> Visit<'a> for ScanVisitor<'_> {
             // A `require` is an import, not an effect call — no call site.
             self.record_import(specifier, it.span.start);
         } else if let Some(chain) = static_chain(&it.callee) {
-            if let Some(callee) = self.bound_callee(&chain) {
+            if let Some(launcher) = self.subprocess_launcher(&chain) {
+                let command = subprocess_command(it);
+                self.record_subprocess(launcher, command, it.span.start);
+            } else if let Some(callee) = self.bound_callee(&chain) {
                 self.record_call_site(callee, it.span.start);
                 if has_unsafe_method_argument(it) {
                     self.mark_idempotent_unsafe();
@@ -592,8 +704,13 @@ impl<'a> Visit<'a> for ScanVisitor<'_> {
         match &it.init {
             // `const u = require("undici")` / `const { request } = require(…)`
             Some(Expression::CallExpression(call)) => {
-                if let Some(class) = require_specifier(call).and_then(classify) {
-                    self.bind_pattern(&it.id, class.lib);
+                if let Some(specifier) = require_specifier(call) {
+                    if specifier == "child_process" {
+                        self.bind_child_process_pattern(&it.id);
+                    }
+                    if let Some(class) = classify(specifier) {
+                        self.bind_pattern(&it.id, class.lib);
+                    }
                 }
             }
             // `const client = new OpenAI()` — the instance carries the lib.

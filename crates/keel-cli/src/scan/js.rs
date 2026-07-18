@@ -55,7 +55,7 @@ mod ast;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::{FunctionFacts, LangFindings, collect_files};
+use super::{FunctionFacts, LangFindings, TransportClass, collect_files};
 
 /// Extensions the scan reads.
 pub(crate) const JS_EXTS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
@@ -111,6 +111,27 @@ pub fn scan(project: &Path) -> JsScan {
             eprintln!("keel: warning: skipped {rel}: JS/TS parse failed");
             result.parse_failures.push(rel.clone());
         }
+    }
+    // Transport classification, project-scan-wide (not per-file): `http_in_use`
+    // is only known once every file has been visited, since a URL literal and
+    // the fetch/undici/http import that reaches it can live in different
+    // files — the same coarse granularity `merge_lang` already uses to gate
+    // `hosts` into `targets` (see the module docs). Every JS-sighted host is
+    // `Tracked` when the scan saw an HTTP-capable import or `fetch` call
+    // anywhere, else `Unknown` — JS URLs are only emitted alongside that
+    // evidence today, so this blanket split is faithful without needing
+    // per-file reach the walker's per-file passes don't do here.
+    let class = if result.findings.http_in_use {
+        TransportClass::Tracked
+    } else {
+        TransportClass::Unknown
+    };
+    for (host, _) in &result.findings.hosts {
+        result
+            .findings
+            .host_transports
+            .entry(host.clone())
+            .or_insert(class);
     }
     result
 }
@@ -487,6 +508,37 @@ mod tests {
         assert_eq!(one.imports, two.imports);
     }
 
+    #[test]
+    fn hosts_are_tracked_when_the_scan_saw_http_evidence_anywhere() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.ts"),
+            "await fetch(\"https://api.example.com/v1\");\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(
+            scan.findings.host_transports.get("api.example.com"),
+            Some(&TransportClass::Tracked)
+        );
+    }
+
+    #[test]
+    fn hosts_are_unknown_transport_without_http_evidence_anywhere() {
+        let dir = TempDir::new().unwrap();
+        // A bare URL literal, no fetch/undici/http import anywhere in the scan.
+        fs::write(
+            dir.path().join("app.ts"),
+            "const url = \"https://api.mystery.com/v1\";\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert_eq!(
+            scan.findings.host_transports.get("api.mystery.com"),
+            Some(&TransportClass::Unknown)
+        );
+    }
+
     // ---- function attribution (real AST scope containment) ----
 
     #[test]
@@ -553,6 +605,40 @@ export function shellOut() {
             fns[0].unsafe_reasons,
             vec!["child_process use at run.js:2".to_owned()]
         );
+    }
+
+    #[test]
+    fn subprocess_launches_are_itemized_with_literal_argv() {
+        let src = "\
+import { spawn, exec } from \"child_process\";
+import * as cp from \"child_process\";
+
+export function launch(cmd) {
+  spawn(\"uvx\");
+  exec(cmd);
+  cp.spawn(\"./scripts/kill_switch.sh\");
+}
+";
+        let f = findings_named(src, "launch.ts");
+        let items: Vec<(&str, &str)> = f
+            .subprocesses
+            .iter()
+            .map(|x| (x.launcher.as_str(), x.command.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("child_process.spawn", "uvx"),
+                ("child_process.exec", "<dynamic>"),
+                ("child_process.spawn", "./scripts/kill_switch.sh"),
+            ]
+        );
+        assert!(f.subprocesses.iter().all(|x| x.file == "launch.ts"));
+        // child_process is not an effect library: no call sites, no
+        // http_in_use, no libs entry — a process boundary, not a network one.
+        assert!(f.call_sites.is_empty());
+        assert!(!f.http_in_use);
+        assert!(!f.libs.contains("child_process"));
     }
 
     #[test]
