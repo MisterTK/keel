@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
 use keel_cli::{
-    doctor, effective, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record, replay,
-    resume, run, sim, status, tail,
+    doctor, effective, exec, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record,
+    replay, resume, run, sim, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -66,6 +66,28 @@ enum Command {
         /// `keel_configure` receives, instead of the coverage report.
         #[arg(long)]
         effective_policy: bool,
+    },
+    /// Wrap one external command as a journaled Tier-2 durable flow (CCR-4):
+    /// at-most-once dispatch per identity, crash-safe retry gating, and a
+    /// declared-side-effect gate (KEEL-E033) — NOT exactly-once execution
+    /// inside the child.
+    Exec {
+        /// Flow name; becomes the `cmd:<name>` entrypoint. `[a-z0-9][a-z0-9-]*`.
+        #[arg(long)]
+        flow: String,
+        /// Explicit flow identity key (default: derived from name + argv).
+        #[arg(long)]
+        flow_id: Option<String>,
+        /// Declared side-effect file (repeatable): line count + content hash
+        /// recorded before/after; changes across a failed run gate re-dispatch.
+        #[arg(long = "journal-file", value_name = "PATH")]
+        journal_files: Vec<PathBuf>,
+        /// Override the KEEL-E033 side-effect gate and re-dispatch anyway.
+        #[arg(long)]
+        force: bool,
+        /// The command to run, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
     },
     /// Show one screen of coverage and flow state.
     Status,
@@ -251,6 +273,26 @@ fn main() {
                 doctor::run(&project)
             };
             emit(&r, json)
+        }
+        Command::Exec {
+            flow,
+            flow_id,
+            journal_files,
+            force,
+            command,
+        } => {
+            let options = exec::ExecOptions {
+                flow,
+                flow_id,
+                journal_files,
+                force,
+                command,
+            };
+            let (rendered, code) = exec::run(&project, &options);
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
         }
         Command::Status => emit(&status::run(&project, SystemClock.now_ms()), json),
         Command::Flows { dead, action } => dispatch_flows(&project, dead, action, json),

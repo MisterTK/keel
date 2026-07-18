@@ -26,6 +26,7 @@ pub mod agents_cli;
 pub mod diff;
 pub mod doctor;
 pub mod effective;
+pub mod exec;
 pub mod explain;
 pub mod flows;
 pub mod flows_add;
