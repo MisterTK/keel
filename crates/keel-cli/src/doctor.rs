@@ -1717,6 +1717,58 @@ mod tests {
         }
     }
 
+    /// Issue #17, end-to-end: a pure-Node project (no Python files at all) that
+    /// imports `@modelcontextprotocol/sdk` must light up doctor's merged
+    /// python+node `mcp` adapter row as `detected: true` — not be reported as an
+    /// "invisible" unadapted library. Drives the real `scan()` over a temp dir
+    /// so the whole JS-scan → cross-language `libs` merge → `build_report` path
+    /// is exercised, reproducing the exact symptom the issue reported
+    /// (`detected: false` for a Node-only MCP client). The `agent_pack_*` test
+    /// above pins the doctor half from a synthetic `libs`; this pins the wiring
+    /// from a real filesystem scan with zero Python.
+    #[test]
+    fn pure_node_mcp_project_lights_up_the_mcp_adapter() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("server.ts"),
+            "import { Client } from \"@modelcontextprotocol/sdk/client/index.js\";\n",
+        )
+        .unwrap();
+        let scan = scan::scan(dir.path());
+        assert!(
+            scan.libs.contains("mcp"),
+            "a Node-only scan must carry `mcp` into ScanResult.libs: {:?}",
+            scan.libs
+        );
+
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            &[],
+        );
+        let mcp = r
+            .adapters
+            .iter()
+            .find(|a| a.lib == "mcp")
+            .expect("mcp REGISTRY row");
+        assert!(
+            mcp.detected,
+            "pure-Node MCP project must show the mcp adapter detected"
+        );
+        assert_eq!(mcp.target, "mcp:<server>");
+        assert!(
+            !r.coverage.invisible.iter().any(|l| l == "mcp"),
+            "a registered adapter is coverage, not an invisible finding: {:?}",
+            r.coverage.invisible
+        );
+    }
+
     fn default_policy() -> PolicyValidation {
         PolicyValidation {
             check: PolicyCheck {

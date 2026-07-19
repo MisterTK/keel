@@ -408,6 +408,31 @@ mod tests {
         assert_eq!(f.llm[0].0, "anthropic");
     }
 
+    #[test]
+    fn mcp_sdk_imports_are_detected_as_the_mcp_lib() {
+        // Issue #17: a pure-Node MCP project imports `@modelcontextprotocol/sdk`,
+        // almost always through a deep subpath (`.../client/index.js`) that
+        // `package_name` must reduce back to the scoped package. Every import
+        // shape must land `"mcp"` in `libs` so doctor's merged python+node `mcp`
+        // registry row shows `detected: true` for a Node-only project. Unlike
+        // the provider SDKs, `mcp` carries no `llm:` provider, so `llm` stays
+        // empty (its target grammar is the per-server `mcp:<server>`).
+        let subpath =
+            findings("import { Client } from \"@modelcontextprotocol/sdk/client/index.js\";\n");
+        assert!(subpath.libs.contains("mcp"));
+        assert!(subpath.http_in_use);
+        assert!(subpath.llm.is_empty());
+
+        let bare = findings("import * as mcp from \"@modelcontextprotocol/sdk\";\n");
+        assert!(bare.libs.contains("mcp"));
+
+        let cjs = findings_named(
+            "const { Client } = require(\"@modelcontextprotocol/sdk/client/index.js\");\n",
+            "server.cjs",
+        );
+        assert!(cjs.libs.contains("mcp"));
+    }
+
     // ---- attribution ----
 
     #[test]
