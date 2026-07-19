@@ -21,6 +21,7 @@ import io
 import os
 import sqlite3
 import sys
+import threading
 import unittest
 from importlib import metadata
 from pathlib import Path
@@ -378,6 +379,96 @@ class ToolWrappingTest(AdkTestBase):
         tool.name = None  # some exotic tool object
         self.assertIsNone(self.see(self.plugin(), tool))
         self.assertFalse(getattr(tool.run_async, adk_pack._REBOUND_ATTR, False))
+
+
+class CrossThreadRebindRaceTest(AdkTestBase):
+    """The check-then-act in `_on_before_tool` (the "already rebound?"
+    getattr, then the separate `_rebind_tool(tool, name)` call) has no lock
+    between the two steps. Within a single event loop this is safe -- there
+    is no `await` between the check and the act, so asyncio can never
+    interleave two callbacks mid-sequence. The real hazard is CROSS-THREAD:
+    two OS threads, each driving its OWN event loop (two concurrent ADK
+    Runner sessions on separate threads sharing a tool instance/toolset --
+    a realistic host-app pattern), can both execute the getattr check
+    before either thread's `setattr` (inside `_rebind_tool`) has landed --
+    nothing serializes across that multi-bytecode sequence. Whichever
+    thread's `_rebind_tool` call runs second then captures the FIRST
+    thread's already-installed wrapper as `original`, silently
+    double-wrapping the tool (double breaker/retry/discovery accounting on
+    every real call through it from then on).
+
+    Reproducing this reliably (not by GIL-scheduling luck) needs the race
+    window WIDENED rather than merely invited: a `threading.Barrier(2,
+    timeout=...)` is planted at the very first line of `_rebind_tool`
+    itself (patched in for the duration of the test, restored after). A
+    thread only ever reaches that line after ITS OWN "already rebound?"
+    check already returned False -- so a caller arriving there has, by
+    construction, already observed the pre-race state. Two callers that
+    both arrive rendezvous at the barrier BEFORE either is allowed to run
+    the real rebind body (the read of `tool.run_async`, the wrapper
+    construction, the `setattr`) -- proving both checks raced -- which is
+    exactly the "reach the already-rebound check at nearly the same
+    moment" widening the brief called for. A solitary caller (the
+    lock-serialized, fixed world, where the second thread's check never
+    even sees False) just times out on the barrier and proceeds normally,
+    so the same test terminates cleanly whether the code is locked or not.
+
+    The observable: how many times `_rebind_tool` actually ran (how many
+    times a wrap_tool-produced closure was constructed and installed).
+    Locked correctly, that number is 1 no matter how the two threads are
+    scheduled. Racing unlocked, forcing both callers to prove they passed
+    the check before either proceeds pins it at 2 -- the exact defect."""
+
+    def test_two_threads_two_event_loops_rebind_exactly_once(self) -> None:
+        self.install_runtime({"target": {"tool:get_weather": {}}})
+        tool = FakeTool("get_weather", lambda city: city)
+
+        real_rebind_tool = adk_pack._rebind_tool
+        # timeout: a lock-serialized (fixed) world only ever has ONE caller
+        # reach this barrier -- it must not hang forever waiting for a
+        # second party that a correct fix never sends.
+        barrier = threading.Barrier(2, timeout=1.0)
+        count_lock = threading.Lock()
+        calls = {"n": 0}
+
+        def counting_rebind_tool(t: Any, name: str) -> bool:
+            with count_lock:
+                calls["n"] += 1
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass  # solitary caller: the other thread's check already saw "rebound" (the fix)
+            return real_rebind_tool(t, name)
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                asyncio.run(adk_pack._on_before_tool(tool, {}, object()))
+            except BaseException as exc:  # pragma: no cover - surfaced via assertion, not silently lost
+                errors.append(exc)
+
+        with mock.patch.object(adk_pack, "_rebind_tool", counting_rebind_tool):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        self.assertFalse(t1.is_alive() or t2.is_alive(), "a worker thread hung")
+        self.assertFalse(errors, f"worker thread(s) raised: {errors!r}")
+        self.assertTrue(
+            getattr(tool.run_async, adk_pack._REBOUND_ATTR, False),
+            "the tool ends up rebound either way",
+        )
+        self.assertEqual(
+            calls["n"],
+            1,
+            "the tool was rebound more than once: two threads both observed "
+            "'not yet rebound' and both ran _rebind_tool -- the cross-thread "
+            "check-then-act race this test targets",
+        )
 
 
 class RebindLifecycleTest(AdkTestBase):

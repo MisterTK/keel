@@ -85,6 +85,7 @@ import hashlib
 import importlib.metadata
 import os
 import sys
+import threading
 import weakref
 from typing import Any, Callable
 
@@ -136,6 +137,17 @@ _ABSENT = object()
 #: A tool that cannot be weak-referenced still gets rebound — it just cannot
 #: be individually restored by ``uninstall()`` (noted in the docstring).
 _rebound: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
+
+#: Serializes `_on_before_tool`'s "already rebound?" check-then-act against
+#: `_rebind_tool` ACROSS THREADS. Two ADK Runner sessions can share a tool
+#: instance while each drives its own event loop on its own OS thread; within
+#: a single event loop the check-then-act is already safe (no `await` sits
+#: between them, so asyncio can't interleave two callbacks mid-sequence), but
+#: nothing serializes the same sequence across two real threads. A plain
+#: `threading.Lock` held only across the check + the (fully synchronous, no
+#: `await` inside it) `_rebind_tool` call briefly stalls a concurrent
+#: callback on another thread, never the event loop itself.
+_rebind_lock = threading.Lock()
 
 
 # --- contract operations -----------------------------------------------------
@@ -609,15 +621,30 @@ async def _on_before_tool(tool: Any, tool_args: dict[str, Any], tool_context: An
     happens at ADK's step 3 through our rebound wrapper, and a terminal
     failure raises from the real call — inside ADK's try/except — so user
     ``on_tool_error`` plugins/callbacks (including ADK's own
-    ``ReflectAndRetryToolPlugin``) fire exactly as they would unwrapped."""
+    ``ReflectAndRetryToolPlugin``) fire exactly as they would unwrapped.
+
+    The "already rebound?" check and the ``_rebind_tool`` call are a
+    check-then-act, held under ``_rebind_lock`` to serialize them ACROSS
+    THREADS: two ADK Runner sessions on separate OS threads (each driving
+    its own event loop) can share a tool instance, and without the lock both
+    threads' checks can observe "not yet rebound" before either thread's
+    ``setattr`` (inside ``_rebind_tool``) has landed — the second thread's
+    ``_rebind_tool`` call then captures the FIRST thread's already-installed
+    wrapper as ``original``, silently double-wrapping the tool (double
+    breaker/retry/discovery accounting on every real call through it from
+    then on). ``_rebind_tool`` has no ``await`` inside it (fully
+    synchronous), so holding a plain ``threading.Lock`` across it briefly
+    serializes a concurrent callback on another thread without risking an
+    event-loop deadlock."""
     name = getattr(tool, "name", None)
     if not is_valid_tool_name(name):
         _note_skip(name)
         return None  # not our target grammar: let ADK invoke it, unwrapped
-    if getattr(getattr(tool, "run_async", None), _REBOUND_ATTR, False):
-        return None  # already rebound on a prior sight
-    if _rebind_tool(tool, name):
-        return None  # rebound: ADK proceeds normally, Keel wraps the real call
+    with _rebind_lock:
+        if getattr(getattr(tool, "run_async", None), _REBOUND_ATTR, False):
+            return None  # already rebound on a prior sight
+        if _rebind_tool(tool, name):
+            return None  # rebound: ADK proceeds normally, Keel wraps the real call
     # Instance rejects setattr (slots/frozen): keep coverage via the old
     # loop-in-callback path — documented trade-off (agent-level
     # before-callbacks are bypassed for THIS tool only).
@@ -789,6 +816,13 @@ def _rebind_tool(tool: Any, name: str) -> bool:
     method) to a Keel-wrapped version. The breaker still guards attempt 1:
     ``wrap_tool``'s wrapper consults policy before the first underlying
     invoke. Returns ``False`` when the instance rejects attribute assignment.
+
+    Callers MUST hold ``_rebind_lock`` (``_on_before_tool`` does): this
+    function is fully synchronous (no ``await`` inside it) but captures
+    ``tool.run_async`` as ``original`` before shadowing it, so two unlocked
+    callers on two different threads can each capture the OTHER's
+    already-installed wrapper as ``original`` — the cross-thread
+    double-wrap the lock exists to prevent.
 
     MCP error-dict classification: under ADK's ``_MCP_GRACEFUL_ERROR_HANDLING``
     feature flag, a failed ``McpTool`` call RETURNS ``{"error": "..."}``
