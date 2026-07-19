@@ -340,6 +340,33 @@ fn get_doctor_report_surfaces_a_real_preexisting_resilience_finding() {
     assert!(finding["detail"].as_str().unwrap().contains("tenacity"));
 }
 
+/// Node parity to the Python preexisting-resilience test above (issue #21):
+/// `get_doctor_report` surfaces the same finding for a real Node project, no
+/// `python3` gate needed since the JS/TS scan is the Rust-native oxc parser.
+#[test]
+fn get_doctor_report_surfaces_a_real_node_preexisting_resilience_finding() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("app.mjs"),
+        "import pRetry from \"p-retry\";\n\nasync function call() {\n  return pRetry(() => fetch(\"https://api.example.com\"));\n}\n",
+    )
+    .unwrap();
+
+    let script = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_doctor_report\",\"arguments\":{}}}\n";
+    let lines = run_session(dir.path(), script, SystemClock.now_ms());
+    let text = tool_text(&lines, 1);
+
+    assert_eq!(text, json_string(&doctor::run(dir.path()).json));
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["topic"] == "preexisting-resilience")
+        .unwrap_or_else(|| panic!("no preexisting-resilience finding in {report}"));
+    assert!(finding["detail"].as_str().unwrap().contains("p-retry"));
+}
+
 /// `get_doctor_report` surfaces the `agents-cli-config-placement` finding for
 /// a real agents-cli project (manifest + `app/` + a root `keel.toml`) and
 /// stays byte-identical to `keel doctor --json` for it, per the same

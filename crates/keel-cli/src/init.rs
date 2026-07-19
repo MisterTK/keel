@@ -566,6 +566,14 @@ fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
             ));
         }
     }
+    // Deliberately ignores `added`: this mirrors doctor's `resilience_finding`,
+    // which fires on ANY compounding lib currently in the project regardless
+    // of what this particular `--diff` newly proposes — a resilience library
+    // that already compounds with an already-wrapped target is exactly as
+    // real a concern as one that compounds with a target this diff adds. Not
+    // a bug; if this proves noisy in practice (e.g. a no-op `--diff` on an
+    // already-fully-configured project still emitting the note), reconsider
+    // gating it on `added` then — but don't "fix" it without that signal.
     let registry_libs = crate::doctor::registry_libs();
     if !scan.resilience_libs.is_empty()
         && scan.libs.iter().any(|l| registry_libs.contains(l.as_str()))

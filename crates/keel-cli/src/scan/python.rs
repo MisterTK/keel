@@ -219,6 +219,14 @@ def argv_text(call):
 
 
 def is_sleep(node, aliases):
+    """Known conservative miss: `from time import sleep as pause` binds
+    `pause` to the "time" MODULE in `aliases` (`import_entries` only tracks
+    module -> binding, never the specific imported symbol name), so a bare
+    `pause(...)` call falls into the `ast.Name` branch below with
+    `name = "pause"` — never `"sleep"` — and is missed. Renaming the sleep
+    call itself (as opposed to renaming the time/asyncio module, which IS
+    tracked via `aliases`) defeats detection. Not worth chasing for a
+    synthetic edge case."""
     if not isinstance(node, ast.Call):
         return False
     lib = aliases.get(call_root(node.func))
@@ -248,6 +256,33 @@ def is_default_return(stmt):
     return False
 
 
+def _test_has_string_compare(test):
+    """Does an expression subtree (an `if`/`while` test) contain a
+    comparison against a string constant?"""
+    return any(
+        isinstance(n, ast.Compare) and any(
+            isinstance(c, ast.Constant) and isinstance(c.value, str)
+            for c in [n.left] + list(n.comparators))
+        for n in ast.walk(test))
+
+
+def _governs_status_cmp(node):
+    """A string-comparison compare that actually governs whether the loop
+    exits: the loop's own `while` condition, or a nested `if` whose body
+    breaks or returns. Restricting to these (rather than ANY string compare
+    found anywhere inside the loop) avoids mislabeling a hand-rolled retry
+    loop as a poll loop merely because some unrelated string comparison
+    happens to sit deeper in the body — the wrong recommended fix (`poll`
+    policy instead of retry/backoff) would follow from that mislabel."""
+    if isinstance(node, ast.While) and _test_has_string_compare(node.test):
+        return True
+    return any(
+        isinstance(sub, ast.If)
+        and any(isinstance(s, (ast.Break, ast.Return)) for s in sub.body)
+        and _test_has_string_compare(sub.test)
+        for sub in ast.walk(node))
+
+
 def detect_simplifications(fn, aliases):
     """The three WS3 patterns inside one function def, each anchored at the
     construct to delete. Precedence inside a loop: a status-string comparison
@@ -259,14 +294,10 @@ def detect_simplifications(fn, aliases):
     for node in ast.walk(fn):
         if not isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
             continue
-        has_sleep = has_status_cmp = has_counter = False
+        has_sleep = has_counter = False
         for sub in ast.walk(node):
             if is_sleep(sub, aliases):
                 has_sleep = True
-            elif isinstance(sub, ast.Compare) and any(
-                    isinstance(c, ast.Constant) and isinstance(c.value, str)
-                    for c in [sub.left] + list(sub.comparators)):
-                has_status_cmp = True
             elif isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.Add):
                 has_counter = True
             elif (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.BinOp)
@@ -278,7 +309,7 @@ def detect_simplifications(fn, aliases):
                 has_counter = True
         if not has_sleep:
             continue
-        if has_status_cmp:
+        if _governs_status_cmp(node):
             kind = "hand-rolled-poll"
         elif has_counter:
             kind = "hand-rolled-retry"
@@ -1193,6 +1224,166 @@ def lookup():
             s.findings.simplifications.is_empty(),
             "{:?}",
             s.findings.simplifications
+        );
+    }
+
+    #[test]
+    fn bare_from_import_sleep_is_still_detected() {
+        // `from time import sleep` binds `sleep` -> "time" in `aliases`
+        // (import_entries tracks module -> binding); a direct `sleep(1)`
+        // call (an `ast.Name`, not `ast.Attribute`) resolves `name =
+        // call_root(node.func) = "sleep"`, matching `is_sleep` without the
+        // `time.` prefix. Issue #28 item 4: "verified correct by
+        // inspection, untested" — this pins it.
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("retry.py"),
+            r#"import httpx
+from time import sleep
+
+API = "https://api.tavily.com/search"
+
+def retryer():
+    attempts = 0
+    while True:
+        try:
+            return httpx.get(API)
+        except Exception:
+            attempts += 1
+            sleep(1)
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.kind.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(got, vec![("hand-rolled-retry", "retryer")]);
+    }
+
+    #[test]
+    fn for_and_async_for_loops_hand_roll_retry_and_poll_directly() {
+        // Coverage beyond `ast.While`: the primary loop-classification pass
+        // (not the except-handler fallback) must also fire for `for` and
+        // `async for` loops when the sleep/counter (or sleep/status-compare)
+        // sit directly in the loop body.
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // `for`: counter + sleep directly in the loop body (not nested in
+        // an except handler) — exercises the `ast.For` arm of the primary
+        // classification match.
+        fs::write(
+            dir.path().join("for_retry.py"),
+            r#"import time
+import httpx
+
+API = "https://api.tavily.com/search"
+
+def retryer():
+    attempts = 0
+    for _ in range(5):
+        attempts += 1
+        time.sleep(1)
+        try:
+            return httpx.get(API)
+        except Exception:
+            pass
+"#,
+        )
+        .unwrap();
+        // `async for`: a status-string compare governing a `return` (the
+        // poll shape) — exercises the `ast.AsyncFor` arm.
+        fs::write(
+            dir.path().join("async_for_poll.py"),
+            r#"import asyncio
+import httpx
+
+API = "https://api.tavily.com/search"
+
+async def poller():
+    httpx.get(API)
+    async for chunk in stream():
+        if chunk == "done":
+            return chunk
+        await asyncio.sleep(1)
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, &str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.file.as_str(), x.kind.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("async_for_poll.py", "hand-rolled-poll", "poller"),
+                ("for_retry.py", "hand-rolled-retry", "retryer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_hand_rolled_loops_are_each_sighted() {
+        // Characterization test (issue #28 item 4): a hand-rolled loop
+        // nested inside another loop is currently "double-sighted" — the
+        // outer loop's own subtree walk also contains the inner loop's
+        // sleep/counter, so BOTH the outer and inner `while` independently
+        // satisfy the detection predicate and each produce a finding for
+        // what a human would call one construct. This pins today's actual
+        // behavior; it is not an assertion that double-sighting is ideal.
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("nested.py"),
+            r#"import time
+import httpx
+
+API = "https://api.tavily.com/search"
+
+def retryer():
+    outer_attempts = 0
+    while outer_attempts < 3:
+        inner_attempts = 0
+        while True:
+            inner_attempts += 1
+            try:
+                return httpx.get(API)
+            except Exception:
+                time.sleep(1)
+        outer_attempts += 1
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.kind.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("hand-rolled-retry", "retryer"),
+                ("hand-rolled-retry", "retryer"),
+            ],
+            "expected today's double-sighting (outer + inner loop both flagged): {got:?}"
         );
     }
 

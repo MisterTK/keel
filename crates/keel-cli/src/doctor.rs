@@ -376,7 +376,7 @@ struct PolicyValidation {
 #[must_use]
 pub fn preflight_advisory(project: &Path) -> Option<String> {
     let scan = scan::scan(project);
-    let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
+    let registry_libs = registry_libs();
     let finding = resilience_finding(&scan, &registry_libs)?;
     Some(format!(
         "keel \u{25b8} {}\n  next: {} (run `keel doctor --json` for detail; skip this check with \
@@ -424,11 +424,11 @@ pub fn run(project: &Path) -> Rendered {
 /// one adapter library Keel wraps (`registry_libs`): a resilience library
 /// imported for something unrelated to any Keel-wrapped effect is not
 /// evidence of compounding, and flagging it anyway would be a false
-/// positive that erodes trust in doctor's other findings. Python-only as of
-/// this build (`scan::python`'s `RESILIENCE_LIBS`) — Node has no equivalent
-/// signal today (Keel doesn't even adapt `axios`, the library most
-/// associated with `axios-retry`), documented as accepted debt rather than
-/// silently absent.
+/// positive that erodes trust in doctor's other findings. Detected in both
+/// languages: `scan::python`'s `RESILIENCE_LIBS` (tenacity/backoff/
+/// retrying/stamina) and `scan::js`'s equivalent (p-retry/async-retry) —
+/// `got`'s built-in `retry` option is a different, non-import-based signal
+/// and not covered here.
 fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Option<Finding> {
     let compounds_with = scan
         .libs
@@ -552,7 +552,7 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                  then narrow or remove the broad except."
                     .to_owned(),
             ),
-            _ => (
+            "hand-rolled-retry" => (
                 "hand-rolled-retry",
                 format!(
                     "`{}` ({}:{}) hand-rolls retry around `{}` — {}, this loop becomes redundant",
@@ -562,6 +562,15 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                  loop — don't run both."
                     .to_owned(),
             ),
+            other => {
+                // The scanner is the only producer of `simplifications`, and it emits
+                // exactly the three kinds matched above — an unrecognized kind is a
+                // scanner/doctor drift bug, not a real finding to mislabel and report.
+                // Fail loud where it's cheap to catch (debug/test builds); in release,
+                // skip rather than surface a wrong action.
+                debug_assert!(false, "unknown simplification kind: {other}");
+                continue;
+            }
         };
         findings.push(Finding {
             action,
@@ -751,7 +760,7 @@ fn build_report(
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
-    let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
+    let registry_libs = registry_libs();
 
     // Coverage from the target sets.
     let visible: BTreeSet<&String> = scan.targets.keys().collect();
@@ -2189,6 +2198,10 @@ def caller():
             return httpx.get(U)
         except Exception:
             # CANARY_COMMENT_9f31 must never appear in any report
+            # Deliberate handler-local canary: an unused local-variable
+            # assignment RHS, a syntactic position distinct from the other
+            # four canaries above (comment, module const, URL query param,
+            # docstring) — not dead code left behind by mistake.
             local_secret = "CANARY_QUERY2_9f31"
             attempt += 1
             time.sleep(1)
