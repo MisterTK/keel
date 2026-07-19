@@ -126,7 +126,13 @@ enforcing wall-clock timeouts).
      that base64-decodes and JSON-parses to an object, which becomes the
      document; any other payload object is the document itself; anything
      else (non-object payload, undecodable/non-object body) is **fail-open**:
-     the payload is returned as-is.
+     the payload is returned as-is. The decode is **canonical/strict**
+     (RFC 4648 §4 alphabet only, correct padding, and zero discarded
+     padding bits — matching Rust's `base64::engine::general_purpose::
+     STANDARD.decode`, not a lenient decoder): a `body_b64` that would only
+     decode under a lenient reading (e.g. `"AB=="`, which some decoders
+     silently accept as identical to canonical `"AA=="`) fails open rather
+     than being judged, in every implementation (scenario 35).
    - Verdict: document lacks `until.field` → fail-open; field's value is a
      JSON string equal to one of `until.terminal` → terminal (returned
      unchanged); any other value → pending.

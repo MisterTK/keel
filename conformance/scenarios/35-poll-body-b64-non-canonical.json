@@ -1,0 +1,50 @@
+{
+  "name": "poll-body-b64-non-canonical",
+  "description": "Poll (CCR-3) body_b64 strictness (issue #29): a non-canonical base64 body_b64 (valid alphabet, wrong discarded padding bits — decodes byte-identically to a canonical pending envelope under a lenient decoder, but keel-core's Rust `base64` STANDARD engine rejects it outright) must fail-open on attempt 1, never be judged pending. Contrasted against the same payload shape canonically encoded, which polls pending-to-terminal normally.",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/canonical", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": 200, "headers": [["content-type", "application/json"]], "body_b64": "eyJzdGF0dXMiOiJydW5uaW5nIn0=" } },
+          { "status": "ok", "payload": { "status": 200, "headers": [["content-type", "application/json"]], "body_b64": "eyJzdGF0dXMiOiJjb21wbGV0ZWQifQ==" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "status": 200, "body_b64": "eyJzdGF0dXMiOiJjb21wbGV0ZWQifQ==" },
+          "attempts": 2
+        }
+      }
+    },
+    {
+      "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/non-canonical", "idempotent": true, "args_hash": "h2" },
+        "effect": [
+          { "status": "ok", "payload": { "status": 200, "headers": [["content-type", "application/json"]], "body_b64": "eyJzdGF0dXMiOiJydW5uaW5nIn1=" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "status": 200, "body_b64": "eyJzdGF0dXMiOiJydW5uaW5nIn1=" },
+          "attempts": 1
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "clock_ms": 10000,
+        "targets": {
+          "api.jobs.example": { "calls": 2, "attempts": 3, "successes": 2, "failures": 0 }
+        }
+      }
+    }
+  ]
+}
