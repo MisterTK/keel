@@ -577,7 +577,12 @@ class SetattrFallbackTest(AdkTestBase):
 class McpErrorDictTest(AdkTestBase):
     """ADK graceful error handling returns {"error": ...} dicts from McpTool
     — a *successful* call from a naive wrapper's perspective. Keel must
-    count it as a failure (breaker/discovery) while returning it unchanged."""
+    count it as a failure (breaker/discovery) while returning it unchanged.
+
+    Also covers the opt-in `KEEL_MCP_CLASSIFY_ISERROR` path (issue #16): the
+    raw MCP `isError: true` business-logic convention, invisible to ADK's
+    own success/failure handling, classified as a failure only when the env
+    var is explicitly set — default OFF, byte-identical otherwise."""
 
     def plugin(self) -> Any:
         with FakeAdkModules():
@@ -631,6 +636,91 @@ class McpErrorDictTest(AdkTestBase):
             pass
 
         self.assertTrue(adk_pack._is_mcp_tool(MCPTool()))
+
+    # -- issue #16: opt-in raw MCP `isError: true` classification ----------
+
+    def test_iserror_dict_classified_as_failure_when_env_var_set(self) -> None:
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        payload = {"content": [{"type": "text", "text": "not found"}], "isError": True}
+        with mock.patch.dict(os.environ, {"KEEL_MCP_CLASSIFY_ISERROR": "1"}):
+            tool = self.rebound(McpTool("mcp_search", lambda: dict(payload)))
+            result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, payload, "agent-visible value unchanged")
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 1, "breaker/discovery sees the failure")
+
+    def test_iserror_dict_not_reclassified_when_env_var_unset(self) -> None:
+        # Default OFF: identical isError:true result passes through as an
+        # ordinary successful result — byte-identical to pre-opt-in behavior.
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        payload = {"content": [{"type": "text", "text": "not found"}], "isError": True}
+        self.assertNotIn("KEEL_MCP_CLASSIFY_ISERROR", os.environ)
+        tool = self.rebound(McpTool("mcp_search", lambda: dict(payload)))
+        result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, payload)
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 0, "default OFF: no reclassification")
+
+    def test_transport_error_dict_still_unconditional_regardless_of_env_var(self) -> None:
+        # Regression: the pre-existing {"error": ...} classification must
+        # never become gated by the new opt-in, in either env var state.
+        # Distinct target names per iteration: install_runtime reuses the
+        # same on-disk discovery db across calls in this test (same self.cwd)
+        # so failure counts would otherwise accumulate across iterations.
+        cases = [
+            ({}, "tool:mcp_search_env_unset"),
+            ({"KEEL_MCP_CLASSIFY_ISERROR": "1"}, "tool:mcp_search_env_set"),
+        ]
+        for env, target in cases:
+            with self.subTest(env=env):
+                name = target.removeprefix("tool:")
+                _, discovery = self.install_runtime({"target": {target: {}}})
+                tool = self.rebound(McpTool(name, lambda: {"error": "connection closed"}))
+                with mock.patch.dict(os.environ, env):
+                    result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+                self.assertEqual(result, {"error": "connection closed"})
+                rows = self.read_rows(discovery)
+                self.assertEqual(rows[target]["failures"], 1)
+
+    def test_is_mcp_business_error_dict_shape_matching(self) -> None:
+        # Strict match: isError literally True (not merely truthy) plus a
+        # `content` list, keys drawn only from CallToolResult's real fields.
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": True})
+        )
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "structuredContent": {"code": 404}}
+            )
+        )
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "meta": {"trace": "abc"}}
+            )
+        )
+        # A successful call: isError present but False (never omitted by
+        # ADK's exclude_none dump, since False is not None).
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": False})
+        )
+        # Truthy but not the literal bool True.
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": 1})
+        )
+        # Missing/wrong-typed `content`.
+        self.assertFalse(adk_pack._is_mcp_business_error_dict({"isError": True}))
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": "oops", "isError": True})
+        )
+        # A key outside CallToolResult's real field set.
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "extra": "nope"}
+            )
+        )
+        # The transport-failure shape must never match here.
+        self.assertFalse(adk_pack._is_mcp_business_error_dict({"error": "x"}))
+        self.assertFalse(adk_pack._is_mcp_business_error_dict(["isError"]))
 
 
 class _NoFlowSurfaceBackend:

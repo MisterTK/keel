@@ -76,6 +76,14 @@ returning it to the agent unchanged. ``McpTool``'s own single blind retry
 runs beneath Keel; each underlying JSON-RPC attempt is separately visible
 to the ``mcp:<server>`` target at the transport seam (``keel.packs.
 mcp_pack``), which sees raw failures regardless of the graceful flag.
+Separately, and OFF by default, ``KEEL_MCP_CLASSIFY_ISERROR`` (issue #16)
+opts into classifying the raw MCP tool-result convention too: a call that
+executes fine at the transport level but reports its own business-logic
+failure comes back as an ordinary-looking ``isError: true`` dict, which ADK
+itself treats as a success (``_detect_error_in_response`` only logs it). Set
+truthy, Keel counts that shape as a FAILURE the same way, still returning it
+to the agent unchanged; unset, it passes through exactly as before this
+opt-in existed.
 """
 
 from __future__ import annotations
@@ -768,7 +776,13 @@ def _note_model_fallback_skip(name: str) -> None:
 class _McpErrorDict(Exception):
     """Internal sentinel: an ADK graceful-error dict, raised inside the
     wrapped effect so the core records a failure, then caught at the rebound
-    wrapper and unwrapped — the agent-visible value never changes."""
+    wrapper and unwrapped — the agent-visible value never changes. Covers two
+    distinct shapes (see ``_rebind_tool``'s docstring): the ``{"error": ...}``
+    transport-failure shape (``_is_mcp_error_dict``, unconditional), and,
+    opt-in only via ``KEEL_MCP_CLASSIFY_ISERROR``, the raw MCP
+    ``isError: true`` business-logic shape (``_is_mcp_business_error_dict``).
+    Either way the payload is the exact, unmodified dict the underlying call
+    produced."""
 
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(str(payload.get("error", "")))
@@ -811,6 +825,59 @@ def _is_mcp_error_dict(result: Any) -> bool:
     )
 
 
+#: The full field set of MCP's `CallToolResult` — verified directly against
+#: the real `mcp` package (1.28.1, the same version pinned by the adapter
+#: farm and co-installed for this check, `types.py` line 1363):
+#: `class CallToolResult(Result): content: list[ContentBlock]` (required),
+#: `structuredContent: dict[str, Any] | None = None`, `isError: bool = False`
+#: — plus `meta: dict[str, Any] | None = None` (declared `alias="_meta"`,
+#: but `model_dump()` — with or without `by_alias=True` — emits the key as
+#: `"meta"`, confirmed by constructing a real `CallToolResult` and dumping
+#: it) inherited from `Result`. Used by `_is_mcp_business_error_dict` to
+#: reject a dict carrying any key outside this set.
+_MCP_RESULT_KEYS = {"content", "isError", "structuredContent", "meta"}
+
+
+def _is_mcp_business_error_dict(result: Any) -> bool:
+    """Mirror of the RAW MCP tool-result error convention — `isError: true`
+    — a DIFFERENT shape than `_is_mcp_error_dict` above (see its docstring's
+    closing note). Verified directly against `mcp_tool.py`'s
+    `_detect_error_in_response` (lines 472-476, issue #16 verification, real
+    `google-adk` 2.4.0 + `mcp` 1.28.1 in a throwaway venv): ADK's OWN
+    detector for this shape is `isinstance(response, dict) and
+    response.get("isError")` — but it is wired only into a telemetry hook
+    that logs and returns, never altering what `run_async` hands back (per
+    `_is_mcp_error_dict`'s note). The dict actually returned on this path
+    (`_run_async_impl`, line 455: `response.model_dump(exclude_none=True,
+    mode="json")` of a real `CallToolResult`, then handed back unmodified by
+    `run_async`'s success path — confirmed by reading both call chains) is
+    NOT the same shape a naive `.get("isError")` truthiness check would
+    suggest: `isError` defaults to `False`, not `None`, so
+    `exclude_none=True` NEVER drops it — a genuinely successful call dumps
+    `{"content": [...], "isError": False}` (confirmed by constructing a real
+    `CallToolResult` and calling `model_dump` directly), meaning the key is
+    present either way and only its VALUE distinguishes success from
+    failure. So this checks `result.get("isError") is True` — the literal
+    `bool`, matching the field's declared type exactly, the same precision
+    `_is_mcp_error_dict` applies to its own `str` check — plus `content`
+    (the one field `CallToolResult` always carries, success or failure)
+    present as a `list`, plus every key in `result` drawn from
+    `_MCP_RESULT_KEYS`. Deliberately strict, identical philosophy to
+    `_is_mcp_error_dict`: a non-MCP-shaped dict is a tool RESULT and must
+    never be reclassified — this is the ONE shape a dict must have to be
+    read as a business-logic failure, not merely "has a truthy isError key".
+    Opt-in only (`KEEL_MCP_CLASSIFY_ISERROR`, see `_rebind_tool`): ADK itself
+    treats this shape as an ordinary successful call, so matching it changes
+    discovery/breaker accounting for callers who never asked for that — it
+    stays off unless explicitly enabled."""
+    return (
+        isinstance(result, dict)
+        and result.get("isError") is True
+        and isinstance(result.get("content"), list)
+        and set(result) <= _MCP_RESULT_KEYS
+    )
+
+
 def _rebind_tool(tool: Any, name: str) -> bool:
     """Rebind ``tool.run_async`` (instance attribute shadowing the class
     method) to a Keel-wrapped version. The breaker still guards attempt 1:
@@ -832,13 +899,43 @@ def _rebind_tool(tool: Any, name: str) -> bool:
     MCP-shaped error dict so ``wrap_tool``'s core records a failure
     (``classify_tool_error`` files it under ``other``); the rebound
     ``run_async`` unwraps it back to the identical payload on the way out, so
-    the agent sees byte-identical output either way."""
+    the agent sees byte-identical output either way. This path is
+    unconditional — it fires regardless of ``KEEL_MCP_CLASSIFY_ISERROR``
+    below.
+
+    Opt-in MCP business-error classification (``KEEL_MCP_CLASSIFY_ISERROR``,
+    issue #16): the transport shape above covers only calls where the MCP
+    session itself failed. A call that executes fine at the transport level
+    but reports its OWN business-logic failure returns an ordinary-looking
+    ``isError: true`` `CallToolResult` dict (see
+    ``_is_mcp_business_error_dict``) — today invisible to Keel, since it
+    comes back from ``McpTool.run_async`` looking like any other successful
+    result, so the breaker never trips on repeated business-logic errors.
+    Because ADK itself treats this shape as a normal successful call,
+    reclassifying it changes discovery/breaker accounting for every caller,
+    so it is gated behind an env var rather than unconditional (the same
+    ``_TRUTHY`` set ``KEEL_QUIET``/``KEEL_FLOW_LEASE_MS`` read; a new
+    ``keel.toml`` policy key would need a Contract Change Request, per
+    ``contracts/policy.schema.json``'s ``additionalProperties: false`` —
+    explicitly out of scope for this fast-follow). Default OFF: unset (or
+    not truthy), behavior is byte-identical to before this opt-in existed.
+    Set truthy AND ``_is_mcp_business_error_dict`` matches, ``_invoke``
+    raises the SAME ``_McpErrorDict`` sentinel as the transport path —
+    identical unwrap-on-the-way-out behavior, so the agent sees
+    byte-identical output regardless of whether Keel classified the call as
+    a failure."""
     original = tool.run_async  # the bound method, captured pre-shadow
     is_mcp = _is_mcp_tool(tool)
 
     async def _invoke(*, args: dict[str, Any], tool_context: Any) -> Any:
         result = await original(args=args, tool_context=tool_context)
-        if is_mcp and _is_mcp_error_dict(result):
+        if is_mcp and (
+            _is_mcp_error_dict(result)
+            or (
+                os.environ.get("KEEL_MCP_CLASSIFY_ISERROR", "").strip().lower() in _TRUTHY
+                and _is_mcp_business_error_dict(result)
+            )
+        ):
             raise _McpErrorDict(result)  # counted as a failure by the core
         return result
 
