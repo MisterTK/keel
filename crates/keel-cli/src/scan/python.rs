@@ -752,6 +752,39 @@ mod tests {
             .is_ok_and(|s| s.success())
     }
 
+    /// Issue #29: the tracked-transport set is enumerated in three places —
+    /// this file's Rust [`HTTP_LIBS`], the embedded walker's `HTTP_LIBS` set,
+    /// and `doctor.rs`'s `REGISTRY`. That shape is inherent, not a bug: the
+    /// walker runs out-of-process so its copy must be spelled in real Python,
+    /// the Rust copy classifies the walker's JSON back in-process, and REGISTRY
+    /// is a richer per-adapter table (its `host`-targeted python rows include
+    /// `psycopg`, so it isn't even the same 5-set). None can derive from
+    /// another across the process/semantic boundary — so per the issue we guard
+    /// the pair that lives in THIS file with a consistency test rather than
+    /// collapse it. Pure string-parse, so it runs without `python3`.
+    #[test]
+    fn rust_and_walker_http_libs_stay_in_sync() {
+        let line = AST_WALKER
+            .lines()
+            .find(|l| l.trim_start().starts_with("HTTP_LIBS = {"))
+            .expect("walker defines HTTP_LIBS as a set literal");
+        let inner = line
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(names, _)| names)
+            .expect("HTTP_LIBS set-literal braces");
+        let walker: std::collections::BTreeSet<&str> = inner
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let rust: std::collections::BTreeSet<&str> = HTTP_LIBS.iter().copied().collect();
+        assert_eq!(
+            walker, rust,
+            "Rust HTTP_LIBS and the embedded walker HTTP_LIBS have drifted (issue #29)"
+        );
+    }
+
     #[test]
     fn walks_imports_and_url_literals() {
         if !python3_present() {
