@@ -76,6 +76,14 @@ returning it to the agent unchanged. ``McpTool``'s own single blind retry
 runs beneath Keel; each underlying JSON-RPC attempt is separately visible
 to the ``mcp:<server>`` target at the transport seam (``keel.packs.
 mcp_pack``), which sees raw failures regardless of the graceful flag.
+Separately, and OFF by default, ``KEEL_MCP_CLASSIFY_ISERROR`` (issue #16)
+opts into classifying the raw MCP tool-result convention too: a call that
+executes fine at the transport level but reports its own business-logic
+failure comes back as an ordinary-looking ``isError: true`` dict, which ADK
+itself treats as a success (``_detect_error_in_response`` only logs it). Set
+truthy, Keel counts that shape as a FAILURE the same way, still returning it
+to the agent unchanged; unset, it passes through exactly as before this
+opt-in existed.
 """
 
 from __future__ import annotations
@@ -85,6 +93,7 @@ import hashlib
 import importlib.metadata
 import os
 import sys
+import threading
 import weakref
 from typing import Any, Callable
 
@@ -136,6 +145,17 @@ _ABSENT = object()
 #: A tool that cannot be weak-referenced still gets rebound — it just cannot
 #: be individually restored by ``uninstall()`` (noted in the docstring).
 _rebound: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
+
+#: Serializes `_on_before_tool`'s "already rebound?" check-then-act against
+#: `_rebind_tool` ACROSS THREADS. Two ADK Runner sessions can share a tool
+#: instance while each drives its own event loop on its own OS thread; within
+#: a single event loop the check-then-act is already safe (no `await` sits
+#: between them, so asyncio can't interleave two callbacks mid-sequence), but
+#: nothing serializes the same sequence across two real threads. A plain
+#: `threading.Lock` held only across the check + the (fully synchronous, no
+#: `await` inside it) `_rebind_tool` call briefly stalls a concurrent
+#: callback on another thread, never the event loop itself.
+_rebind_lock = threading.Lock()
 
 
 # --- contract operations -----------------------------------------------------
@@ -259,20 +279,20 @@ def _flow_entrypoint_designated() -> str | None:
     (``RUNNER_FLOW_ENTRYPOINT``, echoed back verbatim), or ``None`` when
     undesignated OR when Keel bootstrap is disabled/never ran.
 
-    Reads ``keel.bootstrap._STATE.state`` directly — a deliberate
-    module-private reach into a sibling module, not a new ``_runtime`` API.
-    ``keel.bootstrap.install_keel()`` is re-entrant (its already-installed
-    path returns the full cached state, including ``flow_entrypoints``), but
-    calling it here to *read* that state would also *perform* a fresh
-    install as a side effect on a bare/not-yet-bootstrapped process — wrong
-    for what is meant to be a passive designation check invoked from
-    arbitrary Runner-construction code. Reading the cached ``_STATE.state``
-    instead never triggers that side effect: ``None`` (never installed, or
-    ``KEEL_DISABLE`` short-circuited before ``_STATE.state`` was ever
-    populated — ``install_keel`` returns before touching ``_STATE`` in that
-    branch, so the two cases are indistinguishable here, and correctly so:
-    both mean "no Tier 2 designation is in force") means undesignated,
-    exactly like finding no matching entry.
+    Reads ``_runtime.get_flow_entrypoints()`` — the same process-global
+    accessor shape ``get_backend()``/``in_active_flow()`` already use, set
+    once by ``bootstrap.install_keel()`` via ``_runtime.set_flow_entrypoints``
+    right after ``_policy.extract_flow_entrypoints`` computes it. A plain
+    ``_runtime`` read has no install side effect (exactly like those two
+    accessors), so — unlike calling ``install_keel()`` itself, which is
+    re-entrant and would perform a fresh install as an unwanted side effect
+    on a bare/not-yet-bootstrapped process — this is safe to call from
+    arbitrary Runner-construction code as a passive designation check.
+    ``get_flow_entrypoints()`` returns ``()`` both when Keel was never
+    installed and when ``KEEL_DISABLE`` short-circuited before installing
+    (``install_keel`` returns before touching ``_runtime`` in that branch),
+    so the two cases are indistinguishable here, and correctly so: both mean
+    "no Tier 2 designation is in force", same as finding no matching entry.
 
     The match is EXACT: only an entrypoint whose parsed ``module``/
     ``function`` are precisely ``"google.adk.runners"`` /
@@ -281,20 +301,7 @@ def _flow_entrypoint_designated() -> str | None:
     `[flows] entrypoints` globs are designed for `keel run`'s script-path
     matching (`_flow.match_flow`), not for matching a live Python call site.
     """
-    # Local import: avoids a circular import at module-load time (`bootstrap`
-    # -> `keel.packs` -> this module, since `bootstrap.install_keel` imports
-    # `keel.packs` for `install_mcp_pack`/`present_provider_defaults` — a
-    # module-level `from .. import bootstrap` here would deadlock that chain
-    # the first time either module is imported first; verified by import
-    # order flip: `import keel.packs.adk_pack` before any `keel.bootstrap`
-    # import raised `ImportError: cannot import name 'install_mcp_pack' from
-    # partially initialized module 'keel.packs'`).
-    from .. import bootstrap
-
-    state = bootstrap._STATE.state
-    if state is None:
-        return None
-    for entry in state.get("flow_entrypoints") or ():
+    for entry in _runtime.get_flow_entrypoints():
         if entry.module == "google.adk.runners" and entry.function == "Runner.run_async":
             return entry.raw
     return None
@@ -622,15 +629,30 @@ async def _on_before_tool(tool: Any, tool_args: dict[str, Any], tool_context: An
     happens at ADK's step 3 through our rebound wrapper, and a terminal
     failure raises from the real call — inside ADK's try/except — so user
     ``on_tool_error`` plugins/callbacks (including ADK's own
-    ``ReflectAndRetryToolPlugin``) fire exactly as they would unwrapped."""
+    ``ReflectAndRetryToolPlugin``) fire exactly as they would unwrapped.
+
+    The "already rebound?" check and the ``_rebind_tool`` call are a
+    check-then-act, held under ``_rebind_lock`` to serialize them ACROSS
+    THREADS: two ADK Runner sessions on separate OS threads (each driving
+    its own event loop) can share a tool instance, and without the lock both
+    threads' checks can observe "not yet rebound" before either thread's
+    ``setattr`` (inside ``_rebind_tool``) has landed — the second thread's
+    ``_rebind_tool`` call then captures the FIRST thread's already-installed
+    wrapper as ``original``, silently double-wrapping the tool (double
+    breaker/retry/discovery accounting on every real call through it from
+    then on). ``_rebind_tool`` has no ``await`` inside it (fully
+    synchronous), so holding a plain ``threading.Lock`` across it briefly
+    serializes a concurrent callback on another thread without risking an
+    event-loop deadlock."""
     name = getattr(tool, "name", None)
     if not is_valid_tool_name(name):
         _note_skip(name)
         return None  # not our target grammar: let ADK invoke it, unwrapped
-    if getattr(getattr(tool, "run_async", None), _REBOUND_ATTR, False):
-        return None  # already rebound on a prior sight
-    if _rebind_tool(tool, name):
-        return None  # rebound: ADK proceeds normally, Keel wraps the real call
+    with _rebind_lock:
+        if getattr(getattr(tool, "run_async", None), _REBOUND_ATTR, False):
+            return None  # already rebound on a prior sight
+        if _rebind_tool(tool, name):
+            return None  # rebound: ADK proceeds normally, Keel wraps the real call
     # Instance rejects setattr (slots/frozen): keep coverage via the old
     # loop-in-callback path — documented trade-off (agent-level
     # before-callbacks are bypassed for THIS tool only).
@@ -706,9 +728,10 @@ async def _model_fallback(llm_request: Any, error: Exception) -> Any:
 
     from google.adk.models.registry import LLMRegistry  # function-local: adapter-pack rule 1
 
-    failing_cls = _resolve_model_class(LLMRegistry, getattr(llm_request, "model", None))
+    original_model = getattr(llm_request, "model", None)
+    failing_cls = _resolve_model_class(LLMRegistry, original_model)
 
-    for entry in chain:
+    for index, entry in enumerate(chain, start=1):
         entry_cls = _resolve_model_class(LLMRegistry, entry, note_on_failure=True)
         if entry_cls is None:
             continue  # unknown model / missing package: already noted
@@ -723,7 +746,8 @@ async def _model_fallback(llm_request: Any, error: Exception) -> Any:
         try:
             async for resp in model.generate_content_async(llm_request, stream=False):
                 response = resp  # keep only the FINAL response of this hop's stream
-        except Exception:
+        except Exception as hop_error:
+            _note_model_fallback_hop_failed(entry, index, len(chain), original_model, hop_error)
             continue  # this hop failed too: try the next chain entry
         if response is not None:
             return response
@@ -751,10 +775,50 @@ def _note_model_fallback_skip(name: str) -> None:
     )
 
 
+_noted_model_fallback_hop_failures: set[str] = set()
+
+
+def _note_model_fallback_hop_failed(
+    entry: str, index: int, total: int, original_model: Any, error: Exception
+) -> None:
+    """Note (once per entry name, ``KEEL_QUIET``-aware — mirrors
+    ``_note_model_fallback_skip``) a fallback-chain entry that resolved AND
+    constructed fine but whose ``generate_content_async`` call itself raised
+    (issue #19): distinct from ``_note_model_fallback_skip`` — that note
+    covers a hop that never got a chance to run (unresolvable name /
+    ``new_llm`` construction failure); this one covers a hop that ran and
+    failed at the actual generate call, which was previously silent. Also
+    carries the hop's position (``index`` of ``total``) and the ORIGINAL
+    failing model name so a fallback provider's own ``llm:<provider>``
+    transport-seam traffic (which the transport seam logs/counts under its
+    own target) can be correlated back to "this was ADK fallback hop N of M,
+    replacing originally-failing model X" from this note's text alone — a
+    deliberately shallow fix; deeper transport-seam/journal-schema
+    correlation would touch the frozen ``contracts/`` surface and is out of
+    scope for this fast-follow."""
+    if entry in _noted_model_fallback_hop_failures:
+        return
+    _noted_model_fallback_hop_failures.add(entry)
+    if os.environ.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return
+    sys.stderr.write(
+        f"keel ▸ adk: model fallback hop {index}/{total} ({entry!r}, "
+        f"replacing originally-failing model {original_model!r}) failed "
+        f"calling generate_content_async ({error!r}) — skipped; the next "
+        "chain entry is tried\n"
+    )
+
+
 class _McpErrorDict(Exception):
     """Internal sentinel: an ADK graceful-error dict, raised inside the
     wrapped effect so the core records a failure, then caught at the rebound
-    wrapper and unwrapped — the agent-visible value never changes."""
+    wrapper and unwrapped — the agent-visible value never changes. Covers two
+    distinct shapes (see ``_rebind_tool``'s docstring): the ``{"error": ...}``
+    transport-failure shape (``_is_mcp_error_dict``, unconditional), and,
+    opt-in only via ``KEEL_MCP_CLASSIFY_ISERROR``, the raw MCP
+    ``isError: true`` business-logic shape (``_is_mcp_business_error_dict``).
+    Either way the payload is the exact, unmodified dict the underlying call
+    produced."""
 
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(str(payload.get("error", "")))
@@ -797,11 +861,71 @@ def _is_mcp_error_dict(result: Any) -> bool:
     )
 
 
+#: The full field set of MCP's `CallToolResult` — verified directly against
+#: the real `mcp` package (1.28.1, the same version pinned by the adapter
+#: farm and co-installed for this check, `types.py` line 1363):
+#: `class CallToolResult(Result): content: list[ContentBlock]` (required),
+#: `structuredContent: dict[str, Any] | None = None`, `isError: bool = False`
+#: — plus `meta: dict[str, Any] | None = None` (declared `alias="_meta"`,
+#: but `model_dump()` — with or without `by_alias=True` — emits the key as
+#: `"meta"`, confirmed by constructing a real `CallToolResult` and dumping
+#: it) inherited from `Result`. Used by `_is_mcp_business_error_dict` to
+#: reject a dict carrying any key outside this set.
+_MCP_RESULT_KEYS = {"content", "isError", "structuredContent", "meta"}
+
+
+def _is_mcp_business_error_dict(result: Any) -> bool:
+    """Mirror of the RAW MCP tool-result error convention — `isError: true`
+    — a DIFFERENT shape than `_is_mcp_error_dict` above (see its docstring's
+    closing note). Verified directly against `mcp_tool.py`'s
+    `_detect_error_in_response` (lines 472-476, issue #16 verification, real
+    `google-adk` 2.4.0 + `mcp` 1.28.1 in a throwaway venv): ADK's OWN
+    detector for this shape is `isinstance(response, dict) and
+    response.get("isError")` — but it is wired only into a telemetry hook
+    that logs and returns, never altering what `run_async` hands back (per
+    `_is_mcp_error_dict`'s note). The dict actually returned on this path
+    (`_run_async_impl`, line 455: `response.model_dump(exclude_none=True,
+    mode="json")` of a real `CallToolResult`, then handed back unmodified by
+    `run_async`'s success path — confirmed by reading both call chains) is
+    NOT the same shape a naive `.get("isError")` truthiness check would
+    suggest: `isError` defaults to `False`, not `None`, so
+    `exclude_none=True` NEVER drops it — a genuinely successful call dumps
+    `{"content": [...], "isError": False}` (confirmed by constructing a real
+    `CallToolResult` and calling `model_dump` directly), meaning the key is
+    present either way and only its VALUE distinguishes success from
+    failure. So this checks `result.get("isError") is True` — the literal
+    `bool`, matching the field's declared type exactly, the same precision
+    `_is_mcp_error_dict` applies to its own `str` check — plus `content`
+    (the one field `CallToolResult` always carries, success or failure)
+    present as a `list`, plus every key in `result` drawn from
+    `_MCP_RESULT_KEYS`. Deliberately strict, identical philosophy to
+    `_is_mcp_error_dict`: a non-MCP-shaped dict is a tool RESULT and must
+    never be reclassified — this is the ONE shape a dict must have to be
+    read as a business-logic failure, not merely "has a truthy isError key".
+    Opt-in only (`KEEL_MCP_CLASSIFY_ISERROR`, see `_rebind_tool`): ADK itself
+    treats this shape as an ordinary successful call, so matching it changes
+    discovery/breaker accounting for callers who never asked for that — it
+    stays off unless explicitly enabled."""
+    return (
+        isinstance(result, dict)
+        and result.get("isError") is True
+        and isinstance(result.get("content"), list)
+        and set(result) <= _MCP_RESULT_KEYS
+    )
+
+
 def _rebind_tool(tool: Any, name: str) -> bool:
     """Rebind ``tool.run_async`` (instance attribute shadowing the class
     method) to a Keel-wrapped version. The breaker still guards attempt 1:
     ``wrap_tool``'s wrapper consults policy before the first underlying
     invoke. Returns ``False`` when the instance rejects attribute assignment.
+
+    Callers MUST hold ``_rebind_lock`` (``_on_before_tool`` does): this
+    function is fully synchronous (no ``await`` inside it) but captures
+    ``tool.run_async`` as ``original`` before shadowing it, so two unlocked
+    callers on two different threads can each capture the OTHER's
+    already-installed wrapper as ``original`` — the cross-thread
+    double-wrap the lock exists to prevent.
 
     MCP error-dict classification: under ADK's ``_MCP_GRACEFUL_ERROR_HANDLING``
     feature flag, a failed ``McpTool`` call RETURNS ``{"error": "..."}``
@@ -811,13 +935,43 @@ def _rebind_tool(tool: Any, name: str) -> bool:
     MCP-shaped error dict so ``wrap_tool``'s core records a failure
     (``classify_tool_error`` files it under ``other``); the rebound
     ``run_async`` unwraps it back to the identical payload on the way out, so
-    the agent sees byte-identical output either way."""
+    the agent sees byte-identical output either way. This path is
+    unconditional — it fires regardless of ``KEEL_MCP_CLASSIFY_ISERROR``
+    below.
+
+    Opt-in MCP business-error classification (``KEEL_MCP_CLASSIFY_ISERROR``,
+    issue #16): the transport shape above covers only calls where the MCP
+    session itself failed. A call that executes fine at the transport level
+    but reports its OWN business-logic failure returns an ordinary-looking
+    ``isError: true`` `CallToolResult` dict (see
+    ``_is_mcp_business_error_dict``) — today invisible to Keel, since it
+    comes back from ``McpTool.run_async`` looking like any other successful
+    result, so the breaker never trips on repeated business-logic errors.
+    Because ADK itself treats this shape as a normal successful call,
+    reclassifying it changes discovery/breaker accounting for every caller,
+    so it is gated behind an env var rather than unconditional (the same
+    ``_TRUTHY`` set ``KEEL_QUIET``/``KEEL_FLOW_LEASE_MS`` read; a new
+    ``keel.toml`` policy key would need a Contract Change Request, per
+    ``contracts/policy.schema.json``'s ``additionalProperties: false`` —
+    explicitly out of scope for this fast-follow). Default OFF: unset (or
+    not truthy), behavior is byte-identical to before this opt-in existed.
+    Set truthy AND ``_is_mcp_business_error_dict`` matches, ``_invoke``
+    raises the SAME ``_McpErrorDict`` sentinel as the transport path —
+    identical unwrap-on-the-way-out behavior, so the agent sees
+    byte-identical output regardless of whether Keel classified the call as
+    a failure."""
     original = tool.run_async  # the bound method, captured pre-shadow
     is_mcp = _is_mcp_tool(tool)
 
     async def _invoke(*, args: dict[str, Any], tool_context: Any) -> Any:
         result = await original(args=args, tool_context=tool_context)
-        if is_mcp and _is_mcp_error_dict(result):
+        if is_mcp and (
+            _is_mcp_error_dict(result)
+            or (
+                os.environ.get("KEEL_MCP_CLASSIFY_ISERROR", "").strip().lower() in _TRUTHY
+                and _is_mcp_business_error_dict(result)
+            )
+        ):
             raise _McpErrorDict(result)  # counted as a failure by the core
         return result
 

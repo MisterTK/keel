@@ -21,6 +21,7 @@ import io
 import os
 import sqlite3
 import sys
+import threading
 import unittest
 from importlib import metadata
 from pathlib import Path
@@ -45,7 +46,7 @@ from fake_adk import (
     McpTool,
 )
 
-from keel import _runtime, bootstrap
+from keel import _runtime
 from keel._backend import load_backend
 from keel._discovery import Discovery
 from keel._errors import KeelError
@@ -59,6 +60,7 @@ class AdkTestBase(unittest.TestCase):
         adk_pack._noted_skips.clear()
         adk_pack._noted_fallbacks.clear()
         adk_pack._noted_model_fallback_skips.clear()
+        adk_pack._noted_model_fallback_hop_failures.clear()
         adk_pack._rebound.clear()
         adk_pack._noted_busy = False
         FakeLLMRegistry.reset()
@@ -380,6 +382,96 @@ class ToolWrappingTest(AdkTestBase):
         self.assertFalse(getattr(tool.run_async, adk_pack._REBOUND_ATTR, False))
 
 
+class CrossThreadRebindRaceTest(AdkTestBase):
+    """The check-then-act in `_on_before_tool` (the "already rebound?"
+    getattr, then the separate `_rebind_tool(tool, name)` call) has no lock
+    between the two steps. Within a single event loop this is safe -- there
+    is no `await` between the check and the act, so asyncio can never
+    interleave two callbacks mid-sequence. The real hazard is CROSS-THREAD:
+    two OS threads, each driving its OWN event loop (two concurrent ADK
+    Runner sessions on separate threads sharing a tool instance/toolset --
+    a realistic host-app pattern), can both execute the getattr check
+    before either thread's `setattr` (inside `_rebind_tool`) has landed --
+    nothing serializes across that multi-bytecode sequence. Whichever
+    thread's `_rebind_tool` call runs second then captures the FIRST
+    thread's already-installed wrapper as `original`, silently
+    double-wrapping the tool (double breaker/retry/discovery accounting on
+    every real call through it from then on).
+
+    Reproducing this reliably (not by GIL-scheduling luck) needs the race
+    window WIDENED rather than merely invited: a `threading.Barrier(2,
+    timeout=...)` is planted at the very first line of `_rebind_tool`
+    itself (patched in for the duration of the test, restored after). A
+    thread only ever reaches that line after ITS OWN "already rebound?"
+    check already returned False -- so a caller arriving there has, by
+    construction, already observed the pre-race state. Two callers that
+    both arrive rendezvous at the barrier BEFORE either is allowed to run
+    the real rebind body (the read of `tool.run_async`, the wrapper
+    construction, the `setattr`) -- proving both checks raced -- which is
+    exactly the "reach the already-rebound check at nearly the same
+    moment" widening the brief called for. A solitary caller (the
+    lock-serialized, fixed world, where the second thread's check never
+    even sees False) just times out on the barrier and proceeds normally,
+    so the same test terminates cleanly whether the code is locked or not.
+
+    The observable: how many times `_rebind_tool` actually ran (how many
+    times a wrap_tool-produced closure was constructed and installed).
+    Locked correctly, that number is 1 no matter how the two threads are
+    scheduled. Racing unlocked, forcing both callers to prove they passed
+    the check before either proceeds pins it at 2 -- the exact defect."""
+
+    def test_two_threads_two_event_loops_rebind_exactly_once(self) -> None:
+        self.install_runtime({"target": {"tool:get_weather": {}}})
+        tool = FakeTool("get_weather", lambda city: city)
+
+        real_rebind_tool = adk_pack._rebind_tool
+        # timeout: a lock-serialized (fixed) world only ever has ONE caller
+        # reach this barrier -- it must not hang forever waiting for a
+        # second party that a correct fix never sends.
+        barrier = threading.Barrier(2, timeout=1.0)
+        count_lock = threading.Lock()
+        calls = {"n": 0}
+
+        def counting_rebind_tool(t: Any, name: str) -> bool:
+            with count_lock:
+                calls["n"] += 1
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass  # solitary caller: the other thread's check already saw "rebound" (the fix)
+            return real_rebind_tool(t, name)
+
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                asyncio.run(adk_pack._on_before_tool(tool, {}, object()))
+            except BaseException as exc:  # pragma: no cover - surfaced via assertion, not silently lost
+                errors.append(exc)
+
+        with mock.patch.object(adk_pack, "_rebind_tool", counting_rebind_tool):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        self.assertFalse(t1.is_alive() or t2.is_alive(), "a worker thread hung")
+        self.assertFalse(errors, f"worker thread(s) raised: {errors!r}")
+        self.assertTrue(
+            getattr(tool.run_async, adk_pack._REBOUND_ATTR, False),
+            "the tool ends up rebound either way",
+        )
+        self.assertEqual(
+            calls["n"],
+            1,
+            "the tool was rebound more than once: two threads both observed "
+            "'not yet rebound' and both ran _rebind_tool -- the cross-thread "
+            "check-then-act race this test targets",
+        )
+
+
 class RebindLifecycleTest(AdkTestBase):
     def test_uninstall_restores_rebound_instances(self) -> None:
         self.install_runtime({"target": {"tool:get_weather": {}}})
@@ -486,7 +578,12 @@ class SetattrFallbackTest(AdkTestBase):
 class McpErrorDictTest(AdkTestBase):
     """ADK graceful error handling returns {"error": ...} dicts from McpTool
     — a *successful* call from a naive wrapper's perspective. Keel must
-    count it as a failure (breaker/discovery) while returning it unchanged."""
+    count it as a failure (breaker/discovery) while returning it unchanged.
+
+    Also covers the opt-in `KEEL_MCP_CLASSIFY_ISERROR` path (issue #16): the
+    raw MCP `isError: true` business-logic convention, invisible to ADK's
+    own success/failure handling, classified as a failure only when the env
+    var is explicitly set — default OFF, byte-identical otherwise."""
 
     def plugin(self) -> Any:
         with FakeAdkModules():
@@ -541,6 +638,91 @@ class McpErrorDictTest(AdkTestBase):
 
         self.assertTrue(adk_pack._is_mcp_tool(MCPTool()))
 
+    # -- issue #16: opt-in raw MCP `isError: true` classification ----------
+
+    def test_iserror_dict_classified_as_failure_when_env_var_set(self) -> None:
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        payload = {"content": [{"type": "text", "text": "not found"}], "isError": True}
+        with mock.patch.dict(os.environ, {"KEEL_MCP_CLASSIFY_ISERROR": "1"}):
+            tool = self.rebound(McpTool("mcp_search", lambda: dict(payload)))
+            result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, payload, "agent-visible value unchanged")
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 1, "breaker/discovery sees the failure")
+
+    def test_iserror_dict_not_reclassified_when_env_var_unset(self) -> None:
+        # Default OFF: identical isError:true result passes through as an
+        # ordinary successful result — byte-identical to pre-opt-in behavior.
+        _, discovery = self.install_runtime({"target": {"tool:mcp_search": {}}})
+        payload = {"content": [{"type": "text", "text": "not found"}], "isError": True}
+        self.assertNotIn("KEEL_MCP_CLASSIFY_ISERROR", os.environ)
+        tool = self.rebound(McpTool("mcp_search", lambda: dict(payload)))
+        result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+        self.assertEqual(result, payload)
+        rows = self.read_rows(discovery)
+        self.assertEqual(rows["tool:mcp_search"]["failures"], 0, "default OFF: no reclassification")
+
+    def test_transport_error_dict_still_unconditional_regardless_of_env_var(self) -> None:
+        # Regression: the pre-existing {"error": ...} classification must
+        # never become gated by the new opt-in, in either env var state.
+        # Distinct target names per iteration: install_runtime reuses the
+        # same on-disk discovery db across calls in this test (same self.cwd)
+        # so failure counts would otherwise accumulate across iterations.
+        cases = [
+            ({}, "tool:mcp_search_env_unset"),
+            ({"KEEL_MCP_CLASSIFY_ISERROR": "1"}, "tool:mcp_search_env_set"),
+        ]
+        for env, target in cases:
+            with self.subTest(env=env):
+                name = target.removeprefix("tool:")
+                _, discovery = self.install_runtime({"target": {target: {}}})
+                tool = self.rebound(McpTool(name, lambda: {"error": "connection closed"}))
+                with mock.patch.dict(os.environ, env):
+                    result = asyncio.run(tool.run_async(args={}, tool_context=object()))
+                self.assertEqual(result, {"error": "connection closed"})
+                rows = self.read_rows(discovery)
+                self.assertEqual(rows[target]["failures"], 1)
+
+    def test_is_mcp_business_error_dict_shape_matching(self) -> None:
+        # Strict match: isError literally True (not merely truthy) plus a
+        # `content` list, keys drawn only from CallToolResult's real fields.
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": True})
+        )
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "structuredContent": {"code": 404}}
+            )
+        )
+        self.assertTrue(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "meta": {"trace": "abc"}}
+            )
+        )
+        # A successful call: isError present but False (never omitted by
+        # ADK's exclude_none dump, since False is not None).
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": False})
+        )
+        # Truthy but not the literal bool True.
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": [], "isError": 1})
+        )
+        # Missing/wrong-typed `content`.
+        self.assertFalse(adk_pack._is_mcp_business_error_dict({"isError": True}))
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict({"content": "oops", "isError": True})
+        )
+        # A key outside CallToolResult's real field set.
+        self.assertFalse(
+            adk_pack._is_mcp_business_error_dict(
+                {"content": [], "isError": True, "extra": "nope"}
+            )
+        )
+        # The transport-failure shape must never match here.
+        self.assertFalse(adk_pack._is_mcp_business_error_dict({"error": "x"}))
+        self.assertFalse(adk_pack._is_mcp_business_error_dict(["isError"]))
+
 
 class _NoFlowSurfaceBackend:
     """A stub-shaped backend: no `enter_flow`/`exit_flow` at all."""
@@ -566,15 +748,13 @@ class RunnerFlowDesignationTest(unittest.TestCase):
     generator wrap here — that is the NEXT task."""
 
     def setUp(self) -> None:
-        self._prior_state = bootstrap._STATE.state
-        self._prior_installed = bootstrap._STATE.installed
+        self._prior_flow_entrypoints = _runtime.get_flow_entrypoints()
 
     def tearDown(self) -> None:
-        # `_flow_entrypoint_designated` reads `bootstrap._STATE` directly
-        # (module-private, deliberately — see its docstring), so every test
-        # that pokes it must restore the real suite-wide state afterward.
-        bootstrap._STATE.state = self._prior_state
-        bootstrap._STATE.installed = self._prior_installed
+        # `_flow_entrypoint_designated` reads `_runtime.get_flow_entrypoints()`
+        # (see its docstring), so every test that pokes it must restore the
+        # real suite-wide state afterward.
+        _runtime.set_flow_entrypoints(self._prior_flow_entrypoints)
 
     # -- _flow_entrypoint_designated ------------------------------------
 
@@ -584,30 +764,27 @@ class RunnerFlowDesignationTest(unittest.TestCase):
             module="google.adk.runners",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([entry])
         self.assertEqual(
             adk_pack._flow_entrypoint_designated(),
             "py:google.adk.runners:Runner.run_async",
         )
 
     def test_undesignated_when_never_installed_or_disabled(self) -> None:
-        # `install_keel()` never populates `_STATE.state` when KEEL_DISABLE is
-        # set (it returns before that point) — bootstrap-disabled and
-        # never-installed are the SAME shape here: `_STATE.state is None`.
-        bootstrap._STATE.state = None
-        bootstrap._STATE.installed = False
+        # `install_keel()` never calls `_runtime.set_flow_entrypoints()` when
+        # `KEEL_DISABLE` is set (it returns before that point) —
+        # bootstrap-disabled and never-installed are the SAME shape here:
+        # `_runtime.get_flow_entrypoints()` returns `()`.
+        _runtime.set_flow_entrypoints(())
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_undesignated_when_no_matching_entrypoint(self) -> None:
         other = FlowEntrypoint(raw="py:pipeline:main", module="pipeline", function="main")
-        bootstrap._STATE.state = {"flow_entrypoints": [other]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([other])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_undesignated_when_no_flow_entrypoints_at_all(self) -> None:
-        bootstrap._STATE.state = {"flow_entrypoints": []}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_glob_entrypoint_does_not_designate(self) -> None:
@@ -619,8 +796,7 @@ class RunnerFlowDesignationTest(unittest.TestCase):
             module="google.adk.*",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [glob_entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([glob_entry])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_runner_flow_entrypoint_constant(self) -> None:
@@ -757,15 +933,9 @@ class RunnerFlowWrapTest(AdkTestBase):
     every other call stays byte-transparent. Runs entirely against
     `_FakeAdkFlowBackend` — no compiled core, no real `google.adk`."""
 
-    def setUp(self) -> None:
-        super().setUp()
-        self._prior_state = bootstrap._STATE.state
-        self._prior_installed = bootstrap._STATE.installed
-
-    def tearDown(self) -> None:
-        bootstrap._STATE.state = self._prior_state
-        bootstrap._STATE.installed = self._prior_installed
-        super().tearDown()
+    # No setUp/tearDown override needed: `AdkTestBase.tearDown()` already
+    # calls `_runtime.clear_runtime()`, which resets `flow_entrypoints`
+    # (along with backend/discovery/flow_active) after every test.
 
     def designate(self) -> None:
         entry = FlowEntrypoint(
@@ -773,12 +943,10 @@ class RunnerFlowWrapTest(AdkTestBase):
             module="google.adk.runners",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([entry])
 
     def undesignate(self) -> None:
-        bootstrap._STATE.state = None
-        bootstrap._STATE.installed = False
+        _runtime.set_flow_entrypoints(())
 
     def use_backend(self, backend: Any) -> None:
         discovery = Discovery(self.cwd)
@@ -850,6 +1018,54 @@ class RunnerFlowWrapTest(AdkTestBase):
 
             runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
             with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
+
+    def test_keyboard_interrupt_mid_stream_marks_failed_and_reraises_original(self) -> None:
+        # Unlike `_flow.py`'s `run_as_flow` (which leaves a `KeyboardInterrupt`
+        # flow `running` for resume, since that path expects the process to
+        # die), this wrapper runs inside a SURVIVING long-lived Runner host —
+        # its `except BaseException` arm treats `KeyboardInterrupt` the same
+        # as any other failure (`_run_async_wrapper` docstring).
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = KeyboardInterrupt()
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
+
+    def test_cancelled_error_mid_stream_marks_failed_and_reraises_original(self) -> None:
+        # Same rationale as the `KeyboardInterrupt` case above:
+        # `asyncio.CancelledError` is an async-generator's own
+        # abandonment/cancel signal, name-checked alongside `KeyboardInterrupt`
+        # in the same `except BaseException` arm rather than being left
+        # `running` for resume (`_run_async_wrapper` docstring).
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = asyncio.CancelledError()
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(asyncio.CancelledError) as ctx:
                 asyncio.run(
                     self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
                 )
@@ -1334,6 +1550,71 @@ class ModelFallbackTest(AdkTestBase):
         FakeLLMRegistry.configure("claude-broken", FakeClaude(error=RuntimeError("still down")))
         result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
         self.assertIsNone(result)
+
+    # -- generate_content_async raising mid-hop: previously silent (issue #19) --
+
+    def test_generate_content_async_failure_noted_once_with_hop_correlation(self) -> None:
+        # "claude-broken" resolves and constructs fine (unlike
+        # test_unknown_model_name_skipped_and_noted_once /
+        # test_new_llm_missing_package_skipped_and_noted, which fail earlier)
+        # -- it fails at the actual generate_content_async call, which used
+        # to be silently swallowed by a bare `except Exception: continue`.
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["claude-broken", "claude-ok"]}}}
+        )
+        broken = FakeClaude(error=RuntimeError("provider 500"))
+        ok_response = FakeLlmResponse("ok")
+        FakeLLMRegistry.configure("claude-broken", broken)
+        FakeLLMRegistry.configure("claude-ok", FakeClaude(responses=[ok_response]))
+        plugin = self.plugin()
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            result = self.fire(
+                plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom")
+            )
+        # The chain still proceeds to the next entry exactly as before.
+        self.assertIs(result, ok_response)
+        self.assertEqual(len(broken.calls), 1)
+        note = err.getvalue()
+        self.assertEqual(note.count("generate_content_async"), 1, note)
+        self.assertIn("claude-broken", note)
+        # Hop correlation: position in the chain (1 of 2) and the ORIGINAL
+        # failing model name, so this note alone ties a fallback provider's
+        # own llm:<provider> transport-seam traffic back to "this was ADK
+        # fallback hop N of M, replacing originally-failing model X."
+        self.assertIn("1/2", note)
+        self.assertIn("gemini-2.0-flash", note)
+        # A second failure of the SAME entry name is noted only once, ever.
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err2:
+            self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertEqual(err2.getvalue(), "")
+
+    def test_quiet_env_suppresses_the_hop_failure_note(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-broken"]}}})
+        FakeLLMRegistry.configure("claude-broken", FakeClaude(error=RuntimeError("provider 500")))
+        plugin = self.plugin()
+        with mock.patch.dict(os.environ, {"KEEL_QUIET": "1"}), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as err:
+            result = self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIsNone(result)  # only entry, and it failed: chain exhausted
+        self.assertEqual(err.getvalue(), "")
+
+    # -- soft-error LlmResponse from a fallback hop: accepted as success --------
+
+    def test_soft_error_response_from_fallback_hop_is_accepted(self) -> None:
+        # A fallback hop's generate_content_async can complete WITHOUT
+        # raising but still yield a response object that carries its own
+        # error_code-like attribute (ADK's own soft-error response shape).
+        # _model_fallback does not special-case this -- any non-None
+        # response from a hop is accepted as success, matching ADK's own
+        # primary-path semantics (issue #19's "untested in either
+        # direction" nuance -- this locks in the accepted behavior).
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-soft-error"]}}})
+        soft_error_response = FakeLlmResponse("degraded", error_code="SAFETY", error_message="blocked")
+        FakeLLMRegistry.configure("claude-soft-error", FakeClaude(responses=[soft_error_response]))
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, soft_error_response)
+        self.assertEqual(getattr(result, "error_code", None), "SAFETY")
 
 
 class ModelFallbackPluginShapeTest(AdkTestBase):
