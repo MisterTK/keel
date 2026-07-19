@@ -40,7 +40,7 @@
 #   python   | pydantic-ai                   | 2.9.0                     | python/keel/src/keel/packs/pydantic_ai_pack.py
 #   python   | openai-agents                 | 0.18.2                    | python/keel/src/keel/packs/openai_agents_pack.py
 #   python   | crewai                        | 1.15.2                    | python/keel/src/keel/packs/crewai_pack.py
-#   python   | langgraph                     | 1.0.10                    | python/keel/src/keel/packs/langgraph_pack.py
+#   python   | langgraph                     | 1.2.9                     | python/keel/src/keel/packs/langgraph_pack.py
 #   python   | mcp                           | 1.28.1                    | python/keel/src/keel/packs/mcp_pack.py
 #   python   | urllib.request (stdlib)       | 3.11 (runtime, no pip pin)| python/keel/src/keel/adapters/urllib_pack.py
 #   python   | aiohttp                       | (planned — no pack yet)   | best-effort in crates/keel-cli/src/doctor.rs REGISTRY
@@ -159,7 +159,7 @@ jobs:
             version: "1.15.2"
             test_module: tests.test_farm_crewai
           - lib: langgraph
-            version: "1.0.10"
+            version: "1.2.9"
             test_module: tests.test_farm_langgraph
           - lib: mcp
             version: "1.28.1"

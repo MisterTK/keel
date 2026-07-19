@@ -115,7 +115,7 @@ NAME = "langgraph"
 #: match against ``importlib.metadata.version``). Outside the range `detect`
 #: reports `best_effort` — the `add_node` seam still tries (it has been
 #: stable since 0.2).
-_PINNED = ("0.2", "0.3", "0.4", "0.5", "0.6", "1.0")
+_PINNED = ("0.2", "0.3", "0.4", "0.5", "0.6", "1.0", "1.1", "1.2")
 
 #: The checkpoint-pack step targets (module docs). All three share the
 #: `tool:` namespace (the frozen targetKey grammar admits no other prefix for
