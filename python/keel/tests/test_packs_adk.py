@@ -1025,6 +1025,54 @@ class RunnerFlowWrapTest(AdkTestBase):
         self.assertEqual(backend.exited, ["failed"])
         self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
 
+    def test_keyboard_interrupt_mid_stream_marks_failed_and_reraises_original(self) -> None:
+        # Unlike `_flow.py`'s `run_as_flow` (which leaves a `KeyboardInterrupt`
+        # flow `running` for resume, since that path expects the process to
+        # die), this wrapper runs inside a SURVIVING long-lived Runner host —
+        # its `except BaseException` arm treats `KeyboardInterrupt` the same
+        # as any other failure (`_run_async_wrapper` docstring).
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = KeyboardInterrupt()
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
+
+    def test_cancelled_error_mid_stream_marks_failed_and_reraises_original(self) -> None:
+        # Same rationale as the `KeyboardInterrupt` case above:
+        # `asyncio.CancelledError` is an async-generator's own
+        # abandonment/cancel signal, name-checked alongside `KeyboardInterrupt`
+        # in the same `except BaseException` arm rather than being left
+        # `running` for resume (`_run_async_wrapper` docstring).
+        self.designate()
+        backend = _FakeAdkFlowBackend()
+        self.use_backend(backend)
+        boom = asyncio.CancelledError()
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with self.assertRaises(asyncio.CancelledError) as ctx:
+                asyncio.run(
+                    self._drain(runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1"))
+                )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never wrapped")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
+
     def test_exit_flow_write_failure_on_success_path_is_reported_not_raised(self) -> None:
         # Issue #14: exit_flow can now raise a KEEL-E040 when the JOURNAL
         # WRITE itself fails, distinct from the wrapped run_async body's own
