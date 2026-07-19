@@ -170,20 +170,39 @@ def aliases_of(tree):
     """Binding name -> tracked module (top-level, or `google.adk`/
     `google.genai` — see `import_entries`). Also follows one hop of
     constructor assignment (client = OpenAI() -> client is an openai handle),
-    the dominant SDK-client pattern."""
+    the dominant SDK-client pattern. A later assignment that rebinds such a
+    name to anything that is NOT another known-library handle (a literal, an
+    unrelated constructor, any other call) invalidates it, so a generic name
+    (`client`, `session`, `resp`) bound to a library in one place and reused
+    for something else elsewhere in the file is not misattributed to the first
+    library. Import bindings themselves are never invalidated — module names
+    like `os`/`time`/`subprocess` are effectively never rebound, and the
+    file-wide subprocess/sleep passes rely on them staying put. Known misses of
+    this flat, unscoped, single-snapshot dict (no scoping/branch modeling here,
+    not worth chasing): two functions binding one name to *different* known
+    libs still collide last-write-wins; invalidation only fires when the known
+    binding precedes the reuse in traversal order; and invalidating a shared
+    name also drops the original binder's own handle (conservative — favor a
+    missed attribution over a wrong one)."""
     a = {}
+    imported = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for key, bound in import_entries(node):
                 if key in TRACKED:
                     a[bound] = key
+                    imported.add(bound)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-            lib = a.get(call_root(node.value.func))
+        if not isinstance(node, ast.Assign):
+            continue
+        lib = a.get(call_root(node.value.func)) if isinstance(node.value, ast.Call) else None
+        for tgt in node.targets:
+            if not isinstance(tgt, ast.Name):
+                continue
             if lib in KNOWN:
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Name):
-                        a[tgt.id] = lib
+                a[tgt.id] = lib
+            elif tgt.id not in imported:
+                a.pop(tgt.id, None)
     return a
 
 
@@ -1043,6 +1062,68 @@ def helper():
             .find(|f| f.entrypoint == "py:pipeline:helper")
             .expect("helper attributed");
         assert_eq!(helper.effects, 0);
+    }
+
+    /// Issue #29: `aliases_of` builds one flat, file-wide binding map, so a
+    /// generic handle name (`client`, `session`, `resp`) bound to a tracked
+    /// library in one function and then REUSED for an unrelated purpose in
+    /// another used to keep its stale mapping — misattributing the second
+    /// function's calls to the first library. A non-known reassignment now
+    /// invalidates the stale entry.
+    #[test]
+    fn reused_handle_name_does_not_leak_its_alias_across_functions() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("clients.py"),
+            r#"import openai
+
+
+def build():
+    client = openai.OpenAI()
+    return client.responses.create(model="gpt-4.1", input="hi")
+
+
+def unrelated():
+    client = LocalThing()
+    client.process()
+    return client
+
+
+def direct():
+    return openai.responses.create(model="gpt-4.1", input="hi")
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let f = |name: &str| {
+            s.functions
+                .iter()
+                .find(|f| f.entrypoint == format!("py:clients:{name}"))
+                .unwrap_or_else(|| panic!("{name} attributed"))
+        };
+        // The bug: `unrelated` reuses `client` for a non-openai handle and must
+        // NOT inherit build()'s openai attribution (before the fix it did:
+        // effects == 1, targets == ["llm:openai"]).
+        let unrelated = f("unrelated");
+        assert_eq!(unrelated.effects, 0, "reused name misattributed an effect");
+        assert!(
+            !unrelated.targets.contains("llm:openai"),
+            "reused name leaked the openai target: {:?}",
+            unrelated.targets
+        );
+        // Import bindings themselves are never invalidated — a direct
+        // `openai.<call>` in a third function is still attributed.
+        let direct = f("direct");
+        assert_eq!(direct.effects, 1);
+        assert!(direct.targets.contains("llm:openai"));
+        // Documented flat-dict tradeoff (characterization): invalidating the
+        // shared name also clears build()'s own handle, so build loses its
+        // attribution rather than risk the collision — conservative by design.
+        assert_eq!(f("build").effects, 0);
     }
 
     #[test]
