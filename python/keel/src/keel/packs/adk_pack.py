@@ -728,9 +728,10 @@ async def _model_fallback(llm_request: Any, error: Exception) -> Any:
 
     from google.adk.models.registry import LLMRegistry  # function-local: adapter-pack rule 1
 
-    failing_cls = _resolve_model_class(LLMRegistry, getattr(llm_request, "model", None))
+    original_model = getattr(llm_request, "model", None)
+    failing_cls = _resolve_model_class(LLMRegistry, original_model)
 
-    for entry in chain:
+    for index, entry in enumerate(chain, start=1):
         entry_cls = _resolve_model_class(LLMRegistry, entry, note_on_failure=True)
         if entry_cls is None:
             continue  # unknown model / missing package: already noted
@@ -745,7 +746,8 @@ async def _model_fallback(llm_request: Any, error: Exception) -> Any:
         try:
             async for resp in model.generate_content_async(llm_request, stream=False):
                 response = resp  # keep only the FINAL response of this hop's stream
-        except Exception:
+        except Exception as hop_error:
+            _note_model_fallback_hop_failed(entry, index, len(chain), original_model, hop_error)
             continue  # this hop failed too: try the next chain entry
         if response is not None:
             return response
@@ -770,6 +772,40 @@ def _note_model_fallback_skip(name: str) -> None:
         f"keel ▸ adk: model fallback entry {name!r} could not be resolved via "
         "LLMRegistry (unknown model name, or its provider package is not "
         "installed) — skipped; the next chain entry is tried\n"
+    )
+
+
+_noted_model_fallback_hop_failures: set[str] = set()
+
+
+def _note_model_fallback_hop_failed(
+    entry: str, index: int, total: int, original_model: Any, error: Exception
+) -> None:
+    """Note (once per entry name, ``KEEL_QUIET``-aware — mirrors
+    ``_note_model_fallback_skip``) a fallback-chain entry that resolved AND
+    constructed fine but whose ``generate_content_async`` call itself raised
+    (issue #19): distinct from ``_note_model_fallback_skip`` — that note
+    covers a hop that never got a chance to run (unresolvable name /
+    ``new_llm`` construction failure); this one covers a hop that ran and
+    failed at the actual generate call, which was previously silent. Also
+    carries the hop's position (``index`` of ``total``) and the ORIGINAL
+    failing model name so a fallback provider's own ``llm:<provider>``
+    transport-seam traffic (which the transport seam logs/counts under its
+    own target) can be correlated back to "this was ADK fallback hop N of M,
+    replacing originally-failing model X" from this note's text alone — a
+    deliberately shallow fix; deeper transport-seam/journal-schema
+    correlation would touch the frozen ``contracts/`` surface and is out of
+    scope for this fast-follow."""
+    if entry in _noted_model_fallback_hop_failures:
+        return
+    _noted_model_fallback_hop_failures.add(entry)
+    if os.environ.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return
+    sys.stderr.write(
+        f"keel ▸ adk: model fallback hop {index}/{total} ({entry!r}, "
+        f"replacing originally-failing model {original_model!r}) failed "
+        f"calling generate_content_async ({error!r}) — skipped; the next "
+        "chain entry is tried\n"
     )
 
 

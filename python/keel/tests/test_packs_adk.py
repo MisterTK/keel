@@ -60,6 +60,7 @@ class AdkTestBase(unittest.TestCase):
         adk_pack._noted_skips.clear()
         adk_pack._noted_fallbacks.clear()
         adk_pack._noted_model_fallback_skips.clear()
+        adk_pack._noted_model_fallback_hop_failures.clear()
         adk_pack._rebound.clear()
         adk_pack._noted_busy = False
         FakeLLMRegistry.reset()
@@ -1549,6 +1550,71 @@ class ModelFallbackTest(AdkTestBase):
         FakeLLMRegistry.configure("claude-broken", FakeClaude(error=RuntimeError("still down")))
         result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
         self.assertIsNone(result)
+
+    # -- generate_content_async raising mid-hop: previously silent (issue #19) --
+
+    def test_generate_content_async_failure_noted_once_with_hop_correlation(self) -> None:
+        # "claude-broken" resolves and constructs fine (unlike
+        # test_unknown_model_name_skipped_and_noted_once /
+        # test_new_llm_missing_package_skipped_and_noted, which fail earlier)
+        # -- it fails at the actual generate_content_async call, which used
+        # to be silently swallowed by a bare `except Exception: continue`.
+        self.install_runtime(
+            {"target": {"llm:google-genai": {"fallback": ["claude-broken", "claude-ok"]}}}
+        )
+        broken = FakeClaude(error=RuntimeError("provider 500"))
+        ok_response = FakeLlmResponse("ok")
+        FakeLLMRegistry.configure("claude-broken", broken)
+        FakeLLMRegistry.configure("claude-ok", FakeClaude(responses=[ok_response]))
+        plugin = self.plugin()
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            result = self.fire(
+                plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom")
+            )
+        # The chain still proceeds to the next entry exactly as before.
+        self.assertIs(result, ok_response)
+        self.assertEqual(len(broken.calls), 1)
+        note = err.getvalue()
+        self.assertEqual(note.count("generate_content_async"), 1, note)
+        self.assertIn("claude-broken", note)
+        # Hop correlation: position in the chain (1 of 2) and the ORIGINAL
+        # failing model name, so this note alone ties a fallback provider's
+        # own llm:<provider> transport-seam traffic back to "this was ADK
+        # fallback hop N of M, replacing originally-failing model X."
+        self.assertIn("1/2", note)
+        self.assertIn("gemini-2.0-flash", note)
+        # A second failure of the SAME entry name is noted only once, ever.
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err2:
+            self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertEqual(err2.getvalue(), "")
+
+    def test_quiet_env_suppresses_the_hop_failure_note(self) -> None:
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-broken"]}}})
+        FakeLLMRegistry.configure("claude-broken", FakeClaude(error=RuntimeError("provider 500")))
+        plugin = self.plugin()
+        with mock.patch.dict(os.environ, {"KEEL_QUIET": "1"}), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as err:
+            result = self.fire(plugin, FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIsNone(result)  # only entry, and it failed: chain exhausted
+        self.assertEqual(err.getvalue(), "")
+
+    # -- soft-error LlmResponse from a fallback hop: accepted as success --------
+
+    def test_soft_error_response_from_fallback_hop_is_accepted(self) -> None:
+        # A fallback hop's generate_content_async can complete WITHOUT
+        # raising but still yield a response object that carries its own
+        # error_code-like attribute (ADK's own soft-error response shape).
+        # _model_fallback does not special-case this -- any non-None
+        # response from a hop is accepted as success, matching ADK's own
+        # primary-path semantics (issue #19's "untested in either
+        # direction" nuance -- this locks in the accepted behavior).
+        self.install_runtime({"target": {"llm:google-genai": {"fallback": ["claude-soft-error"]}}})
+        soft_error_response = FakeLlmResponse("degraded", error_code="SAFETY", error_message="blocked")
+        FakeLLMRegistry.configure("claude-soft-error", FakeClaude(responses=[soft_error_response]))
+        result = self.fire(self.plugin(), FakeLlmRequest(model="gemini-2.0-flash"), RuntimeError("boom"))
+        self.assertIs(result, soft_error_response)
+        self.assertEqual(getattr(result, "error_code", None), "SAFETY")
 
 
 class ModelFallbackPluginShapeTest(AdkTestBase):
