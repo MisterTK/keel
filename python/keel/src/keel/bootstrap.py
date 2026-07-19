@@ -24,7 +24,7 @@ from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._policy import extract_flow_entrypoints, extract_function_targets, load_policy
-from ._runtime import clear_runtime, get_backend, set_runtime
+from ._runtime import clear_runtime, get_backend, set_flow_entrypoints, set_runtime
 from ._targets import clear_outbound_targets, install_outbound_targets
 from .adapters import Detection, install_adapters, uninstall_adapters
 from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
@@ -104,6 +104,7 @@ def install_keel(
     # runner consults these to decide whether `keel run <script>` is a durable
     # flow. Parsing only; running one requires the native backend.
     flow_entrypoints = extract_flow_entrypoints(policy)
+    set_flow_entrypoints(flow_entrypoints)
 
     # Library adapters (httpx/requests/…) plus framework packs with a real
     # seam of their own (adk_pack, pydantic-ai, …): all armed lazily — each

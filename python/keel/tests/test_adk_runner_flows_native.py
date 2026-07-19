@@ -38,7 +38,7 @@ from fake_adk import (
     FakeRunner,
 )
 
-from keel import _runtime, bootstrap
+from keel import _runtime
 from keel._backend import load_backend
 from keel._discovery import Discovery
 from keel._policy import FlowEntrypoint
@@ -77,13 +77,12 @@ class _NativeAdkFlowTestBase(unittest.TestCase):
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
         self.journal_path = self.cwd / ".keel" / "journal.db"
-        self._prior_state = bootstrap._STATE.state
-        self._prior_installed = bootstrap._STATE.installed
         self._discoveries: list[Discovery] = []
 
     def tearDown(self) -> None:
-        bootstrap._STATE.state = self._prior_state
-        bootstrap._STATE.installed = self._prior_installed
+        # `_runtime.clear_runtime()` resets `flow_entrypoints` (along with
+        # backend/discovery/flow_active), so no explicit prior-state
+        # save/restore is needed here.
         _runtime.clear_runtime()
         for d in self._discoveries:
             d.close()
@@ -95,8 +94,7 @@ class _NativeAdkFlowTestBase(unittest.TestCase):
             module="google.adk.runners",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([entry])
 
     def native_backend(self) -> Any:
         backend = load_backend("native", cwd=self.cwd)

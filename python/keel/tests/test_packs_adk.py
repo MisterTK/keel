@@ -45,7 +45,7 @@ from fake_adk import (
     McpTool,
 )
 
-from keel import _runtime, bootstrap
+from keel import _runtime
 from keel._backend import load_backend
 from keel._discovery import Discovery
 from keel._errors import KeelError
@@ -566,15 +566,13 @@ class RunnerFlowDesignationTest(unittest.TestCase):
     generator wrap here — that is the NEXT task."""
 
     def setUp(self) -> None:
-        self._prior_state = bootstrap._STATE.state
-        self._prior_installed = bootstrap._STATE.installed
+        self._prior_flow_entrypoints = _runtime.get_flow_entrypoints()
 
     def tearDown(self) -> None:
-        # `_flow_entrypoint_designated` reads `bootstrap._STATE` directly
-        # (module-private, deliberately — see its docstring), so every test
-        # that pokes it must restore the real suite-wide state afterward.
-        bootstrap._STATE.state = self._prior_state
-        bootstrap._STATE.installed = self._prior_installed
+        # `_flow_entrypoint_designated` reads `_runtime.get_flow_entrypoints()`
+        # (see its docstring), so every test that pokes it must restore the
+        # real suite-wide state afterward.
+        _runtime.set_flow_entrypoints(self._prior_flow_entrypoints)
 
     # -- _flow_entrypoint_designated ------------------------------------
 
@@ -584,30 +582,27 @@ class RunnerFlowDesignationTest(unittest.TestCase):
             module="google.adk.runners",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([entry])
         self.assertEqual(
             adk_pack._flow_entrypoint_designated(),
             "py:google.adk.runners:Runner.run_async",
         )
 
     def test_undesignated_when_never_installed_or_disabled(self) -> None:
-        # `install_keel()` never populates `_STATE.state` when KEEL_DISABLE is
-        # set (it returns before that point) — bootstrap-disabled and
-        # never-installed are the SAME shape here: `_STATE.state is None`.
-        bootstrap._STATE.state = None
-        bootstrap._STATE.installed = False
+        # `install_keel()` never calls `_runtime.set_flow_entrypoints()` when
+        # `KEEL_DISABLE` is set (it returns before that point) —
+        # bootstrap-disabled and never-installed are the SAME shape here:
+        # `_runtime.get_flow_entrypoints()` returns `()`.
+        _runtime.set_flow_entrypoints(())
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_undesignated_when_no_matching_entrypoint(self) -> None:
         other = FlowEntrypoint(raw="py:pipeline:main", module="pipeline", function="main")
-        bootstrap._STATE.state = {"flow_entrypoints": [other]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([other])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_undesignated_when_no_flow_entrypoints_at_all(self) -> None:
-        bootstrap._STATE.state = {"flow_entrypoints": []}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_glob_entrypoint_does_not_designate(self) -> None:
@@ -619,8 +614,7 @@ class RunnerFlowDesignationTest(unittest.TestCase):
             module="google.adk.*",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [glob_entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([glob_entry])
         self.assertIsNone(adk_pack._flow_entrypoint_designated())
 
     def test_runner_flow_entrypoint_constant(self) -> None:
@@ -757,15 +751,9 @@ class RunnerFlowWrapTest(AdkTestBase):
     every other call stays byte-transparent. Runs entirely against
     `_FakeAdkFlowBackend` — no compiled core, no real `google.adk`."""
 
-    def setUp(self) -> None:
-        super().setUp()
-        self._prior_state = bootstrap._STATE.state
-        self._prior_installed = bootstrap._STATE.installed
-
-    def tearDown(self) -> None:
-        bootstrap._STATE.state = self._prior_state
-        bootstrap._STATE.installed = self._prior_installed
-        super().tearDown()
+    # No setUp/tearDown override needed: `AdkTestBase.tearDown()` already
+    # calls `_runtime.clear_runtime()`, which resets `flow_entrypoints`
+    # (along with backend/discovery/flow_active) after every test.
 
     def designate(self) -> None:
         entry = FlowEntrypoint(
@@ -773,12 +761,10 @@ class RunnerFlowWrapTest(AdkTestBase):
             module="google.adk.runners",
             function="Runner.run_async",
         )
-        bootstrap._STATE.state = {"flow_entrypoints": [entry]}
-        bootstrap._STATE.installed = True
+        _runtime.set_flow_entrypoints([entry])
 
     def undesignate(self) -> None:
-        bootstrap._STATE.state = None
-        bootstrap._STATE.installed = False
+        _runtime.set_flow_entrypoints(())
 
     def use_backend(self, backend: Any) -> None:
         discovery = Discovery(self.cwd)

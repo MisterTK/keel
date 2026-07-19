@@ -259,20 +259,20 @@ def _flow_entrypoint_designated() -> str | None:
     (``RUNNER_FLOW_ENTRYPOINT``, echoed back verbatim), or ``None`` when
     undesignated OR when Keel bootstrap is disabled/never ran.
 
-    Reads ``keel.bootstrap._STATE.state`` directly — a deliberate
-    module-private reach into a sibling module, not a new ``_runtime`` API.
-    ``keel.bootstrap.install_keel()`` is re-entrant (its already-installed
-    path returns the full cached state, including ``flow_entrypoints``), but
-    calling it here to *read* that state would also *perform* a fresh
-    install as a side effect on a bare/not-yet-bootstrapped process — wrong
-    for what is meant to be a passive designation check invoked from
-    arbitrary Runner-construction code. Reading the cached ``_STATE.state``
-    instead never triggers that side effect: ``None`` (never installed, or
-    ``KEEL_DISABLE`` short-circuited before ``_STATE.state`` was ever
-    populated — ``install_keel`` returns before touching ``_STATE`` in that
-    branch, so the two cases are indistinguishable here, and correctly so:
-    both mean "no Tier 2 designation is in force") means undesignated,
-    exactly like finding no matching entry.
+    Reads ``_runtime.get_flow_entrypoints()`` — the same process-global
+    accessor shape ``get_backend()``/``in_active_flow()`` already use, set
+    once by ``bootstrap.install_keel()`` via ``_runtime.set_flow_entrypoints``
+    right after ``_policy.extract_flow_entrypoints`` computes it. A plain
+    ``_runtime`` read has no install side effect (exactly like those two
+    accessors), so — unlike calling ``install_keel()`` itself, which is
+    re-entrant and would perform a fresh install as an unwanted side effect
+    on a bare/not-yet-bootstrapped process — this is safe to call from
+    arbitrary Runner-construction code as a passive designation check.
+    ``get_flow_entrypoints()`` returns ``()`` both when Keel was never
+    installed and when ``KEEL_DISABLE`` short-circuited before installing
+    (``install_keel`` returns before touching ``_runtime`` in that branch),
+    so the two cases are indistinguishable here, and correctly so: both mean
+    "no Tier 2 designation is in force", same as finding no matching entry.
 
     The match is EXACT: only an entrypoint whose parsed ``module``/
     ``function`` are precisely ``"google.adk.runners"`` /
@@ -281,20 +281,7 @@ def _flow_entrypoint_designated() -> str | None:
     `[flows] entrypoints` globs are designed for `keel run`'s script-path
     matching (`_flow.match_flow`), not for matching a live Python call site.
     """
-    # Local import: avoids a circular import at module-load time (`bootstrap`
-    # -> `keel.packs` -> this module, since `bootstrap.install_keel` imports
-    # `keel.packs` for `install_mcp_pack`/`present_provider_defaults` — a
-    # module-level `from .. import bootstrap` here would deadlock that chain
-    # the first time either module is imported first; verified by import
-    # order flip: `import keel.packs.adk_pack` before any `keel.bootstrap`
-    # import raised `ImportError: cannot import name 'install_mcp_pack' from
-    # partially initialized module 'keel.packs'`).
-    from .. import bootstrap
-
-    state = bootstrap._STATE.state
-    if state is None:
-        return None
-    for entry in state.get("flow_entrypoints") or ():
+    for entry in _runtime.get_flow_entrypoints():
         if entry.module == "google.adk.runners" and entry.function == "Runner.run_async":
             return entry.raw
     return None
