@@ -39,6 +39,18 @@ use crate::types::{
 /// never drift.
 const SCHEMA: &str = include_str!("../contract/journal.sql");
 
+/// **Do not open a second same-process connection to this file with a
+/// foreign driver** (e.g. Python's stdlib `sqlite3`) while a [`SqliteJournal`]
+/// holds it open. Closing that foreign connection can trigger a
+/// WAL-checkpoint-on-close race that silently drops the still-open core's
+/// pending native (`rusqlite`) writes — confirmed and reproduced 2026-07-16;
+/// discovery narrative in
+/// `docs/superpowers/ledgers/agent-first-class/ws5-task-3-report.md` lines
+/// 147-191 (GitHub issue #14). That race itself is not fixed here; issue #14
+/// instead converts its consequence (a silently-lost terminal-status write)
+/// into a loud, catchable `Journal::complete_flow` error — see
+/// `keel-core`'s `FlowHandle::complete`, the caller that surfaces it.
+///
 /// Per-connection pragmas set on every open. `busy_timeout` MUST come first:
 /// switching a brand-new file into WAL mode briefly needs an exclusive lock,
 /// and when several processes race to open the same fresh path (the exact

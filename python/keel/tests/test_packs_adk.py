@@ -705,7 +705,9 @@ class _FakeAdkFlowBackend:
     a fresh one) well enough to assert correlation without the compiled
     core."""
 
-    def __init__(self, replay: bool = False, persistent: bool = True) -> None:
+    def __init__(
+        self, replay: bool = False, persistent: bool = True, throw_on_exit: bool = False
+    ) -> None:
         self.entered: list[tuple[Any, ...]] = []
         self.exited: list[str] = []
         self.random: dict[str, bytes] = {}
@@ -717,6 +719,9 @@ class _FakeAdkFlowBackend:
         # NEXT enter_flow for that same identity comes back as a replay,
         # modeling the native core substituting the already-recorded steps.
         self._prior_exit_for: dict[tuple[str, str], str] = {}
+        # Models issue #14: exit_flow's own journal WRITE fails, distinct
+        # from whatever outcome the wrapped run_async body itself just had.
+        self._throw_on_exit = throw_on_exit
 
     def enter_flow(
         self,
@@ -739,6 +744,8 @@ class _FakeAdkFlowBackend:
         if self.entered:
             entrypoint, args_hash = self.entered[-1][0], self.entered[-1][1]
             self._prior_exit_for[(entrypoint, args_hash)] = status
+        if self._throw_on_exit:
+            raise KeelError("KEEL-E040", "complete_flow failed: injected failure")
 
     def journal_random(self, key: str, data: bytes) -> bytes:
         return self.random.setdefault(key, data)
@@ -851,6 +858,60 @@ class RunnerFlowWrapTest(AdkTestBase):
         self.assertEqual(backend.exited, ["failed"])
         self.assertFalse(_runtime.in_active_flow(), "flow_active reset after a real failure")
 
+    def test_exit_flow_write_failure_on_success_path_is_reported_not_raised(self) -> None:
+        # Issue #14: exit_flow can now raise a KEEL-E040 when the JOURNAL
+        # WRITE itself fails, distinct from the wrapped run_async body's own
+        # outcome. On the success (`else`) path that failure must degrade to
+        # a stderr line, not propagate out of an async generator the caller
+        # is iterating normally.
+        self.designate()
+        backend = _FakeAdkFlowBackend(throw_on_exit=True)
+        self.use_backend(backend)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1")])
+            with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                events = asyncio.run(
+                    self._drain(
+                        runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                    )
+                )
+            adk_pack.uninstall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(backend.exited, ["completed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active still reset despite the write failure")
+        self.assertIn("KEEL-E040", err.getvalue())
+        self.assertIn("not journaled", err.getvalue())
+
+    def test_exit_flow_write_failure_never_replaces_the_flow_bodys_own_exception(self) -> None:
+        # The critical issue #14 regression this pins: exit_flow("failed")
+        # raising must NOT prevent the wrapped body's real exception from
+        # propagating unchanged — it must not be replaced by the unrelated
+        # journal-write error.
+        self.designate()
+        backend = _FakeAdkFlowBackend(throw_on_exit=True)
+        self.use_backend(backend)
+        boom = RuntimeError("boom")
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(app_name="app", events=[FakeEvent(invocation_id="inv-1"), boom])
+            with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(RuntimeError) as ctx:
+                    asyncio.run(
+                        self._drain(
+                            runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                        )
+                    )
+            adk_pack.uninstall()
+        self.assertIs(ctx.exception, boom, "original exception, never replaced by the journal error")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertIn("KEEL-E040", err.getvalue())
+        self.assertIn("not journaled", err.getvalue())
+
     # -- abandonment (GeneratorExit) -----------------------------------------
 
     def test_abandonment_releases_the_flow_for_in_process_retry(self) -> None:
@@ -900,6 +961,37 @@ class RunnerFlowWrapTest(AdkTestBase):
         self.assertEqual(len(events2), 1, "second turn completes wrapped, not the busy path")
         self.assertEqual(len(backend.entered), 2, "re-entered for the retry, not skipped as busy")
         self.assertEqual(backend.exited, ["failed", "completed"])
+
+    def test_abandonment_exit_flow_write_failure_does_not_break_aclose(self) -> None:
+        # Issue #14: exit_flow("failed") raising inside the GeneratorExit
+        # handler must NOT make gen.aclose() itself raise — ADK's Runner is
+        # not written to expect aclose() to fail, and this handler's own
+        # `raise` (re-raising GeneratorExit to close the generator normally)
+        # must still be what the caller observes.
+        self.designate()
+        backend = _FakeAdkFlowBackend(throw_on_exit=True)
+        self.use_backend(backend)
+        with FakeAdkModules():
+            adk_pack.install()
+            from google.adk.runners import Runner
+
+            runner = Runner(
+                app_name="app",
+                events=[FakeEvent(invocation_id="inv-1"), FakeEvent(invocation_id="inv-1")],
+            )
+
+            async def abandon() -> None:
+                gen = runner.run_async(user_id="u1", session_id="s1", invocation_id="inv-1")
+                await gen.__anext__()
+                await gen.aclose()  # must not raise despite exit_flow failing
+
+            with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+                asyncio.run(abandon())
+            adk_pack.uninstall()
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertFalse(_runtime.in_active_flow(), "flow_active reset despite the write failure")
+        self.assertIn("KEEL-E040", err.getvalue())
+        self.assertIn("not journaled", err.getvalue())
 
     def test_replay_completed_entry_never_demoted(self) -> None:
         # An already-COMPLETED (replayed) flow must never be demoted to

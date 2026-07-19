@@ -319,7 +319,7 @@ async fn flows_land_in_the_policy_selected_journal() {
         })
         .await;
     assert_eq!(out.result, "ok");
-    handle.complete_success();
+    handle.complete_success().unwrap();
     drop(handle);
 
     // The flow row lives in the CUSTOM file, read through a fresh handle.
@@ -520,4 +520,213 @@ impl tracing::Subscriber for WarnCounter {
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A minimal tracing subscriber that counts DEBUG-level events — `flow.rs`
+/// has exactly one (`Drop`'s "flow handle dropped uncompleted" line), so this
+/// is enough to prove a dropped handle was NOT treated as uncompleted,
+/// without pulling in tracing-subscriber.
+#[derive(Debug)]
+struct DebugCounter(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for DebugCounter {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::DEBUG {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A `Journal` that delegates every operation to a real, working
+/// `SqliteJournal` except the ones a test configures it to fail — lets a test
+/// drive a flow to exactly the point issue #14 is about (an entered,
+/// in-progress flow) before injecting the specific write failure the fix must
+/// turn into a loud `Err` instead of a swallowed `warn!`.
+struct SelectiveFailJournal {
+    inner: SqliteJournal<ManualClock>,
+    fail_record_step: bool,
+    fail_complete_flow: bool,
+}
+
+impl Journal for SelectiveFailJournal {
+    fn begin_flow(&self, flow: &NewFlow) -> keel_journal::Result<FlowId> {
+        self.inner.begin_flow(flow)
+    }
+    fn record_step(
+        &self,
+        flow: &FlowId,
+        seq: u64,
+        key: &StepKey,
+        outcome: &StepOutcome,
+    ) -> keel_journal::Result<()> {
+        if self.fail_record_step {
+            return Err(injected_failure());
+        }
+        self.inner.record_step(flow, seq, key, outcome)
+    }
+    fn lookup_step(
+        &self,
+        flow: &FlowId,
+        seq: u64,
+        key: &StepKey,
+    ) -> keel_journal::Result<Option<StepOutcome>> {
+        self.inner.lookup_step(flow, seq, key)
+    }
+    fn step_at(
+        &self,
+        flow: &FlowId,
+        seq: u64,
+    ) -> keel_journal::Result<Option<(StepKey, StepOutcome)>> {
+        self.inner.step_at(flow, seq)
+    }
+    fn get_flow(&self, flow: &FlowId) -> keel_journal::Result<Option<FlowDescriptor>> {
+        self.inner.get_flow(flow)
+    }
+    fn complete_flow(&self, flow: &FlowId, status: FlowStatus) -> keel_journal::Result<()> {
+        if self.fail_complete_flow {
+            return Err(injected_failure());
+        }
+        self.inner.complete_flow(flow, status)
+    }
+    fn incomplete_flows(&self, lease_expired: bool) -> keel_journal::Result<Vec<FlowDescriptor>> {
+        self.inner.incomplete_flows(lease_expired)
+    }
+    fn acquire_lease(
+        &self,
+        flow: &FlowId,
+        holder: &ProcessId,
+        ttl: Duration,
+    ) -> keel_journal::Result<bool> {
+        self.inner.acquire_lease(flow, holder, ttl)
+    }
+    fn put_cache(&self, key: &CacheKey, value: &[u8], ttl: Duration) -> keel_journal::Result<()> {
+        self.inner.put_cache(key, value, ttl)
+    }
+    fn get_cache(&self, key: &CacheKey) -> keel_journal::Result<Option<Vec<u8>>> {
+        self.inner.get_cache(key)
+    }
+}
+
+/// A ready-to-enter flow identity shared by the two issue #14 regression
+/// tests below.
+fn attempt_marker_descriptor() -> FlowIdentity {
+    FlowIdentity {
+        entrypoint: "py:pipeline.ingest:main".to_owned(),
+        args_hash: "a1".to_owned(),
+        explicit_key: None,
+        code_hash: Some("ch-1".to_owned()),
+    }
+}
+
+/// Issue #14: a `complete_flow` write failure must reach the caller as a loud
+/// `Err`, never vanish behind a `warn!` — the exact silent-loss shape the WAL
+/// cross-connection race triggered (discovery narrative:
+/// `docs/superpowers/ledgers/agent-first-class/ws5-task-3-report.md` lines
+/// 147-191). Both terminal-status wrappers must propagate it.
+#[tokio::test(start_paused = true)]
+async fn flow_complete_propagates_journal_write_failure() {
+    let dir = TempDir::new().unwrap();
+    let clock = ManualClock::new(T0);
+    let inner = SqliteJournal::open(dir.path().join("journal.db"), clock.clone()).unwrap();
+    let journal: Arc<dyn Journal> = Arc::new(SelectiveFailJournal {
+        inner,
+        fail_record_step: false,
+        fail_complete_flow: true,
+    });
+    let engine = Arc::new(Engine::new());
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock);
+    let manager = FlowManager::new(engine, journal, clock_dyn, ProcessId::new("host-a:pid-1"));
+
+    let mut handle = manager.enter_flow(&attempt_marker_descriptor()).unwrap();
+    let err = handle
+        .complete_success()
+        .expect_err("a broken journal write must surface as Err, not vanish");
+    assert_eq!(err.code.as_str(), "KEEL-E040");
+
+    let mut handle2 = manager
+        .enter_flow(&FlowIdentity {
+            args_hash: "a2".to_owned(),
+            ..attempt_marker_descriptor()
+        })
+        .unwrap();
+    let err2 = handle2
+        .complete_failed()
+        .expect_err("complete_failed must propagate the same way as complete_success");
+    assert_eq!(err2.code.as_str(), "KEEL-E040");
+}
+
+/// Issue #14: the attempt-counter marker write inside `FlowManager::enter()`
+/// must propagate a journal failure as a loud `Err` too — this site
+/// previously degraded to `warn!` and let `enter()` return `Ok`, the exact
+/// same silent-loss shape `complete_flow` had (see discovery narrative cited
+/// above).
+#[tokio::test(start_paused = true)]
+async fn flow_enter_propagates_attempt_marker_write_failure() {
+    let dir = TempDir::new().unwrap();
+    let clock = ManualClock::new(T0);
+    let inner = SqliteJournal::open(dir.path().join("journal.db"), clock.clone()).unwrap();
+    let journal: Arc<dyn Journal> = Arc::new(SelectiveFailJournal {
+        inner,
+        fail_record_step: true,
+        fail_complete_flow: false,
+    });
+    let engine = Arc::new(Engine::new());
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock);
+    let manager = FlowManager::new(engine, journal, clock_dyn, ProcessId::new("host-a:pid-1"));
+
+    let err = manager
+        .enter_flow(&attempt_marker_descriptor())
+        .expect_err("a broken attempt-counter write must fail enter(), not vanish");
+    assert_eq!(err.code.as_str(), "KEEL-E040");
+}
+
+/// Issue #14, the `self.completed` invariant: `FlowHandle::complete`'s
+/// rustdoc promises `self.completed` is set regardless of the journal
+/// write's outcome, specifically so `Drop` does not ALSO treat a
+/// deliberately-failed-write handle as an uncompleted, crash-shaped one (that
+/// would double-report the same failure two different ways — once as the
+/// `Err` the caller already saw, once again as a spurious "left running for
+/// recovery" log line for a flow that is, from the handle's perspective,
+/// done). A regression that moved `self.completed = true` into the
+/// success-only branch would leave `Drop`'s DEBUG event firing here.
+#[tokio::test(start_paused = true)]
+async fn flow_complete_failure_still_marks_the_handle_completed_on_drop() {
+    let debugs = Arc::new(AtomicUsize::new(0));
+    let dispatch = tracing::Dispatch::new(DebugCounter(debugs.clone()));
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let dir = TempDir::new().unwrap();
+    let clock = ManualClock::new(T0);
+    let inner = SqliteJournal::open(dir.path().join("journal.db"), clock.clone()).unwrap();
+    let journal: Arc<dyn Journal> = Arc::new(SelectiveFailJournal {
+        inner,
+        fail_record_step: false,
+        fail_complete_flow: true,
+    });
+    let engine = Arc::new(Engine::new());
+    let clock_dyn: Arc<dyn Clock> = Arc::new(clock);
+    let manager = FlowManager::new(engine, journal, clock_dyn, ProcessId::new("host-a:pid-1"));
+
+    let mut handle = manager.enter_flow(&attempt_marker_descriptor()).unwrap();
+    handle
+        .complete_success()
+        .expect_err("journal is configured to fail complete_flow");
+    drop(handle);
+
+    assert_eq!(
+        debugs.load(Ordering::SeqCst),
+        0,
+        "a failed complete() must still set self.completed so Drop does not \
+         also log the handle as crashed/uncompleted"
+    );
 }

@@ -541,10 +541,13 @@ pub fn run(project: &Path, options: &ExecOptions) -> (Option<Rendered>, i32) {
 
     // 7. Live run.
     let result = live_run(journal.as_ref(), &flow_id, &step_key, options);
-    if result.exit_code == 0 && !result.spawn_failed {
-        handle.complete_success();
+    let completion = if result.exit_code == 0 && !result.spawn_failed {
+        handle.complete_success()
     } else {
-        handle.complete_failed();
+        handle.complete_failed()
+    };
+    if let Err(e) = completion {
+        eprintln!("keel \u{25b8} exec: flow {flow_id} terminal status not journaled: {e}");
     }
     let code = result.exit_code;
     let report = ExecReport {

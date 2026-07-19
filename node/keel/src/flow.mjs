@@ -153,6 +153,27 @@ function isTruthy(v) {
   return ["1", "true", "yes"].includes(String(v ?? "").trim().toLowerCase());
 }
 
+/** Stamp the flow's terminal `status`, degrading a journal-WRITE failure
+ *  (issue #14: `exitFlow` can now throw a `KEEL-E040` when the journal write
+ *  itself fails) to a stderr line instead of letting it become a new
+ *  exception thrown out of `runAsFlow`'s `catch` block. Every caller of this
+ *  helper is already handling the flow body's OWN outcome (a real exception,
+ *  the one this module's docs promise is "still printed via `console.error`
+ *  first") — a *second, unrelated* journal error thrown here would replace
+ *  it before that `console.error` ever runs, discarding the actual bug
+ *  behind a generic Node "uncaught (in promise)" dump of the journal error
+ *  instead. The write failure is still reported — never silently
+ *  swallowed — just not as a stand-in for whatever the caller is handling. */
+function exitFlowOrWarn(backend, status) {
+  try {
+    backend.exitFlow(status);
+  } catch (err) {
+    const code = err?.code ?? "KEEL-E040";
+    const message = err?.message ?? String(err);
+    process.stderr.write(`keel ▸ ${code}: flow terminal status not journaled: ${message}\n`);
+  }
+}
+
 /** Emit the precise what/why/next error (KEEL-E005) for a flow under a
  *  non-native backend and terminate (Tier 2 requires the native core). The
  *  policy is valid; the capability is missing — unsupported-configuration,
@@ -229,16 +250,19 @@ export async function runAsFlow(targetPath, entry, backend, args, { env = proces
     await fn();
   } catch (err) {
     restore();
+    // The flow body's own exception is printed FIRST, unconditionally — see
+    // `exitFlowOrWarn`'s docs for why this must not be reordered after the
+    // (now-fallible) terminal-status write.
+    console.error(err);
     // Never demote an already-COMPLETED (replayed) flow to `failed` — a
     // replay-miss (KEEL-E031) after a code change, or any error while
     // re-running finished code, must not re-open a done flow for live
     // re-execution (nor march it toward `dead`).
-    if (!replayed) backend.exitFlow("failed");
-    console.error(err);
+    if (!replayed) exitFlowOrWarn(backend, "failed");
     process.exit(1);
     return;
   }
   restore();
-  backend.exitFlow("completed");
+  exitFlowOrWarn(backend, "completed");
   process.exit(0);
 }

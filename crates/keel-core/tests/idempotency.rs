@@ -223,7 +223,7 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
         .await;
     assert_eq!(out.result, "ok");
     assert_eq!(out.attempts, 1);
-    handle.complete_success();
+    handle.complete_success().unwrap();
 
     // The step is now terminal; its payload is the outcome, and the peek no
     // longer surfaces a key (a terminal step is substituted, never re-sent).
@@ -256,7 +256,7 @@ async fn steps_without_a_key_journal_no_payload_while_running() {
         )
         .await;
     assert_eq!(out.result, "ok");
-    handle.complete_success();
+    handle.complete_success().unwrap();
 
     // Re-entering a completed flow is pure replay: the peek always misses.
     let replay = fx.manager.enter_flow(&fx.desc).expect("pure replay");

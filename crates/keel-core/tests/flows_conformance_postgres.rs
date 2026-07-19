@@ -234,8 +234,8 @@ async fn run_flow_scenario(scn: &FlowScenario, journal: Arc<dyn Journal>) -> Vec
             }
         }
         match run.end {
-            RunEnd::Success => handle.complete_success(),
-            RunEnd::Failed => handle.complete_failed(),
+            RunEnd::Success => handle.complete_success().unwrap(),
+            RunEnd::Failed => handle.complete_failed().unwrap(),
             RunEnd::Crash => {
                 drop(handle);
                 // No virtual clock to advance for a Postgres-backed lease

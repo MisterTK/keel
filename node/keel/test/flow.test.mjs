@@ -158,9 +158,11 @@ class FakeFlowBackend {
   times = [];
   persistent;
   #replay;
-  constructor({ replay = false, persistent = true } = {}) {
+  #throwOnExit;
+  constructor({ replay = false, persistent = true, throwOnExit = false } = {}) {
     this.#replay = replay;
     this.persistent = persistent;
+    this.#throwOnExit = throwOnExit;
   }
   enterFlow(entrypoint, argsHash, opts = {}) {
     this.entered.push([entrypoint, argsHash, opts]);
@@ -172,6 +174,13 @@ class FakeFlowBackend {
   }
   exitFlow(status) {
     this.exited.push(status);
+    if (this.#throwOnExit) {
+      // Models issue #14: exitFlow's own journal WRITE fails, distinct from
+      // whatever outcome the flow body itself just had.
+      const err = new Error("complete_flow failed: injected failure (KEEL-E040)");
+      err.code = "KEEL-E040";
+      throw err;
+    }
   }
   journalTime(key, nowMs) {
     this.times.push(nowMs);
@@ -275,6 +284,93 @@ test("runAsFlow: a replayed (already-completed) flow is never demoted on error",
     console.error = origError;
   }
   assert.deepEqual(backend.exited, [], "completed flow must not be demoted to failed");
+});
+
+test("runAsFlow: a journal-write failure on exitFlow (success path) does not crash the process", async (t) => {
+  // Issue #14: exitFlow can now throw a KEEL-E040 when the JOURNAL WRITE
+  // itself fails, distinct from the flow body's own outcome. On the success
+  // path that failure must degrade to a stderr line, not propagate and turn
+  // a working flow into an uncaught exception.
+  const dir = mkdtempSync(join(tmpdir(), "keel-flow-run-exit-fail-ok-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const entry = writeModule(dir, "flowmod_exit_fail_ok", `export function main() {}\n`);
+  const backend = new FakeFlowBackend({ throwOnExit: true });
+  const origExit = process.exit;
+  const origStderr = process.stderr.write;
+  let exitCode;
+  const stderrLines = [];
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__process_exit__");
+  };
+  process.stderr.write = (chunk) => {
+    stderrLines.push(String(chunk));
+    return true;
+  };
+  try {
+    await assert.rejects(
+      runAsFlow(join(dir, "flowmod_exit_fail_ok.mjs"), entry, backend, [], { env: { KEEL_QUIET: "1" } }),
+      /__process_exit__/
+    );
+  } finally {
+    process.exit = origExit;
+    process.stderr.write = origStderr;
+  }
+  assert.equal(exitCode, 0, "the flow body succeeded; a journal-write failure must not flip this to non-zero");
+  assert.deepEqual(backend.exited, ["completed"]);
+  assert.ok(
+    stderrLines.some((l) => l.includes("KEEL-E040") && l.includes("not journaled")),
+    "the journal-write failure is still reported, just not as a crash"
+  );
+});
+
+test("runAsFlow: a journal-write failure on exitFlow never replaces the flow body's own exception", async (t) => {
+  // The critical issue #14 regression this pins: exitFlow("failed") throwing
+  // must NOT prevent the flow body's real exception from being printed, nor
+  // replace it as the exception that propagates out of runAsFlow.
+  const dir = mkdtempSync(join(tmpdir(), "keel-flow-run-exit-fail-err-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const entry = writeModule(
+    dir,
+    "flowmod_exit_fail_err",
+    `export function main() { throw new Error("the real bug"); }\n`
+  );
+  const backend = new FakeFlowBackend({ throwOnExit: true });
+  const origExit = process.exit;
+  const origError = console.error;
+  const origStderr = process.stderr.write;
+  let exitCode;
+  const consoleErrors = [];
+  const stderrLines = [];
+  process.exit = (code) => {
+    exitCode = code;
+    throw new Error("__process_exit__");
+  };
+  console.error = (err) => {
+    consoleErrors.push(err);
+  };
+  process.stderr.write = (chunk) => {
+    stderrLines.push(String(chunk));
+    return true;
+  };
+  try {
+    await assert.rejects(
+      runAsFlow(join(dir, "flowmod_exit_fail_err.mjs"), entry, backend, [], { env: { KEEL_QUIET: "1" } }),
+      /__process_exit__/
+    );
+  } finally {
+    process.exit = origExit;
+    console.error = origError;
+    process.stderr.write = origStderr;
+  }
+  assert.equal(exitCode, 1);
+  assert.deepEqual(backend.exited, ["failed"], "exitFlow was still attempted despite the earlier body error");
+  assert.equal(consoleErrors.length, 1, "the flow body's real exception must still reach console.error");
+  assert.equal(consoleErrors[0]?.message, "the real bug");
+  assert.ok(
+    stderrLines.some((l) => l.includes("KEEL-E040") && l.includes("not journaled")),
+    "the journal-write failure is still reported, just not as a substitute for the real bug"
+  );
 });
 
 test("runAsFlow: stub backend (no enterFlow/exitFlow) is a precise unsupported error", async () => {

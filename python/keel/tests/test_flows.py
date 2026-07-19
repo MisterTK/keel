@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import io
 import sqlite3
 import sys
 import tempfile
@@ -26,8 +27,10 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from keel import _flow
+from keel._errors import KeelError
 from keel._policy import FlowEntrypoint, extract_flow_entrypoints
 
 try:
@@ -204,7 +207,9 @@ class _FakeFlowBackend:
     """A native-shaped double: records enter/exit and routes execute + value
     steps, so `run_as_flow` is testable without the compiled core."""
 
-    def __init__(self, replay: bool = False, persistent: bool = True) -> None:
+    def __init__(
+        self, replay: bool = False, persistent: bool = True, throw_on_exit: bool = False
+    ) -> None:
         self.entered: list[tuple] = []
         self.exited: list[str] = []
         self.executed = 0
@@ -213,6 +218,9 @@ class _FakeFlowBackend:
         # Models a native core with a journal attached (Tier 2 available). Set
         # False to model a native core with no journal (the fix-#2 gate).
         self.persistent = persistent
+        # Models issue #14: exit_flow's own journal WRITE fails, distinct
+        # from whatever outcome the flow body itself just had.
+        self._throw_on_exit = throw_on_exit
 
     def enter_flow(self, entrypoint, args_hash, code_hash=None, explicit_key=None, lease_ms=None):
         self.entered.append((entrypoint, args_hash, code_hash, lease_ms))
@@ -221,6 +229,9 @@ class _FakeFlowBackend:
 
     def exit_flow(self, status: str) -> None:
         self.exited.append(status)
+        if self._throw_on_exit:
+            exc = KeelError("KEEL-E040", "complete_flow failed: injected failure")
+            raise exc
 
     def execute(self, request, effect):
         self.executed += 1
@@ -304,6 +315,58 @@ class RunAsFlowTest(unittest.TestCase):
                 str(self.dir / "flowmod_boom.py"), entry, backend, [], env={"KEEL_QUIET": "1"}
             )
         self.assertEqual(backend.exited, ["failed"])
+
+    def test_exit_flow_write_failure_on_success_path_is_reported_not_raised(self) -> None:
+        # Issue #14: exit_flow can now raise a KEEL-E040 when the JOURNAL
+        # WRITE itself fails, distinct from the flow body's own outcome. On
+        # the success path that failure must degrade to a stderr line, not
+        # propagate and turn a working flow into an unhandled exception.
+        entry = self._module(
+            "flowmod_exit_fail_ok",
+            """
+            def main():
+                pass
+            """,
+        )
+        backend = _FakeFlowBackend(throw_on_exit=True)
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            _flow.run_as_flow(
+                str(self.dir / "flowmod_exit_fail_ok.py"),
+                entry,
+                backend,
+                [],
+                env={"KEEL_QUIET": "1"},
+            )
+        self.assertEqual(backend.exited, ["completed"])
+        self.assertIn("KEEL-E040", err.getvalue())
+        self.assertIn("not journaled", err.getvalue())
+
+    def test_exit_flow_write_failure_never_replaces_the_flow_bodys_own_exception(self) -> None:
+        # The critical issue #14 regression this pins: exit_flow("failed")
+        # raising must NOT prevent the flow body's real exception from
+        # propagating unchanged (DX invariant 5) — it must not be replaced
+        # by the unrelated journal-write error.
+        entry = self._module(
+            "flowmod_exit_fail_err",
+            """
+            def main():
+                raise ValueError("the real bug")
+            """,
+        )
+        backend = _FakeFlowBackend(throw_on_exit=True)
+        with mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(ValueError) as ctx:
+                _flow.run_as_flow(
+                    str(self.dir / "flowmod_exit_fail_err.py"),
+                    entry,
+                    backend,
+                    [],
+                    env={"KEEL_QUIET": "1"},
+                )
+        self.assertEqual(str(ctx.exception), "the real bug")
+        self.assertEqual(backend.exited, ["failed"])
+        self.assertIn("KEEL-E040", err.getvalue())
+        self.assertIn("not journaled", err.getvalue())
 
     def test_clean_sys_exit_completes_not_fails(self) -> None:
         # sys.exit(0) is the ordinary success exit — it must complete the flow,

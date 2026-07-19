@@ -546,8 +546,8 @@ async fn run_one(
         rig.held.insert(run.holder.clone(), handle);
     } else {
         match run.end {
-            RunEnd::Success => handle.complete_success(),
-            RunEnd::Failed => handle.complete_failed(),
+            RunEnd::Success => handle.complete_success().unwrap(),
+            RunEnd::Failed => handle.complete_failed().unwrap(),
             RunEnd::Crash => {
                 drop(handle);
                 rig.clock.advance(PAST_LEASE_TTL_MS);

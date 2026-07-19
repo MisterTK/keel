@@ -360,12 +360,19 @@ impl FlowManager {
             started_at: now,
             ended_at: Some(now),
         };
-        if let Err(e) =
-            self.journal
-                .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
-        {
-            warn!(flow = %flow_id, error = %e, "attempt-counter record failed");
-        }
+        // NOTE: a failure here returns `Err` (issue #14) *after* `acquire_lease`
+        // above already succeeded, but before the heartbeat that would renew it
+        // exists. `Journal` has no explicit lease-release op — the lease is only
+        // ever cleared by `complete_flow` — so this orphans it for up to
+        // `lease_ttl`. That's an existing, self-healing failure mode (the same
+        // shape a crash between `acquire_lease` and heartbeat spawn already has:
+        // `incomplete_flows(lease_expired=true)` reclaims it once the TTL lapses),
+        // not a new correctness bug; it's called out here only because propagating
+        // this write loudly (rather than the old `warn!`-and-continue) is what
+        // makes the orphan possible in the first place.
+        self.journal
+            .record_step(flow_id, ATTEMPT_SEQ, &StepKey::new(ATTEMPT_KEY), &marker)
+            .map_err(|e| internal(format!("attempt-counter record failed: {e}")))?;
 
         // Replay is fenced when the recorded code differs from what is running
         // now: a divergence under a changed deploy downgrades fail→warn (§4.4).
@@ -991,21 +998,36 @@ impl FlowHandle {
     /// second call re-stamps the status — except a `completed` flow is immutable
     /// at the journal (`complete_flow` refuses to demote it), so re-running a
     /// finished flow can never flip it to `failed`/`dead`.
-    pub fn complete(&mut self, status: FlowStatus) {
-        if let Err(e) = self.journal.complete_flow(&self.flow_id, status) {
-            warn!(flow = %self.flow_id, error = %e, "complete_flow failed");
-        }
+    ///
+    /// Unlike [`Self::record`], a failed write here is NOT degraded to a
+    /// `warn!` — it is returned as a `KEEL-E040` [`KeelError`] (issue #14: a
+    /// same-process foreign SQLite connection opened and closed against a live
+    /// journal.db can trigger a WAL-checkpoint-on-close race that silently
+    /// drops a still-open core's pending native writes; see
+    /// `docs/superpowers/ledgers/agent-first-class/ws5-task-3-report.md` for
+    /// the discovery narrative). Losing the terminal-status write is a
+    /// correctness bug (the journal can permanently disagree with the caller
+    /// about how the flow ended), so it must reach the caller loudly instead
+    /// of vanishing into a log line. `self.completed` is set regardless of
+    /// success or failure: a completed attempt is "done" from the handle's
+    /// perspective either way, and `Drop` should not also complain about it.
+    pub fn complete(&mut self, status: FlowStatus) -> Result<(), KeelError> {
+        let result = self
+            .journal
+            .complete_flow(&self.flow_id, status)
+            .map_err(|e| internal(format!("complete_flow failed: {e}")));
         self.completed = true;
+        result
     }
 
     /// Mark the flow `completed` (the success scope exit).
-    pub fn complete_success(&mut self) {
-        self.complete(FlowStatus::Completed);
+    pub fn complete_success(&mut self) -> Result<(), KeelError> {
+        self.complete(FlowStatus::Completed)
     }
 
     /// Mark the flow `failed` (a non-retryable failure exit).
-    pub fn complete_failed(&mut self) {
-        self.complete(FlowStatus::Failed);
+    pub fn complete_failed(&mut self) -> Result<(), KeelError> {
+        self.complete(FlowStatus::Failed)
     }
 }
 
