@@ -156,6 +156,27 @@ function conditionMatches(cond, cls, httpStatus) {
   return /^\d{3}$/.test(cond) && Number(cond) === httpStatus;
 }
 
+// Canonical-shape base64 (RFC 4648 §4): full 4-char groups, correct final
+// padding. Necessary but not sufficient — see strictBase64Decode.
+const B64_STRICT_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$/;
+
+/** Base64-decode `s`, rejecting anything that would not round-trip back to
+ *  `s` under canonical re-encoding — parity with keel-core's Rust
+ *  `base64::engine::general_purpose::STANDARD.decode`, which rejects
+ *  embedded/foreign characters AND non-canonical padding bits (e.g.
+ *  `"AB=="`, which decodes to the same byte as canonical `"AA=="` but isn't
+ *  itself canonical). Node's `Buffer.from(s, "base64")` is lenient on both
+ *  counts by default, so it cannot be used alone here. Returns `null` on
+ *  any rejection. */
+function strictBase64Decode(s) {
+  if (typeof s !== "string" || s.length === 0 || s.length % 4 !== 0 || !B64_STRICT_RE.test(s)) {
+    return null;
+  }
+  const buf = Buffer.from(s, "base64");
+  return buf.toString("base64") === s ? buf : null;
+}
+
 /** Judge one successful poll iteration's payload: "terminal" | "pending" |
  *  "fail_open". Parity with keel-core's `poll_verdict`
  *  (conformance/README.md "Poll"). */
@@ -164,9 +185,11 @@ function pollVerdict(poll, payload) {
   let doc = payload;
   if ("body_b64" in payload || ("status" in payload && "headers" in payload)) {
     if (typeof payload.body_b64 !== "string") return "fail_open";
+    const decoded = strictBase64Decode(payload.body_b64);
+    if (decoded === null) return "fail_open";
     let parsed;
     try {
-      parsed = JSON.parse(Buffer.from(payload.body_b64, "base64").toString("utf8"));
+      parsed = JSON.parse(decoded.toString("utf8"));
     } catch {
       return "fail_open";
     }

@@ -273,6 +273,23 @@ def _condition_matches(cond: str, cls: str, http_status: int | None) -> bool:
     return len(cond) == 3 and cond.isdigit() and int(cond) == http_status
 
 
+def _strict_b64decode(s: str) -> bytes | None:
+    """Base64-decode `s`, rejecting anything that would not round-trip back
+    to `s` under canonical re-encoding — parity with keel-core's Rust
+    ``base64::engine::general_purpose::STANDARD.decode``, which rejects
+    embedded/foreign characters AND non-canonical padding bits (e.g.
+    ``"AB=="``, which decodes to the same byte as canonical ``"AA=="`` but
+    isn't itself canonical). Python's default decoder is lenient on both
+    counts, and ``validate=True`` alone only catches the former — it still
+    accepts non-canonical padding bits — so it cannot be used alone here.
+    Returns ``None`` on any rejection."""
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except Exception:
+        return None
+    return raw if base64.b64encode(raw).decode("ascii") == s else None
+
+
 def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
     """Judge one successful iteration's payload: "terminal" | "pending" |
     "fail_open". Parity with keel-core's ``poll_verdict``
@@ -284,8 +301,11 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
         b64 = payload.get("body_b64")
         if not isinstance(b64, str):
             return "fail_open"
+        decoded = _strict_b64decode(b64)
+        if decoded is None:
+            return "fail_open"
         try:
-            parsed = json.loads(base64.b64decode(b64))
+            parsed = json.loads(decoded)
         except Exception:
             return "fail_open"
         if not isinstance(parsed, dict):

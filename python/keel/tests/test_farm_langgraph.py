@@ -3,8 +3,10 @@
 Runs ONLY under KEEL_ADAPTER_FARM=1 (see test_farm_adk.py's module docs for
 the full convention). The offline fast path is tests/test_packs_langgraph.py
 against structural fakes. This module certifies, on the real package
-(langgraph 1.0.10 — the latest 1.0.x release at certification time; see
-ws3-task-1-report.md for the exact pin Task 2's matrix freezes):
+(langgraph 1.2.9 — the latest 1.2.x release at certification time, extending
+the certified range from 1.0 through 1.1/1.2 per issue #18; verified in a
+scratch venv against both 1.1.9 and 1.2.9 before landing — see the farm
+job's `version:` pin for the exact version CI runs):
 
 * ``StateGraph.add_node`` binds BOTH overloads
   (``add_node(fn)`` / ``add_node("name", fn)``) via
@@ -24,9 +26,14 @@ ws3-task-1-report.md for the exact pin Task 2's matrix freezes):
   documented refusal, langgraph_pack.py:302-321), even against the real
   ``BaseCheckpointSaver`` base class.
 
-No adjustment to the pack's calls was needed against the real 1.0.10 API —
-``StateGraph.add_node``'s signature and every ``BaseCheckpointSaver`` abstract
-method matched the module's documented assumptions exactly.
+No adjustment to the pack's calls was needed against the real 1.2.9 API —
+``StateGraph.add_node`` gained several new keyword-only parameters since 1.0
+(``defer``, ``input_schema``, ``retry_policy``, ``cache_policy``,
+``error_handler``, ``destinations``, ``timeout``) but the wrapper binds via
+``inspect.signature(orig).bind`` against only the ``node``/``action`` names
+(langgraph_pack.py's ``_make_add_node_wrapper``), so the extra parameters
+pass through untouched; every ``BaseCheckpointSaver`` abstract method still
+matched the module's documented assumptions exactly.
 """
 
 from __future__ import annotations
