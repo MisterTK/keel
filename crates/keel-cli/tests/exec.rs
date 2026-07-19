@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use keel_cli::render::json_string;
+
 /// Seed a `flows` row directly (the technique `resume`-style tests use to
 /// simulate a foreign holder) so on_busy/dead-PID paths can be exercised
 /// without a second real process. `flow_id` MUST be derived via
@@ -195,6 +197,73 @@ fn exec_runs_a_command_as_a_flow_and_replays_when_completed() {
         .query_row("SELECT kind FROM steps WHERE seq = 1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kind, "subprocess");
+}
+
+/// Issue #29 ("exec/poll test hardening"): `keel trace` has its own `mod
+/// tests` in `src/flows.rs`, but every fixture it exercises there
+/// (`conformance/fixtures/journal/*.sql`) is a hand-built `py:` flow — none
+/// represents a `cmd:` flow, the kind `keel exec` creates. Rather than
+/// hand-writing new SQL rows for a `cmd:` shape (and risking it drift from
+/// what `exec.rs::live_run` actually journals), drive a REAL command through
+/// `keel_cli::exec::run` to get a genuine `cmd:` flow on a real journal, then
+/// read it back through the real `flows::trace` path a `keel trace <flow>`
+/// invocation would take.
+#[test]
+fn trace_reflects_a_completed_cmd_flow() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path();
+    let options = keel_cli::exec::ExecOptions {
+        flow: "traced".into(),
+        flow_id: None,
+        journal_files: vec![],
+        force: false,
+        command: vec!["/bin/sh".into(), "-c".into(), "echo hi".into()],
+    };
+    let (_r, code) = keel_cli::exec::run(project, &options);
+    assert_eq!(code, 0);
+
+    // "traced" is a unique substring of the `cmd:traced` entrypoint in this
+    // fresh journal, so it resolves exactly like `keel trace traced` would.
+    let r = keel_cli::flows::trace(project, "traced");
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "trace failed: {}", r.human);
+    assert_eq!(r.json["entrypoint"], "cmd:traced");
+    assert_eq!(r.json["status"], "completed");
+
+    let steps = r.json["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "a cmd: flow journals exactly one step");
+    let step = &steps[0];
+    assert_eq!(step["seq"], 1);
+    // exec.rs::live_run journals the command as a `Subprocess`-kind step —
+    // that, its outcome, and its attempt count are what `keel trace` actually
+    // surfaces for a cmd: flow (the step's exit-code/stdout-tail payload is
+    // not part of the TraceStep/TraceReport shape trace() reads).
+    assert_eq!(step["kind"], "subprocess");
+    let step_key = step["step_key"].as_str().expect("step_key is a string");
+    assert!(
+        step_key.starts_with("cmd:"),
+        "a cmd: flow's step key must start with `cmd:`, got {step_key:?}"
+    );
+    assert_eq!(step["outcome"], "ok");
+    assert_eq!(step["attempt"], 1);
+    assert!(
+        step["duration_ms"].as_i64().is_some_and(|ms| ms >= 0),
+        "a completed step has a non-negative duration: {:?}",
+        step["duration_ms"]
+    );
+    assert!(!step["ended_at"].is_null());
+
+    // The human view reflects the same real data.
+    assert!(r.human.contains("subprocess"));
+    assert!(r.human.contains(step_key));
+    assert!(r.human.contains("completed"));
+
+    // Round-trips through `render::json_string` the same way every other
+    // flow kind's trace report does (this is the exact call `keel trace
+    // --json` and the `get_trace` MCP tool both make over this report —
+    // see `render::emit` and `mcp.rs`'s `get_trace` handler).
+    let text = json_string(&r.json);
+    let reparsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(reparsed, r.json, "json_string must round-trip losslessly");
 }
 
 #[test]
