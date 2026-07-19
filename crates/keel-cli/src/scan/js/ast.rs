@@ -109,6 +109,23 @@ fn classify(specifier: &str) -> Option<LibClass> {
     }
 }
 
+/// Known Node resilience libraries — the Node parity to [`super::python`]'s
+/// `RESILIENCE_LIBS` (tenacity/backoff/retrying/stamina): a `keel doctor`
+/// signal that a target may already have its own retry/backoff, separate
+/// from `classify` (which is about libraries Keel *adapts* — these are
+/// libraries Keel never adapts, so mixing them into `classify`'s result
+/// would misclassify them as an "invisible" coverage gap, same rationale as
+/// [`LangFindings::resilience_libs`]'s doc). `got`'s built-in `retry` option
+/// is a different (non-import-based) detection shape and deliberately out of
+/// scope here.
+fn resilience_lib_name(specifier: &str) -> Option<&'static str> {
+    match package_name(specifier) {
+        "p-retry" => Some("p-retry"),
+        "async-retry" => Some("async-retry"),
+        _ => None,
+    }
+}
+
 /// The package name of a specifier: both segments for a scoped package, the
 /// first segment otherwise. `node:` specifiers pass through unchanged.
 fn package_name(specifier: &str) -> &str {
@@ -291,7 +308,10 @@ impl ScanVisitor<'_> {
     /// and `worker_threads` are not effect libraries (no `classify` match —
     /// they are not network clients) but they defeat replay outright, so they
     /// are checked here as a separate, additional signal that does not affect
-    /// `http_in_use`/`libs`.
+    /// `http_in_use`/`libs`. A resilience-library import (`p-retry`,
+    /// `async-retry`) is the same kind of separate signal — recorded
+    /// independently of `classify`, since these are never Keel-adapted
+    /// effect libraries either.
     fn record_import(&mut self, specifier: &str, offset: u32) -> Option<LibClass> {
         if specifier.starts_with("./") || specifier.starts_with("../") {
             self.extras.relative_imports.push(specifier.to_owned());
@@ -304,6 +324,9 @@ impl ScanVisitor<'_> {
             self.extras.functions[idx]
                 .unsafe_reasons
                 .push(format!("{specifier} use at {}:{line}", self.rel));
+        }
+        if let Some(name) = resilience_lib_name(specifier) {
+            self.findings.resilience_libs.insert(name.to_owned());
         }
         let class = classify(specifier)?;
         self.record_lib(class, offset);

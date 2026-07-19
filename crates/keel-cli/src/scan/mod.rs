@@ -205,8 +205,8 @@ pub struct ScanResult {
     /// Per-function attribution (see [`FunctionFacts`]), sorted by
     /// `(file, line)` — deterministic across runs.
     pub functions: Vec<FunctionFacts>,
-    /// Known resilience-library names detected (Python-only as of this
-    /// build — see [`LangFindings::resilience_libs`]).
+    /// Known resilience-library names detected, across both languages (see
+    /// [`LangFindings::resilience_libs`]).
     pub resilience_libs: BTreeSet<String>,
     /// Best-known [`TransportClass`] per sighted host, merged across every
     /// file and language that sighted it (minimum = best class wins). Unlike

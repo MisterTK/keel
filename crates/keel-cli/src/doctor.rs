@@ -424,11 +424,11 @@ pub fn run(project: &Path) -> Rendered {
 /// one adapter library Keel wraps (`registry_libs`): a resilience library
 /// imported for something unrelated to any Keel-wrapped effect is not
 /// evidence of compounding, and flagging it anyway would be a false
-/// positive that erodes trust in doctor's other findings. Python-only as of
-/// this build (`scan::python`'s `RESILIENCE_LIBS`) — Node has no equivalent
-/// signal today (Keel doesn't even adapt `axios`, the library most
-/// associated with `axios-retry`), documented as accepted debt rather than
-/// silently absent.
+/// positive that erodes trust in doctor's other findings. Detected in both
+/// languages: `scan::python`'s `RESILIENCE_LIBS` (tenacity/backoff/
+/// retrying/stamina) and `scan::js`'s equivalent (p-retry/async-retry) —
+/// `got`'s built-in `retry` option is a different, non-import-based signal
+/// and not covered here.
 fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Option<Finding> {
     let compounds_with = scan
         .libs

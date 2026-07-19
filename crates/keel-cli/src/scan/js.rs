@@ -356,6 +356,29 @@ mod tests {
     }
 
     #[test]
+    fn resilience_lib_imports_are_detected_separately_from_known_libs() {
+        // Node parity to python.rs's
+        // `resilience_lib_imports_are_detected_separately_from_known_libs`.
+        let f = findings(
+            "import { request } from \"undici\";\nimport pRetry from \"p-retry\";\n\
+             const retry = require(\"async-retry\");\n",
+        );
+        assert_eq!(
+            f.resilience_libs,
+            ["async-retry".to_owned(), "p-retry".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        // Resilience libs never pollute `libs` (which feeds doctor's
+        // "invisible/unadapted effect library" coverage classification —
+        // p-retry/async-retry were never adapter candidates), and they don't
+        // gate `http_in_use` the way a real effect-library import does.
+        assert!(!f.libs.contains("p-retry"));
+        assert!(!f.libs.contains("async-retry"));
+        assert!(f.libs.contains("undici"));
+    }
+
+    #[test]
     fn axios_default_import_call_sites() {
         let f = findings(
             "import axios from \"axios\";\nawait axios.get(\"https://api.example.com\");\n",
