@@ -209,6 +209,27 @@ class HardRulesTest(UrllibBase):
             self.assertEqual(ctx.exception.keel_outcome["error"]["code"], "KEEL-E014")
             self.assertEqual(srv.served, 1)
 
+    def test_explicit_idempotent_method_on_request_is_retried_without_key(self) -> None:
+        # Method now comes from `req.get_method()` (delegated to stdlib), so
+        # an explicit idempotent method wins over the POST-if-body default —
+        # even across the pre-fold timing boundary. `urlopen(Request(url,
+        # method="PUT"), data=b"x")` is a keyless idempotent PUT: Keel must
+        # retry it, not misjudge it as a keyless POST (which would E014).
+        with FaultServer([fail(503), ok(b"put-through")]) as srv:
+            req = urllib.request.Request(srv.url(), method="PUT")
+            with urllib.request.urlopen(req, data=b"x") as r:
+                self.assertEqual(r.read(), b"put-through")
+                self.assertEqual(r.keel_outcome["attempts"], 2)
+
+    def test_bare_request_with_no_data_is_judged_as_idempotent_get(self) -> None:
+        # The no-body branch of `get_method()`: a `Request` with neither an
+        # explicit method nor data resolves to GET (idempotent), so a 5xx is
+        # retried without any key.
+        with FaultServer([fail(503), ok(b"got")]) as srv:
+            with urllib.request.urlopen(urllib.request.Request(srv.url())) as r:
+                self.assertEqual(r.read(), b"got")
+                self.assertEqual(r.keel_outcome["attempts"], 2)
+
     def test_post_with_idempotency_key_is_retried(self) -> None:
         with FaultServer([fail(503), ok(b"posted")]) as srv:
             req = urllib.request.Request(
