@@ -16,8 +16,13 @@ we state them honestly rather than uniformly:
   no long-lived tokens). PyPI records the publishing workflow identity.
 - **npm** (`keelrun`, `keelrun-cli`, per-platform binaries): published from
   GitHub Actions with a registry token. npm provenance attestations
-  (`npm publish --provenance`) are **not yet enabled** — tracked as a
-  release-infrastructure follow-up.
+  (`npm publish --provenance`) are generated, backed by the publish job's
+  `id-token: write` OIDC permission — the same OIDC trust root as the PyPI
+  bullet above, though the parity is partial: npm still authenticates the
+  publish with a registry token, and only the provenance metadata is
+  OIDC-signed (PyPI needs no token at all). Enabled as a post-v0.3.0
+  release-infrastructure follow-up, effective from the next published
+  release onward.
 - **crates.io** (6 crates): published manually from a maintainer machine
   with a local token, in dependency order. No provenance attestation exists
   for crates.io artifacts beyond crates.io's own publish log.
