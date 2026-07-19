@@ -7,6 +7,11 @@
   "main": "keelrun-core-native.linux-x64-gnu.node",
   "files": ["keelrun-core-native.linux-x64-gnu.node"],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisterTK/keel.git",
+    "directory": "node/keel-core-native/npm/linux-x64-gnu"
+  },
   "engines": {
     "node": ">=20"
   }

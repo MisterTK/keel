@@ -2,6 +2,11 @@
   "name": "keelrun-core-native",
   "version": "0.3.0",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisterTK/keel.git",
+    "directory": "node/keel-core-native"
+  },
   "description": "Native napi addon wrapping keel-core::Engine (built from crates/keel-node). Source-only in a dev checkout — binaries are built locally by `npm run build` (or scripts/napi-prebuild.sh) and never committed; the release workflow builds+packs the npm/*/ platform packages below per platform.",
   "type": "module",
   "main": "index.mjs",

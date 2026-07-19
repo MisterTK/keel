@@ -47,5 +47,10 @@
     "test": "node --test"
   },
   "keywords": ["keel", "keelrun", "resilience", "retry", "circuit-breaker", "durable", "fetch"],
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisterTK/keel.git",
+    "directory": "node/keel"
+  }
 }

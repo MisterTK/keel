@@ -7,6 +7,11 @@
   "main": "keelrun-core-native.darwin-arm64.node",
   "files": ["keelrun-core-native.darwin-arm64.node"],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisterTK/keel.git",
+    "directory": "node/keel-core-native/npm/darwin-arm64"
+  },
   "engines": {
     "node": ">=20"
   }
