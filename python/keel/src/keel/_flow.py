@@ -245,6 +245,30 @@ def _unsupported_without_journal(entry: FlowEntrypoint) -> None:
     raise SystemExit(1)
 
 
+def exit_flow_or_warn(backend: Any, status: str) -> None:
+    """Stamp the flow's terminal `status`, degrading a *write* failure (issue
+    #14: `exit_flow` can now raise a `KEEL-E040` when the journal write
+    itself fails) to a loud stderr line instead of letting it become a new
+    exception raised out of an `except`/`finally` scope.
+
+    Every caller of this helper is already inside exception handling for the
+    flow body's OWN outcome (a `SystemExit`, the real bug, or a
+    `GeneratorExit` abandonment) — DX invariant 5 promises that a real
+    exception on a fresh run "propagates unchanged". Letting a *second,
+    unrelated* journal-write error replace it via Python's implicit
+    `__context__` chaining would violate that promise (and, inside a
+    `GeneratorExit` handler specifically, make `aclose()` raise instead of
+    closing quietly, which callers do not expect). The write failure is
+    still reported — never silently swallowed — just not as a stand-in for
+    whatever the caller is actually handling."""
+    try:
+        backend.exit_flow(status)
+    except BaseException as exc:  # noqa: BLE001 - deliberately broad, see docstring
+        code = getattr(exc, "code", "KEEL-E040")
+        message = getattr(exc, "message", str(exc))
+        sys.stderr.write(f"keel ▸ {code}: flow terminal status not journaled: {message}\n")
+
+
 def run_as_flow(
     target: str,
     entry: FlowEntrypoint,
@@ -314,14 +338,14 @@ def run_as_flow(
                 _runtime.set_flow_active(False)
     except SystemExit as exc:
         if exc.code in (None, 0):  # clean exit == success (common main() shape)
-            backend.exit_flow("completed")
+            exit_flow_or_warn(backend, "completed")
         elif not replayed:
-            backend.exit_flow("failed")
+            exit_flow_or_warn(backend, "failed")
         raise
     except KeyboardInterrupt:
         raise  # leave the flow 'running' for resume; don't stamp 'failed'
     except BaseException:
         if not replayed:  # never demote an already-completed (replayed) flow
-            backend.exit_flow("failed")
+            exit_flow_or_warn(backend, "failed")
         raise
-    backend.exit_flow("completed")
+    exit_flow_or_warn(backend, "completed")

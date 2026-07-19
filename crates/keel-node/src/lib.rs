@@ -750,7 +750,9 @@ mod bindings {
                 ));
             };
             if let Some(mut handle) = guard.take() {
-                handle.complete(final_status);
+                handle
+                    .complete(final_status)
+                    .map_err(|e| throw_keel_from(env, &e))?;
                 // `handle` drops here, aborting the heartbeat task.
             }
             Ok(())

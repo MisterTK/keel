@@ -217,7 +217,7 @@ async fn fresh_flow_journals_each_step_live_then_completes() {
         assert_eq!(out.result, "ok");
         assert_eq!(out.payload, Some(json!({ "ok": true })));
     }
-    handle.complete_success();
+    handle.complete_success().unwrap();
     drop(handle);
 
     // All three effects ran live.
@@ -363,7 +363,7 @@ async fn crash_after_step_three_resumes_substituting_completed_steps() {
             "replayed payload matches"
         );
     }
-    handle.complete_success();
+    handle.complete_success().unwrap();
 
     assert_eq!(
         run2.load(Ordering::SeqCst),
@@ -457,7 +457,7 @@ async fn resumes_the_interrupted_flow_golden_fixture() {
         "crashed step 4 + fresh step 5 ran live"
     );
 
-    handle.complete_success();
+    handle.complete_success().unwrap();
     assert_eq!(
         journal.get_flow(handle.flow_id()).unwrap().unwrap().status,
         FlowStatus::Completed
@@ -581,7 +581,7 @@ async fn attempt_cap_marks_a_poison_flow_dead_with_e032() {
     // so the next attempt can re-enter immediately).
     for _ in 0..2 {
         let mut h = r.manager.enter_flow(&d).expect("attempt within cap");
-        h.complete_failed();
+        h.complete_failed().unwrap();
     }
 
     // The third entry exceeds the cap: the flow is marked dead and refused.
@@ -715,7 +715,7 @@ async fn a_forward_wall_clock_jump_alone_does_not_fence_a_live_step() {
         "no theft occurred; a wall-clock jump alone must not fence the step"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    handle.complete_success();
+    handle.complete_success().unwrap();
 }
 
 /// A live step whose lease was stolen by another process fences with KEEL-E030
@@ -793,7 +793,7 @@ async fn journal_time_and_random_replay_recorded_values() {
         vec![1, 2, 3],
         "random replays"
     );
-    handle.complete_success();
+    handle.complete_success().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -819,7 +819,7 @@ async fn re_entering_a_completed_flow_is_pure_replay() {
                 )
                 .await;
         }
-        handle.complete_success();
+        handle.complete_success().unwrap();
     }
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -846,7 +846,7 @@ async fn re_entering_a_completed_flow_is_pure_replay() {
             "recorded payload substituted"
         );
     }
-    replay.complete_success();
+    replay.complete_success().unwrap();
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -877,7 +877,7 @@ async fn replay_only_refuses_an_unrecorded_step_with_e031() {
                 counting_ok(&calls, json!(1)),
             )
             .await;
-        handle.complete_success();
+        handle.complete_success().unwrap();
     }
 
     let mut replay = r.manager.enter_flow(&descriptor("ah-1")).unwrap();

@@ -92,7 +92,7 @@ from .. import _runtime
 from ..adapters import _http, _llm_policy
 from ..adapters._pack import Detection, Seam, TargetDecl
 from .._errors import KeelError
-from .._flow import backend_has_journal, backend_supports_flows
+from .._flow import backend_has_journal, backend_supports_flows, exit_flow_or_warn
 from ._provider import module_present
 from .tool import is_valid_tool_name, wrap_tool
 
@@ -465,17 +465,23 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
             # re-enter and substitute completed steps. Counts an attempt
             # (exit "failed"), unlike keel run's KeyboardInterrupt precedent
             # — there the process dies, so leaving the flow running is free.
+            # `exit_flow_or_warn` (not a bare `backend.exit_flow` call)
+            # degrades a journal-WRITE failure to a stderr line rather than
+            # letting it raise out of this handler — a new exception raised
+            # while handling `GeneratorExit` would make the caller's
+            # `aclose()` itself raise instead of closing quietly, which ADK's
+            # Runner is not written to expect (issue #14).
             if not replayed:
-                backend.exit_flow("failed")
+                exit_flow_or_warn(backend, "failed")
             _runtime.set_flow_active(False)
             raise
         except BaseException:
             if not replayed:  # never demote an already-completed (replayed) flow
-                backend.exit_flow("failed")
+                exit_flow_or_warn(backend, "failed")
             _runtime.set_flow_active(False)
             raise
         else:
-            backend.exit_flow("completed")
+            exit_flow_or_warn(backend, "completed")
             _runtime.set_flow_active(False)
         # NOTE (decision 8, revised): abandonment now exits the flow "failed"
         # and clears flow_active exactly like any other failure, rather than

@@ -734,7 +734,9 @@ impl KeelCore {
         // Detached for the same deadlock-avoidance reason as `enter_flow`.
         let handle = py.detach(|| self.active_flow.blocking_lock().take());
         if let Some(mut handle) = handle {
-            handle.complete(final_status);
+            handle
+                .complete(final_status)
+                .map_err(|e| keel_error_from(py, &e))?;
             // `handle` drops here, aborting the heartbeat task.
         }
         Ok(())
