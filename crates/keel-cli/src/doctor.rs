@@ -376,7 +376,7 @@ struct PolicyValidation {
 #[must_use]
 pub fn preflight_advisory(project: &Path) -> Option<String> {
     let scan = scan::scan(project);
-    let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
+    let registry_libs = registry_libs();
     let finding = resilience_finding(&scan, &registry_libs)?;
     Some(format!(
         "keel \u{25b8} {}\n  next: {} (run `keel doctor --json` for detail; skip this check with \
@@ -552,7 +552,7 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                  then narrow or remove the broad except."
                     .to_owned(),
             ),
-            _ => (
+            "hand-rolled-retry" => (
                 "hand-rolled-retry",
                 format!(
                     "`{}` ({}:{}) hand-rolls retry around `{}` — {}, this loop becomes redundant",
@@ -562,6 +562,15 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                  loop — don't run both."
                     .to_owned(),
             ),
+            other => {
+                // The scanner is the only producer of `simplifications`, and it emits
+                // exactly the three kinds matched above — an unrecognized kind is a
+                // scanner/doctor drift bug, not a real finding to mislabel and report.
+                // Fail loud where it's cheap to catch (debug/test builds); in release,
+                // skip rather than surface a wrong action.
+                debug_assert!(false, "unknown simplification kind: {other}");
+                continue;
+            }
         };
         findings.push(Finding {
             action,
@@ -751,7 +760,7 @@ fn build_report(
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation { check: policy, fix } = policy;
-    let registry_libs: BTreeSet<&str> = REGISTRY.iter().map(|a| a.lib).collect();
+    let registry_libs = registry_libs();
 
     // Coverage from the target sets.
     let visible: BTreeSet<&String> = scan.targets.keys().collect();
@@ -2189,6 +2198,10 @@ def caller():
             return httpx.get(U)
         except Exception:
             # CANARY_COMMENT_9f31 must never appear in any report
+            # Deliberate handler-local canary: an unused local-variable
+            # assignment RHS, a syntactic position distinct from the other
+            # four canaries above (comment, module const, URL query param,
+            # docstring) — not dead code left behind by mistake.
             local_secret = "CANARY_QUERY2_9f31"
             attempt += 1
             time.sleep(1)
