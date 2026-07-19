@@ -920,6 +920,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.publish == true
     runs-on: ubuntu-latest
     environment: release # no protection rules configured (2026-07-14 decision) — workflow_dispatch's `publish: true` input is the only gate
+    permissions:
+      contents: read
+      id-token: write # mandatory for npm provenance attestations (OIDC), same GitHub Actions token PyPI Trusted Publishing above uses
     steps:
       - uses: actions/checkout@v4
       # Required for npm auth: setup-node's `registry-url` writes an .npmrc
@@ -991,7 +994,7 @@ jobs:
             ')"
             if npm view "$pkg" version >/dev/null 2>&1; then
               echo "already published: $pkg (skipping)"
-            elif npm publish --access public "./$tgz"; then
+            elif npm publish --provenance --access public "./$tgz"; then
               echo "published: $pkg"
             else
               echo "::error::failed to publish $pkg"
