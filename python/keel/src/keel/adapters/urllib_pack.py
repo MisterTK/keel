@@ -179,9 +179,15 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
         # inside `orig`, which we haven't called yet. Judge as if it already
         # happened, or `urlopen(Request(url), data=b"...")` misreads as GET
         # (req.data is still None here) instead of POST.
+        #
+        # Method resolution is `Request.get_method()`'s job (explicit method
+        # wins, else POST-if-body-else-GET) — delegate to it rather than
+        # re-deriving the fallback. It keys off `req.data`, so stage the fold
+        # locally first; `orig` re-folds the same kwarg on every attempt, so
+        # this leaves `req` in exactly the state stdlib's own dispatch would.
         body = data if data is not None else req.data
-        explicit_method = getattr(req, "method", None)
-        method = explicit_method if explicit_method is not None else ("POST" if body is not None else "GET")
+        req.data = body
+        method = req.get_method()
     else:
         body = data
         method = "POST" if data is not None else "GET"
