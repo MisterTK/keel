@@ -36,7 +36,19 @@
 #   python   | google-adk                    | 2.4.0                     | python/keel/src/keel/packs/adk_pack.py
 #   python   | google-adk + mcp (composition)| 2.4.0 + 1.28.1            | adk_pack.py + mcp_pack.py (real LlmAgent
 #            |                               |                           | + Runner + MCPToolset over a real stdio
-#            |                               |                           | server — tests.test_farm_adk_composition)
+#            |                               |                           | server — tests.test_farm_adk_composition,
+#            |                               |                           | STUB backend, Tier 1 only)
+#   python   | google-adk + mcp (native      | 2.4.0 + 1.28.1            | adk_pack.py (real LlmAgent + InMemoryRunner
+#            | flow composition, issue #22d) |                           | + MCPToolset over a real stdio server) x a
+#            |                               |                           | REAL maturin-built native journal, DESIGNATED
+#            |                               |                           | as a Tier 2 flow — tests.test_farm_adk_
+#            |                               |                           | composition_native, separate `native-adk-
+#            |                               |                           | composition` job below (the only job in this
+#            |                               |                           | workflow with a Rust toolchain step). Installs
+#            |                               |                           | adk_pack only, NOT mcp_pack — see that test
+#            |                               |                           | module's docstring for the empirically-found
+#            |                               |                           | deadlock (both packs + an open native flow)
+#            |                               |                           | this sidesteps.
 #   python   | pydantic-ai                   | 2.9.0                     | python/keel/src/keel/packs/pydantic_ai_pack.py
 #   python   | openai-agents                 | 0.18.2                    | python/keel/src/keel/packs/openai_agents_pack.py
 #   python   | crewai                        | 1.15.2                    | python/keel/src/keel/packs/crewai_pack.py
@@ -178,6 +190,44 @@ jobs:
         env:
           KEEL_ADAPTER_FARM: "1"
         run: python3 -m unittest ${{ matrix.test_module }} -v
+
+  # ---------------------------------------------------------------------------
+  # Python: the composed real-ADK x real-native-journal leg (issue #22 item d
+  # — "Agent-program test/hardening follow-ups (umbrella)"). Every OTHER job
+  # in this workflow is a pure pip/npm install — the farm certifies real
+  # library behavior, never Keel's own native core. This is the one exception:
+  # `tests.test_farm_adk_composition_native` proves a DESIGNATED
+  # `Runner.run_async` flow, driven by a real `google-adk` `InMemoryRunner` +
+  # real `MCPToolset` (over the same stdio fixture `python-pinned-frameworks`'
+  # composition leg uses), actually journals into the REAL maturin-built
+  # native `keel_core` — not the pure-Python stub, and not `FakeAdkModules`.
+  # Closes the last untested seam: `test_farm_adk_composition` proves real-ADK
+  # against the stub backend; `test_adk_runner_flows_native` proves the flow
+  # wrap against the real native journal but only through a structural ADK
+  # double. Neither ever proved "real ADK x real native journal" together
+  # until this job. Builds the native wheel exactly like ci.yml's
+  # `native-conformance` job (the working template for this shape in this
+  # repo), then installs the two pinned agent-stack libs into the SAME venv.
+  # ---------------------------------------------------------------------------
+  native-adk-composition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native keel_core, install google-adk==2.4.0 + mcp==1.28.1, run the composed contract test
+        env:
+          KEEL_ADAPTER_FARM: "1"
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip maturin "google-adk==2.4.0" "mcp==1.28.1"
+          maturin develop -m crates/keel-py/Cargo.toml
+          (cd python/keel && python3 -m unittest tests.test_farm_adk_composition_native -v)
 
   # ---------------------------------------------------------------------------
   # Python: urllib.request (stdlib) farm contract test — no pip install needed,
