@@ -122,6 +122,236 @@ class FakeEvent:
         return f"FakeEvent({vars(self)!r})"
 
 
+class FakeEventActions:
+    """Structural twin of ``google.adk.events.event_actions.EventActions``:
+    ``KeelSessionService``/the base ``append_event`` implementation only
+    ever read ``.state_delta`` off it (design doc issue #15 §3.1)."""
+
+    def __init__(self, *, state_delta: dict[str, Any] | None = None, **extra: Any) -> None:
+        self.state_delta: dict[str, Any] = dict(state_delta) if state_delta else {}
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeEventActions) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeEventActions({vars(self)!r})"
+
+
+class FakeSession:
+    """Structural twin of ``google.adk.sessions.session.Session`` — fields
+    ``app_name``/``user_id``/``id``/``state``/``events``/``last_update_time``
+    (no ``created_at``; confirmed against the real 2.4.0 package by the
+    ``KeelSessionService`` implementation phase). Supports
+    ``.model_copy(deep=False)``, the one pydantic-model method
+    ``adk_pack._copy_session_light`` calls on it."""
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        id: str,
+        state: dict[str, Any] | None = None,
+        events: list[Any] | None = None,
+        last_update_time: float = 0.0,
+    ) -> None:
+        self.app_name = app_name
+        self.user_id = user_id
+        self.id = id
+        self.state: dict[str, Any] = dict(state) if state else {}
+        self.events: list[Any] = list(events) if events else []
+        self.last_update_time = last_update_time
+
+    def model_copy(self, *, deep: bool = False) -> "FakeSession":
+        return FakeSession(
+            app_name=self.app_name,
+            user_id=self.user_id,
+            id=self.id,
+            state=self.state,
+            events=self.events,
+            last_update_time=self.last_update_time,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeSession) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeSession({vars(self)!r})"
+
+
+class FakeBaseSessionService:
+    """Structural (non-ABC-enforced) twin of ``google.adk.sessions.
+    base_session_service.BaseSessionService``: the real class's own
+    ``append_event`` has a CONCRETE base implementation (applies the event's
+    ``state_delta`` to ``session.state``, appends the event to
+    ``session.events``, no-ops entirely for a ``partial`` event) — mirrored
+    here so ``KeelSessionService``'s ``await super().append_event(...)`` call
+    (design doc issue #15 §3.1) has a real body to run against offline.
+    Every OTHER method is abstract in the real class; ``KeelSessionService``
+    overrides all of them, so this fake never needs concrete bodies for the
+    rest (mirrors ``FakeEvent``/``FakeTool``'s own "just enough surface"
+    philosophy)."""
+
+    async def append_event(self, session: Any, event: Any) -> Any:
+        if getattr(event, "partial", False):
+            return event
+        actions = getattr(event, "actions", None)
+        if actions is not None and getattr(actions, "state_delta", None):
+            for key, value in actions.state_delta.items():
+                session.state[key] = value
+        session.events.append(event)
+        timestamp = getattr(event, "timestamp", None)
+        if timestamp is not None:
+            session.last_update_time = timestamp
+        return event
+
+    async def get_session(
+        self, *, app_name: str, user_id: str, session_id: str, config: Any | None = None
+    ) -> Any:
+        raise NotImplementedError
+
+    async def create_session(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        state: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> Any:
+        raise NotImplementedError
+
+    async def delete_session(self, *, app_name: str, user_id: str, session_id: str) -> None:
+        raise NotImplementedError
+
+    async def list_sessions(self, *, app_name: str, user_id: str | None = None) -> Any:
+        raise NotImplementedError
+
+
+class FakeListSessionsResponse:
+    """Structural twin of ``google.adk.sessions.base_session_service.
+    ListSessionsResponse``."""
+
+    def __init__(self, *, sessions: list[Any] | None = None) -> None:
+        self.sessions: list[Any] = list(sessions) if sessions else []
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeListSessionsResponse) and self.sessions == other.sessions
+
+    def __repr__(self) -> str:
+        return f"FakeListSessionsResponse(sessions={self.sessions!r})"
+
+
+class FakeGetSessionConfig:
+    """Structural twin of ``google.adk.sessions.base_session_service.
+    GetSessionConfig`` (design doc issue #15 §4/§6 item 1: both fields
+    optional). ``adk_pack`` never imports this class itself (``config`` is
+    duck-typed via ``getattr``) — provided for tests that want a
+    natural-looking constructor instead of a bare namespace object."""
+
+    def __init__(
+        self, *, num_recent_events: int | None = None, after_timestamp: float | None = None
+    ) -> None:
+        self.num_recent_events = num_recent_events
+        self.after_timestamp = after_timestamp
+
+
+class FakeAlreadyExistsError(Exception):
+    """Structural twin of ``google.adk.errors.already_exists_error.
+    AlreadyExistsError``."""
+
+
+class FakeBlob:
+    """Structural twin of ``google.genai.types.Blob``: raw bytes + mime
+    type — the shape ``adk_pack._encode_part``/``_decode_part`` read/build
+    for inline (binary) ``Part`` content (design doc issue #15 §3.1)."""
+
+    def __init__(self, *, data: bytes | None = None, mime_type: str | None = None, **extra: Any) -> None:
+        self.data = data
+        self.mime_type = mime_type
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeBlob) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeBlob({vars(self)!r})"
+
+
+class FakePart:
+    """Structural twin of ``google.genai.types.Part`` — enough fields for
+    ``adk_pack._encode_part``/``_decode_part``'s three cases (plain text /
+    inline binary data / ``model_dump`` fallback for everything else, e.g.
+    ``function_call``/``function_response``). ``model_dump`` mirrors the
+    real ``google.genai._common.BaseModel`` shape closely enough for the
+    pack's own encode/decode round trip: ``exclude_none=True`` drops unset
+    fields, ``mode=\"json\"`` is accepted (bytes-safety is NOT reproduced
+    here — no test in this suite round-trips ``thought_signature`` bytes
+    through JSON mode; the real package's ``ser_json_bytes=\"base64\"``/
+    ``val_json_bytes=\"base64\"`` behavior is verified separately, directly
+    against the real 2.4.0 package, per ``_encode_part``'s own docstring)."""
+
+    def __init__(
+        self,
+        *,
+        text: str | None = None,
+        inline_data: Any = None,
+        thought: bool | None = None,
+        thought_signature: Any = None,
+        function_call: dict[str, Any] | None = None,
+        function_response: dict[str, Any] | None = None,
+        **extra: Any,
+    ) -> None:
+        self.text = text
+        self.inline_data = inline_data
+        self.thought = thought
+        self.thought_signature = thought_signature
+        self.function_call = function_call
+        self.function_response = function_response
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def model_dump(self, *, exclude_none: bool = False, mode: str = "python") -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "text": self.text,
+            "inline_data": (
+                {"data": self.inline_data.data, "mime_type": self.inline_data.mime_type}
+                if self.inline_data is not None
+                else None
+            ),
+            "thought": self.thought,
+            "thought_signature": self.thought_signature,
+            "function_call": self.function_call,
+            "function_response": self.function_response,
+        }
+        if exclude_none:
+            data = {k: v for k, v in data.items() if v is not None}
+        return data
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakePart) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakePart({vars(self)!r})"
+
+
+class FakeContent:
+    """Structural twin of ``google.genai.types.Content``: ``role`` + a list
+    of ``Part``-shaped objects."""
+
+    def __init__(self, *, role: str | None = None, parts: list[Any] | None = None) -> None:
+        self.role = role
+        self.parts: list[Any] = list(parts) if parts else []
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeContent) and self.role == other.role and self.parts == other.parts
+
+    def __repr__(self) -> str:
+        return f"FakeContent(role={self.role!r}, parts={self.parts!r})"
+
+
 class FakeRunner:
     """Structural twin of ``google.adk.runners.Runner``: real ADK resolves
     ``agent=``/``node=``/``app=`` into one ``App`` before building
@@ -422,6 +652,26 @@ _MODULE_NAMES = (
     "google.adk.plugins.base_plugin",
     "google.adk.models",
     "google.adk.models.registry",
+    # `KeelSessionService` (design doc issue #15 §3.1's `_base_session_service_cls`)
+    # imports across all four of these — registered the same way as the two
+    # entries above (a fake package + a fake leaf module underneath it).
+    "google.adk.sessions",
+    "google.adk.sessions.base_session_service",
+    "google.adk.events",
+    "google.adk.events.event",
+    "google.adk.events.event_actions",
+    "google.adk.errors",
+    "google.adk.errors.already_exists_error",
+    # `google.genai` is a SIBLING package to `google.adk` (not a submodule of
+    # it) but shares the same `google` namespace root — `KeelSessionService`
+    # needs `google.genai.types.{Blob,Content,Part}` for event-content
+    # encoding (design §3.1). Faked (never left to a real install) because a
+    # real `google-genai` distribution IS present on at least one dev
+    # machine this suite runs on (an unrelated dependency of some other
+    # `google-*` package) — the same "safe even if a real one exists"
+    # discipline this class's own docstring already applies to `google`.
+    "google.genai",
+    "google.genai.types",
 )
 
 
@@ -450,13 +700,41 @@ class FakeAdkModules:
         base_plugin_mod = _fake_module("google.adk.plugins.base_plugin", BasePlugin=FakeBasePlugin)
         models_pkg = _fake_module("google.adk.models")
         registry_mod = _fake_module("google.adk.models.registry", LLMRegistry=FakeLLMRegistry)
+        sessions_pkg = _fake_module(
+            "google.adk.sessions", BaseSessionService=FakeBaseSessionService, Session=FakeSession
+        )
+        base_session_service_mod = _fake_module(
+            "google.adk.sessions.base_session_service",
+            ListSessionsResponse=FakeListSessionsResponse,
+            GetSessionConfig=FakeGetSessionConfig,
+        )
+        events_pkg = _fake_module("google.adk.events")
+        event_mod = _fake_module("google.adk.events.event", Event=FakeEvent)
+        event_actions_mod = _fake_module("google.adk.events.event_actions", EventActions=FakeEventActions)
+        errors_pkg = _fake_module("google.adk.errors")
+        already_exists_error_mod = _fake_module(
+            "google.adk.errors.already_exists_error", AlreadyExistsError=FakeAlreadyExistsError
+        )
+        genai_pkg = _fake_module("google.genai")
+        genai_types_mod = _fake_module(
+            "google.genai.types", Blob=FakeBlob, Content=FakeContent, Part=FakePart
+        )
 
         google_mod.adk = adk_mod
         adk_mod.runners = runners_mod
         adk_mod.plugins = plugins_pkg
         adk_mod.models = models_pkg
+        adk_mod.sessions = sessions_pkg
+        adk_mod.events = events_pkg
+        adk_mod.errors = errors_pkg
         plugins_pkg.base_plugin = base_plugin_mod
         models_pkg.registry = registry_mod
+        sessions_pkg.base_session_service = base_session_service_mod
+        events_pkg.event = event_mod
+        events_pkg.event_actions = event_actions_mod
+        errors_pkg.already_exists_error = already_exists_error_mod
+        google_mod.genai = genai_pkg
+        genai_pkg.types = genai_types_mod
 
         sys.modules["google"] = google_mod
         sys.modules["google.adk"] = adk_mod
@@ -465,6 +743,15 @@ class FakeAdkModules:
         sys.modules["google.adk.plugins.base_plugin"] = base_plugin_mod
         sys.modules["google.adk.models"] = models_pkg
         sys.modules["google.adk.models.registry"] = registry_mod
+        sys.modules["google.adk.sessions"] = sessions_pkg
+        sys.modules["google.adk.sessions.base_session_service"] = base_session_service_mod
+        sys.modules["google.adk.events"] = events_pkg
+        sys.modules["google.adk.events.event"] = event_mod
+        sys.modules["google.adk.events.event_actions"] = event_actions_mod
+        sys.modules["google.adk.errors"] = errors_pkg
+        sys.modules["google.adk.errors.already_exists_error"] = already_exists_error_mod
+        sys.modules["google.genai"] = genai_pkg
+        sys.modules["google.genai.types"] = genai_types_mod
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -478,18 +765,27 @@ class FakeAdkModules:
 
 __all__ = [
     "FakeAdkModules",
+    "FakeAlreadyExistsError",
     "FakeApp",
     "FakeBasePlugin",
+    "FakeBaseSessionService",
+    "FakeBlob",
     "FakeClaude",
+    "FakeContent",
     "FakeEvent",
+    "FakeEventActions",
     "FakeGemini",
+    "FakeGetSessionConfig",
     "FakeInMemoryRunner",
     "FakeLLMRegistry",
+    "FakeListSessionsResponse",
     "FakeLlmRequest",
     "FakeLlmResponse",
     "FakeModel",
+    "FakePart",
     "FakePluginManager",
     "FakeRunner",
+    "FakeSession",
     "FakeTool",
     "FakeSlottedTool",
     "McpTool",
