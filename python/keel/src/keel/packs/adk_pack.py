@@ -88,12 +88,15 @@ opt-in existed.
 
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import importlib.metadata
 import os
 import sys
 import threading
+import time
+import uuid
 import weakref
 from typing import Any, Callable
 
@@ -102,6 +105,7 @@ from ..adapters import _http, _llm_policy
 from ..adapters._pack import Detection, Seam, TargetDecl
 from .._errors import KeelError
 from .._flow import backend_has_journal, backend_supports_flows, exit_flow_or_warn
+from .._wrap import ENVELOPE_VERSION, _json_safe
 from ._provider import module_present
 from .tool import is_valid_tool_name, wrap_tool
 
@@ -125,6 +129,36 @@ _PINNED = ("1", "2")
 #: The registered plugin's unique name (`BasePlugin.name` / `PluginManager.
 #: get_plugin`/`register_plugin` key).
 PLUGIN_NAME = "keel"
+
+#: `KeelSessionService` step targets (design doc issue #15 §3.1). All three
+#: share the `tool:` namespace — same reasoning as `langgraph_pack`'s
+#: `CHECKPOINT_*_TARGET` constants: the frozen `targetKey` grammar
+#: (`contracts/policy.schema.json`) admits no other prefix for a
+#: framework-pack-owned call boundary, and `adk_pack`'s own code constructs
+#: and passes these strings directly, so there is no external-grammar
+#: matching concern the way chunk-6/#27's `cmd:` case had (design §5's CCR
+#: table).
+SESSION_EVENT_TARGET = "tool:adk.session_event"
+SESSION_IDENTITY_TARGET = "tool:adk.session_identity"
+SESSION_DELETE_TARGET = "tool:adk.session_delete"
+
+#: The (app_name, user_id, session_id) identity of the CURRENTLY open
+#: Runner-flow, or None when no flow is open. Set (and the counter below
+#: reset) exactly once per flow entry, by `_run_async_flow_wrapper` itself —
+#: see that function's own comment for why this can't piggyback on an
+#: existing call site. `KeelSessionService`'s write-path honesty gate
+#: (design §6 item 4) reads this to distinguish "this IS the active flow"
+#: from "a DIFFERENT flow already holds the singleton slot", which a bare
+#: `_runtime.in_active_flow()` check cannot do (only one flow is ever open
+#: at a time, so the busy case reports `True` too).
+_active_session_identity: tuple[str, str, str] | None = None
+#: Per-flow `tool:adk.session_event` sequence counter (design §3.1's
+#: `"<session_id>:<seq>"` step-key convention — mirrors `langgraph_pack`'s
+#: `CHECKPOINT_PUT_TARGET` seq). Reset to 0 at the SAME call site that sets
+#: `_active_session_identity` above — every flow entry, unconditionally. A
+#: single shared counter (not a dict keyed by flow_id) is sufficient because
+#: only one flow is ever open per process at a time.
+_session_event_seq = 0
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -457,6 +491,61 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
         )
         replayed = bool(info.get("replay"))
         _runtime.set_flow_active(True)
+        # Write `tool:adk.session_identity` exactly ONCE per flow, HERE —
+        # before `gen = inner()` is ever driven (design doc issue #15 §3.1's
+        # write-path sequencing-bug fix). A first draft of that design placed
+        # this write at the SAME call site as the `journal_random(
+        # "adk:invocation_id", ...)` correlation call below — but that call
+        # site sits INSIDE the `async for event in gen:` loop, gated on
+        # `if not correlated:`, so it only fires AFTER `inner()` (the real
+        # `Runner.run_async`) has already produced its FIRST event. Per §6
+        # item 1's confirmed assumption (verified against real google-adk
+        # 2.4.0: `runners.py:795-799`/`:1410-1416`), `Runner.run_async`
+        # itself calls `session_service.append_event(...)` BEFORE yielding
+        # each event — so by the time this wrapper regained control at that
+        # later site, `KeelSessionService.append_event` would already have
+        # journaled the flow's FIRST `tool:adk.session_event` step. Reusing
+        # that site would put `session_identity` AFTER the first
+        # `session_event` step in journal order, breaking §3.2's read
+        # algorithm (which assumes `session_identity` is always a flow's
+        # FIRST `adk.session_*` step). So this is a genuinely new, EARLIER
+        # call site — not a piggyback on an existing line.
+        #
+        # `self.app_name`: confirmed directly against the installed
+        # `google-adk==2.4.0` package (`runners.py:156,223`) — `Runner.
+        # __init__` always sets `self.app_name = app_name or app.name`, so
+        # every constructed Runner (whichever of agent=/node=/app= built it)
+        # carries a plain string `app_name` attribute; `run_async` itself
+        # takes no `app_name` parameter, so this is the only "stable value"
+        # (design §3.4) available at this call site.
+        #
+        # Also resets the per-flow `tool:adk.session_event` sequence counter
+        # and the "which session does the open flow belong to" identity that
+        # `KeelSessionService`'s write-path honesty gate (design §6 item 4)
+        # checks. Only ONE Keel Tier 2 flow can be open per process at a time
+        # (the existing `_runtime.in_active_flow()` singleton this whole
+        # module already depends on), so a single shared module-level
+        # counter + identity — reset unconditionally on every flow entry —
+        # is sufficient; no per-flow-id dict is needed (simpler than the
+        # dict the design doc's prose suggested).
+        global _active_session_identity, _session_event_seq
+        _active_session_identity = (self.app_name, user_id, session_id)
+        _session_event_seq = 0
+        # `execute` presence check (not just `backend_supports_flows`'s own
+        # enter_flow/exit_flow check above): every REAL backend (native or
+        # the pure-Python stub) always carries the full configure/execute/
+        # report surface together (`_backend.py` module docs) — this is
+        # purely tolerance for a minimal test double that only fakes
+        # enter_flow/exit_flow/journal_random to exercise flow bookkeeping
+        # in isolation, without a KeelSessionService in the picture at all.
+        if callable(getattr(backend, "execute", None)):
+            _record_session_step(
+                backend,
+                SESSION_IDENTITY_TARGET,
+                f"adk session_identity app={self.app_name} session={session_id}",
+                "-",
+                {"app_name": self.app_name, "user_id": user_id, "session_id": session_id},
+            )
         correlated = False
         try:
             gen = inner()
@@ -481,15 +570,18 @@ def _run_async_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
             if not replayed:
                 exit_flow_or_warn(backend, "failed")
             _runtime.set_flow_active(False)
+            _active_session_identity = None
             raise
         except BaseException:
             if not replayed:  # never demote an already-completed (replayed) flow
                 exit_flow_or_warn(backend, "failed")
             _runtime.set_flow_active(False)
+            _active_session_identity = None
             raise
         else:
             exit_flow_or_warn(backend, "completed")
             _runtime.set_flow_active(False)
+            _active_session_identity = None
         # NOTE (decision 8, revised): abandonment now exits the flow "failed"
         # and clears flow_active exactly like any other failure, rather than
         # leaving the handle open-and-running forever — this wrapper lives in
@@ -1063,15 +1155,563 @@ def _is_pinned(version: str) -> bool:
     return any(version == p or version.startswith(p + ".") for p in _PINNED)
 
 
+# --- KeelSessionService: a Keel-journal-backed BaseSessionService -----------
+#
+# Design doc: issue #15 §3.1 (write path), §3.2/§3.2a/§3.2b (read path, its
+# same-flow crash/resume story, and its stated scan-cost limit), §3.4 (public
+# API surface), §4 (no physical compaction, ever — trimming is read-time
+# only), §6 (open questions this implementation resolves or explicitly
+# defers). Mirrors `KeelSaver` (this module's LangGraph analog, above) in
+# spirit — same write-through-the-open-flow mechanism, same "refuse loudly
+# outside a flow" philosophy for durable writes — but is NOT a copy:
+# `KeelSaver`'s whole instance lifetime is scoped to ONE open Tier 2 flow (a
+# LangGraph invocation IS the flow), so its reads only ever need "this flow's
+# own replayed/live puts". A `KeelSessionService` instance is long-lived
+# across MANY flows (one per `Runner.run_async` turn — design §0), so a
+# `get_session()` call routinely lands on a LATER, already-closed flow, or
+# even a fresh process after a restart — this pack's read path is therefore a
+# genuine in-process journal reader (§3.2), built through the journal's
+# ALREADY-OPEN connection (never a second same-process `sqlite3` handle —
+# issue #14's exact bug, which on the read side would be worse: a torn WAL
+# read doesn't throw, it can return a stale/partial row) via two new
+# read-only `Journal` methods, `flows_by_entrypoint`/`steps_for_flow`
+# (`crates/keel-journal`, bound on `keel-py`'s `KeelCore`).
+
+
+def _can_read_journal(backend: Any) -> bool:
+    """Whether `backend` exposes the two new read-only `Journal` methods
+    (design §3.2) — native-core-only, and Python-only in v1 (design §5/§7:
+    `keel-node` is not touched). A `False` result degrades the read path to
+    cache-only rather than raising `AttributeError` — the same
+    never-crash-on-a-missing-capability discipline `backend_supports_flows`/
+    `backend_has_journal` already apply on the write side."""
+    return (
+        backend is not None
+        and callable(getattr(backend, "flows_by_entrypoint", None))
+        and callable(getattr(backend, "steps_for_flow", None))
+    )
+
+
+def _record_session_step(backend: Any, target: str, op: str, args_hash: str, payload: dict[str, Any]) -> None:
+    """Journal one `KeelSessionService` step through the CURRENTLY open Keel
+    Tier 2 flow. Mirrors `langgraph_pack._record_step` exactly: the payload
+    is already fully known (ADK handed us a complete event/identity/delete to
+    persist), so the effect never fails and its outcome is never read back —
+    durability + `keel trace` visibility are the only reasons to journal."""
+    request = {
+        "v": ENVELOPE_VERSION,
+        "target": target,
+        "op": op,
+        "idempotent": False,
+        "args_hash": args_hash,
+    }
+    backend.execute(request, lambda _attempt: {"status": "ok", "payload": payload})
+
+
+def _copy_session_light(session: Any) -> Any:
+    """A shallow copy whose container fields (`events`, `state`) are ALSO
+    shallow-copied — mirrors `InMemorySessionService`'s own `_light_copy`
+    (verified against the real 2.4.0 package) so mutating the copy (e.g.
+    `GetSessionConfig` trimming, below) never mutates the cached original."""
+    copied = session.model_copy(deep=False)
+    copied.events = list(session.events)
+    copied.state = dict(session.state)
+    return copied
+
+
+def _apply_get_session_config(session: Any, config: Any) -> Any:
+    """Slice a COPY of `session`'s event list per `config` (design §4: no
+    physical compaction, ever — trimming is a read-time concern only).
+    Verbatim port of `InMemorySessionService._get_session_impl`'s own
+    trimming logic (verified against the real 2.4.0 package), including its
+    exact `after_timestamp` quirk: if EVERY event's timestamp is >= the
+    cutoff, the scan-back loop ends at `i == -1` and the real code leaves
+    `events` UNTRIMMED rather than emptying it — reproduced here byte-for-
+    byte rather than "fixed", since diverging from the real service's
+    observable behavior would be a correctness regression, not an
+    improvement."""
+    copied = _copy_session_light(session)
+    if config is None:
+        return copied
+    num_recent = getattr(config, "num_recent_events", None)
+    if num_recent is not None:
+        copied.events = [] if num_recent == 0 else copied.events[-num_recent:]
+    after = getattr(config, "after_timestamp", None)
+    if after:
+        i = len(copied.events) - 1
+        while i >= 0:
+            if copied.events[i].timestamp < after:
+                break
+            i -= 1
+        if i >= 0:
+            copied.events = copied.events[i + 1 :]
+    return copied
+
+
+def _encode_content(content: Any) -> dict[str, Any] | None:
+    """A `google.genai.types.Content` -> a JSON-safe dict (design §3.1's
+    event-content-encoding scheme). Only ever called from `append_event`,
+    where `content` is always a real `Content` or `None` — needs no
+    `google.genai` import of its own."""
+    if content is None:
+        return None
+    return {"role": content.role, "parts": [_encode_part(p) for p in (content.parts or [])]}
+
+
+def _encode_part(part: Any) -> dict[str, Any]:
+    """One `Part` -> a JSON-safe dict — three cases, in the order design
+    §3.1 names them:
+
+    * plain text (no `thought`/`thought_signature` riding along) passes
+      through as `{"text": ...}`;
+    * inline/binary data (images, audio, video) is base64-encoded under a
+      distinct `inline_data_b64` key, mime type preserved, so the decoder
+      never has to guess a binary part from its shape alone;
+    * everything else — function_call/function_response, code execution,
+      thinking parts (`text` + `thought`), `thought_signature` bytes, ... —
+      falls back to `model_dump(exclude_none=True, mode="json")`, the EXACT
+      call `VertexAiSessionService.append_event` itself uses for its
+      `raw_event` persistence (real precedent, not invented here — design
+      §3.1). This fallback is binary-safe too: confirmed directly against
+      the real 2.4.0 package that `google.genai._common.BaseModel` sets both
+      `ser_json_bytes="base64"` AND `val_json_bytes="base64"`, so a `bytes`
+      field (e.g. `thought_signature`) round-trips through
+      `model_dump(mode="json")` -> `Part(**that_dict)` byte-for-byte.
+    """
+    if part.text is not None and part.thought is None and part.thought_signature is None:
+        return {"text": part.text}
+    inline_data = part.inline_data
+    if inline_data is not None and inline_data.data is not None:
+        return {
+            "inline_data_b64": base64.b64encode(inline_data.data).decode("ascii"),
+            "mime_type": inline_data.mime_type,
+        }
+    return part.model_dump(exclude_none=True, mode="json")
+
+
+def _decode_content(data: dict[str, Any] | None, content_cls: type, part_cls: type, blob_cls: type) -> Any:
+    """The inverse of `_encode_content` — reconstructs a REAL `Content`
+    object (not a dict) so a replayed `Session.events` list is exactly as
+    usable to downstream ADK code (content builders, `is_final_response()`,
+    ...) as a live one. Classes are passed in rather than imported here: only
+    the caller (inside `_base_session_service_cls`, where `google.genai` is
+    guaranteed importable because `google.adk` already depends on it) knows
+    they are safe to import."""
+    if data is None:
+        return None
+    return content_cls(
+        role=data.get("role"),
+        parts=[_decode_part(p, part_cls, blob_cls) for p in (data.get("parts") or [])],
+    )
+
+
+def _decode_part(data: dict[str, Any], part_cls: type, blob_cls: type) -> Any:
+    if "inline_data_b64" in data:
+        raw = data.get("inline_data_b64")
+        return part_cls(
+            inline_data=blob_cls(
+                data=base64.b64decode(raw) if isinstance(raw, str) else None,
+                mime_type=data.get("mime_type"),
+            )
+        )
+    if set(data) <= {"text"}:
+        return part_cls(text=data.get("text"))
+    # function_call/function_response/... : `Part(**data)` round-trips a real
+    # `model_dump(exclude_none=True, mode="json")` dict exactly (confirmed
+    # against the real package — see `_encode_part`'s docstring).
+    return part_cls(**data)
+
+
+#: Cache-miss sentinel (module docs): distinguishes "this process already
+#: knows this session was soft-deleted" from an ordinary cache miss, so a
+#: repeated `get_session` for a deleted session doesn't re-run the §3.2b
+#: full-scan fallback every time.
+_DELETED = object()
+
+_session_service_cls: type | None = None
+
+
+def _base_session_service_cls() -> type:
+    """Build (once) and return the `BaseSessionService` subclass. A function,
+    not a module-level `class` statement, so `google.adk`/`google.genai` are
+    imported only when a caller actually asks for a session service
+    (adapter-pack rule 1) — mirrors `langgraph_pack._base_checkpoint_saver_cls`
+    exactly."""
+    global _session_service_cls
+    if _session_service_cls is not None:
+        return _session_service_cls
+    try:
+        from google.adk.errors.already_exists_error import AlreadyExistsError
+        from google.adk.events.event import Event
+        from google.adk.events.event_actions import EventActions
+        from google.adk.sessions import BaseSessionService, Session
+        from google.adk.sessions.base_session_service import ListSessionsResponse
+        from google.genai.types import Blob, Content, Part
+    except ImportError as exc:
+        raise KeelError(
+            "KEEL-E005",
+            "KeelSessionService needs the `google-adk` package installed (it "
+            "implements google.adk.sessions.base_session_service."
+            "BaseSessionService); install google-adk or pass a different "
+            "session_service to your Runner",
+        ) from exc
+
+    class _KeelSessionService(BaseSessionService):  # type: ignore[misc,valid-type]
+        """`BaseSessionService` backed by the currently open Keel Tier 2
+        Runner-flow (design doc issue #15).
+
+        Write path (§3.1): `append_event` always calls the REAL base
+        implementation first (state-delta application, temp-state handling,
+        `session.events.append` — the exact `await super().append_event(...)`
+        pattern confirmed against `VertexAiSessionService`), then — gated by
+        `_write_gate` below — journals one `tool:adk.session_event` step
+        through the flow `_run_async_flow_wrapper` already has open.
+        `create_session` NEVER journals (§6 item 3: an empty session with no
+        turn ever run against it is a deliberate, STATED gap, not a bug).
+        `delete_session` mirrors `KeelSaver.delete_thread`'s soft-delete
+        pattern — one step, the prior journal is never rewritten.
+
+        Read path (§3.2/§3.2a/§3.2b): an in-process cache
+        (`self._cache[(app_name, user_id, session_id)]`) serves any session
+        this process has itself touched, exactly like `KeelSaver`'s `_by_ns`/
+        `_by_id`. A cache MISS falls back to a real in-process journal read
+        (`_scan_flows`) through the backend's ALREADY-OPEN connection — never
+        a second same-process `sqlite3` handle (issue #14) — which is an
+        accepted, STATED v1 cost: a cold read scans every flow ever created
+        for `RUNNER_FLOW_ENTRYPOINT`, across every user/session of the whole
+        app (§3.2b), not just the requesting session's own turn count.
+
+        Scope limits stated plainly, not silently (§7): no physical
+        compaction ever (§4 — `GetSessionConfig` trims the RECONSTRUCTED
+        event list at read time only); `get_session` promises eventual, not
+        linearizable, consistency under concurrent multi-process writers to
+        the same session_id (§6 item 2); a session that is `create_session`d
+        but never has a turn run against it is invisible to a different
+        process/a fresh cache (§6 item 3); Python-only, no Node/TS analog
+        (§5); an incoming `state` dict at `create_session` time is stored as
+        plain session-scoped state — the real service's separate app-/user-
+        scoped state maps (cross-session state SHARING) are a distinct
+        feature the design doc never scopes, a stated v1 gap for a later
+        phase to revisit if needed.
+        """
+
+        def __init__(self, *, app_name: str, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            #: Bound at construction (design §3.4): a STABLE identity for
+            #: `_write_gate`'s honesty check, deliberately NOT re-derived
+            #: from whatever a particular in-flight call happens to pass as
+            #: its own `app_name` argument (e.g. `create_session`'s caller
+            #: could pass anything).
+            self._app_name = app_name
+            #: (app_name, user_id, session_id) -> Session | _DELETED.
+            self._cache: dict[tuple[str, str, str], Any] = {}
+
+        # -- writes: journaled through the active flow (§3.1) ---------------
+
+        async def append_event(self, session: Any, event: Any) -> Any:
+            result = await super().append_event(session=session, event=event)
+            if not event.partial:
+                # `event.partial` early-returns from the REAL base method
+                # (no state/events mutation at all) — mirror that here too,
+                # so this never journals a step for an event the live
+                # session doesn't actually contain.
+                backend = self._write_gate(session.user_id, session.id)
+                if backend is not None:
+                    global _session_event_seq
+                    _session_event_seq += 1
+                    seq = _session_event_seq
+                    state_delta = dict(event.actions.state_delta) if event.actions else {}
+                    payload = {
+                        "event_id": event.id,
+                        "author": event.author,
+                        "invocation_id": event.invocation_id,
+                        "timestamp": event.timestamp,
+                        "content": _encode_content(event.content),
+                        "state_delta": {k: _json_safe(v) for k, v in state_delta.items()},
+                        "partial": event.partial,
+                    }
+                    _record_session_step(
+                        backend,
+                        SESSION_EVENT_TARGET,
+                        f"adk session_event session={session.id} seq={seq}",
+                        f"{session.id}:{seq}",
+                        payload,
+                    )
+            self._cache[(session.app_name, session.user_id, session.id)] = session
+            return result
+
+        async def create_session(
+            self,
+            *,
+            app_name: str,
+            user_id: str,
+            state: dict[str, Any] | None = None,
+            session_id: str | None = None,
+        ) -> Any:
+            # Mirrors `InMemorySessionService._create_session_impl`'s core
+            # shape (AlreadyExistsError check, session_id generation, Session
+            # construction — verified against the real 2.4.0 package) but
+            # NEVER journals (§6 item 3) and does not replicate the real
+            # service's separate app-/user-scoped state maps (class docs).
+            resolved_id = session_id.strip() if session_id and session_id.strip() else str(uuid.uuid4())
+            key = (app_name, user_id, resolved_id)
+            if session_id and self._cache.get(key) not in (None, _DELETED):
+                raise AlreadyExistsError(f"Session with id {resolved_id} already exists.")
+            new_session = Session(
+                app_name=app_name,
+                user_id=user_id,
+                id=resolved_id,
+                state=dict(state) if isinstance(state, dict) else {},
+                last_update_time=time.time(),
+            )
+            self._cache[key] = new_session
+            return _copy_session_light(new_session)
+
+        async def delete_session(self, *, app_name: str, user_id: str, session_id: str) -> None:
+            backend = self._write_gate(user_id, session_id)
+            if backend is not None:
+                _record_session_step(
+                    backend,
+                    SESSION_DELETE_TARGET,
+                    f"adk session_delete session={session_id}",
+                    session_id,
+                    {"session_id": session_id},
+                )
+            self._cache[(app_name, user_id, session_id)] = _DELETED
+
+        def _write_gate(self, user_id: str, session_id: str) -> Any | None:
+            """The two-case honesty gate (design §6 item 4), shared by
+            `append_event` and `delete_session` — anything that journals a
+            step through the currently open Runner-flow needs the SAME
+            distinction, using `_flow_entrypoint_designated()` rather than a
+            bare `_runtime.in_active_flow()` check (which cannot tell "no
+            flow open" apart from "a DIFFERENT flow has the singleton
+            slot" — only one flow is ever open at a time, so the busy case
+            reports `True` too):
+
+            * undesignated (`_flow_entrypoint_designated() is None`) or no
+              backend at all: silently degrade to plain in-memory behavior
+              (return None, write nothing) — this fires on every ADK turn
+              regardless of whether Keel is configured for Tier 2 at all,
+              unlike `KeelSaver`, which is only ever constructed by a caller
+              who already opted in;
+            * designated, but no flow is open OR a DIFFERENT session's flow
+              holds the process-wide singleton slot: raise KEEL-E005,
+              loudly — misattributing this write to someone else's flow
+              would be a correctness bug, not just a missed durability
+              opportunity;
+            * designated and this IS the active flow: return the backend.
+            """
+            if _flow_entrypoint_designated() is None:
+                return None
+            backend = _runtime.get_backend()
+            if backend is None:
+                return None
+            wanted = (self._app_name, user_id, session_id)
+            if not _runtime.in_active_flow() or _active_session_identity != wanted:
+                raise KeelError(
+                    "KEEL-E005",
+                    "KeelSessionService needs an OPEN Keel Tier 2 Runner-flow "
+                    "whose identity matches THIS session: writes are "
+                    "journaled into the CURRENTLY RUNNING flow's steps "
+                    '(design doc issue #15 §3.1, "one file, one trace '
+                    'view"), and this call landed with no MATCHING flow open '
+                    "— either no Runner-flow is active on this backend at "
+                    "all, or a DIFFERENT session's flow holds the "
+                    "process-wide singleton slot.\n"
+                    "  next: call this only from inside a designated "
+                    f"{RUNNER_FLOW_ENTRYPOINT!r} invocation for "
+                    f"app_name={self._app_name!r}, user_id={user_id!r}, "
+                    f"session_id={session_id!r} — or remove this entrypoint "
+                    "from [flows] to use a different (non-durable) session "
+                    "service.",
+                )
+            return backend
+
+        # -- reads: cache first, then a real journal read (§3.2) -------------
+
+        async def get_session(
+            self,
+            *,
+            app_name: str,
+            user_id: str,
+            session_id: str,
+            config: Any | None = None,
+        ) -> Any:
+            key = (app_name, user_id, session_id)
+            cached = self._cache.get(key)
+            if cached is not None:
+                return None if cached is _DELETED else _apply_get_session_config(cached, config)
+            backend = _runtime.get_backend()
+            if not _can_read_journal(backend):
+                return None
+            matches = self._scan_flows(backend).get(key)
+            if not matches:
+                return None
+            events, state, deleted = self._replay(matches)
+            if deleted:
+                self._cache[key] = _DELETED
+                return None
+            session = Session(
+                app_name=app_name,
+                user_id=user_id,
+                id=session_id,
+                state=state,
+                events=events,
+                last_update_time=events[-1].timestamp if events else 0.0,
+            )
+            self._cache[key] = session
+            return _apply_get_session_config(session, config)
+
+        async def list_sessions(self, *, app_name: str, user_id: str | None = None) -> Any:
+            found: dict[tuple[str, str], Any] = {}
+            for (a, u, s), sess in list(self._cache.items()):
+                if a != app_name or sess is _DELETED:
+                    continue
+                if user_id is not None and u != user_id:
+                    continue
+                found[(u, s)] = sess
+            backend = _runtime.get_backend()
+            if _can_read_journal(backend):
+                for (a, u, s), matches in self._scan_flows(backend).items():
+                    if a != app_name or (u, s) in found:
+                        continue
+                    if user_id is not None and u != user_id:
+                        continue
+                    events, state, deleted = self._replay(matches)
+                    if deleted:
+                        self._cache[(a, u, s)] = _DELETED
+                        continue
+                    session = Session(
+                        app_name=a,
+                        user_id=u,
+                        id=s,
+                        state=state,
+                        events=events,
+                        last_update_time=events[-1].timestamp if events else 0.0,
+                    )
+                    self._cache[(a, u, s)] = session
+                    found[(u, s)] = session
+            sessions = []
+            for sess in found.values():
+                # `ListSessionsResponse`'s own contract (real 2.4.0 package,
+                # `base_session_service.py`): "the events and states are not
+                # set within each Session object" — mirrors
+                # `InMemorySessionService._list_sessions_impl` exactly: build
+                # the full session, then blank events.
+                copied = _copy_session_light(sess)
+                copied.events = []
+                sessions.append(copied)
+            return ListSessionsResponse(sessions=sessions)
+
+        def _scan_flows(
+            self, backend: Any
+        ) -> dict[tuple[str, str, str], list[tuple[str, list[dict[str, Any]]]]]:
+            """One full scan of `flows_by_entrypoint(RUNNER_FLOW_ENTRYPOINT)`
+            (§3.2 step 1; §3.2b's accepted full-scan cost — paid ONCE per
+            call here, not once per session found), grouping each flow's
+            steps by the (app_name, user_id, session_id) identity its
+            `SESSION_IDENTITY_TARGET` step recorded. Groups preserve
+            `flows_by_entrypoint`'s own `created_at` order."""
+            grouped: dict[tuple[str, str, str], list[tuple[str, list[dict[str, Any]]]]] = {}
+            for flow in backend.flows_by_entrypoint(RUNNER_FLOW_ENTRYPOINT):
+                steps = backend.steps_for_flow(flow["flow_id"])
+                identity = self._identity_of(steps)
+                if identity is None:
+                    continue
+                grouped.setdefault(identity, []).append((flow["flow_id"], steps))
+            return grouped
+
+        @staticmethod
+        def _identity_of(steps: list[dict[str, Any]]) -> tuple[str, str, str] | None:
+            prefix = SESSION_IDENTITY_TARGET + "#"
+            for step in steps:
+                if str(step.get("step_key") or "").startswith(prefix):
+                    payload = step.get("payload")
+                    if not isinstance(payload, dict):
+                        return None
+                    app_name, user_id, session_id = (
+                        payload.get("app_name"),
+                        payload.get("user_id"),
+                        payload.get("session_id"),
+                    )
+                    if isinstance(app_name, str) and isinstance(user_id, str) and isinstance(session_id, str):
+                        return (app_name, user_id, session_id)
+                    return None
+            return None
+
+        def _replay(
+            self, matches: list[tuple[str, list[dict[str, Any]]]]
+        ) -> tuple[list[Any], dict[str, Any], bool]:
+            """Replay one session's matching flows' `tool:adk.session_event`/
+            `tool:adk.session_delete` steps, in the order `_scan_flows`
+            already preserves (flow `created_at` order, then each flow's own
+            `seq` order — i.e. the SAME order the live process wrote them
+            in), reconstructing `events`/`state`/deleted-ness exactly as
+            `BaseSessionService.append_event`'s own `_update_session_state`
+            would (state_delta keys overwrite earlier same-key values, never
+            merged/deep-merged)."""
+            events: list[Any] = []
+            state: dict[str, Any] = {}
+            deleted = False
+            event_prefix = SESSION_EVENT_TARGET + "#"
+            delete_prefix = SESSION_DELETE_TARGET + "#"
+            for _flow_id, steps in matches:
+                for step in steps:
+                    key = str(step.get("step_key") or "")
+                    if key.startswith(event_prefix):
+                        payload = step.get("payload")
+                        if not isinstance(payload, dict):
+                            continue  # undecodable payload: skip, don't crash a whole read
+                        events.append(self._decode_event(payload))
+                        for k, v in (payload.get("state_delta") or {}).items():
+                            state[k] = v
+                    elif key.startswith(delete_prefix):
+                        deleted = True
+            return events, state, deleted
+
+        def _decode_event(self, payload: dict[str, Any]) -> Any:
+            return Event(
+                id=str(payload.get("event_id") or ""),
+                author=str(payload.get("author") or ""),
+                invocation_id=str(payload.get("invocation_id") or ""),
+                timestamp=float(payload.get("timestamp") or 0.0),
+                content=_decode_content(payload.get("content"), Content, Part, Blob),
+                actions=EventActions(state_delta=dict(payload.get("state_delta") or {})),
+                partial=payload.get("partial"),
+            )
+
+    _session_service_cls = _KeelSessionService
+    return _session_service_cls
+
+
+def KeelSessionService(*, app_name: str, **kwargs: Any) -> Any:
+    """Factory returning a `BaseSessionService` instance whose writes are
+    journaled as steps of the CURRENTLY OPEN Keel Tier 2 Runner-flow (design
+    doc issue #15, §3.4). A callable, not a `class` statement, so
+    `google.adk`/`google.genai` are imported only when this is actually
+    called (adapter-pack rule 1) — used exactly like a constructor:
+    ``session_service = KeelSessionService(app_name="my_app")``, then wired
+    into ADK manually: ``Runner(session_service=session_service,
+    app_name="my_app", ...)`` (§3.4 recommends manual wiring, matching
+    `KeelSaver`'s own precedent — no auto-substitution into `Runner.__init__`
+    in v1)."""
+    return _base_session_service_cls()(app_name=app_name, **kwargs)
+
+
 __all__ = [
     "MODULE",
     "NAME",
     "PLUGIN_NAME",
     "RUNNER_FLOW_ENTRYPOINT",
+    "SESSION_EVENT_TARGET",
+    "SESSION_IDENTITY_TARGET",
+    "SESSION_DELETE_TARGET",
     "detect",
     "seams",
     "targets",
     "defaults",
     "install",
     "uninstall",
+    "KeelSessionService",
 ]
