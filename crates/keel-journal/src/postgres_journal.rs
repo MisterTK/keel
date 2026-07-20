@@ -443,6 +443,36 @@ impl Journal for PostgresJournal {
                 .map_err(Error::from)
         })
     }
+
+    fn flows_by_entrypoint(&self, entrypoint: &str) -> Result<Vec<FlowDescriptor>> {
+        let entrypoint = entrypoint.to_owned();
+        self.exec(move |client| {
+            let rows = client.query(
+                &format!(
+                    "SELECT {FLOW_COLUMNS} FROM flows WHERE entrypoint = $1 ORDER BY created_at"
+                ),
+                &[&entrypoint],
+            )?;
+            rows.iter().map(|r| flow_from_row(flow_row(r)?)).collect()
+        })
+    }
+
+    fn steps_for_flow(&self, flow: &FlowId) -> Result<Vec<(StepKey, StepOutcome)>> {
+        let flow_s = flow.as_str().to_owned();
+        self.exec(move |client| {
+            let rows = client.query(
+                "SELECT step_key, kind, attempt, outcome, payload, error_class, started_at, ended_at \
+                 FROM steps WHERE flow_id = $1 ORDER BY seq",
+                &[&flow_s],
+            )?;
+            rows.iter()
+                .map(|r| {
+                    let key: String = r.try_get(0)?;
+                    Ok((StepKey::new(key), step_from_row(step_row_from(r, 1)?)?))
+                })
+                .collect()
+        })
+    }
 }
 
 /// Extract the nine `flows` columns ([`FLOW_COLUMNS`]'s order) from a row.

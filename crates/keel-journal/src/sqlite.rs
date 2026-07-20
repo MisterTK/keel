@@ -296,6 +296,33 @@ impl<C: Clock> Journal for SqliteJournal<C> {
             .optional()?;
         Ok(value)
     }
+
+    fn flows_by_entrypoint(&self, entrypoint: &str) -> Result<Vec<FlowDescriptor>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FLOW_COLUMNS} FROM flows WHERE entrypoint = ?1 ORDER BY created_at"
+        ))?;
+        let rows = stmt
+            .query_map(params![entrypoint], flow_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(flow_from_row).collect()
+    }
+
+    fn steps_for_flow(&self, flow: &FlowId) -> Result<Vec<(StepKey, StepOutcome)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT step_key, kind, attempt, outcome, payload, error_class, started_at, ended_at \
+             FROM steps WHERE flow_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![flow.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, step_row_from(row, 1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(key, raw)| Ok((StepKey::new(key), step_from_row(raw)?)))
+            .collect()
+    }
 }
 
 /// Extracts the raw flow columns inside the query closure (which must return a
@@ -797,5 +824,96 @@ mod tests {
         }
         let reopened = SqliteJournal::open(&path, ManualClock::new(T0)).unwrap();
         assert!(reopened.get_flow(&FlowId::new("01FLOW")).unwrap().is_some());
+    }
+
+    #[test]
+    fn flows_by_entrypoint_returns_every_status_ordered_by_created_at() {
+        let dir = TempDir::new().unwrap();
+        let clock = ManualClock::new(T0);
+        let j = journal(&dir, clock.clone());
+
+        // A flow under a DIFFERENT entrypoint must never appear below.
+        let other = NewFlow {
+            flow_id: FlowId::new("00OTHER"),
+            entrypoint: "py:other.module:main".to_owned(),
+            args_hash: "ah-other".to_owned(),
+            code_hash: None,
+        };
+        j.begin_flow(&other).unwrap();
+
+        j.begin_flow(&sample_flow("01FIRST")).unwrap();
+        clock.advance(1_000);
+        j.begin_flow(&sample_flow("02SECOND")).unwrap();
+        clock.advance(1_000);
+        let third = FlowId::new("03THIRD");
+        j.begin_flow(&sample_flow("03THIRD")).unwrap();
+        // Unlike `incomplete_flows`, a non-`running` flow must still show up.
+        j.complete_flow(&third, FlowStatus::Failed).unwrap();
+
+        let flows = j.flows_by_entrypoint("py:pipeline.ingest:main").unwrap();
+        let ids: Vec<&str> = flows.iter().map(|f| f.flow_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["01FIRST", "02SECOND", "03THIRD"],
+            "every status for this entrypoint, ordered by created_at"
+        );
+        assert_eq!(flows[0].status, FlowStatus::Running);
+        assert_eq!(
+            flows[2].status,
+            FlowStatus::Failed,
+            "failed flows are included too"
+        );
+
+        assert!(
+            j.flows_by_entrypoint("py:nonexistent:main")
+                .unwrap()
+                .is_empty(),
+            "an entrypoint with no flows reads as empty, not an error"
+        );
+    }
+
+    #[test]
+    fn steps_for_flow_returns_every_step_in_seq_order_with_raw_payload() {
+        let dir = TempDir::new().unwrap();
+        let j = journal(&dir, ManualClock::new(T0));
+        let flow = FlowId::new("01FLOW");
+        j.begin_flow(&sample_flow("01FLOW")).unwrap();
+
+        let step0 = StepOutcome {
+            kind: StepKind::Effect,
+            attempt: 1,
+            status: StepStatus::Ok,
+            payload: Some(vec![0x81, 0xA2, 0x6F, 0x6B, 0xC3]),
+            error_class: None,
+            started_at: T0,
+            ended_at: Some(T0 + 5),
+        };
+        let step1 = StepOutcome {
+            status: StepStatus::Running,
+            payload: None,
+            started_at: T0 + 10,
+            ended_at: None,
+            ..step0.clone()
+        };
+        // Recorded out of seq order, to prove the read orders by `seq`, not
+        // insertion order.
+        j.record_step(&flow, 1, &StepKey::new("api.b.internal#w1"), &step1)
+            .unwrap();
+        j.record_step(&flow, 0, &StepKey::new("api.a.internal#w0"), &step0)
+            .unwrap();
+
+        let got = j.steps_for_flow(&flow).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, StepKey::new("api.a.internal#w0"));
+        assert_eq!(got[0].1, step0, "payload stays raw/undecoded");
+        assert_eq!(got[1].0, StepKey::new("api.b.internal#w1"));
+        assert_eq!(got[1].1, step1);
+
+        let empty = FlowId::new("02EMPTY");
+        j.begin_flow(&sample_flow("02EMPTY")).unwrap();
+        assert!(
+            j.steps_for_flow(&empty).unwrap().is_empty(),
+            "a flow with no steps yet reads as empty, not an error"
+        );
     }
 }

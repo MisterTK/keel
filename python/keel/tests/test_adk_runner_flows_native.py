@@ -332,8 +332,9 @@ class EndToEndRecoveryTest(_NativeAdkFlowTestBase):
         effect_steps = self._steps(flow["flow_id"], kind="effect")
         self.assertEqual(
             [s["step_key"] for s in effect_steps],
-            ["tool:bump_one#-", "tool:bump_two#-"],
-            "exactly one journal row per effect, ever — no duplicate for the substituted one",
+            ["tool:adk.session_identity#-", "tool:bump_one#-", "tool:bump_two#-"],
+            "exactly one journal row per effect, ever — no duplicate for the substituted one "
+            "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
 
     def test_repeated_abandonment_hits_the_attempt_cap_and_the_flow_goes_dead(self) -> None:
@@ -498,12 +499,13 @@ class WrappedEffectAdmissionOrderTest(_NativeAdkFlowTestBase):
         effect_steps = [s for s in steps if s["kind"] == "effect"]
         self.assertEqual(
             [s["step_key"] for s in effect_steps],
-            ["tool:effect_a#-", "tool:effect_b#-"],
-            "effects journaled in call order, never raced",
+            ["tool:adk.session_identity#-", "tool:effect_a#-", "tool:effect_b#-"],
+            "effects journaled in call order, never raced (plus the session_identity step "
+            "every designated flow entry now writes, issue #15)",
         )
         self.assertLess(
             random_step["seq"],
-            effect_steps[0]["seq"],
+            effect_steps[1]["seq"],
             "both wrapped effects admit AFTER the correlation step",
         )
 
@@ -675,17 +677,18 @@ class ModelFallbackWithinFlowCompositionTest(_NativeAdkFlowTestBase):
         self.assertEqual(len(random_steps), 1)
         self.assertEqual(
             [s["step_key"] for s in effect_steps],
-            ["tool:bump_one#-", "tool:bump_fallback#-"],
-            "the runner's own effect, then the fallback hop's effect, in call order",
+            ["tool:adk.session_identity#-", "tool:bump_one#-", "tool:bump_fallback#-"],
+            "the runner's own effect, then the fallback hop's effect, in call order "
+            "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
         self.assertLess(
             random_steps[0]["seq"],
-            effect_steps[0]["seq"],
+            effect_steps[1]["seq"],
             "both effects admit AFTER the correlation step",
         )
         self.assertLess(
-            effect_steps[0]["seq"],
             effect_steps[1]["seq"],
+            effect_steps[2]["seq"],
             "admission order: the runner's own effect before the fallback hop's",
         )
 
@@ -745,8 +748,9 @@ class ModelFallbackWithinFlowCompositionTest(_NativeAdkFlowTestBase):
         effect_steps = self._steps(flow["flow_id"], kind="effect")
         self.assertEqual(
             [s["step_key"] for s in effect_steps],
-            ["tool:bump_one#-", "tool:bump_fallback#-"],
-            "exactly one journal row per effect, ever -- no duplicate for either substituted effect",
+            ["tool:adk.session_identity#-", "tool:bump_one#-", "tool:bump_fallback#-"],
+            "exactly one journal row per effect, ever -- no duplicate for either substituted effect "
+            "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
 
 

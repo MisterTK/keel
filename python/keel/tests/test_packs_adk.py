@@ -15,6 +15,7 @@ tool name, discovery recording).
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import io
@@ -26,21 +27,28 @@ import unittest
 from importlib import metadata
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 from fake_adk import (
     FakeAdkModules,
+    FakeAlreadyExistsError,
     FakeApp,
     FakeBasePlugin,
+    FakeBlob,
     FakeClaude,
+    FakeContent,
     FakeEvent,
+    FakeEventActions,
     FakeGemini,
+    FakeGetSessionConfig,
     FakeInMemoryRunner,
     FakeLLMRegistry,
     FakeLlmRequest,
     FakeLlmResponse,
+    FakePart,
     FakeRunner,
+    FakeSession,
     FakeTool,
     FakeSlottedTool,
     McpTool,
@@ -63,6 +71,19 @@ class AdkTestBase(unittest.TestCase):
         adk_pack._noted_model_fallback_hop_failures.clear()
         adk_pack._rebound.clear()
         adk_pack._noted_busy = False
+        # KeelSessionService (design doc issue #15) module-level state: the
+        # built session-service CLASS is cached across calls (mirrors
+        # `langgraph_pack._saver_cls`) — reset it so every test observes a
+        # FRESH `_base_session_service_cls()` build (needed for e.g. the
+        # "google.adk absent" test to actually exercise the ImportError path
+        # rather than reusing a class a PRIOR test already built under
+        # `FakeAdkModules()`). The per-flow session-event sequence counter
+        # and "whose flow is this" identity (`_run_async_flow_wrapper`'s own
+        # reset site) are reset here too, for the same cross-test isolation
+        # reason `_noted_busy`/`_rebound` already get it.
+        adk_pack._session_service_cls = None
+        adk_pack._active_session_identity = None
+        adk_pack._session_event_seq = 0
         FakeLLMRegistry.reset()
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
@@ -1649,6 +1670,634 @@ class ModelFallbackPluginShapeTest(AdkTestBase):
                 )
             )
         self.assertIs(result, response, "PluginManager substitutes this object verbatim, not a copy")
+
+
+# --- KeelSessionService (design doc issue #15) -------------------------------
+#
+# Runs entirely OFFLINE against the structural fakes `fake_adk.py` adds for
+# this feature (`FakeSession`/`FakeBaseSessionService`/`FakeEventActions`/
+# `FakeBlob`/`FakePart`/`FakeContent`/... — registered into `FakeAdkModules`
+# under `google.adk.sessions`/`google.adk.events`/`google.adk.errors`/
+# `google.genai.types`). Per the WS3 convention (CLAUDE.md: "New agent-pack
+# seams extend THREE test layers together"), this is layer 2 (offline pack
+# tests); layer 3 (a `test_farm_adk_session_service.py` module certifying
+# against the real pinned `google-adk==2.4.0`) is a later phase's job, not
+# this one's.
+
+
+def _fake_session(app_name: str, user_id: str, session_id: str, **kwargs: Any) -> FakeSession:
+    return FakeSession(app_name=app_name, user_id=user_id, id=session_id, **kwargs)
+
+
+def _fake_event(
+    *,
+    event_id: str = "e1",
+    author: str = "model",
+    invocation_id: str = "inv-1",
+    timestamp: float = 1.0,
+    content: Any = None,
+    state_delta: dict[str, Any] | None = None,
+    partial: bool = False,
+) -> FakeEvent:
+    """A fully-shaped `Event` for driving `KeelSessionService.append_event`
+    directly — every field the write path (design §3.1) actually reads."""
+    return FakeEvent(
+        id=event_id,
+        author=author,
+        invocation_id=invocation_id,
+        timestamp=timestamp,
+        content=content,
+        actions=FakeEventActions(state_delta=state_delta or {}),
+        partial=partial,
+    )
+
+
+class _FakeSessionJournalBackend:
+    """`_FakeAdkFlowBackend`'s flow lifecycle (`enter_flow`/`exit_flow`/
+    `journal_random`) PLUS a real, flow-scoped step journal backing
+    `execute()`/`flows_by_entrypoint()`/`steps_for_flow()` (design doc issue
+    #15 §3.2) — enough to exercise `KeelSessionService`'s read path
+    end-to-end offline: no compiled core, no real `google.adk`, but a
+    faithful enough journal shape (flow_id -> ordered steps, each carrying
+    `seq`/`step_key`/`payload`) for the pack's OWN `_scan_flows`/`_replay`
+    to run against completely unmodified.
+
+    Unlike `_FakeAdkFlowBackend` (which hardcodes a single `"fid-1"` — that
+    fixture never needed more than one flow open at a time),
+    `KeelSessionService`'s whole point is reading ACROSS many past flow_ids
+    (design §0), so `enter_flow` here mints a fresh id per NEW
+    `(entrypoint, args_hash)` identity (and reuses the same id for a
+    same-identity replay, mirroring the real core) and this class tracks
+    calls to the two read methods for the read-path's cache-hit/cache-miss
+    call-count assertions."""
+
+    def __init__(self) -> None:
+        self.entered: list[tuple[Any, ...]] = []
+        self.exited: list[str] = []
+        self.random: dict[str, bytes] = {}
+        self.persistent = True
+        self.last_flow_id: str | None = None
+        self._current_flow_id: str | None = None
+        self._flow_seq = 0
+        # flow_id -> {"entrypoint", "args_hash", "created_at", "steps": [...]}
+        self._flows: dict[str, dict[str, Any]] = {}
+        self._flow_id_for_identity: dict[tuple[str, str], str] = {}
+        self.flows_by_entrypoint_calls = 0
+        self.steps_for_flow_calls: list[str] = []
+
+    def enter_flow(
+        self,
+        entrypoint: str,
+        args_hash: str,
+        code_hash: str | None = None,
+        explicit_key: str | None = None,
+        lease_ms: int | None = None,
+    ) -> dict[str, Any]:
+        self.entered.append((entrypoint, args_hash, code_hash, explicit_key, lease_ms))
+        identity = (entrypoint, args_hash)
+        replay = identity in self._flow_id_for_identity
+        if replay:
+            flow_id = self._flow_id_for_identity[identity]
+        else:
+            self._flow_seq += 1
+            flow_id = f"fid-{self._flow_seq}"
+            self._flows[flow_id] = {
+                "entrypoint": entrypoint,
+                "args_hash": args_hash,
+                "created_at": self._flow_seq,
+                "steps": [],
+            }
+            self._flow_id_for_identity[identity] = flow_id
+        self._current_flow_id = flow_id
+        self.last_flow_id = flow_id
+        return {"flow_id": flow_id, "status": "completed" if replay else "running", "replay": replay}
+
+    def exit_flow(self, status: str) -> None:
+        self.exited.append(status)
+
+    def journal_random(self, key: str, data: bytes) -> bytes:
+        return self.random.setdefault(key, data)
+
+    def execute(self, request: dict[str, Any], effect: Any) -> dict[str, Any]:
+        result = effect(0)
+        payload = result.get("payload")
+        step_key = f"{request['target']}#{request['args_hash']}"
+        flow = self._flows[self._current_flow_id]
+        seq = len(flow["steps"]) + 1
+        flow["steps"].append({"seq": seq, "step_key": step_key, "payload": payload})
+        return {"result": result.get("status", "ok"), "payload": payload}
+
+    def flows_by_entrypoint(self, entrypoint: str) -> list[dict[str, Any]]:
+        self.flows_by_entrypoint_calls += 1
+        return [
+            {"flow_id": fid, "entrypoint": f["entrypoint"], "created_at": f["created_at"]}
+            for fid, f in sorted(self._flows.items(), key=lambda kv: kv[1]["created_at"])
+            if f["entrypoint"] == entrypoint
+        ]
+
+    def steps_for_flow(self, flow_id: str) -> list[dict[str, Any]]:
+        self.steps_for_flow_calls.append(flow_id)
+        return [dict(s) for s in self._flows[flow_id]["steps"]]
+
+
+class _FlowRunner:
+    """A `self`-substitute for driving `adk_pack._run_async_wrapper` (the
+    Runner-flow wrap itself) directly, bypassing `FakeRunner`'s plugin/tool
+    machinery entirely (irrelevant to `KeelSessionService` coverage): the
+    wrapper's identity-write call site reads only `self.app_name` (design
+    §3.4's confirmed source — `Runner.__init__` always sets it)."""
+
+    def __init__(self, app_name: str) -> None:
+        self.app_name = app_name
+
+
+def _drive_flow(
+    app_name: str, user_id: str, session_id: str, invocation_id: str, body: Callable[[], Any]
+) -> str:
+    """Drives ONE simulated Runner-flow turn through the REAL
+    `adk_pack._run_async_wrapper` (not a reimplementation of its reset
+    logic) — opens the flow, writes `tool:adk.session_identity` at the
+    wrapper's own (corrected, design §3.1) call site, awaits `body()`
+    (typically one or more `KeelSessionService.append_event` calls), yields
+    one event to correlate/complete, then exits the flow. Requires the
+    caller to have already designated `RUNNER_FLOW_ENTRYPOINT` and installed
+    a backend via `_runtime.set_runtime(...)`. Returns the backend's
+    `last_flow_id` after the turn completes, so callers can inspect that
+    flow's own steps via `backend.steps_for_flow(flow_id)`."""
+
+    async def orig(
+        self: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: str | None = None,
+        new_message: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        await body()
+        yield FakeEvent(invocation_id=invocation_id)
+
+    wrapped = adk_pack._run_async_wrapper(orig)
+    runner = _FlowRunner(app_name=app_name)
+
+    async def run() -> None:
+        async for _event in wrapped(
+            runner, user_id=user_id, session_id=session_id, invocation_id=invocation_id
+        ):
+            pass
+
+    asyncio.run(run())
+    backend = _runtime.get_backend()
+    return backend.last_flow_id
+
+
+class KeelSessionServiceWithoutAdkTest(AdkTestBase):
+    """Mirrors `CheckpointerWithoutLangGraphTest`: the factory needs
+    `google.adk` installed (KEEL-E005 otherwise)."""
+
+    def test_factory_needs_google_adk_installed(self) -> None:
+        # google.adk is genuinely not installed in this test environment,
+        # and AdkTestBase.setUp resets `_session_service_cls` to None so a
+        # PRIOR test's fake build can't paper over this one.
+        with self.assertRaises(KeelError) as ctx:
+            adk_pack.KeelSessionService(app_name="app")
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+
+
+class KeelSessionServiceHonestyGateTest(AdkTestBase):
+    """The write-path honesty gate (design §6 item 4), mirroring
+    `CheckpointerHonestyGateTest`'s structure but with THREE cases instead
+    of two — `_write_gate` distinguishes "never designated" (silent
+    in-memory degrade) from "designated but no/wrong flow open" (KEEL-E005)
+    using `_flow_entrypoint_designated()`, which a bare
+    `_runtime.in_active_flow()` check cannot tell apart."""
+
+    def _designate(self) -> None:
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+
+    def test_undesignated_degrades_silently_no_write_no_error(self) -> None:
+        # [flows] entrypoints never named the Runner entrypoint at all — the
+        # common case for every app that hasn't opted into Tier 2 yet.
+        _runtime.set_flow_entrypoints(())
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            event = _fake_event(state_delta={"x": 1})
+            result = asyncio.run(svc.append_event(session, event))
+        self.assertEqual(backend.entered, [], "no flow ever entered")
+        self.assertEqual(backend.flows_by_entrypoint_calls, 0)
+        self.assertIs(result, event, "the base method's own return value still comes back")
+        self.assertEqual(session.state.get("x"), 1, "the live in-memory mutation still happens")
+        self.assertEqual(session.events, [event])
+
+    def test_designated_but_no_flow_open_raises_e005(self) -> None:
+        self._designate()
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        self.assertFalse(_runtime.in_active_flow())
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            event = _fake_event()
+            with self.assertRaises(KeelError) as ctx:
+                asyncio.run(svc.append_event(session, event))
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+
+    def test_designated_but_a_different_sessions_flow_is_active_raises_e005(self) -> None:
+        # The process-wide singleton flow handle is held by a DIFFERENT
+        # session's turn — misattributing this write to it would be a
+        # correctness bug, not just a missed durability opportunity.
+        self._designate()
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        adk_pack._active_session_identity = ("app", "someone-else", "their-session")
+        _runtime.set_flow_active(True)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            event = _fake_event()
+            with self.assertRaises(KeelError) as ctx:
+                asyncio.run(svc.append_event(session, event))
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+
+    def test_designated_and_this_session_is_the_active_flow_writes_normally(self) -> None:
+        self._designate()
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        # Prime a real flow slot (`execute()` writes into whichever flow
+        # `enter_flow` last opened) — `set_flow_active`/`_active_session_identity`
+        # alone (the honesty gate's own inputs) don't imply a flow exists for
+        # `execute()` to index into; a real `_run_async_flow_wrapper` call
+        # always does both together (`enter_flow` before `set_flow_active`).
+        backend.enter_flow(adk_pack.RUNNER_FLOW_ENTRYPOINT, "ah-1")
+        adk_pack._active_session_identity = ("app", "u1", "s1")
+        _runtime.set_flow_active(True)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            event = _fake_event(state_delta={"greeted": True})
+            asyncio.run(svc.append_event(session, event))
+        steps = backend.steps_for_flow(backend.last_flow_id)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["step_key"], f"{adk_pack.SESSION_EVENT_TARGET}#s1:1")
+        self.assertEqual(session.state.get("greeted"), True)
+
+
+class KeelSessionServiceHonestyGateDeleteTest(AdkTestBase):
+    """The same three-case gate, exercised via `delete_session` instead of
+    `append_event` — `_write_gate` is shared, but this pins that BOTH write
+    call sites actually use it."""
+
+    def _designate(self) -> None:
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+
+    def test_undesignated_delete_degrades_silently(self) -> None:
+        _runtime.set_flow_entrypoints(())
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            asyncio.run(svc.delete_session(app_name="app", user_id="u1", session_id="s1"))
+        self.assertEqual(backend.entered, [])
+
+    def test_designated_no_matching_flow_delete_raises_e005(self) -> None:
+        self._designate()
+        backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(backend, None)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            with self.assertRaises(KeelError) as ctx:
+                asyncio.run(svc.delete_session(app_name="app", user_id="u1", session_id="s1"))
+        self.assertEqual(ctx.exception.code, "KEEL-E005")
+
+
+class KeelSessionServiceWritePathTest(AdkTestBase):
+    """Write-path shape (design §3.1): `append_event` journals
+    `tool:adk.session_event` with the documented `<session_id>:<seq>`
+    args_hash; `create_session` journals NOTHING (§6 item 3); `delete_session`
+    journals `tool:adk.session_delete` keyed by the bare session id."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+        self.backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(self.backend, None)
+        adk_pack._active_session_identity = ("app", "u1", "s1")
+        _runtime.set_flow_active(True)
+        # Prime a real flow slot (append_event/delete_session write THROUGH
+        # `execute()`, which indexes `self._current_flow_id` — a bare
+        # `set_flow_active(True)` alone, without ever calling `enter_flow`,
+        # leaves no flow for `execute()` to write into).
+        self.backend.enter_flow(adk_pack.RUNNER_FLOW_ENTRYPOINT, "ah-1")
+
+    def test_append_event_journals_the_documented_step_key(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            asyncio.run(svc.append_event(session, _fake_event(event_id="e1")))
+            asyncio.run(svc.append_event(session, _fake_event(event_id="e2")))
+        steps = self.backend.steps_for_flow(self.backend.last_flow_id)
+        self.assertEqual(
+            [s["step_key"] for s in steps],
+            [f"{adk_pack.SESSION_EVENT_TARGET}#s1:1", f"{adk_pack.SESSION_EVENT_TARGET}#s1:2"],
+        )
+
+    def test_partial_event_is_never_journaled_or_appended(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            asyncio.run(svc.append_event(session, _fake_event(partial=True)))
+        self.assertEqual(self.backend.steps_for_flow(self.backend.last_flow_id), [])
+        self.assertEqual(session.events, [], "the REAL base method never appends a partial event either")
+
+    def test_create_session_journals_nothing(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            asyncio.run(svc.create_session(app_name="app", user_id="u1", session_id="s-new"))
+        self.assertEqual(self.backend.steps_for_flow(self.backend.last_flow_id), [])
+
+    def test_create_session_duplicate_id_raises_already_exists(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            asyncio.run(svc.create_session(app_name="app", user_id="u1", session_id="dup"))
+            with self.assertRaises(FakeAlreadyExistsError):
+                asyncio.run(svc.create_session(app_name="app", user_id="u1", session_id="dup"))
+
+    def test_delete_session_journals_the_documented_step_key(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            asyncio.run(svc.delete_session(app_name="app", user_id="u1", session_id="s1"))
+        steps = self.backend.steps_for_flow(self.backend.last_flow_id)
+        self.assertEqual([s["step_key"] for s in steps], [f"{adk_pack.SESSION_DELETE_TARGET}#s1"])
+
+
+class KeelSessionServiceStepOrderingTest(AdkTestBase):
+    """The two properties the design review specifically added/fixed (§3.1):
+    `session_identity` is written BEFORE the first `session_event` in
+    journal order, and the per-flow `session_event` sequence counter RESETS
+    to start at 1 for every new flow rather than accumulating across turns
+    — both driven through the REAL `_run_async_wrapper` (`_drive_flow`), not
+    a reimplementation of its reset logic, so a regression in the actual
+    reset call site would fail these tests."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+        self.backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(self.backend, None)
+
+    def test_session_identity_is_journaled_before_the_first_session_event(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+
+            async def body() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e1"))
+
+            flow_id = _drive_flow("app", "u1", "s1", "inv-1", body)
+
+        steps = self.backend.steps_for_flow(flow_id)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["seq"], 1)
+        self.assertEqual(steps[0]["step_key"], f"{adk_pack.SESSION_IDENTITY_TARGET}#-")
+        self.assertEqual(steps[0]["payload"], {"app_name": "app", "user_id": "u1", "session_id": "s1"})
+        self.assertEqual(steps[1]["seq"], 2)
+        self.assertEqual(steps[1]["step_key"], f"{adk_pack.SESSION_EVENT_TARGET}#s1:1")
+
+    def test_session_event_seq_resets_to_1_for_every_new_flow(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+
+            async def body_flow1() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e1"))
+                await svc.append_event(session, _fake_event(event_id="e2"))
+
+            flow1_id = _drive_flow("app", "u1", "s1", "inv-1", body_flow1)
+
+            async def body_flow2() -> None:
+                # A brand-new turn (different invocation_id => a genuinely
+                # NEW flow, not a replay of flow1) for the SAME session.
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e3"))
+                await svc.append_event(session, _fake_event(event_id="e4"))
+
+            flow2_id = _drive_flow("app", "u1", "s1", "inv-2", body_flow2)
+
+        self.assertNotEqual(flow1_id, flow2_id, "two distinct flows, not a replay of the same one")
+        event_keys1 = [
+            s["step_key"]
+            for s in self.backend.steps_for_flow(flow1_id)
+            if s["step_key"].startswith(adk_pack.SESSION_EVENT_TARGET)
+        ]
+        event_keys2 = [
+            s["step_key"]
+            for s in self.backend.steps_for_flow(flow2_id)
+            if s["step_key"].startswith(adk_pack.SESSION_EVENT_TARGET)
+        ]
+        self.assertEqual(
+            event_keys1, [f"{adk_pack.SESSION_EVENT_TARGET}#s1:1", f"{adk_pack.SESSION_EVENT_TARGET}#s1:2"]
+        )
+        self.assertEqual(
+            event_keys2,
+            [f"{adk_pack.SESSION_EVENT_TARGET}#s1:1", f"{adk_pack.SESSION_EVENT_TARGET}#s1:2"],
+            "seq must RESET to 1 for the new flow, not continue accumulating as 3, 4 "
+            "(the exact sequencing bug the design doc's own review caught, §3.1)",
+        )
+
+
+class KeelSessionServiceContentEncodingTest(unittest.TestCase):
+    """Event content encoding (design §3.1's "event mapping" open question):
+    a `Part` round-trips through `_encode_part`/`_decode_part` for all three
+    documented cases. Exercises the private encode/decode helpers directly
+    (they take `content_cls`/`part_cls`/`blob_cls` as plain arguments, not
+    imports of their own) rather than the full write/read path — no
+    `FakeAdkModules` needed."""
+
+    def test_plain_text_part_passes_through_unencoded(self) -> None:
+        part = FakePart(text="hello")
+        self.assertEqual(adk_pack._encode_part(part), {"text": "hello"})
+
+    def test_inline_data_part_survives_round_trip_as_base64_dict(self) -> None:
+        raw = b"\x89PNG\r\n\x1a\n"
+        part = FakePart(inline_data=FakeBlob(data=raw, mime_type="image/png"))
+        encoded = adk_pack._encode_part(part)
+        self.assertEqual(
+            encoded, {"inline_data_b64": base64.b64encode(raw).decode("ascii"), "mime_type": "image/png"}
+        )
+        decoded = adk_pack._decode_part(encoded, FakePart, FakeBlob)
+        self.assertEqual(decoded.inline_data.data, raw)
+        self.assertEqual(decoded.inline_data.mime_type, "image/png")
+
+    def test_function_call_part_survives_round_trip_via_model_dump_fallback(self) -> None:
+        part = FakePart(function_call={"name": "search", "args": {"q": "keel"}})
+        encoded = adk_pack._encode_part(part)
+        self.assertEqual(encoded, {"function_call": {"name": "search", "args": {"q": "keel"}}})
+        decoded = adk_pack._decode_part(encoded, FakePart, FakeBlob)
+        self.assertEqual(decoded.function_call, {"name": "search", "args": {"q": "keel"}})
+
+    def test_function_response_part_survives_round_trip_via_model_dump_fallback(self) -> None:
+        part = FakePart(function_response={"name": "search", "response": {"result": [1, 2]}})
+        encoded = adk_pack._encode_part(part)
+        self.assertEqual(encoded, {"function_response": {"name": "search", "response": {"result": [1, 2]}}})
+        decoded = adk_pack._decode_part(encoded, FakePart, FakeBlob)
+        self.assertEqual(decoded.function_response, {"name": "search", "response": {"result": [1, 2]}})
+
+    def test_content_round_trip_preserves_role_and_part_order(self) -> None:
+        content = FakeContent(
+            role="user",
+            parts=[FakePart(text="hi"), FakePart(inline_data=FakeBlob(data=b"x", mime_type="a/b"))],
+        )
+        encoded = adk_pack._encode_content(content)
+        decoded = adk_pack._decode_content(encoded, FakeContent, FakePart, FakeBlob)
+        self.assertEqual(decoded.role, "user")
+        self.assertEqual(decoded.parts[0].text, "hi")
+        self.assertEqual(decoded.parts[1].inline_data.data, b"x")
+        self.assertEqual(decoded.parts[1].inline_data.mime_type, "a/b")
+
+    def test_none_content_round_trips_to_none(self) -> None:
+        self.assertIsNone(adk_pack._encode_content(None))
+        self.assertIsNone(adk_pack._decode_content(None, FakeContent, FakePart, FakeBlob))
+
+
+class KeelSessionServiceReadPathTest(AdkTestBase):
+    """The read path (design §3.2): an in-process cache hit makes ZERO
+    calls to `flows_by_entrypoint`/`steps_for_flow`; a cache miss falls back
+    to a real scan-and-replay that reconstructs `Session.events`/`state` in
+    order ACROSS multiple past flows; a `create_session` that never had a
+    turn run against it is invisible to a fresh (cache-miss) reader (§6
+    item 3)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+        self.backend = _FakeSessionJournalBackend()
+        _runtime.set_runtime(self.backend, None)
+
+    def test_cache_hit_makes_zero_calls_to_the_journal_read_methods(self) -> None:
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+
+            async def body() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e1"))
+
+            _drive_flow("app", "u1", "s1", "inv-1", body)
+            self.backend.flows_by_entrypoint_calls = 0  # ignore the write path's own bookkeeping
+            self.backend.steps_for_flow_calls = []
+
+            result = asyncio.run(svc.get_session(app_name="app", user_id="u1", session_id="s1"))
+        self.assertIsNotNone(result, "the process's own write already populated the cache")
+        self.assertEqual(self.backend.flows_by_entrypoint_calls, 0)
+        self.assertEqual(self.backend.steps_for_flow_calls, [])
+
+    def test_list_sessions_always_scans_even_when_the_cache_already_has_every_session(self) -> None:
+        # UNLIKE get_session's exact-key point lookup, `list_sessions` has no
+        # way to know its own cache is COMPLETE for (app_name, user_id) —
+        # some other process/turn could have created a session this one
+        # never touched — so design §3.2 step 4 states its "whole job" is an
+        # unconditional `flows_by_entrypoint` scan-and-group, every call,
+        # regardless of what the cache already holds. This pins that
+        # (correct, deliberate) behavior rather than asserting a zero-call
+        # fast path `list_sessions` never promised.
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+
+            async def body() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e1"))
+
+            _drive_flow("app", "u1", "s1", "inv-1", body)
+            self.backend.flows_by_entrypoint_calls = 0
+            self.backend.steps_for_flow_calls = []
+
+            response = asyncio.run(svc.list_sessions(app_name="app", user_id="u1"))
+        self.assertEqual([s.id for s in response.sessions], ["s1"])
+        self.assertEqual(self.backend.flows_by_entrypoint_calls, 1)
+
+    def test_get_session_config_trims_a_cache_hit_without_mutating_the_cached_original(self) -> None:
+        # design §4: no physical compaction, ever — GetSessionConfig trims
+        # the RECONSTRUCTED event list at read time only.
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+
+            async def body() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc.append_event(session, _fake_event(event_id="e1"))
+                await svc.append_event(session, _fake_event(event_id="e2"))
+
+            _drive_flow("app", "u1", "s1", "inv-1", body)
+
+            trimmed = asyncio.run(
+                svc.get_session(
+                    app_name="app",
+                    user_id="u1",
+                    session_id="s1",
+                    config=FakeGetSessionConfig(num_recent_events=1),
+                )
+            )
+            untrimmed = asyncio.run(svc.get_session(app_name="app", user_id="u1", session_id="s1"))
+        self.assertEqual([e.id for e in trimmed.events], ["e2"])
+        self.assertEqual(
+            [e.id for e in untrimmed.events], ["e1", "e2"], "trimming never mutates the cached original"
+        )
+
+    def test_cache_miss_fallback_reconstructs_events_and_state_across_multiple_flows(self) -> None:
+        with FakeAdkModules():
+            svc1 = adk_pack.KeelSessionService(app_name="app")
+
+            async def turn1() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc1.append_event(session, _fake_event(event_id="e1", state_delta={"n": 1}))
+
+            _drive_flow("app", "u1", "s1", "inv-1", turn1)
+
+            async def turn2() -> None:
+                session = _fake_session("app", "u1", "s1")
+                await svc1.append_event(session, _fake_event(event_id="e2", state_delta={"n": 2, "m": "x"}))
+
+            _drive_flow("app", "u1", "s1", "inv-2", turn2)
+
+            # A FRESH instance — simulates a different process / a cold
+            # cache: it has never seen this session, so `get_session` must
+            # take the real scan-and-replay fallback (§3.2 step 2).
+            svc2 = adk_pack.KeelSessionService(app_name="app")
+            session = asyncio.run(svc2.get_session(app_name="app", user_id="u1", session_id="s1"))
+        self.assertIsNotNone(session)
+        self.assertEqual([e.id for e in session.events], ["e1", "e2"], "flow created_at order")
+        self.assertEqual(session.state, {"n": 2, "m": "x"}, "later state_delta overwrites earlier same key")
+        self.assertGreaterEqual(self.backend.flows_by_entrypoint_calls, 1)
+        self.assertGreaterEqual(len(self.backend.steps_for_flow_calls), 2, "both flows were read")
+
+    def test_create_session_then_never_run_a_turn_is_invisible_to_a_fresh_reader(self) -> None:
+        # design §6 item 3: create_session never journals, so a session that
+        # never had a turn run against it does not exist from a DIFFERENT
+        # process's (or a fresh cache's) point of view.
+        with FakeAdkModules():
+            svc1 = adk_pack.KeelSessionService(app_name="app")
+            asyncio.run(svc1.create_session(app_name="app", user_id="u1", session_id="s-never-run"))
+            self.assertEqual(self.backend.entered, [], "create_session never opens/uses a flow")
+
+            svc2 = adk_pack.KeelSessionService(app_name="app")
+            result = asyncio.run(svc2.get_session(app_name="app", user_id="u1", session_id="s-never-run"))
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

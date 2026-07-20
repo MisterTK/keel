@@ -81,4 +81,28 @@ pub trait Journal: Send + Sync {
     /// Fetch a cache entry if present and not yet expired against the
     /// journal's clock; expired entries read as `None`.
     fn get_cache(&self, key: &CacheKey) -> Result<Option<Vec<u8>>>;
+
+    /// Every flow ever created for `entrypoint`, in any status, ordered by
+    /// `created_at` — unlike [`incomplete_flows`](Self::incomplete_flows),
+    /// which is scoped to the `running` recovery set, this returns the
+    /// entrypoint's whole history: completed, failed, and dead flows too. The
+    /// out-of-process, cross-flow read a long-lived caller (outside its own
+    /// live flow handle) uses to reconstruct history it never held open
+    /// itself.
+    ///
+    /// Deliberately no `user_id`/`session_id`-style filter parameter:
+    /// `flows.args_hash` is an opaque hash a caller cannot filter on
+    /// directly, so scoping to a narrower identity is not this method's job.
+    /// A caller that needs that scoping decodes enough of each returned
+    /// flow's own step history (via [`steps_for_flow`](Self::steps_for_flow))
+    /// to recover it — a real, accepted cost this method does not try to
+    /// solve, documented at the call-site layer.
+    fn flows_by_entrypoint(&self, entrypoint: &str) -> Result<Vec<FlowDescriptor>>;
+
+    /// Every step of `flow`, in `seq` order — the full step history, unlike
+    /// [`step_at`](Self::step_at)'s single-seq lookup. `payload` stays
+    /// raw/undecoded (MessagePack, schema-tagged) exactly like every other
+    /// method on this trait: decoding is a front-end concern, not the
+    /// store's.
+    fn steps_for_flow(&self, flow: &FlowId) -> Result<Vec<(StepKey, StepOutcome)>>;
 }

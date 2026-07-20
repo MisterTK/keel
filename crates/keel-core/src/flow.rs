@@ -1191,7 +1191,7 @@ fn encode_payload(value: &Value) -> Option<Vec<u8>> {
 /// fixtures in `conformance/fixtures/journal/` — still replay (the tag is
 /// introduced without a breaking on-disk migration, which is exactly what
 /// "versioned, self-describing" buys).
-fn decode_payload(bytes: &[u8]) -> Option<Value> {
+pub fn decode_payload(bytes: &[u8]) -> Option<Value> {
     if let Ok(envelope) = rmp_serde::from_slice::<StepPayloadOwned>(bytes)
         && envelope.schema == STEP_PAYLOAD_SCHEMA
     {
