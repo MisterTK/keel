@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Iterable
 if TYPE_CHECKING:
     from ._backend import Backend
     from ._discovery import Discovery
-    from ._policy import FlowEntrypoint
+    from ._policy import CmdFlow, FlowEntrypoint
 
 _backend: "Backend | None" = None
 _discovery: "Discovery | None" = None
@@ -31,6 +31,13 @@ _flow_active: bool = False
 #: Tier 2 entrypoint (e.g. `packs.adk_pack._flow_entrypoint_designated`) read
 #: this instead of reaching into `bootstrap`'s module-private state.
 _flow_entrypoints: "tuple[FlowEntrypoint, ...]" = ()
+#: The `cmd:` flow entrypoints + their `[flows.match]` argv rules parsed by
+#: `bootstrap.install_keel()` (`_policy.extract_cmd_flows`), keyed by the full
+#: `cmd:<name>` string. `adapters.subprocess_pack` reads this to decide whether
+#: an intercepted `subprocess.run`/`call` call site maps to a declared `cmd:`
+#: durable flow. Empty `{}` when Keel was never installed or no `cmd:`
+#: entrypoints are declared — the pack short-circuits to a plain passthrough.
+_cmd_flows: "dict[str, CmdFlow]" = {}
 
 
 def set_runtime(backend: "Backend | None", discovery: "Discovery | None") -> None:
@@ -41,11 +48,12 @@ def set_runtime(backend: "Backend | None", discovery: "Discovery | None") -> Non
 
 def clear_runtime() -> None:
     """Reset to the disabled state (used by `uninstall_keel` and tests)."""
-    global _backend, _discovery, _flow_active, _flow_entrypoints
+    global _backend, _discovery, _flow_active, _flow_entrypoints, _cmd_flows
     _backend = None
     _discovery = None
     _flow_active = False
     _flow_entrypoints = ()
+    _cmd_flows = {}
 
 
 def get_backend() -> "Backend | None":
@@ -83,3 +91,18 @@ def get_flow_entrypoints() -> "tuple[FlowEntrypoint, ...]":
     never installed (or `KEEL_DISABLE` short-circuited before installing) —
     exactly like `get_backend()` returning `None` in that same situation."""
     return _flow_entrypoints
+
+
+def set_cmd_flows(cmd_flows: "dict[str, CmdFlow]") -> None:
+    """Store the `cmd:` flow entrypoints + `[flows.match]` rules parsed at
+    install time. Called only by `bootstrap.install_keel()`, once, with
+    `_policy.extract_cmd_flows`'s result."""
+    global _cmd_flows
+    _cmd_flows = dict(cmd_flows)
+
+
+def get_cmd_flows() -> "dict[str, CmdFlow]":
+    """The declared `cmd:` flow entrypoints + their argv-match rules, or `{}`
+    when Keel was never installed (or none are declared) — the
+    `subprocess_pack` reads this to decide whether to intercept a call."""
+    return _cmd_flows
