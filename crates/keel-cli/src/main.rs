@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 
 use keel_cli::render::emit;
 use keel_cli::{
-    doctor, effective, exec, explain, flows, flows_add, flows_suggest, fsck, init, mcp, record,
-    replay, resume, run, sim, status, tail,
+    doctor, effective, exec, explain, flows, flows_add, flows_suggest, force, fsck, init, mcp,
+    record, replay, resume, run, sim, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -200,6 +200,15 @@ enum FlowsCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Arm the durable one-shot KEEL-E033 force override for `<flow>`: the next
+    /// re-dispatch that would otherwise be refused because the flow's declared
+    /// side-effect files changed proceeds exactly once, then the override
+    /// clears itself. The out-of-process, config-free equivalent of `keel exec
+    /// --force` (CCR-5 decision 2); see [`keel_cli::force`].
+    Force {
+        /// A flow_id, or a substring of an id/entrypoint that names one flow.
+        flow: String,
+    },
 }
 
 /// `keel record <action>` (`docs/recording-format.md`).
@@ -349,6 +358,13 @@ fn dispatch_flows(
         Some(FlowsCommand::Resume { flow, all, args }) => {
             let options = resume::ResumeOptions { flow, all, args };
             let (rendered, code) = resume::run(project, &options, SystemClock.now_ms());
+            if let Some(r) = rendered {
+                emit(&r, json);
+            }
+            code
+        }
+        Some(FlowsCommand::Force { flow }) => {
+            let (rendered, code) = force::run(project, &flow);
             if let Some(r) = rendered {
                 emit(&r, json);
             }

@@ -13,9 +13,10 @@
 //! bytes as the corresponding `--json` twins), and the Level 2 on-ramp
 //! [`flows_suggest`] (`keel flows suggest`, a replay-safety analysis over
 //! candidate entrypoints), [`flows_add`] (`keel flows add <entrypoint>`,
-//! one-command durability designation), and [`resume`] (`keel flows resume` —
+//! one-command durability designation), [`resume`] (`keel flows resume` —
 //! actually re-invoke a resumable flow's recorded entrypoint through
-//! `keel run`).
+//! `keel run`), and [`force`] (`keel flows force` — arm the durable one-shot
+//! KEEL-E033 override, the out-of-process equivalent of `keel exec --force`).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -31,6 +32,7 @@ pub mod explain;
 pub mod flows;
 pub mod flows_add;
 pub mod flows_suggest;
+pub mod force;
 pub mod fsck;
 pub mod init;
 pub mod mcp;
