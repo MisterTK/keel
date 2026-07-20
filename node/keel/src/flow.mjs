@@ -44,6 +44,7 @@ import { createHash } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { globToRegExp, relativePosix } from "./loader.mjs";
+import { markFlowEntered, markFlowExited } from "./runtime.mjs";
 
 /** Front-end value-step keys (module-docs convention, mirroring Python's
  *  `py:time.time#-`): `ts:` is the Node front end's SAME prefix as its function
@@ -245,11 +246,18 @@ export async function runAsFlow(targetPath, entry, backend, args, { env = proces
     process.stderr.write(`keel ▸ ${verb} flow ${entry.raw} [${info.flow_id}]\n`);
   }
 
+  // Mark the durable-flow scope for the whole body so the `child_process` pack
+  // (which shares this backend's single active-flow slot) passes a matched
+  // synchronous `spawnSync` through unwrapped instead of clobbering this flow
+  // (see `runtime.mjs`'s scope guard). `finally` keeps it balanced even though
+  // `process.exit` normally ends the process first (it is stubbed in tests).
+  markFlowEntered();
   const restore = virtualizeTimeRandom(backend);
   try {
     await fn();
   } catch (err) {
     restore();
+    markFlowExited();
     // The flow body's own exception is printed FIRST, unconditionally — see
     // `exitFlowOrWarn`'s docs for why this must not be reordered after the
     // (now-fallible) terminal-status write.
@@ -263,6 +271,7 @@ export async function runAsFlow(targetPath, entry, backend, args, { env = proces
     return;
   }
   restore();
+  markFlowExited();
   exitFlowOrWarn(backend, "completed");
   process.exit(0);
 }

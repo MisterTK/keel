@@ -192,6 +192,34 @@ failed run's declared journal files changed, a retry is refused with
 KEEL-E033 (`--force` overrides). A completed flow re-invoked with the same
 identity replays instantly without respawning the child.
 
+#### In-process `cmd:` interception (`[flows.match]`, CCR-5)
+
+The same `cmd:` guarantee is available with **no CLI wrapper**: declare an argv
+match rule and Keel dispatches a matching subprocess call as a durable flow
+from inside a live program.
+
+    [flows]
+    entrypoints = ["cmd:nightly-etl"]
+
+    [flows.match."cmd:nightly-etl"]
+    argv = ["./run_etl.sh", "*"]        # single-`*`, per-position, case-sensitive
+
+When Keel is active in the process (`keel run`, or the `.pth`/`--import`
+activation above), an observed argv matching the rule is wrapped instead of run
+unwrapped — Python's `subprocess.run`/`check_output`/`call`/`check_call`, Node's
+`spawnSync`/`execFileSync`. `on_busy` and the KEEL-E033 side-effect gate behave
+as for `keel exec`. Shell-string commands are never matched (`shell=True`,
+Node's `execSync`, `{ shell: true }`) — the shell, not the argv, decides what
+runs.
+
+The two front ends differ on **replay** today: **Python** gets full
+replay-skip — a re-dispatched completed identity returns the recorded result
+without respawning. **Node** gets at-most-once *dispatch* only; because its
+`spawnSync`/`execFileSync` are synchronous they cannot reach the async replay
+path (KEEL-E005), so a re-dispatch of a completed identity raises rather than
+replays — `keel exec`/`keel flows` remain the replay workaround. Tracked in
+[#42](https://github.com/MisterTK/keel/issues/42).
+
 Both tiers run on the same native Rust core via a C ABI, so the Python and
 Node front ends share identical semantics — verified by a shared
 [conformance suite](conformance/README.md) that every implementation must

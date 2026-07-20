@@ -111,27 +111,28 @@ class DetectTest(unittest.TestCase):
         self.assertTrue(detection.matched)
         self.assertEqual(detection.name, "urllib3")
 
-    def test_available_packs_reports_twelve_registered(self) -> None:
-        # 8 library adapters (aiohttp, boto3, httpx, langgraph, psycopg,
-        # requests, urllib3, urllib.request) + 4 framework packs (adk, crewai,
-        # openai-agents, pydantic-ai — adapters._all_packs). Only the
-        # always-installed libraries plus the stdlib urllib.request pack are
-        # actually present here; aiohttp/boto3/langgraph/psycopg are
-        # exercised (with structural fakes) in their own test files, and the
-        # framework packs are never installed in this repo's test
-        # environment (CLAUDE.md: framework deps never get added to a
-        # manifest), so those eight report unmatched — `available_packs`
+    def test_available_packs_reports_thirteen_registered(self) -> None:
+        # 8 library adapters (aiohttp, boto3, httpx, psycopg, requests,
+        # subprocess, urllib3, urllib.request) + 5 framework packs (adk,
+        # crewai, langgraph, openai-agents, pydantic-ai — adapters._all_packs).
+        # Only the always-installed libraries plus the two stdlib packs
+        # (urllib.request and subprocess) are actually present here;
+        # aiohttp/boto3/psycopg are exercised (with structural fakes) in their
+        # own test files, and the framework packs are never installed in this
+        # repo's test environment (CLAUDE.md: framework deps never get added to
+        # a manifest), so those eight report unmatched — `available_packs`
         # must still report each of them (never silently omit an absent
-        # library's pack), just unmatched. `urllib_pack.detect()` ALWAYS
-        # matches (stdlib), so it's the one guaranteed match beyond the
-        # always-installed dev deps.
+        # library's pack), just unmatched. `urllib_pack.detect()` and
+        # `subprocess_pack.detect()` ALWAYS match (stdlib), so they are the two
+        # guaranteed matches beyond the always-installed dev deps.
         packs = available_packs()
-        self.assertEqual(len(packs), 12, "8 library adapters + 4 framework packs")
+        self.assertEqual(len(packs), 13, "8 library adapters + 5 framework packs")
         present = {d.name for d in packs if d.matched}
-        self.assertEqual(present, _ALWAYS_PRESENT | {"urllib.request"})
-        matched = [d for d in packs if d.matched and d.name == "urllib.request"]
-        self.assertEqual(len(matched), 1)
-        self.assertIn(matched[0].confidence, ("pinned", "best_effort"))
+        self.assertEqual(present, _ALWAYS_PRESENT | {"urllib.request", "subprocess"})
+        for stdlib_name in ("urllib.request", "subprocess"):
+            matched = [d for d in packs if d.matched and d.name == stdlib_name]
+            self.assertEqual(len(matched), 1)
+            self.assertIn(matched[0].confidence, ("pinned", "best_effort"))
         absent = [d for d in packs if not d.matched]
         self.assertEqual(len(absent), 8)
         self.assertTrue(all(d.name == "" for d in absent), "an unmatched pack reports no name")

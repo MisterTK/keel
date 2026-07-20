@@ -305,3 +305,55 @@ export function extractFlowEntrypoints(policy) {
   }
   return out;
 }
+
+/**
+ * The `cmd:` flow entrypoints declared in `[flows] entrypoints`, keyed by their
+ * full `cmd:<name>` string, each paired with its `[flows.match."cmd:<name>"]`
+ * argv rule and the effective `[flows] on_busy` (CCR-5). The Node mirror of
+ * `python/keel/src/keel/_policy.py`'s `extract_cmd_flows`.
+ *
+ * This is the one call the in-process subprocess interceptor (a later build
+ * stage, wrapping `spawnSync`/`execFileSync`) uses to learn every declared
+ * `cmd:` flow and how to recognize its call site. It is additive to
+ * `extractFlowEntrypoints` (which stays `ts:`-only): a `cmd:` entrypoint has no
+ * module/export to load, so it gets its own parsed shape here.
+ *
+ * Each value is `{ name, argvPatterns, onBusy }`:
+ *   - `name` — the full entrypoint string, e.g. `"cmd:nightly-etl"`.
+ *   - `argvPatterns` — the declared per-position argv patterns (single-`*`
+ *     wildcard dialect, docs/targeting.md); `[]` when no `[flows.match]` rule is
+ *     declared (a rule-less `cmd:` entrypoint matches nothing in-process).
+ *   - `onBusy` — `"skip"` | `"wait"` | `"fail"` (CCR-4), defaulting to `"skip"`
+ *     when absent/unreadable, matching `keel exec`.
+ *
+ * Malformed entries are skipped, not guessed; SEMANTIC validation of the
+ * `match` table is the backend's job (KeelCoreStub.configure → KEEL-E001), so
+ * front end and backend never diverge.
+ */
+export function extractCmdFlows(policy) {
+  const flows = policy?.flows;
+  if (flows === null || typeof flows !== "object") return {};
+  const entrypoints = flows.entrypoints;
+  if (!Array.isArray(entrypoints)) return {};
+  let onBusy = flows.on_busy;
+  if (onBusy !== "skip" && onBusy !== "wait" && onBusy !== "fail") onBusy = "skip";
+  const matchTable =
+    flows.match !== null && typeof flows.match === "object" && !Array.isArray(flows.match)
+      ? flows.match
+      : {};
+  const out = {};
+  for (const raw of entrypoints) {
+    if (typeof raw !== "string" || !raw.startsWith("cmd:")) continue;
+    if (!raw.slice(4)) continue; // a bare `cmd:` with no name is malformed
+    let argvPatterns = [];
+    const rule = matchTable[raw];
+    if (rule !== null && typeof rule === "object" && !Array.isArray(rule)) {
+      const argv = rule.argv;
+      if (Array.isArray(argv) && argv.every((a) => typeof a === "string")) {
+        argvPatterns = [...argv];
+      }
+    }
+    out[raw] = { name: raw, argvPatterns, onBusy };
+  }
+  return out;
+}

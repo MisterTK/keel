@@ -134,3 +134,77 @@ def extract_flow_entrypoints(policy: dict[str, Any]) -> list[FlowEntrypoint]:
             continue  # a concrete module still needs its :function
         out.append(FlowEntrypoint(raw=raw, module=module, function=function))
     return out
+
+
+class CmdFlow(NamedTuple):
+    """A `cmd:<name>` Tier-2 flow entrypoint from `[flows] entrypoints`, paired
+    with its `[flows.match."cmd:<name>"]` argv-pattern rule and the effective
+    `[flows] on_busy` disposition (CCR-5).
+
+    In-process subprocess interception (a later build stage) reads these to
+    decide whether a given `subprocess.run(...)` / `check_call` / `check_output`
+    call site maps to a declared `cmd:` flow:
+
+      * ``name`` — the full entrypoint string, e.g. ``"cmd:nightly-etl"`` (the
+        same string used as the ``entrypoints`` list entry and the
+        ``[flows.match]`` key). Strip the ``cmd:`` prefix for the bare label.
+      * ``argv_patterns`` — the declared per-position argv patterns the observed
+        argv must match (single-``*`` wildcard dialect, docs/targeting.md).
+        Empty ``[]`` when the entrypoint has no ``[flows.match]`` rule (a
+        rule-less ``cmd:`` entrypoint matches nothing in-process — the
+        interceptor requires an explicit argv rule to fire).
+      * ``on_busy`` — what a concurrent same-identity dispatch does while the
+        lease is held: ``"skip"`` | ``"wait"`` | ``"fail"`` (CCR-4). Defaults to
+        ``"skip"`` when absent or unreadable, matching ``keel exec``'s behavior
+        (crates/keel-cli/src/exec.rs).
+    """
+
+    name: str  # full entrypoint string, e.g. "cmd:nightly-etl"
+    argv_patterns: list[str]  # per-position argv patterns; [] if no match rule
+    on_busy: str  # "skip" | "wait" | "fail"
+
+
+def extract_cmd_flows(policy: dict[str, Any]) -> dict[str, CmdFlow]:
+    """The `cmd:` flow entrypoints declared in `[flows] entrypoints`, keyed by
+    their full `cmd:<name>` string, each paired with its `[flows.match]` argv
+    rule and the effective `[flows] on_busy` (CCR-5).
+
+    This is the one call the in-process subprocess interceptor uses to learn
+    every declared `cmd:` flow and how to recognize its call site. It is
+    additive to `extract_flow_entrypoints` (which stays `py:`-only, since its
+    `FlowEntrypoint` result is consumed as importable modules/functions):
+    `cmd:` entrypoints have no module/function to import, so they get their own
+    parsed shape here.
+
+    Malformed entries (a non-string, a bare `cmd:` with no name) are skipped —
+    designating a flow is an explicit assertion. SEMANTIC validation of the
+    `match` table (key shape, argv non-emptiness) is the backend's job at
+    configure (KEEL-E001); this parser is deliberately lenient so front end and
+    backend never diverge, mirroring the rest of this module.
+    """
+    flows = policy.get("flows")
+    if not isinstance(flows, dict):
+        return {}
+    entrypoints = flows.get("entrypoints")
+    if not isinstance(entrypoints, list):
+        return {}
+    on_busy = flows.get("on_busy")
+    if on_busy not in ("skip", "wait", "fail"):
+        on_busy = "skip"  # schema default; also the fail-open for absent/invalid
+    match_table = flows.get("match")
+    if not isinstance(match_table, dict):
+        match_table = {}
+    out: dict[str, CmdFlow] = {}
+    for raw in entrypoints:
+        if not isinstance(raw, str) or not raw.startswith("cmd:"):
+            continue
+        if not raw[4:]:
+            continue  # a bare `cmd:` with no name is malformed
+        argv_patterns: list[str] = []
+        rule = match_table.get(raw)
+        if isinstance(rule, dict):
+            argv = rule.get("argv")
+            if isinstance(argv, list) and all(isinstance(a, str) for a in argv):
+                argv_patterns = list(argv)
+        out[raw] = CmdFlow(name=raw, argv_patterns=argv_patterns, on_busy=on_busy)
+    return out

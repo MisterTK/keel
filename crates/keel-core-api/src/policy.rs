@@ -782,6 +782,18 @@ pub enum OnBusy {
     Fail,
 }
 
+/// One `[flows.match."cmd:<name>"]` rule (CCR-5): the argv patterns an
+/// in-process subprocess call site must match to be dispatched as this `cmd:`
+/// flow. `argv` is a list of per-position patterns (single-`*` wildcard
+/// dialect, docs/targeting.md); parsed and carried here, the matching itself
+/// lives in the front-end interceptors. Only in-process interception consults
+/// these — `keel exec` matches the argv typed after `--`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowMatchRule {
+    pub argv: Vec<String>,
+}
+
 /// Tier 2 flow designation — parsed and carried, enforced by the real core.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -789,6 +801,14 @@ pub struct FlowsPolicy {
     pub entrypoints: Vec<String>,
     pub on_nondeterminism: NondeterminismResponse,
     pub on_busy: OnBusy,
+    /// `[flows.match."cmd:<name>"]` argv match rules (CCR-5), keyed by the
+    /// `cmd:<name>` entrypoint string. Parsed and carried structurally so a
+    /// keel.toml with a `[flows.match]` table configures cleanly; the
+    /// front-end subprocess interceptors are the only consumers, not the
+    /// core. `None` when the table is absent. A `BTreeMap` (not `HashMap`)
+    /// so iteration is deterministic, matching `Policy::target`.
+    #[serde(rename = "match")]
+    pub match_: Option<BTreeMap<String, FlowMatchRule>>,
 }
 
 /// A journal location literal (`policy.journal`), validated against the frozen
@@ -1368,5 +1388,34 @@ mod tests {
         assert_eq!(p.flows.as_ref().unwrap().on_busy, OnBusy::Wait);
         let p: Policy = serde_json::from_value(serde_json::json!({ "flows": {} })).unwrap();
         assert_eq!(p.flows.unwrap().on_busy, OnBusy::Skip);
+    }
+
+    #[test]
+    fn flows_match_cmd_rules_parse() {
+        // CCR-5: `[flows.match."cmd:<name>"] argv = [...]` parses structurally
+        // into the carried `match_` map (renamed from the reserved `match`).
+        let p: Policy = serde_json::from_value(serde_json::json!({
+            "flows": {
+                "entrypoints": ["cmd:nightly-etl"],
+                "match": { "cmd:nightly-etl": { "argv": ["*/run_etl.sh", "--env=prod"] } }
+            }
+        }))
+        .unwrap();
+        let flows = p.flows.unwrap();
+        let rules = flows.match_.expect("match table carried");
+        assert_eq!(
+            rules["cmd:nightly-etl"].argv,
+            vec!["*/run_etl.sh".to_owned(), "--env=prod".to_owned()]
+        );
+        // Absent `[flows.match]` leaves `match_` None (struct-level default).
+        let p: Policy = serde_json::from_value(serde_json::json!({ "flows": {} })).unwrap();
+        assert!(p.flows.unwrap().match_.is_none());
+        // An unknown key inside a rule is rejected (deny_unknown_fields).
+        assert!(
+            serde_json::from_value::<Policy>(serde_json::json!({
+                "flows": { "match": { "cmd:x": { "argv": ["a"], "bogus": 1 } } }
+            }))
+            .is_err()
+        );
     }
 }

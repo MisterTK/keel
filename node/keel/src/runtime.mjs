@@ -31,6 +31,32 @@ export function isEnabled() {
   return enabled;
 }
 
+// --- durable-flow scope guard ------------------------------------------------
+// The native core has ONE active-flow slot. The `keel run` ts: flow path
+// (`flow.mjs`'s `runAsFlow`) and the `child_process` pack both open flows on the
+// SAME backend, so a matched synchronous `spawnSync` fired from inside a ts:
+// flow body would clobber the outer flow's slot. This shared depth counter lets
+// the pack detect an already-open flow scope and pass the command through
+// unwrapped (its pre-pack behavior — a sync subprocess is never journaled inside
+// a ts: flow anyway) instead of corrupting the outer flow.
+
+let flowDepth = 0;
+
+/** Enter a durable-flow scope (called by `runAsFlow` around the flow body). */
+export function markFlowEntered() {
+  flowDepth += 1;
+}
+
+/** Leave a durable-flow scope. Never drops below zero. */
+export function markFlowExited() {
+  if (flowDepth > 0) flowDepth -= 1;
+}
+
+/** True iff a durable flow is currently open on the shared backend. */
+export function flowScopeActive() {
+  return flowDepth > 0;
+}
+
 /** Attach the outcome envelope to an object without altering its shape
  *  (non-enumerable, so JSON/iteration are unchanged — DX invariant 5). */
 export function attachOutcome(obj, outcome) {

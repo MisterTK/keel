@@ -27,7 +27,16 @@ import types
 from importlib.machinery import ModuleSpec
 from typing import Any, Sequence
 
-from . import aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack, urllib_pack
+from . import (
+    aiohttp_pack,
+    boto3_pack,
+    httpx_pack,
+    psycopg_pack,
+    requests_pack,
+    subprocess_pack,
+    urllib3_pack,
+    urllib_pack,
+)
 from ._pack import Detection, Seam, TargetDecl
 
 #: Registration order = install/report order (stable, deterministic output).
@@ -47,7 +56,16 @@ from ._pack import Detection, Seam, TargetDecl
 #: dotted fullname, so `_AdapterFinder` intercepts them exactly like a
 #: top-level lib; when `urllib.request` is already imported at activation
 #: time, `install_adapters` patches immediately).
-PACKS = (aiohttp_pack, boto3_pack, httpx_pack, psycopg_pack, requests_pack, urllib3_pack, urllib_pack)
+PACKS = (
+    aiohttp_pack,
+    boto3_pack,
+    httpx_pack,
+    psycopg_pack,
+    requests_pack,
+    subprocess_pack,
+    urllib3_pack,
+    urllib_pack,
+)
 
 
 class _State:
