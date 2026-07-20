@@ -61,6 +61,30 @@ const SNAP_BEFORE_SEQ: u64 = 500_000;
 /// `keel trace` shows as the flow's after-state).
 const SNAP_AFTER_SEQ: u64 = 500_001;
 
+/// The reserved marker seq holding the one-shot KEEL-E033 force override
+/// (CCR-6): a durable "the next gated re-dispatch of this flow may proceed
+/// even though its declared side-effect files changed", armed by
+/// [`request_force_override`] (the `keel flows force <flow-id>` verb) and
+/// consumed+cleared by [`take_force_override`] inside [`side_effect_gate`].
+/// Sits in the same reserved lane as the two snapshot markers, below
+/// [`keel_core`]'s branch lane (`BRANCH_SEQ_BASE = 1_000_000`), so it never
+/// collides with a real step (numbered from 1) or a branch marker. Like the
+/// snapshot markers it is `kind = 'marker'`, so `keel flows`/`keel trace`
+/// (which filter `kind != 'marker'`) never surface it as real work.
+const FORCE_SEQ: u64 = 500_002;
+
+/// The `step_key` of the [`FORCE_SEQ`] marker.
+const FORCE_STEP_KEY: &str = "cmd:force";
+
+/// The [`FORCE_SEQ`] marker payload's `state` when the one-shot force is armed
+/// (set by `keel flows force`, not yet consumed by a gate check).
+const FORCE_STATE_REQUESTED: &str = "requested";
+/// The [`FORCE_SEQ`] marker payload's `state` after a gate check has consumed
+/// the one-shot force. The row is overwritten (not deleted — the [`Journal`]
+/// trait exposes no delete) so it stays visible for `keel trace` forensics
+/// while no longer arming any future attempt.
+const FORCE_STATE_CONSUMED: &str = "consumed";
+
 /// The single command step's seq. A `cmd` flow has exactly one step in v1.
 const STEP_SEQ: u64 = 1;
 
@@ -590,6 +614,23 @@ fn side_effect_gate(
     if changed.is_empty() {
         return None;
     }
+    // A durable one-shot force (CCR-6), armed out-of-band by `keel flows force
+    // <flow-id>`, bypasses the gate for exactly THIS attempt. Read-then-clear:
+    // consuming it here (and only here, where files actually changed and the
+    // gate would otherwise refuse) is what makes it one-shot — a later attempt
+    // with no fresh `keel flows force` is gated again. Consumed before the
+    // in-memory `--force` branch so it does real work; left untouched by the
+    // earlier no-change/no-snapshot bypasses so it is never spent needlessly.
+    if take_force_override(journal, flow_id) {
+        eprintln!(
+            "keel \u{25b8} exec: {} declared side-effect file(s) changed since the last attempt \
+             ({}); re-dispatching anyway (KEEL-E033 overridden by a persistent `keel flows force` \
+             request \u{2014} one-shot, now cleared).",
+            changed.len(),
+            changed.join(", ")
+        );
+        return None;
+    }
     if force {
         eprintln!(
             "keel \u{25b8} exec --force: {} declared side-effect file(s) changed since the last \
@@ -608,6 +649,93 @@ fn side_effect_gate(
         changed.join(", ")
     );
     Some(soft_pair(&message))
+}
+
+/// Arm the one-shot KEEL-E033 force override for `flow_id` (CCR-6): the next
+/// [`side_effect_gate`] check that would otherwise refuse this flow's
+/// re-dispatch (its declared side-effect files changed) proceeds instead, and
+/// clears the flag as it does so.
+///
+/// This is the durable primitive behind `keel flows force <flow-id>` — the
+/// out-of-process, config-free equivalent of `keel exec --force` (CCR-5
+/// decision 2). Unlike `--force` (a purely in-memory per-invocation flag),
+/// this persists a marker step so the override survives across processes and
+/// applies even when no process is currently running against the flow. It
+/// writes through the **same** [`Journal`] handle every exec-time read/write
+/// uses — no second in-process SQLite reader (issue #14).
+///
+/// The caller (the `keel flows force` verb) is responsible for the UX
+/// preconditions: the flow row must already exist (`steps.flow_id` is a
+/// foreign key into `flows`, so arming a non-existent flow errors here) and
+/// should be `running`/`failed` — the only statuses [`side_effect_gate`] gates
+/// — for the arming to have any effect.
+///
+/// # Errors
+/// Propagates any [`Journal::record_step`] failure (e.g. the flow does not
+/// exist, or the store is unwritable).
+pub fn request_force_override(journal: &dyn Journal, flow_id: &FlowId) -> keel_journal::Result<()> {
+    let now = SystemClock.now_ms();
+    let payload = json!({ "state": FORCE_STATE_REQUESTED, "requested_at": now });
+    let outcome = StepOutcome {
+        kind: StepKind::Marker,
+        attempt: 0,
+        status: StepStatus::Ok,
+        payload: encode_payload(&payload),
+        error_class: None,
+        started_at: now,
+        ended_at: Some(now),
+    };
+    journal.record_step(flow_id, FORCE_SEQ, &StepKey::new(FORCE_STEP_KEY), &outcome)
+}
+
+/// Read-and-clear the one-shot force override (CCR-6): `true` iff a `requested`
+/// [`FORCE_SEQ`] marker was present, in which case it is overwritten to
+/// `consumed` before returning so it arms no further attempt. Best-effort and
+/// lenient like the rest of [`side_effect_gate`] — any journal read/write error
+/// reads as "not forced" (`false`), never a panic or a refusal-turned-crash.
+///
+/// The read (`step_at`) and the clear (`record_step` overwrite) are two
+/// autocommit statements, not one transaction: the [`Journal`] trait exposes
+/// no cross-statement transaction, and none is needed here. A hypothetical
+/// double-consume (two concurrent execs both reading `requested` before either
+/// clears) cannot double-run the command — flow entry still serializes on the
+/// single lease ([`FlowManager::enter_flow`]), so at most one re-dispatch
+/// actually proceeds. `keel flows force` is a rare, deliberate operator action,
+/// so the benign race is accepted rather than paid for with a new trait method.
+fn take_force_override(journal: &dyn Journal, flow_id: &FlowId) -> bool {
+    let Ok(Some((_, marker))) = journal.step_at(flow_id, FORCE_SEQ) else {
+        return false;
+    };
+    let armed = marker
+        .payload
+        .as_deref()
+        .and_then(decode_payload)
+        .and_then(|v| v.get("state").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|state| state == FORCE_STATE_REQUESTED);
+    if !armed {
+        return false;
+    }
+    let now = SystemClock.now_ms();
+    let payload = json!({ "state": FORCE_STATE_CONSUMED, "consumed_at": now });
+    let outcome = StepOutcome {
+        kind: StepKind::Marker,
+        attempt: 0,
+        status: StepStatus::Ok,
+        payload: encode_payload(&payload),
+        error_class: None,
+        started_at: now,
+        ended_at: Some(now),
+    };
+    if let Err(e) = journal.record_step(flow_id, FORCE_SEQ, &StepKey::new(FORCE_STEP_KEY), &outcome)
+    {
+        // The override fired (we proceed), but clearing it failed: warn loudly
+        // so a stuck-armed flag is visible rather than silently forcing forever.
+        eprintln!(
+            "keel \u{25b8} exec: force override consumed but its one-shot clear was not journaled \
+             ({e}); a later attempt may be forced again \u{2014} inspect `keel trace {flow_id}`."
+        );
+    }
+    true
 }
 
 /// Enter the flow, handling KEEL-E030 (dead-PID abandonment or `on_busy`) and
@@ -963,5 +1091,69 @@ mod tests {
         let value = json!({ "exit_code": 3, "stdout_tail": "hi" });
         let bytes = encode_payload(&value).expect("encodes");
         assert_eq!(decode_payload(&bytes), Some(value));
+    }
+
+    /// CCR-6: `keel flows force` arms a durable one-shot KEEL-E033 override.
+    /// The gate refuses a changed-files re-dispatch; an armed force lets exactly
+    /// ONE attempt through and clears itself; the next attempt (no re-arm) is
+    /// refused again — the whole point of "one-shot".
+    #[test]
+    fn persistent_force_override_bypasses_the_gate_exactly_once() {
+        use keel_journal::NewFlow;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("trades.jsonl");
+        std::fs::write(&file, "a\nb\n").unwrap();
+
+        let journal = SqliteJournal::open(dir.path().join("journal.db"), SystemClock).unwrap();
+        let flow_id = FlowId::new("01FORCEFLOW");
+        journal
+            .begin_flow(&NewFlow {
+                flow_id: flow_id.clone(),
+                entrypoint: "cmd:trade".to_owned(),
+                args_hash: "ah".to_owned(),
+                code_hash: None,
+            })
+            .unwrap();
+
+        // The pre-run snapshot the gate compares against — the file as it was.
+        let files = std::slice::from_ref(&file);
+        record_marker(
+            &journal,
+            &flow_id,
+            SNAP_BEFORE_SEQ,
+            "cmd:snapshot:before",
+            &json!({ "files": snapshot_files(files) }),
+        );
+
+        // Change the declared file so the gate sees a real side effect.
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+        let gate = || side_effect_gate(&journal, &flow_id, "cmd:trade", files, false);
+
+        // 1. No force armed: refused (KEEL-E033).
+        assert!(
+            gate().is_some(),
+            "a changed-files re-dispatch must be gated when no force is armed"
+        );
+
+        // 2. Arm the durable one-shot force → the gate proceeds this once.
+        request_force_override(&journal, &flow_id).unwrap();
+        assert!(
+            gate().is_none(),
+            "an armed persistent force must let the gate proceed"
+        );
+
+        // 3. One-shot: the force was consumed by (2); a second attempt without
+        //    a fresh `keel flows force` is refused again.
+        assert!(
+            gate().is_some(),
+            "the force must be cleared after one bypass, not persist across attempts"
+        );
+
+        // 4. Re-arming works — it is a fresh one-shot each time.
+        request_force_override(&journal, &flow_id).unwrap();
+        assert!(gate().is_none(), "re-arming grants exactly one more bypass");
+        assert!(gate().is_some(), "…and then it is spent again");
     }
 }
