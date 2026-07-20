@@ -48,6 +48,9 @@ _FACTOR_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 # Exact-status retry.on literal: the frozen schema errorCondition grammar
 # `[1-5][0-9][0-9]` (100–599), ASCII digits only.
 _STATUS_CONDITION_RE = re.compile(r"[1-5][0-9][0-9]")
+# `[flows.match]` keys are `cmd:<name>` entrypoint labels (CCR-5): the frozen
+# entrypointRef `cmd:` fragment `cmd:[a-z0-9][a-z0-9-]*`, ASCII only.
+_CMD_MATCH_KEY_RE = re.compile(r"^cmd:[a-z0-9][a-z0-9-]*$")
 _DURATION_MULT = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000}
 _RATE_WINDOW = {"s": 1_000, "sec": 1_000, "min": 60_000, "h": 3_600_000, "hour": 3_600_000}
 _CLASSES = ("conn", "timeout", "http", "cancelled", "other")
@@ -61,7 +64,7 @@ _ALLOWED_TARGET = ("timeout", "retry", "breaker", "rate", "cache", "idempotency"
 _ALLOWED_RETRY = ("attempts", "schedule", "on")
 _ALLOWED_BREAKER = ("failures", "cooldown", "window", "failure_rate", "min_calls")
 _ALLOWED_CACHE = ("ttl", "scope", "mode", "key")
-_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism", "on_busy")
+_ALLOWED_FLOWS = ("entrypoints", "on_nondeterminism", "on_busy", "match")
 _ALLOWED_TELEMETRY = ("otlp_endpoint", "console")
 
 
@@ -387,6 +390,33 @@ class KeelCoreStub:
         on_busy = flows.get("on_busy")
         if on_busy is not None and on_busy not in ("skip", "wait", "fail"):
             raise self._invalid("flows.on_busy", "must be skip|wait|fail")
+        # `[flows.match]` (CCR-5): per-`cmd:<name>` argv match rules for
+        # in-process subprocess interception. Keys are `cmd:<name>` labels; each
+        # value is a table with exactly one key `argv`, a non-empty array of
+        # string patterns (the frozen schema's `flows.match`).
+        match = flows.get("match")
+        if match is not None:
+            if not isinstance(match, dict):
+                raise self._invalid("flows.match", "expected a table")
+            for name, rule in match.items():
+                if not _CMD_MATCH_KEY_RE.fullmatch(name):
+                    raise self._invalid(
+                        f"flows.match.{name}",
+                        "key must be a cmd:<name> entrypoint (cmd:[a-z0-9][a-z0-9-]*)",
+                    )
+                if not isinstance(rule, dict):
+                    raise self._invalid(f'flows.match."{name}"', "expected a table")
+                self._reject_unknown(f'flows.match."{name}"', rule, ("argv",))
+                argv = rule.get("argv")
+                if (
+                    not isinstance(argv, list)
+                    or not argv
+                    or not all(isinstance(a, str) for a in argv)
+                ):
+                    raise self._invalid(
+                        f'flows.match."{name}"',
+                        "argv must be a non-empty array of strings",
+                    )
 
     def _validate_journal(self, journal: Any) -> None:
         if journal is None:

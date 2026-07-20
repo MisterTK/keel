@@ -43,6 +43,23 @@
           "enum": ["skip", "wait", "fail"],
           "default": "skip",
           "description": "What a concurrent same-identity `keel exec` invocation does while the flow's lease is held by a live process: skip (exit 0, matching the mkdir-mutex pattern it replaces), wait (poll until the lease frees), or fail (nonzero exit). CCR-4."
+        },
+        "match": {
+          "type": "object",
+          "description": "Per-`cmd:` entrypoint argv match rules (CCR-5). Keyed by the same `cmd:<name>` string that appears in `entrypoints`; each rule's `argv` is a list of per-position patterns (single-`*` wildcard dialect, docs/targeting.md) that an observed subprocess argv must match positionally. In-process subprocess interception consults these to map a `subprocess.run`/`spawnSync` call site to a declared `cmd:` flow — `keel exec` needs no rule because it matches the argv typed after `--`. The wildcard dialect is enforced in code, not here (items are plain strings).",
+          "propertyNames": { "pattern": "^cmd:[a-z0-9][a-z0-9-]*$" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "argv": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+              }
+            },
+            "required": ["argv"]
+          }
         }
       }
     },
@@ -89,7 +106,7 @@
     },
     "entrypointRef": {
       "type": "string",
-      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`, or `cmd:<name>` (CCR-4) — an external command wrapped as a Tier-2 flow by `keel exec --flow <name>` (and, in a named fast-follow, by in-process subprocess interception).",
+      "description": "Flow entrypoint reference, e.g. `py:pipeline.ingest:main`, `ts:jobs/nightly.ts#run`, or `cmd:<name>` (CCR-4) — an external command wrapped as a Tier-2 flow by `keel exec --flow <name>`, or (CCR-5) by in-process subprocess interception, which pairs the `cmd:<name>` label with a `[flows.match.\"cmd:<name>\"]` argv rule to recognize the call site.",
       "pattern": "^(py|ts|rs):[^\\s]+$|^cmd:[a-z0-9][a-z0-9-]*$"
     },
     "retry": {
