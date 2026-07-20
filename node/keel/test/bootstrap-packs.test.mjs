@@ -21,9 +21,11 @@ test("installKeel wires every framework pack and disables cleanly under KEEL_DIS
     const result = await installKeel({ cwd: dir, env: { KEEL_QUIET: "1" } });
     assert.equal(result.enabled, true);
     const labels = result.packs.map((p) => p.label).sort();
-    assert.deepEqual(labels, ["ioredis", "mcp: transports", "mysql2", "pg"]);
+    assert.deepEqual(labels, ["child_process", "ioredis", "mcp: transports", "mysql2", "pg"]);
     for (const p of result.packs) {
-      assert.equal(p.active, false, `${p.label} should be inactive — not installed in this repo`);
+      // child_process is inactive here too: no keel.toml, so no `[flows.match]`
+      // cmd: rules to compile (near-zero cost when none are declared).
+      assert.equal(p.active, false, `${p.label} should be inactive — not installed/declared in this repo`);
     }
 
     // The module-level install guard makes a second call a cheap no-op.

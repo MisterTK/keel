@@ -12,7 +12,12 @@
  */
 
 import { register } from "node:module";
-import { loadPolicy, extractFunctionTargets, extractFlowEntrypoints } from "./policy.mjs";
+import {
+  loadPolicy,
+  extractFunctionTargets,
+  extractFlowEntrypoints,
+  extractCmdFlows,
+} from "./policy.mjs";
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { compileOutboundMatchers } from "./judge.mjs";
@@ -20,6 +25,7 @@ import { createDiscovery } from "./discovery.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
 import { resolveDevCache } from "./packs/llm.mjs";
+import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
 import { installPgPack } from "./packs/pg.mjs";
 import { installIoredisPack } from "./packs/ioredis.mjs";
@@ -41,6 +47,7 @@ export function isDisabled(env = process.env) {
  * adding another one; alphabetical by label to minimize merge conflicts.
  */
 const FRAMEWORK_PACKS = [
+  { label: "child_process", install: installChildProcessPack },
   { label: "ioredis", install: installIoredisPack },
   { label: "mcp: transports", install: installMcpPack },
   { label: "mysql2", install: installMysql2Pack },
@@ -103,10 +110,14 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   const outboundTargets = compileOutboundMatchers(policy);
   const uninstallFetch = installFetch(effectiveBackend, discovery, { outboundTargets });
   // Framework/library packs: auto-detect and wrap each one if present.
-  // Best-effort — an absent library is a silent no-op; never fatal.
+  // Best-effort — an absent library is a silent no-op; never fatal. The
+  // `child_process` pack additionally consumes the parsed `cmd:` flow rules
+  // (`extractCmdFlows`, the `cmd:` sibling of `extractFlowEntrypoints`'s `ts:`
+  // handling); other packs ignore the extra key.
+  const cmdFlows = extractCmdFlows(policy);
   const packs = [];
   for (const { label, install } of FRAMEWORK_PACKS) {
-    packs.push({ label, ...(await install({ cwd })) });
+    packs.push({ label, ...(await install({ cwd, cmdFlows })) });
   }
   // eve and ai-sdk are detection-only at this seam: neither patches anything
   // (eve's `tool:` targets are wrapped by the loader below, from source; the
