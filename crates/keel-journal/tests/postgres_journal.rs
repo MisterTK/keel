@@ -16,8 +16,8 @@ mod support;
 use core::time::Duration;
 
 use keel_journal::{
-    CacheKey, FlowId, FlowStatus, Journal, NewFlow, PostgresJournal, ProcessId, StepKey, StepKind,
-    StepOutcome, StepStatus,
+    CacheKey, FlowDescriptor, FlowId, FlowStatus, Journal, NewFlow, PostgresJournal, ProcessId,
+    StepKey, StepKind, StepOutcome, StepStatus,
 };
 use support::ScratchPg;
 
@@ -294,4 +294,94 @@ fn reopening_an_existing_database_keeps_its_rows_and_is_race_safe() {
     }
     let reopened = PostgresJournal::open(&pg.url()).expect("reopen");
     assert!(reopened.get_flow(&FlowId::new("01FLOW")).unwrap().is_some());
+}
+
+#[test]
+fn flows_by_entrypoint_returns_every_status_ordered_by_created_at() {
+    let pg = require_pg!();
+    let j = PostgresJournal::open(&pg.url()).expect("open postgres journal");
+
+    // A flow under a DIFFERENT entrypoint must never appear below.
+    let other = NewFlow {
+        flow_id: FlowId::new("00OTHER"),
+        entrypoint: "py:other.module:main".to_owned(),
+        args_hash: "ah-other".to_owned(),
+        code_hash: None,
+    };
+    j.begin_flow(&other).unwrap();
+
+    j.begin_flow(&sample_flow("01FIRST")).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    j.begin_flow(&sample_flow("02SECOND")).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let third = FlowId::new("03THIRD");
+    j.begin_flow(&sample_flow("03THIRD")).unwrap();
+    // Unlike `incomplete_flows`, a non-`running` flow must still show up.
+    j.complete_flow(&third, FlowStatus::Failed).unwrap();
+
+    let flows: Vec<FlowDescriptor> = j.flows_by_entrypoint("py:pipeline.ingest:main").unwrap();
+    let ids: Vec<&str> = flows.iter().map(|f| f.flow_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["01FIRST", "02SECOND", "03THIRD"],
+        "every status for this entrypoint, ordered by created_at"
+    );
+    assert_eq!(flows[0].status, FlowStatus::Running);
+    assert_eq!(
+        flows[2].status,
+        FlowStatus::Failed,
+        "failed flows are included too"
+    );
+
+    assert!(
+        j.flows_by_entrypoint("py:nonexistent:main")
+            .unwrap()
+            .is_empty(),
+        "an entrypoint with no flows reads as empty, not an error"
+    );
+}
+
+#[test]
+fn steps_for_flow_returns_every_step_in_seq_order_with_raw_payload() {
+    let pg = require_pg!();
+    let j = PostgresJournal::open(&pg.url()).expect("open postgres journal");
+    let flow = FlowId::new("01FLOW");
+    j.begin_flow(&sample_flow("01FLOW")).unwrap();
+
+    let step0 = StepOutcome {
+        kind: StepKind::Effect,
+        attempt: 1,
+        status: StepStatus::Ok,
+        payload: Some(vec![0x81, 0xA2, 0x6F, 0x6B, 0xC3]),
+        error_class: None,
+        started_at: 1_000,
+        ended_at: Some(1_005),
+    };
+    let step1 = StepOutcome {
+        status: StepStatus::Running,
+        payload: None,
+        started_at: 1_010,
+        ended_at: None,
+        ..step0.clone()
+    };
+    // Recorded out of seq order, to prove the read orders by `seq`, not
+    // insertion order.
+    j.record_step(&flow, 1, &StepKey::new("api.b.internal#w1"), &step1)
+        .unwrap();
+    j.record_step(&flow, 0, &StepKey::new("api.a.internal#w0"), &step0)
+        .unwrap();
+
+    let got = j.steps_for_flow(&flow).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, StepKey::new("api.a.internal#w0"));
+    assert_eq!(got[0].1, step0, "payload stays raw/undecoded");
+    assert_eq!(got[1].0, StepKey::new("api.b.internal#w1"));
+    assert_eq!(got[1].1, step1);
+
+    let empty = FlowId::new("02EMPTY");
+    j.begin_flow(&sample_flow("02EMPTY")).unwrap();
+    assert!(
+        j.steps_for_flow(&empty).unwrap().is_empty(),
+        "a flow with no steps yet reads as empty, not an error"
+    );
 }

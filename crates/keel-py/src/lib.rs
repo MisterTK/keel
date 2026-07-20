@@ -85,7 +85,7 @@ use keel_core_api::{
     OutcomeError, Request,
 };
 use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
-use keel_journal::{FlowStatus, ProcessId, SqliteJournal, SystemClock};
+use keel_journal::{FlowId, FlowStatus, ProcessId, SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -764,6 +764,117 @@ impl KeelCore {
                 .blocking_lock()
                 .as_ref()
                 .and_then(|handle| handle.recorded_idempotency_key(step_key))
+        })
+    }
+
+    /// Every flow ever created for `entrypoint`, any status, ordered by
+    /// `created_at` — the cross-flow, out-of-process history read a
+    /// long-lived caller (e.g. a session-service reconstructing a session
+    /// that spans many past, already-closed flows) uses to find flows it
+    /// never itself held open. Backed by
+    /// [`Journal::flows_by_entrypoint`](keel_journal::Journal::flows_by_entrypoint).
+    ///
+    /// Returns a list of dicts: `{flow_id, entrypoint, args_hash, code_hash,
+    /// status, created_at, updated_at}` (`status` is one of `"running"`,
+    /// `"completed"`, `"failed"`, `"dead"`). Raises `KeelCoreError`:
+    /// `KEEL-E040` if this core has no journal, or if the read itself fails.
+    ///
+    /// Plain, synchronous, read-only: reached via `Engine::journal()` alone,
+    /// never `active_flow` or the tokio runtime, so — unlike
+    /// `enter_flow`/`exit_flow`/`recorded_idempotency_key` above — this needs
+    /// no `py.detach()`/`blocking_lock()` dance. Nothing here can contend the
+    /// async-mutex deadlock those exist to avoid.
+    fn flows_by_entrypoint(&self, py: Python<'_>, entrypoint: &str) -> PyResult<Py<PyAny>> {
+        let journal = self.engine.journal().ok_or_else(|| {
+            keel_error(
+                py,
+                "KEEL-E040",
+                "Tier 2 durable flows require a native core with a journal; this core is \
+                 in-memory. Pass a journal_path (the front end attaches one under .keel/).",
+            )
+        })?;
+        let flows = journal
+            .flows_by_entrypoint(entrypoint)
+            .map_err(|e| keel_error(py, "KEEL-E040", &format!("flows_by_entrypoint: {e}")))?;
+        let rows: Vec<Value> = flows
+            .into_iter()
+            .map(|f| {
+                json!({
+                    "flow_id": f.flow_id.as_str(),
+                    "entrypoint": f.entrypoint,
+                    "args_hash": f.args_hash,
+                    "code_hash": f.code_hash,
+                    "status": status_str(f.status),
+                    "created_at": f.created_at,
+                    "updated_at": f.updated_at,
+                })
+            })
+            .collect();
+        pythonize(py, &rows).map(Bound::unbind).map_err(|e| {
+            keel_error(
+                py,
+                "KEEL-E040",
+                &format!("flows_by_entrypoint not encodable: {e}"),
+            )
+        })
+    }
+
+    /// Every step of the flow `flow_id`, in `seq` order — the full step
+    /// history a caller replays to reconstruct that flow's effects from
+    /// outside its own live handle. Backed by
+    /// [`Journal::steps_for_flow`](keel_journal::Journal::steps_for_flow);
+    /// each step's raw MessagePack payload is decoded here (via
+    /// `keel_engine::flow::decode_payload`) before crossing into Python —
+    /// the `Journal` trait itself never decodes payloads (see
+    /// `flows_by_entrypoint`'s sibling note and every other `Journal` read
+    /// method).
+    ///
+    /// Returns a list of dicts: `{step_key, kind, attempt, status, payload,
+    /// started_at, ended_at}` (`kind` is one of `"effect"`, `"time"`,
+    /// `"random"`, `"subprocess"`, `"marker"`; `status` is `"ok"`, `"error"`,
+    /// or `"running"`; `payload` is the decoded JSON value, or `None` when
+    /// the step recorded none or its bytes could not be decoded). Raises
+    /// `KeelCoreError`: `KEEL-E040` if this core has no journal, or if the
+    /// read itself fails.
+    ///
+    /// Plain, synchronous, read-only — see `flows_by_entrypoint`'s doc for
+    /// why no `py.detach()`/`blocking_lock()` dance is needed here either.
+    fn steps_for_flow(&self, py: Python<'_>, flow_id: &str) -> PyResult<Py<PyAny>> {
+        let journal = self.engine.journal().ok_or_else(|| {
+            keel_error(
+                py,
+                "KEEL-E040",
+                "Tier 2 durable flows require a native core with a journal; this core is \
+                 in-memory. Pass a journal_path (the front end attaches one under .keel/).",
+            )
+        })?;
+        let steps = journal
+            .steps_for_flow(&FlowId::new(flow_id))
+            .map_err(|e| keel_error(py, "KEEL-E040", &format!("steps_for_flow: {e}")))?;
+        let rows: Vec<Value> = steps
+            .into_iter()
+            .map(|(key, outcome)| {
+                let payload = outcome
+                    .payload
+                    .as_deref()
+                    .and_then(keel_engine::flow::decode_payload);
+                json!({
+                    "step_key": key.as_str(),
+                    "kind": outcome.kind.as_str(),
+                    "attempt": outcome.attempt,
+                    "status": outcome.status.as_str(),
+                    "payload": payload,
+                    "started_at": outcome.started_at,
+                    "ended_at": outcome.ended_at,
+                })
+            })
+            .collect();
+        pythonize(py, &rows).map(Bound::unbind).map_err(|e| {
+            keel_error(
+                py,
+                "KEEL-E040",
+                &format!("steps_for_flow not encodable: {e}"),
+            )
         })
     }
 

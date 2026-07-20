@@ -497,6 +497,12 @@ impl Journal for FailingJournal {
     fn get_cache(&self, _key: &CacheKey) -> keel_journal::Result<Option<Vec<u8>>> {
         Err(injected_failure())
     }
+    fn flows_by_entrypoint(&self, _entrypoint: &str) -> keel_journal::Result<Vec<FlowDescriptor>> {
+        Err(injected_failure())
+    }
+    fn steps_for_flow(&self, _flow: &FlowId) -> keel_journal::Result<Vec<(StepKey, StepOutcome)>> {
+        Err(injected_failure())
+    }
 }
 
 /// A minimal tracing subscriber that counts WARN-level events — enough to prove
@@ -614,6 +620,12 @@ impl Journal for SelectiveFailJournal {
     }
     fn get_cache(&self, key: &CacheKey) -> keel_journal::Result<Option<Vec<u8>>> {
         self.inner.get_cache(key)
+    }
+    fn flows_by_entrypoint(&self, entrypoint: &str) -> keel_journal::Result<Vec<FlowDescriptor>> {
+        self.inner.flows_by_entrypoint(entrypoint)
+    }
+    fn steps_for_flow(&self, flow: &FlowId) -> keel_journal::Result<Vec<(StepKey, StepOutcome)>> {
+        self.inner.steps_for_flow(flow)
     }
 }
 
