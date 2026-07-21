@@ -35,3 +35,5 @@ python/keel/build/
 # local-only project notes (not shipped with the repo)
 /CLAUDE.md
 /docs/
+/RELEASE_NOTES-*.md
+/SECURITY.md
