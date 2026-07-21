@@ -18,12 +18,13 @@
 //! twin. An invalid policy — or a journal backend this build cannot provide —
 //! exits [`EXIT_USAGE`](crate::EXIT_USAGE); otherwise 0.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use keel_core_api::policy::Policy;
+use keel_core_api::policy::{FlowMatchRule, Policy};
 use serde::Serialize;
 
+use crate::cmd_match::{compile_cmd_rules, match_argv};
 use crate::diff::{PolicyOp, PolicyPath, Proposal, propose, resolve_dotted_path};
 use crate::render::to_json;
 use crate::scan::{ScanResult, TransportClass};
@@ -317,6 +318,16 @@ pub(crate) struct TopologyEntry {
 #[derive(Debug, Serialize)]
 pub(crate) struct ExternalProcess {
     pub(crate) command: String,
+    /// The `cmd:<name>` entrypoint this sighting's argv matches under the
+    /// project's declared `[flows.match."cmd:*"]` rules (issue #41), or
+    /// `None` when unmatched (or the launcher isn't one the runtime pack
+    /// ever intercepts, or its argv is not a genuine positional literal —
+    /// see [`scan::SubprocessSighting::argv`]). A match means "wrapped WHEN
+    /// Keel is active in the process that runs it" — doctor cannot know
+    /// activation from a static scan, so a match downgrades this finding
+    /// rather than dropping it; see [`topology_findings`]/[`build_follow_ups`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) covered_by: Option<String>,
     pub(crate) file: String,
     pub(crate) launcher: String,
     pub(crate) line: u32,
@@ -362,6 +373,11 @@ struct DoctorReport {
 #[derive(Debug)]
 struct PolicyValidation {
     check: PolicyCheck,
+    /// The declared `[flows.match."cmd:*"]` table (issue #41), so
+    /// `classify_topology` can cross-reference subprocess sightings — empty
+    /// when `keel.toml` is absent, invalid, or simply declares no rules
+    /// (the honest default: no rules means no sighting is ever "covered").
+    cmd_match: BTreeMap<String, FlowMatchRule>,
     fix: Option<Proposal>,
 }
 
@@ -475,9 +491,12 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             topic: "url-no-transport",
         });
     }
-    if !topology.external_processes.is_empty() {
-        let cmds: Vec<String> = topology
-            .external_processes
+    let (covered, uncovered): (Vec<_>, Vec<_>) = topology
+        .external_processes
+        .iter()
+        .partition(|p| p.covered_by.is_some());
+    if !uncovered.is_empty() {
+        let cmds: Vec<String> = uncovered
             .iter()
             .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
             .collect();
@@ -487,11 +506,45 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 .to_owned(),
             detail: format!(
                 "Keel cannot see traffic inside {} externally-launched process(es): {}.",
-                topology.external_processes.len(),
+                uncovered.len(),
                 cmds.join(", ")
             ),
             fix: None,
             level: "warn",
+            topic: "subprocess-blind-spot",
+        });
+    }
+    if !covered.is_empty() {
+        // Issue #41: a sighting matching a declared `[flows.match."cmd:*"]`
+        // rule is wrapped WHEN Keel is active in the process that runs it —
+        // a static scan cannot confirm activation, so this downgrades to
+        // `info` rather than dropping the sighting (overclaiming coverage
+        // doctor can't verify would be its own honesty violation).
+        let cmds: Vec<String> = covered
+            .iter()
+            .map(|p| {
+                format!(
+                    "`{}` ({} at {}:{}, matches `{}`)",
+                    p.command,
+                    p.launcher,
+                    p.file,
+                    p.line,
+                    p.covered_by.as_deref().unwrap_or_default()
+                )
+            })
+            .collect();
+        findings.push(Finding {
+            action: "No action needed unless the matching `[flows.match]` rule is wrong, or Keel \
+                      is not actually active in the process that runs this command."
+                .to_owned(),
+            detail: format!(
+                "{} externally-launched process(es) match a declared `[flows.match.\"cmd:*\"]` \
+                 rule and are wrapped when Keel is active in that process: {}.",
+                covered.len(),
+                cmds.join(", ")
+            ),
+            fix: None,
+            level: "info",
             topic: "subprocess-blind-spot",
         });
     }
@@ -619,9 +672,17 @@ fn build_follow_ups(
             subject: entry.host.clone(),
         });
     }
-    if !topology.external_processes.is_empty() {
-        let cmds: Vec<String> = topology
-            .external_processes
+    // Issue #41: a sighting matching a declared `[flows.match."cmd:*"]` rule
+    // is covered when Keel is active, so it drops out of this "investigate
+    // top-down" list entirely — it needs no chasing, only the lower-priority
+    // `info` finding `topology_findings` still emits for it.
+    let uncovered: Vec<&ExternalProcess> = topology
+        .external_processes
+        .iter()
+        .filter(|p| p.covered_by.is_none())
+        .collect();
+    if !uncovered.is_empty() {
+        let cmds: Vec<String> = uncovered
             .iter()
             .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
             .collect();
@@ -633,10 +694,7 @@ fn build_follow_ups(
                 cmds.join(", ")
             ),
             rank: follow_up_rank("subprocess-blind-spot"),
-            subject: format!(
-                "{} externally-launched process(es)",
-                topology.external_processes.len()
-            ),
+            subject: format!("{} externally-launched process(es)", uncovered.len()),
         });
     }
     for entry in &topology.excluded {
@@ -751,6 +809,8 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
 /// `.keel/journal.db` and stat scripts on disk) are computed by the caller
 /// and passed in already resolved, the same pattern `policy`/`journal`
 /// already use.
+#[allow(clippy::too_many_lines)] // straight-line report assembly, one section per
+// DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -759,7 +819,11 @@ fn build_report(
     agents_cli_finding: Option<Finding>,
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
-    let PolicyValidation { check: policy, fix } = policy;
+    let PolicyValidation {
+        check: policy,
+        cmd_match,
+        fix,
+    } = policy;
     let registry_libs = registry_libs();
 
     // Coverage from the target sets.
@@ -780,7 +844,7 @@ fn build_report(
     // Topology: sort every sighted host into exactly one of the three honesty
     // buckets, plus the host-independent external-process signal — see
     // [`classify_topology`].
-    let topology = classify_topology(scan, wrapped_targets);
+    let topology = classify_topology(scan, wrapped_targets, &cmd_match);
 
     // Adapter registry annotated with detection.
     let adapters: Vec<AdapterStatus> = REGISTRY
@@ -883,8 +947,14 @@ fn build_report(
 /// any transport check; otherwise the transport class decides wrappable
 /// (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
 /// `init.rs` reuses this directly for `keel init --diff` to skip proposing
-/// policy for excluded hosts and print why.
-pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<String>) -> Topology {
+/// policy for excluded hosts and print why (passing an empty `cmd_match` —
+/// `--diff` never touches `external_processes`, so cross-referencing it
+/// there would be dead work).
+pub(crate) fn classify_topology(
+    scan: &ScanResult,
+    wrapped_targets: &BTreeSet<String>,
+    cmd_match: &BTreeMap<String, FlowMatchRule>,
+) -> Topology {
     let dep_files: BTreeSet<&str> = scan
         .dependency_averse
         .iter()
@@ -937,11 +1007,13 @@ pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<St
             }),
         }
     }
+    let cmd_rules = compile_cmd_rules(cmd_match);
     let external_processes: Vec<ExternalProcess> = scan
         .subprocesses
         .iter()
         .map(|s| ExternalProcess {
             command: s.command.clone(),
+            covered_by: cmd_flow_covering(&cmd_rules, s),
             file: s.file.clone(),
             launcher: s.launcher.clone(),
             line: s.line,
@@ -953,6 +1025,41 @@ pub(crate) fn classify_topology(scan: &ScanResult, wrapped_targets: &BTreeSet<St
         unreachable,
         wrappable,
     }
+}
+
+/// The launcher names `python/keel/src/keel/adapters/subprocess_pack.py`'s
+/// runtime interceptor actually wraps (issue #41's "Coverage" section):
+/// `subprocess.run`/`check_output`/`call`/`check_call`, patched directly or
+/// via a same-module call the patched name resolves. Deliberately excludes
+/// `subprocess.Popen` (the scanner sights it — see `SUBPROC_NAMES` — but the
+/// pack never patches it) and `os.system`/`os.popen` (a different launch
+/// shape the pack's own docs say it never matches). Node's launchers are
+/// never in this list: `SubprocessSighting::argv` is always `None` for a JS
+/// sighting today (see `record_subprocess`'s doc), so the `argv.is_some()`
+/// gate below already excludes them; this list is the second, explicit gate
+/// so that invariant isn't the ONLY thing standing between a scanner change
+/// and a false "covered" claim.
+const INTERCEPTED_CMD_LAUNCHERS: &[&str] = &[
+    "subprocess.run",
+    "subprocess.check_output",
+    "subprocess.call",
+    "subprocess.check_call",
+];
+
+/// The `cmd:<name>` entrypoint `sighting` is covered by, or `None` — issue
+/// #41. A sighting is only ever a match candidate when its launcher is one
+/// the runtime pack actually intercepts AND the scanner captured a genuine
+/// positional argv (`argv.is_some()`; see [`scan::SubprocessSighting::argv`]'s
+/// doc for the exact conditions — list/tuple of literals, no `shell=True`).
+fn cmd_flow_covering(
+    rules: &[crate::cmd_match::CompiledCmdRule],
+    sighting: &scan::SubprocessSighting,
+) -> Option<String> {
+    if !INTERCEPTED_CMD_LAUNCHERS.contains(&sighting.launcher.as_str()) {
+        return None;
+    }
+    let argv = sighting.argv.as_ref()?;
+    match_argv(rules, argv).map(str::to_owned)
 }
 
 /// Validate `keel.toml` against the typed [`Policy`] model, reporting the exact
@@ -967,6 +1074,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 present: false,
                 valid: true,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         };
     }
@@ -988,13 +1096,14 @@ fn validate_policy(path: &Path) -> PolicyValidation {
         }
     };
     match serde_path_to_error::deserialize::<_, Policy>(&json_value) {
-        Ok(_) => PolicyValidation {
+        Ok(policy) => PolicyValidation {
             check: PolicyCheck {
                 field: None,
                 message: None,
                 present: true,
                 valid: true,
             },
+            cmd_match: policy.flows.and_then(|f| f.match_).unwrap_or_default(),
             fix: None,
         },
         Err(e) => {
@@ -1013,6 +1122,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
             present: true,
             valid: false,
         },
+        cmd_match: BTreeMap::new(),
         fix,
     }
 }
@@ -1203,6 +1313,7 @@ mod tests {
                 present: false,
                 valid: true,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         };
         let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
@@ -1284,6 +1395,7 @@ mod tests {
             line: 12,
             launcher: "subprocess.run".into(),
             command: "uvx alpaca-mcp-server".into(),
+            argv: Some(vec!["uvx".into(), "alpaca-mcp-server".into()]),
         });
         let r = build_report(
             &scan,
@@ -1320,6 +1432,139 @@ mod tests {
         );
         // ok is unaffected: honesty findings are not configuration errors.
         assert!(r.ok);
+    }
+
+    /// Issue #41: a subprocess sighting whose launcher/argv the runtime pack
+    /// actually intercepts, and whose argv matches a declared
+    /// `[flows.match."cmd:*"]` rule, is downgraded (info, `covered_by` set,
+    /// excluded from the rank-2 follow-up) rather than nagged about — while
+    /// an unmatched sighting alongside it keeps the full `warn` + follow-up
+    /// treatment `topology_buckets_classify_hosts_honestly` already pins.
+    #[test]
+    fn covered_subprocess_sighting_is_downgraded_not_dropped() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses.push(SubprocessSighting {
+            file: "etl.py".into(),
+            line: 9,
+            launcher: "subprocess.run".into(),
+            command: "etl run".into(),
+            argv: Some(vec!["etl".into(), "run".into()]),
+        });
+        scan.subprocesses.push(SubprocessSighting {
+            file: "backup.py".into(),
+            line: 20,
+            launcher: "subprocess.run".into(),
+            command: "backup now".into(),
+            argv: Some(vec!["backup".into(), "now".into()]),
+        });
+        let mut policy = default_policy();
+        policy.check.present = true;
+        policy.cmd_match.insert(
+            "cmd:etl".to_owned(),
+            FlowMatchRule {
+                argv: vec!["etl".into(), "run".into()],
+            },
+        );
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            &[],
+        );
+
+        assert_eq!(r.topology.external_processes.len(), 2);
+        let etl = r
+            .topology
+            .external_processes
+            .iter()
+            .find(|p| p.command == "etl run")
+            .expect("etl sighting present");
+        assert_eq!(etl.covered_by.as_deref(), Some("cmd:etl"));
+        let backup = r
+            .topology
+            .external_processes
+            .iter()
+            .find(|p| p.command == "backup now")
+            .expect("backup sighting present");
+        assert_eq!(backup.covered_by, None);
+
+        // The covered sighting gets an `info` finding naming the match...
+        assert!(r.findings.iter().any(|f| f.topic == "subprocess-blind-spot"
+            && f.level == "info"
+            && f.detail.contains("etl run")
+            && f.detail.contains("cmd:etl")));
+        // ...the uncovered one keeps the full `warn` finding...
+        assert!(r.findings.iter().any(|f| f.topic == "subprocess-blind-spot"
+            && f.level == "warn"
+            && f.detail.contains("backup now")
+            && !f.detail.contains("etl run")));
+        // ...and only the uncovered one counts toward the rank-2 follow-up.
+        let follow_up = r
+            .follow_ups
+            .iter()
+            .find(|u| u.code == "subprocess-blind-spot")
+            .expect("one uncovered sighting still yields a follow-up");
+        assert!(follow_up.detail.contains("backup now"));
+        assert!(!follow_up.detail.contains("etl run"));
+        assert_eq!(follow_up.subject, "1 externally-launched process(es)");
+    }
+
+    /// Issue #41: `os.system`/`os.popen` sightings, and `subprocess.Popen`
+    /// sightings, are NEVER match candidates even with argv text that would
+    /// otherwise match a declared rule — the runtime pack never intercepts
+    /// those launchers at all (`subprocess_pack.py`'s "Coverage" section).
+    #[test]
+    fn uncovered_launchers_never_match_even_with_matching_text() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses.push(SubprocessSighting {
+            file: "legacy.py".into(),
+            line: 4,
+            launcher: "os.system".into(),
+            command: "etl run".into(),
+            argv: None,
+        });
+        scan.subprocesses.push(SubprocessSighting {
+            file: "legacy.py".into(),
+            line: 8,
+            launcher: "subprocess.Popen".into(),
+            command: "etl run".into(),
+            argv: Some(vec!["etl".into(), "run".into()]),
+        });
+        let mut policy = default_policy();
+        policy.check.present = true;
+        policy.cmd_match.insert(
+            "cmd:etl".to_owned(),
+            FlowMatchRule {
+                argv: vec!["etl".into(), "run".into()],
+            },
+        );
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            &[],
+        );
+        assert!(
+            r.topology
+                .external_processes
+                .iter()
+                .all(|p| p.covered_by.is_none()),
+            "neither os.system nor subprocess.Popen is ever a match candidate"
+        );
     }
 
     /// WS3: each hand-rolled pattern the scan sighted becomes ONE paired
@@ -1452,6 +1697,7 @@ mod tests {
             line: 12,
             launcher: "subprocess.run".into(),
             command: "uvx alpaca-mcp-server".into(),
+            argv: Some(vec!["uvx".into(), "alpaca-mcp-server".into()]),
         });
         // One excluded host (rank 3).
         scan.targets.insert(
@@ -1678,6 +1924,7 @@ mod tests {
                 present: false,
                 valid: true,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         };
         let r = build_report(
@@ -1777,6 +2024,7 @@ mod tests {
                 present: false,
                 valid: true,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         }
     }
@@ -1895,6 +2143,7 @@ mod tests {
                 present: true,
                 valid: false,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         };
         let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
@@ -1920,6 +2169,7 @@ mod tests {
                 present: true,
                 valid: true,
             },
+            cmd_match: BTreeMap::new(),
             fix: None,
         };
         let journal = JournalReport {

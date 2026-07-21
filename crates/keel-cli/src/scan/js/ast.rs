@@ -404,12 +404,20 @@ impl ScanVisitor<'_> {
     /// Record one subprocess/external-process launch. Separate from
     /// `call_sites`/`effects`: `child_process` is not an intercepted effect
     /// library, just a process boundary Keel cannot see past.
+    ///
+    /// `argv` is always `None` (issue #41): this scanner only sights
+    /// `child_process.spawn`/`.exec`, but `node/keel/src/packs/child-process.mjs`
+    /// only intercepts the SYNC `spawnSync`/`execFileSync` — disjoint from what
+    /// this scanner sees, so no JS sighting could ever be an actual
+    /// `[flows.match."cmd:*"]` match candidate today. Sighting the sync
+    /// variants (and their argv) is separate scanner work, not this issue.
     fn record_subprocess(&mut self, launcher: &'static str, command: String, offset: u32) {
         self.findings.subprocesses.push(SubprocessSighting {
             file: self.rel.to_owned(),
             line: self.line_of(offset),
             launcher: launcher.to_owned(),
             command,
+            argv: None,
         });
     }
 

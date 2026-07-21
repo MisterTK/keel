@@ -24,6 +24,7 @@
 //! testable core; [`main`](../keel/index.html) is a thin clap front.
 
 pub mod agents_cli;
+mod cmd_match;
 pub mod diff;
 pub mod doctor;
 pub mod effective;
