@@ -21,26 +21,32 @@ cleanly otherwise — see ``SKIP`` below); the CI leg that actually exercises
 it is the new ``adapter-farm.yml`` job added alongside this file (a native
 build step, unlike every other job in that workflow).
 
-## Why this module does NOT install ``mcp_pack`` (an issue #22(d) finding)
+## Why this module does NOT install ``mcp_pack`` (an issue #22(d) finding,
+## fixed by issue #38 — kept installing ``adk_pack`` only pending farm re-cert)
 
 Empirically verified in a scratch venv (google-adk==2.4.0 + mcp==1.28.1 +
 this repo's maturin-built ``keel_core``): installing BOTH ``adk_pack`` AND
-``mcp_pack`` while a Tier 2 flow is DESIGNATED and OPEN deadlocks the process
-on the very first real MCP tool call — every other combination tried (either
-pack alone with an open flow; both packs together against the native backend
-with NO flow open, i.e. plain Tier 1) completes normally. The failure shape
-(one thread blocked in ``asyncio``'s child-process reaper, the event loop
-itself idle in ``select()``) points at re-entrancy in the native core's
-open-flow bookkeeping: ``adk_pack``'s ``tool:echo`` wrap and ``mcp_pack``'s
-``mcp:farm-fixture`` wrap both call into ``execute_async`` for the SAME
-outgoing call while the SAME flow is open, and the outer call apparently
-never releases whatever the inner call needs to proceed. This is a genuine,
-previously-uncovered gap (neither pack's own farm suite nor
-``AdkMcpCompositionTest`` ever combines "both packs" with "an open native
-flow" — this module is the first test to even ATTEMPT that combination), not
-an artifact of this harness. Recommended as a fast-follow issue rather than
-fixed here: this module's job is the composition CI leg, and a native-core
-re-entrancy fix deserves its own focused change + review.
+``mcp_pack`` while a Tier 2 flow is DESIGNATED and OPEN deadlocked the
+process on the very first real MCP tool call — every other combination tried
+(either pack alone with an open flow; both packs together against the native
+backend with NO flow open, i.e. plain Tier 1) completed normally. Root cause
+(issue #38, fixed): ``adk_pack``'s ``tool:echo`` wrap and ``mcp_pack``'s
+``mcp:farm-fixture`` wrap both called into ``execute_async`` for the SAME
+outgoing call while the SAME flow was open — the outer call held
+``active_flow``'s lock for its whole step, so the inner call's
+``.lock().await`` could never be granted. Fixed in ``crates/keel-py/src/lib.rs``
+(``execute_async``'s nested-call passthrough, ``async_in_effect``/
+``guarded_awaitable``) and proven with a minimal bare-``KeelCore`` repro at
+``test_flows.py``'s
+``NativeFlowReplayTest.test_nested_execute_async_from_inside_an_open_flow_passes_through``
+— no ADK/MCP involved, confirming it was core-level re-entrancy, not specific
+to this pack pairing.
+
+This module still installs ``adk_pack`` only, NOT because the deadlock is
+unfixed, but because flipping it to install both packs needs re-certifying
+against the real, pinned ``google-adk``/``mcp`` libs (this environment has
+neither installed) before trusting it in the composition CI leg — tracked as
+a fast-follow rather than flipped blind in the same change as the core fix.
 
 Consequently: every test class below installs ``adk_pack`` only. Real
 ``MCPToolset``/``McpTool`` traffic still flows for real (``adk_pack``'s own

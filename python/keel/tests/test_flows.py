@@ -729,6 +729,48 @@ class NativeFlowReplayTest(unittest.TestCase):
         self.assertEqual(finished, [0, 1, 2], "each effect finishes before the next is admitted")
         self.assertEqual([r["payload"] for r in results], [{"i": 0}, {"i": 1}, {"i": 2}])
 
+    def test_nested_execute_async_from_inside_an_open_flow_passes_through(self) -> None:
+        """Issue #38: an async effect that itself calls `execute_async` again
+        while the SAME flow is still open (e.g. one wrapped pack's tool call
+        invoking another wrapped pack's transport call, as in the real-ADK×MCP
+        composition farm test) used to deadlock — the outer call holds
+        `active_flow`'s lock for its whole step, so the inner call's
+        `.lock().await` could never be granted. The inner call must instead
+        pass through unwrapped (no lock, no journaling) and return promptly."""
+        core = self._core()
+
+        async def inner_eff(_attempt):
+            return {"status": "ok", "payload": {"who": "inner"}}
+
+        async def outer_eff(_attempt):
+            inner = await asyncio.wait_for(
+                core.execute_async(
+                    {"v": 1, "target": "inner", "op": "inner", "args_hash": "hi"},
+                    inner_eff,
+                ),
+                timeout=5.0,
+            )
+            self.assertEqual(inner["payload"], {"who": "inner"})
+            return {"status": "ok", "payload": {"who": "outer"}}
+
+        async def run_once():
+            core.enter_flow("py:pipeline:main", "ah-nested", code_hash="ch-1")
+            out = await asyncio.wait_for(
+                core.execute_async(
+                    {"v": 1, "target": "outer", "op": "outer", "args_hash": "ho"},
+                    outer_eff,
+                ),
+                timeout=5.0,
+            )
+            core.exit_flow("completed")
+            return out
+
+        try:
+            out = asyncio.run(run_once())
+        except asyncio.TimeoutError:
+            self.fail("nested execute_async deadlocked (issue #38 regression)")
+        self.assertEqual(out["payload"], {"who": "outer"})
+
     def test_async_flow_crash_and_resume_substitutes_completed_steps(self) -> None:
         """The kill-9 shape for the async bridge: two concurrent async steps
         complete and are journaled, the handle is dropped WITHOUT `exit_flow`
