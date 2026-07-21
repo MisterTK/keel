@@ -86,6 +86,16 @@ pub struct SubprocessSighting {
     /// (a bare string, or a list/tuple of string-literal elements); otherwise
     /// `"<dynamic>"`.
     pub command: String,
+    /// The literal argv as a positional vector, when the call is the
+    /// "list/tuple of string literals, no shell string" shape a `cmd:`
+    /// interceptor can ever match (issue #41) — `None` for a bare-string
+    /// command, a dynamic call, `shell=True`, or a launcher no runtime pack
+    /// currently intercepts at all (`os.system`/`os.popen`; Node's scanner
+    /// doesn't sight the launchers `child-process.mjs` intercepts, so it
+    /// always reports `None` here too, pending its own scanner work). `None`
+    /// means "never a `[flows.match."cmd:*"]` match candidate", independent
+    /// of what `command`'s text happens to look like.
+    pub argv: Option<Vec<String>>,
 }
 
 /// One hand-rolled resilience pattern sighted inside a function that also

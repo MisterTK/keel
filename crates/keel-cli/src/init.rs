@@ -655,7 +655,11 @@ fn diff(
     };
 
     let wrapped_targets: BTreeSet<String> = discovery.iter().map(|s| s.target.clone()).collect();
-    let topology = crate::doctor::classify_topology(scan, &wrapped_targets);
+    // `--diff` only reads `topology.excluded` below, never `external_processes`
+    // — an empty match table is correct, not a shortcut (see
+    // `classify_topology`'s doc for why cross-referencing here would be dead
+    // work).
+    let topology = crate::doctor::classify_topology(scan, &wrapped_targets, &BTreeMap::new());
     let excluded_hosts: BTreeSet<&str> =
         topology.excluded.iter().map(|e| e.host.as_str()).collect();
 

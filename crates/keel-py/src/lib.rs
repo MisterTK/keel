@@ -77,7 +77,8 @@
 //! FFI facade does — the callback can never crash the core.
 
 use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::ffi::CString;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use keel_core_api::{
@@ -88,7 +89,7 @@ use keel_engine::{Engine, FlowConfig, FlowDescriptor, FlowHandle, FlowManager};
 use keel_journal::{FlowId, FlowStatus, ProcessId, SqliteJournal, SystemClock};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyModule};
 use pythonize::{depythonize, pythonize};
 use serde_json::{Value, json};
 use tokio::runtime::{Builder, Runtime};
@@ -273,10 +274,41 @@ fn invoke_sync_effect(py: Python<'_>, effect: &Py<PyAny>, attempt: u32) -> Attem
 /// `effect(attempt)` and turn the returned awaitable into a Rust future, then
 /// await it off the GIL and decode the result. Failures degrade to
 /// `Error { class: other }`.
-async fn invoke_async_effect(effect: &Py<PyAny>, attempt: u32) -> AttemptResult {
+///
+/// `guard_reentrancy`: wrap the awaitable so [`async_in_effect`] reports `true`
+/// for the duration of ITS OWN execution (issue #38) — narrower than "any
+/// effect is running somewhere". A Rust thread-local (or any other "is some
+/// effect active" global) is the wrong granularity here: this effect can
+/// itself `await` (real IO, `asyncio.sleep`, …), and while it's suspended the
+/// event loop is free to advance an unrelated SIBLING `execute_async` call
+/// `asyncio.gather`ed alongside it — a thread/process-global flag would make
+/// that sibling see "nested" too and skip admission entirely, breaking the
+/// documented FIFO-on-the-lock concurrent-admission guarantee (confirmed by
+/// `test_concurrent_async_effects_serialize_in_admission_order` regressing
+/// when this was first tried as a thread-local). A genuine nested call — one
+/// made synchronously from INSIDE this effect's own running body, no
+/// intervening `await` — must see `true`; an unrelated sibling task must not,
+/// even though both may run on the very same OS thread (this bridge's tokio
+/// runtime is multi-threaded, but the Python coroutines themselves all
+/// execute on the single asyncio loop thread — see the module docs' "async
+/// flow bridge" section). `contextvars.ContextVar` is exactly this scope:
+/// per-`asyncio.Task`, copy-on-task-creation, invisible across sibling tasks
+/// sharing a thread, but visible to a synchronous nested call within the same
+/// task's continuation. `guarded_awaitable` sets it via literal Python
+/// bytecode running inside the wrapped coroutine itself.
+async fn invoke_async_effect(
+    effect: &Py<PyAny>,
+    attempt: u32,
+    guard_reentrancy: bool,
+) -> AttemptResult {
     let future = Python::attach(|py| {
-        let awaitable = effect.call1(py, (attempt,))?;
-        pyo3_async_runtimes::tokio::into_future(awaitable.into_bound(py))
+        let awaitable = effect.call1(py, (attempt,))?.into_bound(py);
+        let awaitable = if guard_reentrancy {
+            guarded_awaitable(py, awaitable)?
+        } else {
+            awaitable
+        };
+        pyo3_async_runtimes::tokio::into_future(awaitable)
     });
     let future = match future {
         Ok(future) => future,
@@ -286,6 +318,59 @@ async fn invoke_async_effect(effect: &Py<PyAny>, attempt: u32) -> AttemptResult 
         Ok(obj) => Python::attach(|py| decode_attempt(obj.bind(py))),
         Err(err) => synth_other(format!("awaiting async effect result failed: {err}")),
     }
+}
+
+/// The embedded `_keel_async_guard` module: a `contextvars.ContextVar`-backed
+/// coroutine wrapper (`_keel_guarded`) plus a plain getter (`_keel_in_effect`)
+/// [`async_in_effect`] calls. Compiled once (`OnceLock`) and reused.
+fn async_guard_module(py: Python<'_>) -> Py<PyModule> {
+    static MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+    MODULE
+        .get_or_init(|| {
+            let src = CString::new(
+                "import contextvars\n\
+                 _keel_ctxvar = contextvars.ContextVar(\"_keel_in_effect\", default=False)\n\
+                 \n\
+                 async def _keel_guarded(coro):\n\
+                 \x20   token = _keel_ctxvar.set(True)\n\
+                 \x20   try:\n\
+                 \x20       return await coro\n\
+                 \x20   finally:\n\
+                 \x20       _keel_ctxvar.reset(token)\n\
+                 \n\
+                 def _keel_in_effect():\n\
+                 \x20   return _keel_ctxvar.get()\n",
+            )
+            .expect("guard source has no interior NUL");
+            let filename = CString::new("_keel_async_guard.py").expect("no interior NUL");
+            let modname = CString::new("_keel_async_guard").expect("no interior NUL");
+            PyModule::from_code(py, &src, &filename, &modname)
+                .expect("embedding the reentrancy-guard module failed")
+                .unbind()
+        })
+        .clone_ref(py)
+}
+
+/// Wrap `coro` so [`async_in_effect`] reports `true` for the span of its
+/// execution — see [`invoke_async_effect`]'s doc for why this must be real
+/// Python bytecode (a `ContextVar`) rather than a Rust-side flag.
+fn guarded_awaitable<'py>(py: Python<'py>, coro: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    async_guard_module(py)
+        .bind(py)
+        .getattr("_keel_guarded")?
+        .call1((coro,))
+}
+
+/// Whether the asyncio Task currently executing (if any) is inside a
+/// [`guarded_awaitable`]-wrapped effect — the async-path analogue of
+/// [`in_effect`], read via the same `ContextVar` `guarded_awaitable` sets.
+fn async_in_effect(py: Python<'_>) -> bool {
+    async_guard_module(py)
+        .bind(py)
+        .getattr("_keel_in_effect")
+        .and_then(|f| f.call0())
+        .and_then(|r| r.extract())
+        .unwrap_or(false)
 }
 
 /// Build a current-thread runtime with only the time driver; `paused` turns on
@@ -549,6 +634,19 @@ impl KeelCore {
     /// order their calls *reach* the handle (FIFO on the lock), never in
     /// completion order. Outside a flow the lock is only held long enough to see
     /// `None`, so concurrent Tier 1 `execute_async` calls are unaffected.
+    ///
+    /// Re-entrant call (issue #38): an async effect that itself calls
+    /// `execute_async` again — e.g. one wrapped pack's tool call invoking
+    /// another wrapped pack's transport call — would otherwise deadlock:
+    /// the outer call already holds `active_flow`'s lock for the step's whole
+    /// duration (see above), so the inner call's `.lock().await` can never be
+    /// granted. Detected via [`async_in_effect`] — a `ContextVar` scoped to
+    /// the currently-running `asyncio.Task`, set for the duration of this
+    /// method's own effect invocation below (see [`invoke_async_effect`]'s doc
+    /// for why task-scoping, not a thread-local, is required here). On a
+    /// nested call we pass through unwrapped — one direct attempt, no lock, no
+    /// journaling — rather than deadlock; the OUTER call keeps full
+    /// resilience.
     #[pyo3(signature = (request, effect, idempotency_key=None))]
     fn execute_async<'py>(
         &self,
@@ -558,6 +656,12 @@ impl KeelCore {
         idempotency_key: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request = decode_request(py, request)?;
+        if async_in_effect(py) {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                let attempt = invoke_async_effect(&effect, 1, false).await;
+                Python::attach(|py| outcome_to_py(py, &outcome_from_single_attempt(attempt)))
+            });
+        }
         let engine = Arc::clone(&self.engine);
         let active_flow = Arc::clone(&self.active_flow);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -567,10 +671,12 @@ impl KeelCore {
             // general enough" that an `async` closure borrowing state triggers
             // inside `future_into_py`'s `Send` future. Passed to whichever of
             // `execute_step`/`engine.execute` below actually runs — the other
-            // branch never touches it.
+            // branch never touches it. `guard_reentrancy = true` so a nested
+            // re-entrant `execute_async`/`execute` call the effect triggers
+            // passes through above instead of deadlocking (issue #38).
             let effect_fn = move |attempt: u32| {
                 let effect = Python::attach(|py| effect.clone_ref(py));
-                async move { invoke_async_effect(&effect, attempt).await }
+                async move { invoke_async_effect(&effect, attempt, true).await }
             };
             // Admission: acquire the flow lock ASYNCHRONOUSLY — `.lock().await`
             // queues fairly without parking an OS thread, so a second concurrent

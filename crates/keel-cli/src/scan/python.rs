@@ -237,6 +237,28 @@ def argv_text(call):
     return "<dynamic>"
 
 
+def argv_list(call):
+    """The launched argv as a genuine positional list, or ``None`` (issue
+    #41). Only a list/tuple of string-literal elements, with no ``shell=True``
+    keyword, is this shape — the exact condition
+    ``subprocess_pack.py``'s runtime interceptor requires to consider a call
+    for ``[flows.match."cmd:*"]`` dispatch (``_str_argv``/the ``shell``
+    check). A bare string command (``os.system``, ``shell=True``) is a
+    DIFFERENT launch shape the runtime pack never matches; ``None`` here is
+    doctor's signal that this sighting can never be a match candidate,
+    regardless of what its text happens to look like."""
+    for kw in call.keywords:
+        if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+            return None
+    if call.args:
+        a = call.args[0]
+        if isinstance(a, (ast.List, ast.Tuple)) and a.elts and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str)
+                for e in a.elts):
+            return [e.value for e in a.elts]
+    return None
+
+
 def is_sleep(node, aliases):
     """Known conservative miss: `from time import sleep as pause` binds
     `pause` to the "time" MODULE in `aliases` (`import_entries` only tracks
@@ -464,11 +486,13 @@ for dirpath, dirnames, filenames in os.walk(root):
             if lib == "subprocess" and name in SUBPROC_NAMES:
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "subprocess." + name,
-                                     "command": argv_text(node)})
+                                     "command": argv_text(node),
+                                     "argv": argv_list(node)})
             elif lib == "os" and name in ("system", "popen"):
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "os." + name,
-                                     "command": argv_text(node)})
+                                     "command": argv_text(node),
+                                     "argv": None})
         consts = url_consts_of(tree)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -567,6 +591,13 @@ struct WalkerSubprocess {
     line: u32,
     launcher: String,
     command: String,
+    /// The literal argv as a positional vector, or `None` when the call is
+    /// not the "list/tuple of string literals, no `shell=True`" shape
+    /// `subprocess_pack.py`'s runtime interceptor requires (issue #41) —
+    /// `argv_list`'s doc explains why this is a stricter, DIFFERENT
+    /// condition than `command`'s "statically extractable at all".
+    #[serde(default)]
+    argv: Option<Vec<String>>,
 }
 
 /// One simplification sighting from the walker (see
@@ -676,6 +707,7 @@ pub fn scan(project: &Path) -> PyScan {
             line: sub.line,
             launcher: sub.launcher,
             command: sub.command,
+            argv: sub.argv,
         });
     }
     for s in output.simplifications {
