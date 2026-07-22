@@ -382,6 +382,30 @@ calls *reach* the flow handle (await/admission order), never completion
 order, so replay always reproduces the same step sequence (the async-flow-step
 ordering rule, normatively documented in `conformance/README.md`).
 
+### `cmd:` interception (`[flows.match]`)
+
+`spawnSync`/`execFileSync` (patched via `createRequire("node:child_process")`
+— a plain `import` doesn't observe the live-binding rewrite) are wrapped
+in-process the same way the Python front end wraps `subprocess`:
+
+```toml
+[flows]
+entrypoints = ["cmd:nightly-etl"]
+
+[flows.match."cmd:nightly-etl"]
+argv = ["./run_etl.sh", "*"]
+```
+
+**Replay gap** ([#42](https://github.com/MisterTK/keel/issues/42)): the
+native core's synchronous `execute()` can't reach the async replay path
+(KEEL-E005), so unlike Python's full replay-skip, a re-dispatch of an
+already-completed identity here throws
+`KeelCmdFlowReplayUnsupportedError` rather than replaying — dispatch
+parity, not replay parity. `execSync`/`{ shell: true }` calls are never
+matched. See the
+[root README](../../README.md#in-process-cmd-interception-flowsmatch-ccr-5)
+for the shared cross-language contract, including `keel flows force`.
+
 ## Config errors are fatal
 
 A missing `keel.toml` falls back to Level 0 defaults silently. A *present but

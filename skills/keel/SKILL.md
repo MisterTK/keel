@@ -125,7 +125,17 @@ the four phases in order; the static scan is evidence, not the verdict.
    source) but is exactly what `keel exec --flow <name> [--journal-file
    <path>...] -- <command>` replaces: at-most-once dispatch per identity,
    crash-safe retry gating, and (with `--journal-file`) a declared-
-   side-effect gate (KEEL-E033) before a failed run is retried. Before
+   side-effect gate (KEEL-E033) before a failed run is retried. When the
+   same subprocess call is launched *from inside* an already-Keel-active
+   Python or Node process rather than a standalone shell script, prefer
+   in-process `cmd:` interception instead — declare an argv match rule
+   under `[flows.match."cmd:<name>"]` and Keel wraps the matching
+   `subprocess`/`child_process` call directly, no `keel exec` wrapper
+   needed; `keel doctor`'s `subprocess-blind-spot` follow-up now
+   cross-references any `[flows.match]` rule that already covers a
+   sighted call. A durable flow refused with KEEL-E033 can be cleared
+   once, out-of-process, with `keel flows force <flow-id>` — a durable
+   one-shot override, not a config change. Before
    resuming or trusting a durable flow's replay, check `code_hash_stale` in
    `keel flows --json` / `keel doctor --json` — `true` means the
    entrypoint's resolved code changed since the flow's last run, so a
