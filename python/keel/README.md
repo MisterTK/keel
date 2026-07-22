@@ -87,6 +87,26 @@ order): if the runtime reaches the handle in a different order on resume
 (racing tasks whose scheduling differs run-to-run), that is nondeterminism,
 handled per `flows.on_nondeterminism` like any other divergence.
 
+### `cmd:` interception (`[flows.match]`)
+
+`subprocess.run`/`check_output`/`call`/`check_call` are wrapped in-process:
+declare an argv match rule and a matching call dispatches as a durable
+flow with no `keel exec` wrapper needed.
+
+```toml
+[flows]
+entrypoints = ["cmd:nightly-etl"]
+
+[flows.match."cmd:nightly-etl"]
+argv = ["./run_etl.sh", "*"]
+```
+
+Full replay-skip: a re-dispatched completed identity returns the recorded
+result without respawning the child. Shell-string calls (`shell=True`)
+are never matched — the shell, not the argv, decides what runs. See the
+[root README](../../README.md#in-process-cmd-interception-flowsmatch-ccr-5)
+for the shared cross-language contract, including `keel flows force`.
+
 ## Errors
 
 Every Keel error carries a stable `KEEL-E0NN` code (see `keel explain <code>`),

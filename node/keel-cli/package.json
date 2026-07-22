@@ -1,6 +1,6 @@
 {
   "name": "keelrun-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -20,10 +20,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "keelrun-cli-darwin-x64": "0.3.0",
-    "keelrun-cli-darwin-arm64": "0.3.0",
-    "keelrun-cli-linux-x64-musl": "0.3.0",
-    "keelrun-cli-linux-arm64-musl": "0.3.0",
-    "keelrun-cli-win32-x64": "0.3.0"
+    "keelrun-cli-darwin-x64": "0.4.0",
+    "keelrun-cli-darwin-arm64": "0.4.0",
+    "keelrun-cli-linux-x64-musl": "0.4.0",
+    "keelrun-cli-linux-arm64-musl": "0.4.0",
+    "keelrun-cli-win32-x64": "0.4.0"
   }
 }

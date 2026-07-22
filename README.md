@@ -225,6 +225,20 @@ Node front ends share identical semantics — verified by a shared
 [conformance suite](conformance/README.md) that every implementation must
 pass, not just documentation asserting it.
 
+#### `keel flows force` — the durable escape hatch (CCR-6)
+
+A failed `cmd:`/`keel exec` flow whose declared journal files changed on
+disk refuses a retry with KEEL-E033, by design — Keel won't silently
+re-run a side-effecting command against state it can no longer vouch for.
+`keel flows force <flow-id>` is the deliberate, out-of-process override:
+it durably marks that one flow-id as force-approved for its next retry, so
+the KEEL-E033 gate steps aside exactly once. It is not a schema change or
+a persistent policy flip — the approval is a single reserved marker-step
+in the journal, consumed on the next dispatch, leaving no frozen-contract
+footprint. Prefer `keel exec --force` when you're the one re-running the
+command; reach for `keel flows force` when another process or operator
+needs to clear the gate without re-invoking the original command itself.
+
 ## Agent integration
 
 Two ways a coding agent picks up Keel:
@@ -326,6 +340,28 @@ provider switch, not just a same-provider retry — the plugin's
 `on_model_error` hook resolves and constructs a real fallback model via
 ADK's own `LLMRegistry`, the one seam that can build a request for a
 genuinely different provider.
+
+**`KeelSessionService`** is a journal-backed `google.adk.sessions.BaseSessionService`
+(`keel.packs.adk_pack.KeelSessionService`) — ADK session state rides the
+same Keel journal your flows already write, instead of a separate
+in-memory or database-backed session store. Session writes
+(`session_event`/`session_identity`/`session_delete`) are journaled as
+steps through the currently-open Runner flow; reads reconstruct session
+state from the journal via an in-process cache with a genuine cross-flow
+journal-read fallback — never a second same-process SQLite connection
+(that exact bug, [#14](https://github.com/MisterTK/keel/issues/14), is
+the one thing this design goes out of its way to avoid on the read side
+too). It only engages inside a designated `Runner.run_async` flow; outside
+one it degrades silently to plain in-memory ADK session state, and if
+you've designated the entrypoint but the call happens on the *wrong* flow
+it raises KEEL-E005 loudly rather than writing to the wrong journal.
+**Known limitation** ([#44](https://github.com/MisterTK/keel/issues/44)):
+after a mid-turn crash and resume, the replayed session's substantive
+content matches the pre-crash run exactly, but `Event.id`/`timestamp`/
+`invocation_id` (and ADK-internal tool-call correlation ids) on the
+replay-substituted prefix do not — ADK assigns those fresh on every run
+and Keel does not virtualize them. If your integration depends on stable
+event ids across a crash/resume boundary, this isn't there yet.
 
 ## Status
 
