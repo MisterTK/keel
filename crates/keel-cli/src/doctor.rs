@@ -19,6 +19,7 @@
 //! exits [`EXIT_USAGE`](crate::EXIT_USAGE); otherwise 0.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use keel_core_api::policy::{FlowMatchRule, Policy};
@@ -958,6 +959,40 @@ fn build_report(
         level: "info",
         topic: "invisible",
     });
+    // Conditional: unparsed orchestration files that hand-roll at-most-once
+    // dispatch. A lead, not a verdict — the scan cannot parse these files, so
+    // the finding names where to look and never claims what it found.
+    if !scan.orchestration.is_empty() {
+        const MAX_LISTED: usize = 5;
+        let mut files: Vec<&str> = scan.orchestration.iter().map(|o| o.file.as_str()).collect();
+        // `scan.orchestration` is sorted by (file, line, kind), so same-file
+        // entries are adjacent and `dedup` is exact.
+        files.dedup();
+        let shown = files.len().min(MAX_LISTED);
+        let mut list = files[..shown]
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if files.len() > shown {
+            let rest = files.len() - shown;
+            let _ = write!(list, " and {rest} more");
+        }
+        findings.push(Finding {
+            action: "Inspect these files for hand-rolled at-most-once dispatch (lockfile/guard/\
+                     PID checks). A durable `cmd:` flow replaces it crash-safely: `keel exec \
+                     --flow` for a standalone launcher, or `[flows.match.\"cmd:<name>\"]` when \
+                     the call is made from inside an already-Keel-active process."
+                .to_owned(),
+            detail: format!(
+                "Static scan cannot parse these orchestration files, but sighted the \
+                 at-most-once-dispatch signature in: {list}."
+            ),
+            fix: None,
+            level: "warn",
+            topic: "orchestration-blind-spot",
+        });
+    }
     findings.extend(topology_findings(&topology));
     findings.extend(simplification_findings(scan, &topology));
     if !policy.valid && policy.present {
@@ -2758,6 +2793,89 @@ def caller():
         assert!(
             lines <= 3,
             "boundaries section is {lines} lines:\n{section}"
+        );
+    }
+
+    // ---- orchestration blind spot ----
+
+    #[test]
+    fn orchestration_sightings_become_a_finding() {
+        let mut scan = ScanResult::default();
+        for (file, line) in [("scripts/run_autonomous.sh", 3), ("scripts/run_autonomous.sh", 9)] {
+            scan.orchestration.push(scan::OrchestrationSighting {
+                file: file.to_owned(),
+                line,
+                kind: "lockfile-mutex".to_owned(),
+                snippet: "flock -n /tmp/x.lock || exit 0".to_owned(),
+            });
+        }
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "orchestration-blind-spot")
+            .expect("orchestration finding present");
+        assert_eq!(f.level, "warn");
+        assert!(f.detail.contains("run_autonomous.sh"), "{}", f.detail);
+        // Two sightings in one file name it once.
+        assert_eq!(f.detail.matches("run_autonomous.sh").count(), 1, "{}", f.detail);
+    }
+
+    /// A monorepo must not get a multi-kilobyte finding.
+    #[test]
+    fn orchestration_finding_caps_the_file_list() {
+        let mut scan = ScanResult::default();
+        for i in 0..40 {
+            scan.orchestration.push(scan::OrchestrationSighting {
+                file: format!("scripts/s{i:02}.sh"),
+                line: 1,
+                kind: "pid-check".to_owned(),
+                snippet: "kill -0 $PID".to_owned(),
+            });
+        }
+        scan.orchestration.sort();
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "orchestration-blind-spot")
+            .unwrap();
+        assert!(f.detail.contains("and 35 more"), "{}", f.detail);
+        assert!(f.detail.len() < 600, "detail is {} bytes", f.detail.len());
+    }
+
+    #[test]
+    fn no_orchestration_no_finding() {
+        let scan = ScanResult::default();
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        assert!(
+            !r.findings
+                .iter()
+                .any(|f| f.topic == "orchestration-blind-spot")
         );
     }
 }
