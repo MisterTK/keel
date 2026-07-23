@@ -60,6 +60,27 @@ fn run_scenario(scenario: &Scenario) -> Vec<String> {
                         .map(|m| format!("{label} outcome: {m}")),
                 );
             }
+            Step::Resolve { resolve, expect } => {
+                let got = core.resolve_target(
+                    &resolve.method,
+                    &resolve.host,
+                    resolve.scheme.as_deref(),
+                    resolve.port,
+                    resolve.path.as_deref(),
+                );
+                if got != *expect {
+                    failures.push(format!("{label} resolve: got {got:?}, want {expect:?}"));
+                }
+            }
+            Step::Layer { layer, expect } => {
+                let got = core.layer(&layer.target, &layer.key);
+                if got != *expect {
+                    failures.push(format!(
+                        "{label} layer({},{}): got {got}, want {expect}",
+                        layer.target, layer.key
+                    ));
+                }
+            }
         }
     }
     failures

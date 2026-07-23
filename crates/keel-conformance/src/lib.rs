@@ -40,9 +40,27 @@ fn default_tier() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Step {
-    Call { call: CallStep },
-    Advance { advance_ms: u64 },
-    ReportExpect { report_expect: Value },
+    Call {
+        call: CallStep,
+    },
+    Advance {
+        advance_ms: u64,
+    },
+    ReportExpect {
+        report_expect: Value,
+    },
+    /// Resolve a request to its policy target key (SP-1). Asserts the returned
+    /// key equals `expect`.
+    Resolve {
+        resolve: ResolveStep,
+        expect: String,
+    },
+    /// Look up one resolved layer value. Asserts the JSON value equals `expect`
+    /// (absence is JSON null).
+    Layer {
+        layer: LayerStep,
+        expect: Value,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +106,27 @@ impl CallStep {
             args_hash: self.request.args_hash.clone(),
         }
     }
+}
+
+/// A `Step::Resolve` payload: the request fields `Policy::resolve_target`
+/// (SP-1) matches against.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveStep {
+    pub method: String,
+    pub host: String,
+    #[serde(default)]
+    pub scheme: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// A `Step::Layer` payload: the resolved target and layer key to read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LayerStep {
+    pub target: String,
+    pub key: String,
 }
 
 /// A scripted effect: attempt N returns the Nth scripted `AttemptResult`.

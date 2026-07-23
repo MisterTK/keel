@@ -370,6 +370,143 @@ function breakerWindowRateReached(b, failureRate, minCalls) {
   return failed / total >= failureRate;
 }
 
+// -- outbound target resolution (mirrors node/keel/src/judge.mjs) -----------
+//
+// Standalone port, not a call-through: this stub package must stay
+// self-contained (no dependency on the `keel` front-end package) so it can
+// serve as an independent oracle. The matchers below are a faithful copy of
+// `node/keel/src/judge.mjs`'s algorithm; see that module's comments for the
+// full precedence/grammar spec. Unlike the front end (which compiles once via
+// `compileOutboundMatchers` and caches the result), this stub re-derives the
+// pattern list from `this.#policy` on every `resolveTarget` call — the same
+// no-separate-compile-step convention `#layer` already uses.
+
+/** Host -> LLM provider map. Parity contract with `node/keel/src/judge.mjs`'s
+ *  `LLM_HOST_PROVIDERS` (and the Python stub's `_LLM_HOST_PROVIDERS`); extend
+ *  all in lockstep. Vertex's regional endpoints vary by location and are
+ *  matched by suffix below instead of listed here. */
+const LLM_HOST_PROVIDERS = Object.freeze({
+  "api.openai.com": "openai",
+  "api.anthropic.com": "anthropic",
+  "generativelanguage.googleapis.com": "google-genai",
+  "aiplatform.googleapis.com": "google-genai",
+});
+
+/** Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
+ *  "us-central1-aiplatform.googleapis.com". */
+const VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com";
+
+const OUTBOUND_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+const CLASS_PREFIXES = ["py:", "ts:", "rs:", "llm:", "tool:", "mcp:"];
+const SCHEME_PORTS = { http: 80, https: 443 };
+
+/** `*`-only glob → anchored RegExp. `*` crosses `.` and `/`; everything else is
+ *  literal (never full glob syntax: `?`/`[` must stay literal for parity). */
+function globRegex(glob) {
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^" + glob.split("*").map(escape).join(".*") + "$");
+}
+
+/** Split an outbound key into { method, host, port, path } per the frozen
+ *  grammar, or null when it is not outbound-shaped (defensive — the backend
+ *  schema-validates keys before we compile them). */
+function parseOutboundKey(key) {
+  let method = null;
+  let rest = key;
+  for (const m of OUTBOUND_METHODS) {
+    if (rest.startsWith(m + " ")) {
+      method = m;
+      rest = rest.slice(m.length + 1);
+      break;
+    }
+  }
+  let path = null;
+  const slash = rest.indexOf("/");
+  if (slash >= 0) {
+    path = rest.slice(slash);
+    rest = rest.slice(0, slash);
+  }
+  let host = rest;
+  let port = null;
+  const colon = rest.lastIndexOf(":");
+  if (colon >= 0 && /^\d+$/.test(rest.slice(colon + 1))) {
+    host = rest.slice(0, colon);
+    port = Number(rest.slice(colon + 1));
+  }
+  if (!host) return null;
+  return { method, host, port, path };
+}
+
+/** Compile the outbound view of an effective policy's `[target]` table:
+ *  { exact: Set<bareHostKey>, patterns: [...] most-specific-first }. */
+function compileOutboundMatchers(policy) {
+  const exact = new Set();
+  const patterns = [];
+  const targets = policy?.target;
+  if (targets !== null && typeof targets === "object" && !Array.isArray(targets)) {
+    for (const key of Object.keys(targets)) {
+      if (CLASS_PREFIXES.some((p) => key.startsWith(p))) continue;
+      const parsed = parseOutboundKey(key);
+      if (parsed === null) continue;
+      if (
+        parsed.method === null &&
+        parsed.port === null &&
+        parsed.path === null &&
+        !parsed.host.includes("*")
+      ) {
+        exact.add(key);
+        continue;
+      }
+      const wildcards = key.split("*").length - 1;
+      patterns.push({
+        key,
+        method: parsed.method,
+        hostGlob: globRegex(parsed.host.toLowerCase()),
+        port: parsed.port,
+        pathGlob: parsed.path === null ? null : globRegex(parsed.path),
+        wildcards,
+        literal: key.length - wildcards,
+      });
+    }
+  }
+  // Most specific first: fewest `*`, most literal characters, method-prefixed
+  // over unprefixed, then lexicographic — selection is total, so two runs (and
+  // two languages) always pick the same key.
+  patterns.sort(
+    (a, b) =>
+      a.wildcards - b.wildcards ||
+      b.literal - a.literal ||
+      (a.method ? 0 : 1) - (b.method ? 0 : 1) ||
+      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  );
+  return { exact, patterns };
+}
+
+function patternMatches(p, method, host, effectivePort, path) {
+  if (p.method !== null && p.method !== method) return false;
+  if (!p.hostGlob.test(host)) return false;
+  if (p.port !== null && p.port !== effectivePort) return false;
+  return p.pathGlob === null || p.pathGlob.test(path);
+}
+
+/** The `[target]` policy key for one outbound request: exact host key, else
+ *  the most specific matching pattern key (verbatim, so the core's exact
+ *  lookup hits it), else the bare host (class-default fallthrough). */
+function resolveOutbound(policy, { method, host, scheme, port, path }) {
+  const { exact, patterns } = compileOutboundMatchers(policy);
+  if (exact.has(host)) return host;
+  if (patterns.length > 0) {
+    const effectivePort = port ?? SCHEME_PORTS[scheme ?? ""] ?? null;
+    const hostL = host.toLowerCase();
+    const pathN = path || "/";
+    const methodU = (method || "GET").toUpperCase();
+    for (const p of patterns) {
+      if (patternMatches(p, methodU, hostL, effectivePort, pathN)) return p.key;
+    }
+  }
+  return host;
+}
+
 /** Token bucket: burst capacity `limit`, continuous refill of `limit` per
  *  `windowMs`. Bit-identical to the real core's `TokenBucket::plan_admit`
  *  (crates/keel-core/src/engine.rs) — same fixed-point integer arithmetic (1
@@ -429,6 +566,24 @@ export class KeelCoreStub {
     if (target.startsWith("llm:") && isTable(defaults.llm) && defaults.llm[key] !== undefined)
       return defaults.llm[key];
     return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
+  }
+
+  /** One resolved layer value (`undefined` when unset) — the public surface
+   *  of `#layer`, mirroring `Engine::layer`/`KeelCoreStub::layer` (Rust). */
+  layer(target, key) {
+    return this.#layer(target, key);
+  }
+
+  /** Resolve the policy target key for one outbound request — the LLM host
+   *  map first (exact host, then the Vertex regional suffix), else the
+   *  `[target]` table's exact-host/pattern resolution (see
+   *  `resolveOutbound`), else the bare host. Mirrors `Policy::resolve_target`
+   *  (Rust) / the Python stub's `resolve_target` exactly. */
+  resolveTarget(method, host, scheme = null, port = null, path = null) {
+    const provider = LLM_HOST_PROVIDERS[host] ??
+      (host.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
+    if (provider) return `llm:${provider}`;
+    return resolveOutbound(this.#policy, { method, host, scheme, port, path });
   }
 
   #met(target) {

@@ -257,6 +257,12 @@ struct Report<'a> {
 #[derive(Debug, Default)]
 pub struct KeelCoreStub {
     policy: Policy,
+    /// The configured policy as RAW JSON (never re-derived from `policy`) —
+    /// `layer` walks this directly rather than typed-serializing `policy`,
+    /// since `DurationMs` has no `Serialize` impl and re-serializing would
+    /// not reproduce original config literals (e.g. `"120s"`) verbatim.
+    /// Mirrors `Engine::raw_policy` (`crates/keel-core/src/engine.rs`) exactly.
+    raw_policy: Value,
     clock: VirtualClock,
     trace_seq: u64,
     breakers: HashMap<String, Breaker>,
@@ -615,6 +621,54 @@ impl KeelCoreStub {
         }
         out.breaker = self.breaker_state(target);
     }
+
+    /// Resolve the policy target key for one outbound request — the stub
+    /// surface of [`Policy::resolve_target`] (SP-1), identical to
+    /// `Engine::resolve_target`.
+    #[must_use]
+    pub fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        self.policy.resolve_target(method, host, scheme, port, path)
+    }
+
+    /// One resolved layer value as JSON (`null` when unset) — the stub
+    /// surface of the front ends' `backend.layer(target, key)` reader. Walks
+    /// the RAW configured JSON (never a typed re-serialization), identical
+    /// precedence to `Engine::layer` (`crates/keel-core/src/engine.rs`): an
+    /// exact `[target]` entry for `target`, else (for `llm:*` targets)
+    /// `defaults.llm`, else `defaults.outbound`, else `null`.
+    #[must_use]
+    pub fn layer(&self, target: &str, key: &str) -> Value {
+        if let Some(value) = self
+            .raw_policy
+            .get("target")
+            .and_then(|t| t.get(target))
+            .and_then(|t| t.get(key))
+        {
+            return value.clone();
+        }
+        if target.starts_with("llm:")
+            && let Some(value) = self
+                .raw_policy
+                .get("defaults")
+                .and_then(|d| d.get("llm"))
+                .and_then(|l| l.get(key))
+        {
+            return value.clone();
+        }
+        self.raw_policy
+            .get("defaults")
+            .and_then(|d| d.get("outbound"))
+            .and_then(|o| o.get(key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
 }
 
 impl KeelCore for KeelCoreStub {
@@ -625,6 +679,7 @@ impl KeelCore for KeelCoreStub {
                 message: format!("policy invalid at {}: {}", e.path(), e.inner()),
             })?;
         self.policy = policy;
+        self.raw_policy = policy_json.clone();
         Ok(())
     }
 

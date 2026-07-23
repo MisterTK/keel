@@ -281,6 +281,14 @@ fn drive(scenario: &Scenario, core: *mut KeelCore) -> Vec<String> {
                 run_report(core, report_expect, &label, &mut failures);
             }
             Step::Call { call } => run_call(core, call, &label, &mut failures),
+            Step::Resolve { .. } | Step::Layer { .. } => {
+                // resolve_target/layer are intentionally NOT exposed via the frozen C
+                // ABI (SP-1 program spec: scoped out of contracts/core-ffi.h, no CCR).
+                // Native Rust (Engine/KeelCoreStub) + both PyO3/napi bindings + both
+                // language stubs are the full oracle set for these two methods; the
+                // ABI facade simply doesn't carry them, so these steps are inapplicable
+                // here and are skipped rather than asserted.
+            }
         }
     }
     failures
