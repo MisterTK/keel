@@ -556,6 +556,40 @@ mod bindings {
                 .and_then(|handle| handle.recorded_idempotency_key(&step_key))
         }
 
+        /// Resolve the policy target key for one outbound request — the
+        /// front ends' `backend.resolveTarget(...)` reader, backed by
+        /// [`Engine::resolve_target`] (SP-1: LLM host map, exact bare-host
+        /// `[target]` key, most-specific pattern match, then the bare host).
+        /// Plain, synchronous, read-only: reads the policy lock directly,
+        /// never `active_flow` or the tokio runtime, so this needs no
+        /// `lock_recover`/`block_on` dance.
+        #[napi]
+        #[allow(clippy::needless_pass_by_value, reason = "napi decodes owned strings")]
+        pub fn resolve_target(
+            &self,
+            method: String,
+            host: String,
+            scheme: Option<String>,
+            port: Option<u16>,
+            path: Option<String>,
+        ) -> String {
+            self.engine
+                .resolve_target(&method, &host, scheme.as_deref(), port, path.as_deref())
+        }
+
+        /// One resolved layer value for `target`/`key`, or `null` when
+        /// unset — the front ends' `backend.layer(target, key)` reader,
+        /// backed by [`Engine::layer`]. Walks the raw configured JSON
+        /// (never a typed re-serialization), so a literal like `"120s"`
+        /// round-trips as the JS string `"120s"`, not a re-serialized
+        /// number. Plain, synchronous, read-only — same no-`block_on`
+        /// rationale as `resolve_target` above.
+        #[napi]
+        #[allow(clippy::needless_pass_by_value, reason = "napi decodes owned strings")]
+        pub fn layer(&self, target: String, key: String) -> Value {
+            self.engine.layer(&target, &key)
+        }
+
         /// The deterministic per-target metrics/discovery report. Read inside the
         /// handle runtime so `clock_ms` reflects its (possibly paused) clock.
         #[napi]
