@@ -136,8 +136,9 @@ class JsonlWriter {
 /**
  * A transparent tee over `inner` (a `Backend`): `execute` is forwarded
  * unchanged and its outcome is appended to a recording; every other member
- * (`report`, `layer`, `persistent`) delegates straight through. Recording is
- * a pure observer — it never alters what the wrapped call receives.
+ * (`report`, `layer`, `resolveTarget`, `persistent`) delegates straight
+ * through. Recording is a pure observer — it never alters what the wrapped
+ * call receives.
  */
 export class RecordingBackend {
   #inner;
@@ -165,6 +166,9 @@ export class RecordingBackend {
   }
   layer(target, key) {
     return this.#inner.layer(target, key);
+  }
+  resolveTarget(method, host, scheme, port, path) {
+    return this.#inner.resolveTarget(method, host, scheme, port, path);
   }
   flushEvents() {
     this.#inner.flushEvents?.();

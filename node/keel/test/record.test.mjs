@@ -45,6 +45,9 @@ function fakeBackend(outcomes) {
     layer() {
       return undefined;
     },
+    resolveTarget(method, host) {
+      return host;
+    },
   };
 }
 
@@ -79,7 +82,7 @@ test("RecordingBackend forwards execute unchanged and never invokes effect itsel
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("RecordingBackend delegates configure/report/persistent/layer", async () => {
+test("RecordingBackend delegates configure/report/persistent/layer/resolveTarget", async () => {
   const inner = fakeBackend([]);
   const rb = new RecordingBackend(inner, { writeCall: () => {} }, DEFAULT_REDACT_HEADERS);
   rb.configure({ target: {} });
@@ -87,6 +90,7 @@ test("RecordingBackend delegates configure/report/persistent/layer", async () =>
   assert.deepEqual(rb.report(), { reported: true });
   assert.equal(rb.persistent, true);
   assert.equal(rb.layer("x", "y"), undefined);
+  assert.equal(rb.resolveTarget("GET", "api.example.com"), "api.example.com");
 });
 
 test("installRecording writes a meta header then one call line per execute, redacting auth headers", async () => {

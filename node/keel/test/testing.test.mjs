@@ -125,9 +125,15 @@ test("ReplayBackend never invokes the caller's real effect", async () => {
   assert.equal(ran, false);
 });
 
-test("ReplayBackend exposes layer()/persistent so fetch.mjs's unconditional calls don't throw", () => {
+test("ReplayBackend exposes layer()/resolveTarget()/persistent so fetch.mjs's unconditional calls don't throw", () => {
   const backend = new ReplayBackend(new Recording(META, []));
   assert.equal(backend.layer("x", "y"), undefined);
   assert.equal(backend.persistent, false);
   assert.deepEqual(backend.report(), {});
+  // No recorded policy to pattern-match against: the LLM host map/Vertex
+  // suffix rule still applies (policy-independent), everything else falls
+  // back to the bare host — matching pre-Task-11 behavior (installReplay
+  // never installed `[target]` pattern matchers either).
+  assert.equal(backend.resolveTarget("POST", "api.openai.com"), "llm:openai");
+  assert.equal(backend.resolveTarget("GET", "api.example.com"), "api.example.com");
 });

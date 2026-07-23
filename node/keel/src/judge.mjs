@@ -3,8 +3,6 @@
  * Node twin of the Python adapter judgments (Task 10 items 3–4) and MUST stay
  * in parity with them:
  *
- *   - target:        the URL hostname, unless the host maps to an LLM provider,
- *                    in which case the semantic target `llm:<provider>`.
  *   - idempotency:   safe/idempotent HTTP methods are retryable; POST/PATCH are
  *                    NOT retryable (Level 0 hard rule) UNLESS an idempotency
  *                    header is present (a POST with an idempotency key is safe).
@@ -15,31 +13,16 @@
  *                    non-429 4xx) is passed through UNCHANGED as a success —
  *                    Keel never turns a real HTTP response into a failure.
  *                    Thrown transport errors map to conn/timeout/other.
+ *
+ * Target resolution (the LLM host map, Vertex regional suffix, and
+ * `[target]` host/URL-pattern matching, `docs/targeting.md`) is NOT a
+ * front-end judgment as of Task 11/SP-1: it is owned by the backend
+ * (`backend.resolveTarget(method, host, scheme, port, path)`, proven
+ * identical across native/stub/both language front ends by conformance
+ * scenarios 36–38) and this module no longer duplicates it.
  */
 
 import { createHash, randomUUID } from "node:crypto";
-
-/**
- * Host → LLM provider map. This is a parity contract with the Python front end;
- * adding a host here changes which default pack (`defaults.llm`) applies, so it
- * is deliberately small and conservative. Extend in lockstep across languages.
- *
- * `aiplatform.googleapis.com` is Vertex AI's GLOBAL endpoint; Vertex's
- * REGIONAL endpoints (`<location>-aiplatform.googleapis.com`, one per
- * `--location`) vary by location and so cannot be listed exactly — they are
- * matched by the suffix rule in `resolveTarget` below instead.
- */
-export const LLM_HOST_PROVIDERS = Object.freeze({
-  "api.openai.com": "openai",
-  "api.anthropic.com": "anthropic",
-  "generativelanguage.googleapis.com": "google-genai",
-  "aiplatform.googleapis.com": "google-genai",
-});
-
-/** Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
- *  "us-central1-aiplatform.googleapis.com". Parity contract with the Python
- *  twin's identical suffix check in `adapters/_http.py`. */
-export const VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com";
 
 // The idempotent-method set is a cross-language parity contract with the Python
 // twin, so it includes TRACE per the brief's list even though WHATWG fetch
@@ -65,146 +48,6 @@ export function normalizeRequest(input, init) {
     body = init?.body;
   }
   return { url, method, headers, body };
-}
-
-export function resolveTarget(hostname) {
-  const provider = LLM_HOST_PROVIDERS[hostname] ?? (hostname.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
-  return provider ? `llm:${provider}` : hostname;
-}
-
-// --- outbound host/URL-pattern targets ---------------------------------------
-//
-// The frozen target grammar (contracts/policy.schema.json $defs.targetKey)
-// admits host/URL *patterns* for outbound keys — optional METHOD prefix, a host
-// that may contain `*`, optional `:port`, optional `/path` glob — e.g.
-// `*.internal.corp`, `GET api.catalog.internal/*`, `api.stripe.com/v1/*`.
-// Selecting which key applies to a request is a FRONT-END judgment (parity
-// contract with the Python twin, `keel/_targets.py` + `_http.resolve_policy_target`;
-// normative rules in docs/targeting.md): the front end picks ONE key per request
-// and passes it to the core verbatim, so core/stub resolution (exact key, then
-// class defaults) is unchanged. Precedence: LLM host map (semantic class) >
-// exact bare-host key > most specific matching pattern key > bare host
-// (class-default fallthrough). A matched pattern KEY becomes the call's target,
-// so everything it matches shares that key's breaker/rate/cache/status line —
-// one policy target is one dependency (cache still keys the full URL via
-// args_hash). `*` is the only metacharacter and crosses `.` and `/`; hosts
-// compare case-insensitively, paths case-sensitively; a `:port` key must equal
-// the request's EFFECTIVE port (explicit, else 80 http / 443 https).
-
-const OUTBOUND_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
-const CLASS_PREFIXES = ["py:", "ts:", "rs:", "llm:", "tool:", "mcp:"];
-const SCHEME_PORTS = { http: 80, https: 443 };
-
-/** `*`-only glob → anchored RegExp. `*` crosses `.` and `/`; everything else is
- *  literal (never full glob syntax: `?`/`[` must stay literal for parity). */
-function globRegex(glob) {
-  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp("^" + glob.split("*").map(escape).join(".*") + "$");
-}
-
-/** Split an outbound key into { method, host, port, path } per the frozen
- *  grammar, or null when it is not outbound-shaped (defensive — the backend
- *  schema-validates keys before we compile them). */
-function parseOutboundKey(key) {
-  let method = null;
-  let rest = key;
-  for (const m of OUTBOUND_METHODS) {
-    if (rest.startsWith(m + " ")) {
-      method = m;
-      rest = rest.slice(m.length + 1);
-      break;
-    }
-  }
-  let path = null;
-  const slash = rest.indexOf("/");
-  if (slash >= 0) {
-    path = rest.slice(slash);
-    rest = rest.slice(0, slash);
-  }
-  let host = rest;
-  let port = null;
-  const colon = rest.lastIndexOf(":");
-  if (colon >= 0 && /^\d+$/.test(rest.slice(colon + 1))) {
-    host = rest.slice(0, colon);
-    port = Number(rest.slice(colon + 1));
-  }
-  if (!host) return null;
-  return { method, host, port, path };
-}
-
-/** Compile the outbound view of an effective policy's `[target]` table:
- *  { exact: Set<bareHostKey>, patterns: [...] most-specific-first }. */
-export function compileOutboundMatchers(policy) {
-  const exact = new Set();
-  const patterns = [];
-  const targets = policy?.target;
-  if (targets !== null && typeof targets === "object" && !Array.isArray(targets)) {
-    for (const key of Object.keys(targets)) {
-      if (CLASS_PREFIXES.some((p) => key.startsWith(p))) continue;
-      const parsed = parseOutboundKey(key);
-      if (parsed === null) continue;
-      if (
-        parsed.method === null &&
-        parsed.port === null &&
-        parsed.path === null &&
-        !parsed.host.includes("*")
-      ) {
-        exact.add(key);
-        continue;
-      }
-      const wildcards = key.split("*").length - 1;
-      patterns.push({
-        key,
-        method: parsed.method,
-        hostGlob: globRegex(parsed.host.toLowerCase()),
-        port: parsed.port,
-        pathGlob: parsed.path === null ? null : globRegex(parsed.path),
-        wildcards,
-        literal: key.length - wildcards,
-      });
-    }
-  }
-  // Most specific first: fewest `*`, most literal characters, method-prefixed
-  // over unprefixed, then lexicographic — selection is total, so two runs (and
-  // two languages) always pick the same key.
-  patterns.sort(
-    (a, b) =>
-      a.wildcards - b.wildcards ||
-      b.literal - a.literal ||
-      (a.method ? 0 : 1) - (b.method ? 0 : 1) ||
-      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
-  );
-  return { exact, patterns };
-}
-
-function patternMatches(p, method, host, effectivePort, path) {
-  if (p.method !== null && p.method !== method) return false;
-  if (!p.hostGlob.test(host)) return false;
-  if (p.port !== null && p.port !== effectivePort) return false;
-  return p.pathGlob === null || p.pathGlob.test(path);
-}
-
-/**
- * The policy target for one outbound request, honoring URL-pattern keys
- * (docs/targeting.md; the Python twin is `_http.resolve_policy_target`).
- * `compiled` comes from `compileOutboundMatchers`; with none (or an empty
- * table) this is exactly `resolveTarget`.
- */
-export function resolvePolicyTarget(compiled, { method, hostname, scheme, port, path }) {
-  const provider = LLM_HOST_PROVIDERS[hostname];
-  if (provider) return `llm:${provider}`;
-  if (!compiled) return hostname;
-  if (compiled.exact.has(hostname)) return hostname;
-  if (compiled.patterns.length > 0) {
-    const effectivePort = port ?? SCHEME_PORTS[scheme ?? ""] ?? null;
-    const hostL = hostname.toLowerCase();
-    const pathN = path || "/";
-    const methodU = (method || "GET").toUpperCase();
-    for (const p of compiled.patterns) {
-      if (patternMatches(p, methodU, hostL, effectivePort, pathN)) return p.key;
-    }
-  }
-  return hostname;
 }
 
 /**

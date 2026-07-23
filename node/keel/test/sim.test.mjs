@@ -30,6 +30,9 @@ function fakeBackend() {
     layer() {
       return undefined;
     },
+    resolveTarget(method, host) {
+      return host;
+    },
   };
 }
 
@@ -129,13 +132,15 @@ test("a crash directive invokes the injected crash and never the real effect", a
   assert.equal(crashed, true);
 });
 
-test("configure and report delegate; persistent/layer pass through", () => {
+test("configure and report delegate; persistent/layer/resolveTarget pass through", () => {
   const inner = fakeBackend();
   const backend = new SimBackend(inner, {}, memoryCursor());
   backend.configure({ x: 1 });
   assert.deepEqual(inner.configured, { x: 1 });
   assert.deepEqual(backend.report(), { reported: true });
   assert.equal(backend.persistent, true);
+  assert.equal(backend.layer("x", "y"), undefined);
+  assert.equal(backend.resolveTarget("GET", "api.example.com"), "api.example.com");
 });
 
 test("installSim loads the faults block and wraps the backend", () => {

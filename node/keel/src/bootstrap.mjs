@@ -20,7 +20,6 @@ import {
 } from "./policy.mjs";
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
-import { compileOutboundMatchers } from "./judge.mjs";
 import { createDiscovery } from "./discovery.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
@@ -102,13 +101,12 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   const discovery = createDiscovery(cwd, { knownTargets });
   setRuntime({ enabled: true, backend: effectiveBackend, discovery });
 
-  // Outbound host/URL-pattern matchers (docs/targeting.md), compiled from the
-  // same effective policy the backend was configured with: `fetch`'s target
-  // judgment consults these so `[target."*.internal.corp"]`-style keys actually
-  // select requests. The core still sees one exact key per call (parity with
-  // the Python front end's `install_outbound_targets`).
-  const outboundTargets = compileOutboundMatchers(policy);
-  const uninstallFetch = installFetch(effectiveBackend, discovery, { outboundTargets });
+  // Outbound host/URL-pattern targets (docs/targeting.md) are resolved by the
+  // backend itself (`backend.resolveTarget(...)`, configured with this same
+  // effective policy just above) — `fetch`'s target judgment consults it
+  // directly, so `[target."*.internal.corp"]`-style keys actually select
+  // requests. The core still sees one exact key per call.
+  const uninstallFetch = installFetch(effectiveBackend, discovery);
   // Framework/library packs: auto-detect and wrap each one if present.
   // Best-effort — an absent library is a silent no-op; never fatal. The
   // `child_process` pack additionally consumes the parsed `cmd:` flow rules

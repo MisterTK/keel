@@ -127,7 +127,6 @@ export function virtualClock() {
  */
 export class AsyncEngine {
   kind = "node-stub";
-  #policy = {};
   #validator = new KeelCoreStub();
   #clock;
   #traceSeq = 0;
@@ -144,18 +143,23 @@ export class AsyncEngine {
    *  delegated to KeelCoreStub so the two never diverge. Throws KeelError. */
   configure(policy) {
     this.#validator.configure(policy); // throws KeelError on invalid policy
-    this.#policy = policy;
   }
 
   /** Public layer resolution (front-end judgments consult this, e.g. to find a
-   *  target's idempotency header). Identical rule to KeelCoreStub#layer. */
+   *  target's idempotency header) — delegates to `KeelCoreStub#layer` so the
+   *  two never diverge (Task 11/SP-1: this used to be a hand-rolled copy of
+   *  the identical rule; `#validator` already holds the configured policy). */
   layer(target, key) {
-    const t = this.#policy.target;
-    if (isTable(t) && isTable(t[target]) && t[target][key] !== undefined) return t[target][key];
-    const defaults = this.#policy.defaults ?? {};
-    if (target.startsWith("llm:") && isTable(defaults.llm) && defaults.llm[key] !== undefined)
-      return defaults.llm[key];
-    return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
+    return this.#validator.layer(target, key);
+  }
+
+  /** Resolve the policy target key for one outbound request — delegates to
+   *  `KeelCoreStub#resolveTarget` (the LLM host map, Vertex regional suffix,
+   *  and `[target]` host/URL-pattern matching, `docs/targeting.md`), proven
+   *  identical to the native core and both language stubs by conformance
+   *  scenarios 36–38. The front ends' `backend.resolveTarget(...)` reader. */
+  resolveTarget(method, host, scheme, port, path) {
+    return this.#validator.resolveTarget(method, host, scheme, port, path);
   }
 
   advanceClock(ms) {

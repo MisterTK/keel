@@ -9,7 +9,6 @@ export { installKeel, isDisabled } from "./src/bootstrap.mjs";
 export { loadBackend } from "./src/backend.mjs";
 export { loadPolicy, parseToml, extractFunctionTargets } from "./src/policy.mjs";
 export { level0Defaults, applyPackDefaults } from "./src/defaults.mjs";
-export { LLM_HOST_PROVIDERS } from "./src/judge.mjs";
 export { KeelError } from "./src/engine.mjs";
 
 // Framework/provider packs (adapter-pack contract).
