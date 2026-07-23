@@ -112,7 +112,10 @@ the five phases in order; the static scan is evidence, not the verdict.
    facts awaiting a decision. Codes are a closed set: `url-no-transport`,
    `subprocess-blind-spot`, `dependency-averse-excluded`,
    `preexisting-resilience`, `code-hash-stale`.
-   Then read `findings` — it carries `warn` items that are not follow-up codes.
+   Then read `boundaries` — it names what this report could not parse (source
+   languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
+   prose) — and `findings`, which carries `warn` items that are not follow-up
+   codes.
 4. **Baseline before you mutate.** Before proposing any *behavior-changing*
    policy — retry, breaker, or a timeout that alters an outcome, as opposed to
    a pure simplification swap like a poll loop → `poll` policy — measure what

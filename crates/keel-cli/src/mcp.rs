@@ -43,7 +43,11 @@ list_flows = `keel flows --json`, get_trace = `keel trace <flow> --json`, \
 explain_error = `keel explain <code> --json`. Outputs are deterministic \
 (sorted keys, no timestamps), so two calls can be diffed to see real change. \
 get_doctor_report also returns a ranked follow_ups list (rank 1 = least Keel-verifiable, \
-investigate first) — work it top-down before proposing policy.";
+investigate first) — work it top-down before proposing policy, and read its `boundaries` \
+object for what the report could not parse. For an evaluate/adopt/review task, drive these \
+tools through the keel skill's protocol rather than calling one alone — they are diagnostic \
+primitives, and get_doctor_report is static Python/JS-TS evidence that cannot see project \
+governance (CLAUDE.md/AGENTS.md) or shell/CI orchestration.";
 
 // JSON-RPC 2.0 error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -280,7 +284,7 @@ fn tool_catalog() -> Value {
             "name": "explain_error"
         },
         {
-            "description": "The honesty report: what is wrapped, what is visible but unwrapped and why, adapter pins, policy validity, and the journal backend — findings carry applyable fixes where possible. Byte-identical to `keel doctor --json`.",
+            "description": "The honesty report: what is wrapped, what is visible but unwrapped and why, adapter pins, policy validity, the journal backend, and a `boundaries` object naming what this report could not read — findings carry applyable fixes where possible. Static evidence, not a verdict: for evaluate/adopt/review work drive it through the keel skill's protocol. Byte-identical to `keel doctor --json`.",
             "inputSchema": { "properties": {}, "type": "object" },
             "name": "get_doctor_report"
         },
