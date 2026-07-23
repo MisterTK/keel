@@ -343,10 +343,12 @@ _TARGET_CLASS_PREFIXES = ("py:", "ts:", "rs:", "llm:", "tool:", "mcp:")
 #: Default ports per scheme, for `:port`-qualified keys (parity with Rust/Node).
 _SCHEME_PORTS = {"http": 80, "https": 443}
 
-#: Host -> LLM provider (parity contract with `keel.adapters._http`'s
-#: `LLM_HOST_PROVIDERS` and Node's judge.mjs; extend all three in lockstep).
-#: Vertex's regional endpoints vary by location and are matched by suffix
-#: below instead of listed here.
+#: Host -> LLM provider. Parity contract with `crates/keel-core-api/src/
+#: policy.rs`'s `LLM_HOST_PROVIDERS` (authoritative) and the Node stub's
+#: `LLM_HOST_PROVIDERS`; extend all three in lockstep — the front end's
+#: `keel.adapters._http.known_llm_hosts()` (issue #49) calls `known_llm_hosts`
+#: below, not this dict directly. Vertex's regional endpoints vary by
+#: location and are matched by suffix below instead of listed here.
 _LLM_HOST_PROVIDERS = {
     "api.openai.com": "openai",
     "api.anthropic.com": "anthropic",
@@ -767,16 +769,28 @@ class KeelCoreStub:
         """The policy target key for one outbound request: the LLM host map
         first (exact host, then the Vertex regional suffix), else the
         `[target]` table's exact-host/pattern resolution (see
-        `_resolve_outbound`), else the bare host. Front-end target selection —
-        the front end picks one key per request and hands it to the core
-        verbatim; this mirrors `keel._targets.resolve_outbound` plus
-        `keel.adapters._http`'s LLM host map/Vertex suffix check exactly."""
+        `_resolve_outbound`), else the bare host. Core-and-stub judgment as of
+        SP-1 (`docs/targeting.md`): this is an independent, self-contained
+        mirror of `crates/keel-core-api/src/policy.rs`'s
+        `Policy::resolve_target`, proven equivalent by conformance scenarios
+        36-38, NOT a call-through to the front end (which has no matcher of
+        its own left to call)."""
         provider = _LLM_HOST_PROVIDERS.get(host)
         if provider is None and host.endswith(_VERTEX_REGIONAL_SUFFIX):
             provider = "google-genai"
         if provider:
             return f"llm:{provider}"
         return _resolve_outbound(self._policy, method, host, scheme=scheme, port=port, path=path)
+
+    @staticmethod
+    def known_llm_hosts() -> list[tuple[str, str]]:
+        """Every host the LLM host map (`resolve_target`'s tier 1) knows
+        about, as `(host, provider)` pairs — a class-level enumeration
+        accessor, not tied to any instance (the map is a hardcoded constant,
+        identical for every `KeelCoreStub`). Lets front-end packs' `targets()`
+        (`keel doctor`/`keel init` documentation output) enumerate every
+        known LLM provider host without holding their own copy (issue #49)."""
+        return list(_LLM_HOST_PROVIDERS.items())
 
     # -- execution ---------------------------------------------------------
 

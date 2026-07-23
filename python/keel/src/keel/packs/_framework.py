@@ -15,9 +15,10 @@ A framework pack differs from a *provider* pack (``_provider``) in two ways:
 
 The framework's LLM legs need no seam here: model requests ride the provider
 SDKs (openai / anthropic / google) or litellm over httpx/requests, so the
-transport seam (``adapters._http.LLM_HOST_PROVIDERS``) already maps them to
-``llm:<provider>`` — Retry-After-aware retry and the dev cache apply without
-this pack doing anything. Each pack's ``targets()`` documents that routing.
+transport seam (the backend's ``resolve_target`` LLM host map —
+``docs/targeting.md``) already maps them to ``llm:<provider>`` —
+Retry-After-aware retry and the dev cache apply without this pack doing
+anything. Each pack's ``targets()`` documents that routing.
 """
 
 from __future__ import annotations

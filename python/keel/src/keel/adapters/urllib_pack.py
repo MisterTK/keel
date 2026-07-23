@@ -123,7 +123,7 @@ def targets() -> list[TargetDecl]:
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule="sha256(method + url) for idempotent GET; None otherwise",
         )
-        for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
+        for host_name, provider in _http.known_llm_hosts()
     ]
     return [host, *llm]
 

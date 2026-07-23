@@ -2,7 +2,8 @@
 
 The official ``anthropic`` Python SDK rides httpx, so Task 10's transport seam
 already intercepts its calls and maps ``api.anthropic.com`` → ``llm:anthropic``
-(see ``adapters._http.LLM_HOST_PROVIDERS``). This pack owns no seam of its own;
+(see the backend's ``resolve_target`` LLM host map, ``docs/targeting.md``).
+This pack owns no seam of its own;
 it declares the ``llm:anthropic`` target and the generic ``[defaults.llm]``
 fragment (Retry-After-aware retry + dev cache), merged UNDER user config.
 """

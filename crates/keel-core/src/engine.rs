@@ -961,6 +961,15 @@ impl Engine {
             .unwrap_or(Value::Null)
     }
 
+    /// Every host the LLM host map knows about, as `(host, provider)` pairs —
+    /// the engine surface of [`Policy::known_llm_hosts`]. Not read from
+    /// `self`: the map is a hardcoded constant, identical regardless of
+    /// which policy is configured, so this needs no live lock (issue #49).
+    #[must_use]
+    pub fn known_llm_hosts() -> Vec<(&'static str, &'static str)> {
+        Policy::known_llm_hosts()
+    }
+
     /// The configured Tier 2 `flows.on_nondeterminism` response (default
     /// [`NondeterminismResponse::Fail`]), read live so a reconfigure is honored.
     /// The flow manager consults this when a replay `(seq, step_key)` diverges.

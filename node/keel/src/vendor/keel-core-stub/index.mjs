@@ -381,10 +381,12 @@ function breakerWindowRateReached(b, failureRate, minCalls) {
 // pattern list from `this.#policy` on every `resolveTarget` call — the same
 // no-separate-compile-step convention `#layer` already uses.
 
-/** Host -> LLM provider map. Parity contract with `node/keel/src/judge.mjs`'s
- *  `LLM_HOST_PROVIDERS` (and the Python stub's `_LLM_HOST_PROVIDERS`); extend
- *  all in lockstep. Vertex's regional endpoints vary by location and are
- *  matched by suffix below instead of listed here. */
+/** Host -> LLM provider map. Parity contract with `crates/keel-core-api/src/
+ *  policy.rs`'s `LLM_HOST_PROVIDERS` (authoritative) and the Python stub's
+ *  `_LLM_HOST_PROVIDERS`; extend all in lockstep — `knownLlmHosts()` below is
+ *  a class-level enumeration of the same map (issue #49). Vertex's regional
+ *  endpoints vary by location and are matched by suffix below instead of
+ *  listed here. */
 const LLM_HOST_PROVIDERS = Object.freeze({
   "api.openai.com": "openai",
   "api.anthropic.com": "anthropic",
@@ -584,6 +586,16 @@ export class KeelCoreStub {
       (host.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
     if (provider) return `llm:${provider}`;
     return resolveOutbound(this.#policy, { method, host, scheme, port, path });
+  }
+
+  /** Every host the LLM host map (`resolveTarget`'s tier 1) knows about, as
+   *  `[host, provider]` pairs — a class-level enumeration accessor, not tied
+   *  to any instance (the map is a hardcoded constant, identical for every
+   *  `KeelCoreStub`). Lets front-end packs' `targets()` (`keel doctor`/`keel
+   *  init` documentation output) enumerate every known LLM provider host
+   *  without holding their own copy (issue #49). */
+  static knownLlmHosts() {
+    return Object.entries(LLM_HOST_PROVIDERS);
   }
 
   #met(target) {

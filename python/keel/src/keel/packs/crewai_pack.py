@@ -25,8 +25,9 @@ LLM legs: CrewAI's own ``LLM`` class (``crewai.llm.LLM``) routes model calls
 through ``litellm`` by default (lazy-imported to dodge its module-level
 ``dotenv.load_dotenv()``); litellm places the actual request over each
 provider's SDK/httpx, so a call to one of the three hosts the transport seam
-already maps (``adapters._http.LLM_HOST_PROVIDERS``: OpenAI, Anthropic, Google
-Gemini) still resolves to ``llm:<provider>`` and gets Retry-After-aware retry
+already maps (the backend's ``resolve_target`` LLM host map,
+``docs/targeting.md``: OpenAI, Anthropic, Google Gemini) still resolves to
+``llm:<provider>`` and gets Retry-After-aware retry
 + the dev cache "for free" — but litellm fans out to dozens of OTHER
 providers/hosts that are NOT in that map, and those calls surface as a plain
 host target (or are missed entirely when a provider's own SDK does not ride
@@ -123,11 +124,11 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=(
                 "crewai.llm.LLM routes model calls through litellm by default; a "
-                "call litellm places to a host the transport seam maps "
-                "(adapters._http.LLM_HOST_PROVIDERS: OpenAI/Anthropic/Google "
-                "Gemini) resolves to llm:<provider> incidentally — this pack owns "
-                "no model-call seam and does not cover litellm's other provider "
-                "hosts"
+                "call litellm places to a host the transport seam maps (the "
+                "backend's resolve_target host map, docs/targeting.md: "
+                "OpenAI/Anthropic/Google Gemini) resolves to llm:<provider> "
+                "incidentally — this pack owns no model-call seam and does not "
+                "cover litellm's other provider hosts"
             ),
             args_hash_rule=(
                 "as the transport seam derives it for a covered host: sha256 over "

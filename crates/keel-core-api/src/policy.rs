@@ -1183,6 +1183,20 @@ impl Policy {
         // 4. No pattern matched: fall through to the bare host.
         host.to_owned()
     }
+
+    /// Every host the LLM host map (tier 1 of `resolve_target`'s precedence)
+    /// knows about, as `(host, provider)` pairs — the enumeration twin of
+    /// `resolve_target`'s single-lookup form. Not tied to any policy
+    /// instance: the map is a hardcoded constant, identical for every
+    /// `Policy`. Lets front-end packs' `targets()` (consumed by `keel
+    /// doctor`/`keel init` documentation output) enumerate every known LLM
+    /// provider host without holding their own copy (issue #49). Vertex's
+    /// REGIONAL endpoints are matched by suffix (`VERTEX_REGIONAL_SUFFIX`),
+    /// not enumerated here — there is no fixed list of regions to list.
+    #[must_use]
+    pub fn known_llm_hosts() -> Vec<(&'static str, &'static str)> {
+        LLM_HOST_PROVIDERS.to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -1818,5 +1832,19 @@ mod resolve_target_tests {
             ),
             "llm:google-genai"
         );
+    }
+
+    #[test]
+    fn known_llm_hosts_matches_resolve_target_for_every_pair() {
+        let hosts = Policy::known_llm_hosts();
+        assert!(hosts.contains(&("api.openai.com", "openai")));
+        assert!(hosts.contains(&("api.anthropic.com", "anthropic")));
+        assert!(hosts.contains(&("generativelanguage.googleapis.com", "google-genai")));
+        for (host, provider) in hosts {
+            assert_eq!(
+                Policy::default().resolve_target("GET", host, None, None, None),
+                format!("llm:{provider}")
+            );
+        }
     }
 }

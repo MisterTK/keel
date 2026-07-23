@@ -40,6 +40,36 @@ class ResolveTargetTest(unittest.TestCase):
         self.assertEqual(backend.resolve_target("GET", "127.0.0.1"), "127.0.0.1")
 
 
+class KnownLlmHostsTest(unittest.TestCase):
+    """`_http.known_llm_hosts()` (issue #49): the enumeration twin of
+    `resolve_target`'s single-lookup form, delegating to the always-available
+    pure-Python stub rather than `_runtime.get_backend()` (no live runtime is
+    required to enumerate — see the function's own docstring)."""
+
+    def test_delegates_to_the_stubs_enumeration(self) -> None:
+        self.assertEqual(_http.known_llm_hosts(), KeelCoreStub.known_llm_hosts())
+
+    def test_every_llm_host_resolve_target_maps_appears_in_the_enumeration(self) -> None:
+        # The enumeration and the single-lookup form must agree: every pair
+        # `known_llm_hosts()` lists must resolve to `llm:<provider>` via
+        # `resolve_target`, and vice versa (no drift between the two forms).
+        backend = KeelCoreStub()
+        hosts = _http.known_llm_hosts()
+        host_set = {h for h, _ in hosts}
+        for host in ("api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com"):
+            self.assertIn(host, host_set)
+        for host, provider in hosts:
+            self.assertEqual(backend.resolve_target("GET", host), f"llm:{provider}")
+
+    def test_no_active_runtime_required(self) -> None:
+        # targets() (keel doctor/keel init) may enumerate before any backend
+        # is installed — this must not raise, regardless of what another
+        # test in this process happened to install.
+        _runtime.clear_runtime()
+        self.assertIsNone(_runtime.get_backend())
+        self.assertTrue(len(_http.known_llm_hosts()) > 0)
+
+
 class ResolvePolicyTargetTest(unittest.TestCase):
     """`backend.resolve_target` (docs/targeting.md): the LLM host map first,
     then the configured `[target]` table's exact/pattern/default resolution —

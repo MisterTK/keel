@@ -590,6 +590,21 @@ mod bindings {
             self.engine.layer(&target, &key)
         }
 
+        /// Every host the LLM host map (`resolveTarget`'s tier 1) knows
+        /// about, as `[host, provider]` pairs — a class-level enumeration
+        /// accessor, not tied to any instance (the map is a hardcoded
+        /// constant, identical for every `KeelCore`). Lets front-end packs'
+        /// `targets()` (`keel doctor`/`keel init` documentation output)
+        /// enumerate every known LLM provider host without holding their
+        /// own copy (issue #49).
+        #[napi]
+        pub fn known_llm_hosts() -> Vec<Vec<String>> {
+            Engine::known_llm_hosts()
+                .into_iter()
+                .map(|(host, provider)| vec![host.to_owned(), provider.to_owned()])
+                .collect()
+        }
+
         /// The deterministic per-target metrics/discovery report. Read inside the
         /// handle runtime so `clock_ms` reflects its (possibly paused) clock.
         #[napi]

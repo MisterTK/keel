@@ -111,7 +111,7 @@ def targets() -> list[TargetDecl]:
                 "(dev-cache replay); None otherwise"
             ),
         )
-        for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
+        for host_name, provider in _http.known_llm_hosts()
     ]
     return [host, *llm]
 

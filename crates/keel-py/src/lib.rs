@@ -1017,6 +1017,17 @@ impl KeelCore {
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("layer not encodable: {e}")))
     }
 
+    /// Every host the LLM host map (`resolve_target`'s tier 1) knows about,
+    /// as `(host, provider)` pairs — a class-level enumeration accessor, not
+    /// tied to any instance (the map is a hardcoded constant, identical for
+    /// every `KeelCore`). Lets front-end packs' `targets()` (`keel doctor`/
+    /// `keel init` documentation output) enumerate every known LLM provider
+    /// host without holding their own copy (issue #49).
+    #[staticmethod]
+    fn known_llm_hosts() -> Vec<(&'static str, &'static str)> {
+        Engine::known_llm_hosts()
+    }
+
     /// Journal (or, on replay, substitute) a virtualized clock read under `key`
     /// (the front-end convention, e.g. `py:time.time#-`). Must be inside a flow.
     ///

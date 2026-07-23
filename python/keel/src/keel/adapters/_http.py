@@ -36,7 +36,6 @@ import re
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
 from .. import _runtime
@@ -51,27 +50,22 @@ _DURATION_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 #: carries as `payload`; see `response_envelope`).
 RESPONSE_MARK = "__keel_http__"
 
-#: Host → LLM provider, for DECLARATIVE use only (each HTTP pack's
-#: ``targets()`` enumerates one ``TargetDecl`` per known provider host, for
-#: doctor/``keel init`` documentation). Actual target RESOLUTION no longer
-#: consults this dict — as of Task 10/SP-1 it happens inside the backend
-#: (the native core, or ``keel_core_stub.KeelCoreStub``'s own
-#: ``_LLM_HOST_PROVIDERS``/suffix rule), which every pack now calls via
-#: ``_runtime.get_backend().resolve_target(...)``. Kept here (same name, same
-#: values) since several framework packs' docstrings reference it by this
-#: exact dotted path; still a cross-language parity contract with the Node
-#: front end (``LLM_HOST_PROVIDERS`` in judge.mjs) and the backend's own
-#: copies — extend all three in lockstep, since adding a host here changes
-#: which default pack applies (and which host each pack's ``targets()``
-#: declares).
-LLM_HOST_PROVIDERS: MappingProxyType[str, str] = MappingProxyType(
-    {
-        "api.openai.com": "openai",
-        "api.anthropic.com": "anthropic",
-        "generativelanguage.googleapis.com": "google-genai",
-        "aiplatform.googleapis.com": "google-genai",
-    }
-)
+def known_llm_hosts() -> list[tuple[str, str]]:
+    """Every host the LLM host map (`resolve_target`'s tier 1;
+    `docs/targeting.md`) knows about, as `(host, provider)` pairs — the
+    enumeration twin of `resolve_target`'s single-lookup form, for the HTTP
+    packs' `targets()` (`keel doctor`/`keel init` documentation output;
+    issue #49). Reads the pure-Python stub directly rather than
+    `_runtime.get_backend()`: `targets()` runs with no active runtime
+    (doctor/init introspect packs before any policy is installed), and the
+    enumeration is a hardcoded constant identical across every
+    implementation (native/stub) anyway, so the always-available stub is
+    the simplest correct source. (Replaces the former doc-only
+    `LLM_HOST_PROVIDERS` module constant, which duplicated this same data as
+    a fourth, hand-maintained copy — see issue #49.)"""
+    from keel_core_stub import KeelCoreStub
+
+    return KeelCoreStub.known_llm_hosts()
 
 #: Methods whose semantics make a retry safe (RFC 9110 §9.2.2). Matches the
 #: Node twin's ``IDEMPOTENT_METHODS`` exactly — TRACE is included for parity of
@@ -492,7 +486,7 @@ def deliver(
 __all__ = [
     "ENVELOPE_VERSION",
     "RESPONSE_MARK",
-    "LLM_HOST_PROVIDERS",
+    "known_llm_hosts",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
     "resolve_layer",
