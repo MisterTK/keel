@@ -645,6 +645,13 @@ fn terminal_attempt_error(
 pub struct Engine {
     started: Instant,
     policy: RwLock<Policy>,
+    /// The exact JSON document last passed to [`configure`](Self::configure),
+    /// verbatim — kept alongside the typed `policy` so [`Engine::layer`] can
+    /// resolve a value over the RAW configured shape (e.g. `"120s"`, not a
+    /// re-serialized `DurationMs`), matching what the front ends' `layer()`
+    /// readers have always returned. Written atomically with `policy` inside
+    /// `configure`, so the two can never drift apart.
+    raw_policy: RwLock<Value>,
     state: Mutex<State>,
     /// Persistence for the `scope = persistent` cache and Tier 2 flows. Behind
     /// a lock because `configure` honors `policy.journal` by (re)attaching the
@@ -676,6 +683,7 @@ impl fmt::Debug for Engine {
         // The trait-object attachments aren't `Debug`; report their presence.
         f.debug_struct("Engine")
             .field("policy", &self.policy)
+            .field("raw_policy", &self.raw_policy)
             .field("state", &self.state)
             .field("journal_attached", &self.current_journal().is_some())
             .field("discovery_attached", &self.discovery.is_some())
@@ -696,6 +704,7 @@ impl Engine {
         Self {
             started: Instant::now(),
             policy: RwLock::new(Policy::default()),
+            raw_policy: RwLock::new(Value::Null),
             state: Mutex::new(State::default()),
             journal: RwLock::new(JournalSlot::default()),
             discovery: None,
@@ -829,6 +838,7 @@ impl Engine {
         }
         warn_inert_breaker_knobs(&policy);
         *self.policy.write().expect("policy lock poisoned") = policy;
+        *self.raw_policy.write().expect("raw policy lock poisoned") = policy_json.clone();
         Ok(())
     }
 
@@ -895,6 +905,60 @@ impl Engine {
             .resolve(target)
             .idempotency
             .map(|i| i.header)
+    }
+
+    /// Resolve the policy target key for one outbound request — the engine
+    /// surface of [`Policy::resolve_target`] (SP-1: LLM host map, exact
+    /// bare-host `[target]` key, most-specific pattern match, then the bare
+    /// host). Read live so a reconfigure is honored.
+    #[must_use]
+    pub fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        self.policy
+            .read()
+            .expect("policy lock poisoned")
+            .resolve_target(method, host, scheme, port, path)
+    }
+
+    /// One resolved layer value as JSON (`null` when unset) — the front ends'
+    /// `backend.layer(target, key)` reader. Walks the RAW configured JSON
+    /// (never a typed re-serialization) with the same precedence as
+    /// [`Policy::resolve`]/the stubs' `_layer`: an exact `[target]` entry for
+    /// `target`, else (for `llm:*` targets) `defaults.llm`, else
+    /// `defaults.outbound`, else `null`. Resolving over the raw document
+    /// (rather than serializing the typed `ResolvedPolicy`) preserves the
+    /// original config literal verbatim — e.g. `"120s"`, not a re-serialized
+    /// `DurationMs` number — which is what callers actually need; see
+    /// `DurationMs`'s `Deserialize`-only impl (`policy.rs`).
+    #[must_use]
+    pub fn layer(&self, target: &str, key: &str) -> Value {
+        let raw = self.raw_policy.read().expect("raw policy lock poisoned");
+        if let Some(value) = raw
+            .get("target")
+            .and_then(|t| t.get(target))
+            .and_then(|t| t.get(key))
+        {
+            return value.clone();
+        }
+        if target.starts_with("llm:")
+            && let Some(value) = raw
+                .get("defaults")
+                .and_then(|d| d.get("llm"))
+                .and_then(|l| l.get(key))
+        {
+            return value.clone();
+        }
+        raw.get("defaults")
+            .and_then(|d| d.get("outbound"))
+            .and_then(|o| o.get(key))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// The configured Tier 2 `flows.on_nondeterminism` response (default
@@ -1969,5 +2033,44 @@ mod tests {
         assert_eq!(out.result, "ok");
         assert_eq!(out.payload, Some(raw));
         assert_eq!(out.attempts, 1);
+    }
+
+    #[test]
+    fn engine_resolve_target_delegates_to_policy() {
+        let e = Engine::new();
+        e.configure(&json!({ "target": { "*.internal.corp": {} } }))
+            .unwrap();
+        assert_eq!(
+            e.resolve_target("GET", "db.internal.corp", None, None, None),
+            "*.internal.corp"
+        );
+    }
+
+    #[test]
+    fn engine_layer_reads_resolved_value() {
+        let e = Engine::new();
+        e.configure(
+            &json!({ "target": { "api.x": { "idempotency": { "header": "Idempotency-Key" } } } }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.layer("api.x", "idempotency"),
+            json!({ "header": "Idempotency-Key" })
+        );
+        assert_eq!(e.layer("api.x", "retry"), serde_json::Value::Null);
+    }
+
+    /// The real value of resolving over the RAW configured JSON instead of a
+    /// typed re-serialization: `DurationMs` derives only `Deserialize` (see
+    /// `policy.rs`), so `serde_json::to_value(resolved.timeout)` cannot even
+    /// compile — and even a hypothetical round-trip would naturally produce a
+    /// number (120000), not the original `"120s"` string literal callers
+    /// actually wrote. `layer` must hand that literal back verbatim.
+    #[test]
+    fn engine_layer_round_trips_the_original_duration_literal_verbatim() {
+        let e = Engine::new();
+        e.configure(&json!({ "defaults": { "llm": { "timeout": "120s" } } }))
+            .unwrap();
+        assert_eq!(e.layer("llm:openai", "timeout"), json!("120s"));
     }
 }
