@@ -2801,7 +2801,10 @@ def caller():
     #[test]
     fn orchestration_sightings_become_a_finding() {
         let mut scan = ScanResult::default();
-        for (file, line) in [("scripts/run_autonomous.sh", 3), ("scripts/run_autonomous.sh", 9)] {
+        for (file, line) in [
+            ("scripts/run_autonomous.sh", 3),
+            ("scripts/run_autonomous.sh", 9),
+        ] {
             scan.orchestration.push(scan::OrchestrationSighting {
                 file: file.to_owned(),
                 line,
@@ -2826,7 +2829,12 @@ def caller():
         assert_eq!(f.level, "warn");
         assert!(f.detail.contains("run_autonomous.sh"), "{}", f.detail);
         // Two sightings in one file name it once.
-        assert_eq!(f.detail.matches("run_autonomous.sh").count(), 1, "{}", f.detail);
+        assert_eq!(
+            f.detail.matches("run_autonomous.sh").count(),
+            1,
+            "{}",
+            f.detail
+        );
     }
 
     /// A monorepo must not get a multi-kilobyte finding.
