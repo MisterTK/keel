@@ -984,6 +984,39 @@ impl KeelCore {
         })
     }
 
+    /// Resolve the policy target key for one outbound request — the
+    /// front ends' `backend.resolve_target(...)` reader, backed by
+    /// [`Engine::resolve_target`] (SP-1: LLM host map, exact bare-host
+    /// `[target]` key, most-specific pattern match, then the bare host).
+    /// Plain, synchronous, read-only: reads the policy lock directly, never
+    /// `active_flow` or the tokio runtime, so — like `flows_by_entrypoint`/
+    /// `steps_for_flow` above — this needs no `py.detach()`/`blocking_lock()`
+    /// dance.
+    #[pyo3(signature = (method, host, scheme=None, port=None, path=None))]
+    fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        self.engine.resolve_target(method, host, scheme, port, path)
+    }
+
+    /// One resolved layer value for `target`/`key`, or `None` when unset —
+    /// the front ends' `backend.layer(target, key)` reader, backed by
+    /// [`Engine::layer`]. Walks the raw configured JSON (never a typed
+    /// re-serialization), so a literal like `"120s"` round-trips as the
+    /// Python string `"120s"`, not a re-serialized number. Plain, synchronous,
+    /// read-only — same no-detach rationale as `resolve_target` above.
+    fn layer(&self, py: Python<'_>, target: &str, key: &str) -> PyResult<Py<PyAny>> {
+        let value = self.engine.layer(target, key);
+        pythonize(py, &value)
+            .map(Bound::unbind)
+            .map_err(|e| keel_error(py, "KEEL-E040", &format!("layer not encodable: {e}")))
+    }
+
     /// Journal (or, on replay, substitute) a virtualized clock read under `key`
     /// (the front-end convention, e.g. `py:time.time#-`). Must be inside a flow.
     ///
