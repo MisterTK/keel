@@ -323,6 +323,156 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
     return "pending"
 
 
+# -- outbound target resolution (mirrors keel._targets + adapters._http) -----
+#
+# Standalone port, not a call-through: this stub package must stay
+# self-contained (no dependency on the `keel` front-end package) so it can
+# serve as an independent oracle. The matcher below is a faithful copy of
+# `python/keel/src/keel/_targets.py`'s algorithm; see that module's docstring
+# for the full precedence/grammar spec. Unlike the front end (which compiles
+# once via `install_outbound_targets` and caches the result), this stub
+# re-derives the pattern list from `self._policy` on every `resolve_target`
+# call — the same no-separate-compile-step convention `_layer` already uses.
+
+#: Methods the frozen targetKey grammar admits as a key prefix.
+_TARGET_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+#: Non-outbound target classes (function + semantic targets) — never host keys.
+_TARGET_CLASS_PREFIXES = ("py:", "ts:", "rs:", "llm:", "tool:", "mcp:")
+
+#: Default ports per scheme, for `:port`-qualified keys (parity with Rust/Node).
+_SCHEME_PORTS = {"http": 80, "https": 443}
+
+#: Host -> LLM provider (parity contract with `keel.adapters._http`'s
+#: `LLM_HOST_PROVIDERS` and Node's judge.mjs; extend all three in lockstep).
+#: Vertex's regional endpoints vary by location and are matched by suffix
+#: below instead of listed here.
+_LLM_HOST_PROVIDERS = {
+    "api.openai.com": "openai",
+    "api.anthropic.com": "anthropic",
+    "generativelanguage.googleapis.com": "google-genai",
+    "aiplatform.googleapis.com": "google-genai",
+}
+_VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
+
+
+def _target_glob_regex(glob: str) -> re.Pattern[str]:
+    """`*`-only glob -> anchored regex. `*` crosses `.` and `/`; everything
+    else is literal (never fnmatch: `?`/`[` must stay literal for parity)."""
+    return re.compile("^" + ".*".join(re.escape(p) for p in glob.split("*")) + "$")
+
+
+def _parse_outbound_key(key: str) -> tuple[str | None, str, int | None, str | None] | None:
+    """Split an outbound key into (method, host, port, path) per the frozen
+    grammar, or None when the key is not outbound-shaped (defensive — the
+    backend schema-validates keys before we ever compile them)."""
+    method = None
+    rest = key
+    for m in _TARGET_METHODS:
+        if rest.startswith(m + " "):
+            method, rest = m, rest[len(m) + 1 :]
+            break
+    slash = rest.find("/")
+    path: str | None = None
+    if slash >= 0:
+        rest, path = rest[:slash], rest[slash:]
+    host, port = rest, None
+    head, sep, tail = rest.rpartition(":")
+    if sep and tail.isascii() and tail.isdigit():
+        host, port = head, int(tail)
+    if not host:
+        return None
+    return (method, host, port, path)
+
+
+# One compiled pattern-tier key: (wildcards, -literal, method_rank, key,
+# method, host_glob, port, path_glob). The first four fields are exactly the
+# sort key (wildcards ascending, literal descending, method-prefixed-first,
+# key ascending) — sorting on them directly keeps the compiled list
+# pre-ordered most-specific-first, matching `_targets.compile_outbound_targets`.
+_OutboundPattern = tuple[
+    int, int, int, str, "str | None", "re.Pattern[str]", "int | None", "re.Pattern[str] | None"
+]
+
+
+def _compile_outbound_targets(policy: Any) -> tuple[frozenset[str], list[_OutboundPattern]]:
+    """The outbound matchers of an effective policy's `[target]` table: bare-
+    host exact keys (tier 1), and pattern keys (tier 2), pre-sorted most-
+    specific-first."""
+    exact: set[str] = set()
+    patterns: list[_OutboundPattern] = []
+    targets = policy.get("target") if isinstance(policy, dict) else None
+    if isinstance(targets, dict):
+        for key in targets:
+            if not isinstance(key, str) or key.startswith(_TARGET_CLASS_PREFIXES):
+                continue
+            parsed = _parse_outbound_key(key)
+            if parsed is None:
+                continue
+            method, host, port, path = parsed
+            if method is None and port is None and path is None and "*" not in host:
+                exact.add(key)
+                continue
+            wildcards = key.count("*")
+            literal = len(key) - wildcards
+            patterns.append(
+                (
+                    wildcards,
+                    -literal,
+                    0 if method else 1,
+                    key,
+                    method,
+                    _target_glob_regex(host.lower()),
+                    port,
+                    _target_glob_regex(path) if path is not None else None,
+                )
+            )
+    # Most specific first; the lexicographic tail (the unique `key` field)
+    # makes selection total, so two runs (and two languages) always pick the
+    # same key.
+    patterns.sort(key=lambda p: p[:4])
+    return frozenset(exact), patterns
+
+
+def _outbound_pattern_matches(
+    p: _OutboundPattern, method: str, host: str, effective_port: int | None, path: str
+) -> bool:
+    _wildcards, _neg_literal, _method_rank, _key, p_method, host_glob, p_port, path_glob = p
+    if p_method is not None and p_method != method:
+        return False
+    if not host_glob.match(host):
+        return False
+    if p_port is not None and p_port != effective_port:
+        return False
+    return path_glob is None or bool(path_glob.match(path))
+
+
+def _resolve_outbound(
+    policy: Any,
+    method: str,
+    host: str,
+    *,
+    scheme: str | None = None,
+    port: int | None = None,
+    path: str | None = None,
+) -> str:
+    """The `[target]` policy key for one outbound request: exact host key,
+    else the most specific matching pattern key (verbatim, so the core's
+    exact lookup hits it), else the bare host (class-default fallthrough)."""
+    exact, patterns = _compile_outbound_targets(policy)
+    if host in exact:
+        return host
+    if patterns:
+        effective_port = port if port is not None else _SCHEME_PORTS.get(scheme or "")
+        host_l = host.lower()
+        path_n = path or "/"
+        method_u = (method or "GET").upper()
+        for p in patterns:
+            if _outbound_pattern_matches(p, method_u, host_l, effective_port, path_n):
+                return p[3]  # key
+    return host
+
+
 class KeelCoreStub:
     def __init__(self) -> None:
         self._policy: dict[str, Any] = {}
@@ -605,6 +755,28 @@ class KeelCoreStub:
         honor `idempotency.header` and gate cache buffering). Parity with Node's
         `AsyncEngine.layer`."""
         return self._layer(target, key)
+
+    def resolve_target(
+        self,
+        method: str,
+        host: str,
+        scheme: str | None = None,
+        port: int | None = None,
+        path: str | None = None,
+    ) -> str:
+        """The policy target key for one outbound request: the LLM host map
+        first (exact host, then the Vertex regional suffix), else the
+        `[target]` table's exact-host/pattern resolution (see
+        `_resolve_outbound`), else the bare host. Front-end target selection —
+        the front end picks one key per request and hands it to the core
+        verbatim; this mirrors `keel._targets.resolve_outbound` plus
+        `keel.adapters._http`'s LLM host map/Vertex suffix check exactly."""
+        provider = _LLM_HOST_PROVIDERS.get(host)
+        if provider is None and host.endswith(_VERTEX_REGIONAL_SUFFIX):
+            provider = "google-genai"
+        if provider:
+            return f"llm:{provider}"
+        return _resolve_outbound(self._policy, method, host, scheme=scheme, port=port, path=path)
 
     # -- execution ---------------------------------------------------------
 
