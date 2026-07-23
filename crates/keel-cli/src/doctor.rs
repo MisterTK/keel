@@ -260,10 +260,11 @@ struct Finding {
 
 /// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
 /// agent/human reading the report to work top-down. `code` is a CLOSED set —
-/// url-no-transport | subprocess-blind-spot | dependency-averse-excluded |
-/// preexisting-resilience | code-hash-stale — ranked lowest-Keel-confidence
-/// first (rank 1 = Keel knows least, investigate first). Text is entirely
-/// keel-authored; only hostnames, file paths, and lib names are interpolated.
+/// url-no-transport | orchestration-blind-spot | subprocess-blind-spot |
+/// dependency-averse-excluded | preexisting-resilience | code-hash-stale —
+/// ranked lowest-Keel-confidence first (rank 1 = Keel knows least, investigate
+/// first). Text is entirely keel-authored; only hostnames, file paths, and lib
+/// names are interpolated.
 #[derive(Debug, Serialize)]
 struct FollowUp {
     code: &'static str,
@@ -676,16 +677,21 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
 
 /// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
 /// the claim Keel knows least about — it saw a URL but cannot even name the
-/// dispatch path — so it is investigated first; rank 5 (code-hash-stale,
-/// reserved for the WS6 emitter) is a mechanical, fully-verified fact that
-/// merely awaits a human decision.
+/// dispatch path — so it is investigated first. Rank 2
+/// (orchestration-blind-spot) is a coarse substring match on a file Keel
+/// cannot parse at all — strictly less verifiable than rank 3
+/// (subprocess-blind-spot), which comes from an AST sighting of a real call
+/// — so it sorts above it. Rank 6 (code-hash-stale, reserved for the WS6
+/// emitter) is a mechanical, fully-verified fact that merely awaits a human
+/// decision.
 fn follow_up_rank(code: &str) -> u32 {
     match code {
         "url-no-transport" => 1,
-        "subprocess-blind-spot" => 2,
-        "dependency-averse-excluded" => 3,
-        "preexisting-resilience" => 4,
-        _ => 5, // code-hash-stale (WS6)
+        "orchestration-blind-spot" => 2,
+        "subprocess-blind-spot" => 3,
+        "dependency-averse-excluded" => 4,
+        "preexisting-resilience" => 5,
+        _ => 6, // code-hash-stale (WS6)
     }
 }
 
@@ -708,6 +714,19 @@ fn build_follow_ups(
             ),
             rank: follow_up_rank("url-no-transport"),
             subject: entry.host.clone(),
+        });
+    }
+    if !scan.orchestration.is_empty() {
+        let mut files: Vec<&str> = scan.orchestration.iter().map(|o| o.file.as_str()).collect();
+        files.dedup();
+        ups.push(FollowUp {
+            code: "orchestration-blind-spot",
+            detail: "Keel cannot parse shell/Makefile/CI files; these carry a coarse \
+                     at-most-once-dispatch signature (lockfile/guard/PID check). Confirm \
+                     whether each is real dispatch gating a `cmd:` flow could replace."
+                .to_owned(),
+            rank: follow_up_rank("orchestration-blind-spot"),
+            subject: format!("{} orchestration file(s)", files.len()),
         });
     }
     // Issue #41: a sighting matching a declared `[flows.match."cmd:*"]` rule
@@ -1567,7 +1586,7 @@ mod tests {
     /// Issue #41: a subprocess sighting whose launcher/argv the runtime pack
     /// actually intercepts, and whose argv matches a declared
     /// `[flows.match."cmd:*"]` rule, is downgraded (info, `covered_by` set,
-    /// excluded from the rank-2 follow-up) rather than nagged about — while
+    /// excluded from the rank-3 follow-up) rather than nagged about — while
     /// an unmatched sighting alongside it keeps the full `warn` + follow-up
     /// treatment `topology_buckets_classify_hosts_honestly` already pins.
     #[test]
@@ -1636,7 +1655,7 @@ mod tests {
             && f.level == "warn"
             && f.detail.contains("backup now")
             && !f.detail.contains("etl run")));
-        // ...and only the uncovered one counts toward the rank-2 follow-up.
+        // ...and only the uncovered one counts toward the rank-3 follow-up.
         let follow_up = r
             .follow_ups
             .iter()
@@ -1824,7 +1843,7 @@ mod tests {
             scan.host_transports
                 .insert(host.into(), TransportClass::UntrackedKnown);
         }
-        // One external process (rank 2).
+        // One external process (rank 3).
         scan.subprocesses.push(SubprocessSighting {
             file: "launch.py".into(),
             line: 12,
@@ -1832,7 +1851,7 @@ mod tests {
             command: "uvx alpaca-mcp-server".into(),
             argv: Some(vec!["uvx".into(), "alpaca-mcp-server".into()]),
         });
-        // One excluded host (rank 3).
+        // One excluded host (rank 4).
         scan.targets.insert(
             "api.broker.com".into(),
             TargetEvidence {
@@ -1849,7 +1868,7 @@ mod tests {
             file: "risk_gate.py".into(),
             reason: "stdlib-only + name/docstring signal: risk".into(),
         });
-        // Pre-existing resilience alongside a wrapped lib (rank 4).
+        // Pre-existing resilience alongside a wrapped lib (rank 5).
         scan.libs.insert("httpx".to_owned());
         scan.resilience_libs.insert("tenacity".to_owned());
 
@@ -1874,12 +1893,12 @@ mod tests {
                 (1, "url-no-transport", "api.alpha.com"),
                 (1, "url-no-transport", "api.zeta.com"),
                 (
-                    2,
+                    3,
                     "subprocess-blind-spot",
                     "1 externally-launched process(es)"
                 ),
-                (3, "dependency-averse-excluded", "api.broker.com"),
-                (4, "preexisting-resilience", "tenacity"),
+                (4, "dependency-averse-excluded", "api.broker.com"),
+                (5, "preexisting-resilience", "tenacity"),
             ]
         );
         // Every detail is non-empty keel-authored text.
@@ -2587,9 +2606,9 @@ mod tests {
     }
 
     /// WS6: a resumable flow recorded under a different code hash surfaces as
-    /// the rank-5 `code-hash-stale` follow-up.
+    /// the rank-6 `code-hash-stale` follow-up.
     #[test]
-    fn code_hash_stale_flow_emits_the_rank5_follow_up() {
+    fn code_hash_stale_flow_emits_the_rank6_follow_up() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let schema = std::fs::read_to_string(root.join("contracts/journal.sql")).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
@@ -2618,7 +2637,7 @@ mod tests {
             .iter()
             .find(|f| f["code"] == "code-hash-stale")
             .expect("code-hash-stale emitted");
-        assert_eq!(f["rank"], 5);
+        assert_eq!(f["rank"], 6);
         assert!(f["detail"].as_str().unwrap().contains("keel replay"));
     }
 
@@ -2885,5 +2904,34 @@ def caller():
                 .iter()
                 .any(|f| f.topic == "orchestration-blind-spot")
         );
+    }
+
+    #[test]
+    fn orchestration_sightings_become_a_ranked_follow_up() {
+        let mut scan = ScanResult::default();
+        scan.orchestration.push(scan::OrchestrationSighting {
+            file: "scripts/run_autonomous.sh".to_owned(),
+            line: 3,
+            kind: "lockfile-mutex".to_owned(),
+            snippet: "flock -n /tmp/x.lock || exit 0".to_owned(),
+        });
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        let up = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "orchestration-blind-spot")
+            .expect("orchestration follow-up present");
+        assert_eq!(up.rank, 2);
+        assert!(!up.detail.is_empty());
+        // follow_ups never affect ok.
+        assert!(r.ok);
     }
 }

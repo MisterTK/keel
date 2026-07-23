@@ -110,8 +110,8 @@ the five phases in order; the static scan is evidence, not the verdict.
    `follow_ups` strictly top-down: it is ranked with rank 1 = the claim Keel
    is least able to verify itself (an unattributed URL) down to mechanical
    facts awaiting a decision. Codes are a closed set: `url-no-transport`,
-   `subprocess-blind-spot`, `dependency-averse-excluded`,
-   `preexisting-resilience`, `code-hash-stale`.
+   `orchestration-blind-spot`, `subprocess-blind-spot`,
+   `dependency-averse-excluded`, `preexisting-resilience`, `code-hash-stale`.
    Then read `boundaries` — it names what this report could not parse (source
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
