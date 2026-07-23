@@ -353,10 +353,45 @@ pub(crate) struct Topology {
     pub(crate) wrappable: Vec<String>,
 }
 
+/// What this report could and could not read — the honest frame around every
+/// other field, and the one place a consumer that called `keel doctor --json`
+/// (or the `get_doctor_report` MCP tool) *alone* learns that the report is
+/// evidence, not a verdict.
+///
+/// Deliberately NOT a [`Finding`]: findings are things to act on, they feed the
+/// human findings list and (via structured evidence) `follow_ups`, and an
+/// unconditional advisory in that list is exactly the kind of false positive
+/// [`resilience_finding`] argues erodes trust in the real ones. These are
+/// standing properties of the tool instead. The MCP surface is contractually
+/// byte-identical to `keel doctor --json`, so there is no agent-only channel —
+/// anything an agent must read has to live here, in the shared report.
+///
+/// `governance_files` is filesystem-dependent, so the whole object is built in
+/// [`run`] and passed into the pure, golden-pinned [`build_report`] — the same
+/// pattern `agents_cli_finding`/`stale_flows` already use.
+#[derive(Debug, Serialize)]
+struct Boundaries {
+    /// Root files carrying project constraints this report cannot parse —
+    /// `CLAUDE.md`, `AGENTS.md`. Empty when neither exists. Edit deny-lists,
+    /// fail-closed contracts and "never touch this file" rules live in that
+    /// prose, so a call site that looks wrappable may be deliberately locked.
+    governance_files: Vec<&'static str>,
+    /// The languages the static scan parses into an AST.
+    parsed_languages: &'static [&'static str],
+    /// One line naming the protocol that turns this evidence into a verdict,
+    /// for an agent that reached the tool without the skill.
+    protocol: &'static str,
+    /// File classes this report never parses. Shell/`Makefile`/CI files are
+    /// sighted coarsely by substring (see the `orchestration-blind-spot`
+    /// finding); governance prose is not read at all.
+    unparsed: &'static [&'static str],
+}
+
 /// The whole doctor report.
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     adapters: Vec<AdapterStatus>,
+    boundaries: Boundaries,
     coverage: Coverage,
     findings: Vec<Finding>,
     follow_ups: Vec<FollowUp>,
@@ -418,6 +453,7 @@ pub fn run(project: &Path) -> Rendered {
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
     let agents_cli_finding = agents_cli_placement_finding(project);
+    let boundaries = boundaries(project);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
     let report = build_report(
         &scan,
@@ -425,6 +461,7 @@ pub fn run(project: &Path) -> Rendered {
         policy,
         journal,
         agents_cli_finding,
+        boundaries,
         &stale_flows,
     );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
@@ -787,6 +824,32 @@ fn relative_display(base: &Path, target: &Path) -> String {
     )
 }
 
+/// Build the [`Boundaries`] frame for `project`. Only `governance_files` touches
+/// the filesystem; the rest are standing properties of this tool, kept in one
+/// place so there is a single edit when the scan learns a new language or file
+/// class. The `protocol` line enumerates the skill's five phases verbatim — if
+/// `skills/keel/SKILL.md`'s protocol changes, change this with it.
+fn boundaries(project: &Path) -> Boundaries {
+    let mut governance_files = Vec::new();
+    if project.join("CLAUDE.md").exists() {
+        governance_files.push("CLAUDE.md");
+    }
+    if project.join("AGENTS.md").exists() {
+        governance_files.push("AGENTS.md");
+    }
+    Boundaries {
+        governance_files,
+        parsed_languages: &["python", "js-ts"],
+        protocol: "Static + adapter-interception evidence, not a verdict. Drive an \
+                   evaluate/adopt/review task through the keel skill's five phases: Scope every \
+                   I/O process (including shell/CI launchers) -> Explore how each call is \
+                   dispatched -> Collect this report -> Baseline real failure classes in observe \
+                   mode (`keel record run`) -> Analyze & propose. Retry only helps \
+                   genuinely-transient classes (conn/timeout/5xx/429).",
+        unparsed: &["shell", "makefile", "ci-workflow", "governance-prose"],
+    }
+}
+
 /// An unsupported journal backend is an error finding: the app would fail to
 /// configure with KEEL-E005, so doctor must not read clean.
 fn journal_finding(journal: &JournalReport) -> Option<Finding> {
@@ -802,10 +865,11 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the six evidence inputs. Pure, so the golden test
+/// Assemble the report from the seven evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3` — the filesystem-dependent
 /// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
-/// check for a root `keel.toml`; `stale_flows`, since it needs to read
+/// check for a root `keel.toml`; `boundaries`, since it stats the project root
+/// for governance files; `stale_flows`, since it needs to read
 /// `.keel/journal.db` and stat scripts on disk) are computed by the caller
 /// and passed in already resolved, the same pattern `policy`/`journal`
 /// already use.
@@ -817,6 +881,7 @@ fn build_report(
     policy: PolicyValidation,
     journal: JournalReport,
     agents_cli_finding: Option<Finding>,
+    boundaries: Boundaries,
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation {
@@ -923,6 +988,7 @@ fn build_report(
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
         adapters,
+        boundaries,
         coverage: Coverage {
             invisible,
             visible_unwrapped,
@@ -1149,6 +1215,8 @@ fn suggest_removal(text: &str, field: &str) -> Option<Proposal> {
 }
 
 /// The human report, derived from [`DoctorReport`] so no fact escapes the JSON.
+#[allow(clippy::too_many_lines)] // straight-line rendering, one section per
+// DoctorReport field; the boundaries section added a few lines, not new complexity.
 fn human(r: &DoctorReport) -> String {
     let mut out = String::from("keel \u{25b8} doctor\n");
 
@@ -1241,6 +1309,24 @@ fn human(r: &DoctorReport) -> String {
             out.push_str(&line);
         }
     }
+    out.push_str("\nboundaries\n");
+    let parsed = format!(
+        "  parsed:            {} — {} not parsed (shell/Makefile/CI sighted coarsely only)\n",
+        r.boundaries.parsed_languages.join(", "),
+        r.boundaries.unparsed.join(", "),
+    );
+    out.push_str(&parsed);
+    if !r.boundaries.governance_files.is_empty() {
+        let gov = format!(
+            "  governance:        {} — read before applying policy; this report can't parse it\n",
+            r.boundaries.governance_files.join(", "),
+        );
+        out.push_str(&gov);
+    }
+    out.push_str(
+        "  next:              evidence, not a verdict — see the keel skill's evaluation protocol\n",
+    );
+
     let tail = format!(
         "\n{}\n",
         if r.ok {
@@ -1316,7 +1402,15 @@ mod tests {
             cmd_match: BTreeMap::new(),
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
+        let r = build_report(
+            &scan,
+            &wrapped,
+            policy,
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
         assert_eq!(r.coverage.visible_unwrapped, vec!["llm:openai"]);
@@ -1403,6 +1497,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
@@ -1476,6 +1571,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
 
@@ -1556,6 +1652,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         assert!(
@@ -1631,6 +1728,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         let retry = r
@@ -1726,6 +1824,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
 
@@ -1773,6 +1872,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
@@ -1858,6 +1958,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
 
@@ -1933,6 +2034,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
 
@@ -1997,6 +2099,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         let mcp = r
@@ -2044,6 +2147,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         let row = r
@@ -2077,6 +2181,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         let finding = r
@@ -2105,6 +2210,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         assert!(
@@ -2123,6 +2229,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            empty_boundaries(),
             &[],
         );
         assert!(
@@ -2146,7 +2253,15 @@ mod tests {
             cmd_match: BTreeMap::new(),
             fix: None,
         };
-        let r = build_report(&scan, &wrapped, policy, default_journal(), None, &[]);
+        let r = build_report(
+            &scan,
+            &wrapped,
+            policy,
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
         assert!(!r.ok);
         assert!(
             r.findings
@@ -2178,7 +2293,15 @@ mod tests {
             source: "keel.toml",
             supported: false,
         };
-        let r = build_report(&scan, &wrapped, policy, journal, None, &[]);
+        let r = build_report(
+            &scan,
+            &wrapped,
+            policy,
+            journal,
+            None,
+            empty_boundaries(),
+            &[],
+        );
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
             .findings
@@ -2553,6 +2676,88 @@ def caller():
         assert!(
             init_json.contains("hand-rolled-retry"),
             "init --diff notes should surface the hand-rolled retry loop: {init_json}"
+        );
+    }
+
+    // ---- boundaries ----
+
+    /// A `Boundaries` frame for a project root with no governance files — what
+    /// every `build_report` unit test wants unless it is specifically testing
+    /// governance detection. Uses the real constructor so the tests cannot
+    /// drift from `run`'s behavior.
+    fn empty_boundaries() -> Boundaries {
+        let dir = tempfile::TempDir::new().unwrap();
+        boundaries(dir.path())
+    }
+
+    #[test]
+    fn report_always_carries_boundaries() {
+        let scan = ScanResult::default();
+        let wrapped = BTreeSet::new();
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
+        assert!(r.boundaries.unparsed.contains(&"ci-workflow"));
+        // Boundaries are a frame, not work: they must never inflate findings.
+        assert!(!r.findings.iter().any(|f| f.topic == "evaluation-protocol"));
+        assert!(!r.findings.iter().any(|f| f.topic == "governance-boundary"));
+    }
+
+    #[test]
+    fn boundaries_list_governance_files_that_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# rules\n").unwrap();
+        let b = boundaries(dir.path());
+        assert_eq!(b.governance_files, vec!["CLAUDE.md"]);
+
+        std::fs::write(dir.path().join("AGENTS.md"), "# keel\n").unwrap();
+        let b = boundaries(dir.path());
+        assert_eq!(b.governance_files, vec!["CLAUDE.md", "AGENTS.md"]);
+    }
+
+    #[test]
+    fn boundaries_are_empty_but_present_without_governance_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let b = boundaries(dir.path());
+        assert!(b.governance_files.is_empty());
+        // The standing facts are unconditional — an agent that reached the tool
+        // without the skill must always learn what was not parsed.
+        assert!(b.parsed_languages.contains(&"python"));
+        assert!(b.unparsed.contains(&"shell"));
+        assert!(b.protocol.contains("Baseline"));
+    }
+
+    #[test]
+    fn human_report_carries_a_compact_boundaries_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "# rules\n").unwrap();
+        let scan = ScanResult::default();
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            boundaries(dir.path()),
+            &[],
+        );
+        let text = human(&r);
+        assert!(text.contains("\nboundaries\n"), "{text}");
+        assert!(text.contains("python, js-ts"), "{text}");
+        assert!(text.contains("CLAUDE.md"), "{text}");
+        // Compact: the whole section, not one line per fact.
+        let section = text.split("\nboundaries\n").nth(1).unwrap();
+        let lines = section.lines().take_while(|l| l.starts_with("  ")).count();
+        assert!(
+            lines <= 3,
+            "boundaries section is {lines} lines:\n{section}"
         );
     }
 }

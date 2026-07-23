@@ -534,6 +534,9 @@ fn doctor_json_matches_golden_for_agents_cli_placement() {
         "[target.\"api.example.com\"]\nretry = { attempts = 5 }\n",
     )
     .unwrap();
+    // A root CLAUDE.md so one golden pins `boundaries.governance_files`
+    // non-empty; the other doctor goldens pin the empty case.
+    std::fs::write(dir.path().join("CLAUDE.md"), "# project rules\n").unwrap();
 
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK, "a warn finding does not fail ok");
