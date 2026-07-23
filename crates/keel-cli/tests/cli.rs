@@ -247,6 +247,21 @@ fn skill_tool_list_matches_mcp_catalog() {
          edit one, copy to the other"
     );
 
+    // The Agent Skills spec caps `description` at 1024 characters and SILENTLY
+    // TRUNCATES the overflow — a too-long description loses its tail, which is
+    // where the "Do not use for…" anti-trigger clause lives. Pin the limit here
+    // rather than discovering it as a skill that fires on everything.
+    let description = SKILL_MD
+        .lines()
+        .find_map(|l| l.strip_prefix("description: "))
+        .expect("SKILL.md frontmatter has a `description:` line");
+    assert!(
+        description.len() <= 1024,
+        "skills/keel/SKILL.md description is {} characters; the spec hard limit is 1024 and \
+         the overflow is silently truncated",
+        description.len()
+    );
+
     for name in keel_cli::mcp::TOOL_NAMES {
         assert!(
             SKILL_MD.contains(name),
