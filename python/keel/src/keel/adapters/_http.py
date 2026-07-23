@@ -39,7 +39,7 @@ from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from typing import Any, Callable, Iterable
 
-from .. import _runtime, _targets
+from .. import _runtime
 from .._errors import KeelError
 
 ENVELOPE_VERSION = 1
@@ -51,13 +51,19 @@ _DURATION_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 #: carries as `payload`; see `response_envelope`).
 RESPONSE_MARK = "__keel_http__"
 
-#: Host → LLM provider. A cross-language parity contract with the Node front
-#: end (``LLM_HOST_PROVIDERS`` in judge.mjs); extend in lockstep across
-#: languages, since adding a host here changes which default pack applies.
-#: ``aiplatform.googleapis.com`` is Vertex AI's GLOBAL endpoint; Vertex's
-#: REGIONAL endpoints (``<location>-aiplatform.googleapis.com``, one per
-#: ``--location``) vary by location and so cannot be listed exactly — they are
-#: matched by the suffix rule in :func:`resolve_target` instead.
+#: Host → LLM provider, for DECLARATIVE use only (each HTTP pack's
+#: ``targets()`` enumerates one ``TargetDecl`` per known provider host, for
+#: doctor/``keel init`` documentation). Actual target RESOLUTION no longer
+#: consults this dict — as of Task 10/SP-1 it happens inside the backend
+#: (the native core, or ``keel_core_stub.KeelCoreStub``'s own
+#: ``_LLM_HOST_PROVIDERS``/suffix rule), which every pack now calls via
+#: ``_runtime.get_backend().resolve_target(...)``. Kept here (same name, same
+#: values) since several framework packs' docstrings reference it by this
+#: exact dotted path; still a cross-language parity contract with the Node
+#: front end (``LLM_HOST_PROVIDERS`` in judge.mjs) and the backend's own
+#: copies — extend all three in lockstep, since adding a host here changes
+#: which default pack applies (and which host each pack's ``targets()``
+#: declares).
 LLM_HOST_PROVIDERS: MappingProxyType[str, str] = MappingProxyType(
     {
         "api.openai.com": "openai",
@@ -66,11 +72,6 @@ LLM_HOST_PROVIDERS: MappingProxyType[str, str] = MappingProxyType(
         "aiplatform.googleapis.com": "google-genai",
     }
 )
-
-#: Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
-#: ``us-central1-aiplatform.googleapis.com``. Parity contract with the Node
-#: twin's identical suffix check in ``judge.mjs``.
-VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
 
 #: Methods whose semantics make a retry safe (RFC 9110 §9.2.2). Matches the
 #: Node twin's ``IDEMPOTENT_METHODS`` exactly — TRACE is included for parity of
@@ -119,8 +120,9 @@ def resolve_layer(target: str, key: str) -> Any:
     Reads the active backend's ``layer(target, key)`` (parity with Node, whose
     packs read ``backend.layer``). Resolution — exact ``[target."…"]`` wins, then
     ``[defaults.llm]`` for an ``llm:`` target, then ``[defaults.outbound]`` — is
-    owned by the backend (the stub's public ``layer``; the native core wrapped by
-    ``_backend._NativeBackend.layer``), so the two front ends make identical
+    owned by the backend (the stub's public ``layer``; the native core's own
+    ``layer`` binding, exposed directly since Task 10/SP-1 dropped the
+    ``_backend._NativeBackend`` wrapper), so the two front ends make identical
     per-target judgments for the same policy."""
     backend = _runtime.get_backend()
     layer = getattr(backend, "layer", None)
@@ -173,48 +175,6 @@ def buffer_body_configured(target: str) -> bool:
     """The body-buffering gate at the seam: cache ttl OR poll table. Mirrors
     Node's fetch gate."""
     return cache_configured(target) or poll_configured(target)
-
-
-def resolve_target(host: str) -> str:
-    """The policy target for a host: ``llm:<provider>`` for a known provider
-    host (exact match, or a Vertex AI regional endpoint via the suffix rule),
-    else the bare host string."""
-    provider = LLM_HOST_PROVIDERS.get(host)
-    if provider is None and host.endswith(VERTEX_REGIONAL_SUFFIX):
-        provider = "google-genai"
-    return f"llm:{provider}" if provider else host
-
-
-def resolve_policy_target(
-    method: str,
-    host: str,
-    *,
-    scheme: str | None = None,
-    port: int | None = None,
-    path: str | None = None,
-) -> str:
-    """The policy target for one outbound request, honoring URL-pattern keys.
-
-    Precedence (``docs/targeting.md``; parity contract with the Node twin's
-    ``resolvePolicyTarget``): the LLM host map first (a provider host is the
-    semantic target ``llm:<provider>``, exactly as before), then an exact
-    bare-host ``[target]`` key, then the most specific matching host/URL
-    *pattern* key (``*.internal.corp``, ``GET api.catalog.internal/*``, …) —
-    returned verbatim so the core's exact lookup lands on it — and finally the
-    bare host, whose layers fall through to ``[defaults.outbound]``. With no
-    matchers installed (bootstrap not run) this is exactly ``resolve_target``.
-    """
-    provider = LLM_HOST_PROVIDERS.get(host)
-    if provider:
-        return f"llm:{provider}"
-    return _targets.resolve_outbound(
-        _targets.current_outbound_targets(),
-        method,
-        host,
-        scheme=scheme,
-        port=port,
-        path=path,
-    )
 
 
 def is_idempotent(
@@ -533,7 +493,6 @@ __all__ = [
     "ENVELOPE_VERSION",
     "RESPONSE_MARK",
     "LLM_HOST_PROVIDERS",
-    "VERTEX_REGIONAL_SUFFIX",
     "IDEMPOTENT_METHODS",
     "DEFAULT_IDEMPOTENCY_HEADERS",
     "resolve_layer",
@@ -542,8 +501,6 @@ __all__ = [
     "cache_configured",
     "poll_configured",
     "buffer_body_configured",
-    "resolve_policy_target",
-    "resolve_target",
     "is_idempotent",
     "new_idempotency_key",
     "step_key",

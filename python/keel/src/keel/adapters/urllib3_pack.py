@@ -47,6 +47,7 @@ import importlib.util
 import inspect
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .. import _runtime
 from . import _http
@@ -168,12 +169,20 @@ def _header_names(headers: Any) -> tuple[str, ...]:
 def _judge(pool: Any, method: str, url: str, headers: Any, body: Any) -> tuple[str, str, bool, str | None]:
     method = method.upper()
     host = getattr(pool, "host", "") or ""
-    target = _http.resolve_target(host)
+    scheme = getattr(pool, "scheme", None) or "http"
+    port = getattr(pool, "port", None)
+    path = urlsplit(url).path
+    # Pattern-aware target selection (docs/targeting.md): exact host key, else
+    # the most specific matching host/URL pattern key, else the bare host —
+    # resolved by the backend (native core or stub; see Task 7/SP-1). Was
+    # host-only before Task 10; now gains pattern + Vertex-suffix support like
+    # every other HTTP pack (intended behavior change).
+    target = _runtime.get_backend().resolve_target(  # type: ignore[union-attr]
+        method, host, scheme=scheme, port=port, path=path
+    )
     op = f"{method} {host}{url}"
     idem_header = _http.idempotency_header(target)
     idempotent = _http.is_idempotent(method, _header_names(headers), idem_header)
-    scheme = getattr(pool, "scheme", None) or "http"
-    port = getattr(pool, "port", None)
     netloc = f"{host}:{port}" if port else host
     full_url = f"{scheme}://{netloc}{url}"
     # Only a buffered (bytes/str) body is hashed — a file-like/generator body

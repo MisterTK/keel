@@ -8,10 +8,10 @@ once per Tier 1 attempt — never ``execute``'s return value, so a scripted
 failure is genuinely retried/backed-off/breaker-tripped by the real backend's
 own resilience logic, exactly like a real failure would be. Every other
 ``Backend`` member (``enter_flow``/``exit_flow``/``journal_time``/
-``journal_random``/``report``/``layer``) delegates straight through
-(``__getattr__``, mirroring ``_backend._NativeBackend`` and
-``_record.RecordingBackend``) — Tier 2 flow control and journal semantics are
-completely untouched by fault injection.
+``journal_random``/``report``/``layer``/``resolve_target``) delegates
+straight through (``__getattr__``, mirroring ``_record.RecordingBackend``) —
+Tier 2 flow control and journal semantics are completely untouched by fault
+injection.
 """
 
 from __future__ import annotations

@@ -11,23 +11,25 @@ Covers the brief's item-3 acceptance:
   * per-provider target resolution lands in the report under llm:openai /
     llm:anthropic.
 
-The local fault server binds 127.0.0.1, so each test patches the host→provider
-map (`_http.LLM_HOST_PROVIDERS`) to route the loopback host to the provider
-under test — the same seam the real api.openai.com / api.anthropic.com hosts use.
+The local fault server binds 127.0.0.1, so each test patches the INSTALLED
+BACKEND's `resolve_target` to route the loopback host to the provider under
+test — the same seam the real api.openai.com / api.anthropic.com hosts use.
+Since Task 10/SP-1 moved target resolution into the backend (native core or
+stub), the map lives there now, not in a front-end dict a test could
+monkeypatch process-wide — so `map_host` patches the specific backend
+instance `install()` returns, per test.
 """
 
 from __future__ import annotations
 
 import unittest
 from tempfile import TemporaryDirectory
-from types import MappingProxyType
 from typing import Any
 from unittest import mock
 
 import httpx
 import requests
 
-from keel.adapters import _http
 from keel.bootstrap import install_keel, uninstall_keel
 
 from .faultserver import FaultServer, ok, throttled
@@ -56,16 +58,25 @@ class LlmE2EBase(unittest.TestCase):
         return install_keel(cwd=self.cwd, env=base)
 
     @staticmethod
-    def map_host(host: str, provider: str) -> Any:
-        merged = {**dict(_http.LLM_HOST_PROVIDERS), host: provider}
-        return mock.patch.object(_http, "LLM_HOST_PROVIDERS", MappingProxyType(merged))
+    def map_host(backend: Any, host: str, provider: str) -> Any:
+        """Map `host` to `llm:<provider>` on THIS `backend` instance only, for
+        the duration of the returned context manager (restores the instance's
+        original `resolve_target` on exit)."""
+        orig = backend.resolve_target
+
+        def mapped(method: str, h: str, *, scheme: str | None = None, port: int | None = None, path: str | None = None) -> str:
+            if h == host:
+                return f"llm:{provider}"
+            return orig(method, h, scheme=scheme, port=port, path=path)
+
+        return mock.patch.object(backend, "resolve_target", mapped)
 
 
 class DevCacheReplayTest(LlmE2EBase):
     def test_identical_prompt_replays_from_cache_off_prod(self) -> None:
-        with self.map_host("127.0.0.1", "openai"):
-            with FaultServer([ok(b'{"choices":[{"message":{"content":"hi"}}]}', _JSON)]) as srv:
-                backend = self.install()["backend"]  # KEEL_ENV unset → dev
+        with FaultServer([ok(b'{"choices":[{"message":{"content":"hi"}}]}', _JSON)]) as srv:
+            backend = self.install()["backend"]  # KEEL_ENV unset → dev
+            with self.map_host(backend, "127.0.0.1", "openai"):
                 with httpx.Client() as c:
                     r1 = c.post(srv.url("/v1/chat/completions"), json=_chat_body("hello"))
                     first_outcome = r1.keel_outcome  # capture before the replay rebinds it
@@ -93,9 +104,9 @@ class DevCacheReplayTest(LlmE2EBase):
                 )
 
     def test_requests_adapter_replays_too(self) -> None:
-        with self.map_host("127.0.0.1", "openai"):
-            with FaultServer([ok(b'{"choices":[]}', _JSON)]) as srv:
-                backend = self.install()["backend"]
+        with FaultServer([ok(b'{"choices":[]}', _JSON)]) as srv:
+            backend = self.install()["backend"]
+            with self.map_host(backend, "127.0.0.1", "openai"):
                 session = requests.Session()
                 session.post(srv.url("/v1/chat/completions"), json=_chat_body("hi"))
                 r2 = session.post(srv.url("/v1/chat/completions"), json=_chat_body("hi"))
@@ -106,9 +117,9 @@ class DevCacheReplayTest(LlmE2EBase):
 
 class DevCacheProdBypassTest(LlmE2EBase):
     def test_prod_bypasses_dev_cache(self) -> None:
-        with self.map_host("127.0.0.1", "openai"):
-            with FaultServer([ok(b'{"a":1}', _JSON), ok(b'{"a":2}', _JSON)]) as srv:
-                backend = self.install(KEEL_ENV="prod")["backend"]
+        with FaultServer([ok(b'{"a":1}', _JSON), ok(b'{"a":2}', _JSON)]) as srv:
+            backend = self.install(KEEL_ENV="prod")["backend"]
+            with self.map_host(backend, "127.0.0.1", "openai"):
                 with httpx.Client() as c:
                     c.post(srv.url("/v1/chat/completions"), json=_chat_body("hello"))
                     r2 = c.post(srv.url("/v1/chat/completions"), json=_chat_body("hello"))
@@ -137,10 +148,10 @@ class LlmRetryStormTest(LlmE2EBase):
         # over the llm schedule (500ms → 1000ms). KEEL_ENV=prod isolates retry
         # from the dev cache. Non-idempotent LLM POSTs are NOT retried (Level 0
         # hard rule) — that is covered by the httpx adapter suite.
-        with self.map_host("127.0.0.1", "openai"):
-            script = [throttled("1"), throttled("1"), ok(b'{"choices":[]}', _JSON)]
-            with FaultServer(script) as srv:
-                backend = self.install(KEEL_ENV="prod")["backend"]
+        script = [throttled("1"), throttled("1"), ok(b'{"choices":[]}', _JSON)]
+        with FaultServer(script) as srv:
+            backend = self.install(KEEL_ENV="prod")["backend"]
+            with self.map_host(backend, "127.0.0.1", "openai"):
                 with httpx.Client() as c:
                     r = c.post(
                         srv.url("/v1/chat/completions"),
@@ -164,10 +175,10 @@ class PerProviderReportTest(LlmE2EBase):
             [ok(b'{"a":1}', _JSON)]
         ) as srv_a:
             backend = self.install(KEEL_ENV="prod")["backend"]
-            with self.map_host("127.0.0.1", "openai"):
+            with self.map_host(backend, "127.0.0.1", "openai"):
                 with httpx.Client() as c:
                     c.post(srv_o.url("/v1/chat/completions"), json=_chat_body("o"))
-            with self.map_host("127.0.0.1", "anthropic"):
+            with self.map_host(backend, "127.0.0.1", "anthropic"):
                 with httpx.Client() as c:
                     c.post(srv_a.url("/v1/messages"), json=_chat_body("a"))
         targets = backend.report()["targets"]

@@ -3,9 +3,11 @@ generic httpx/requests transport seams (Task L1). Mirrors
 node/keel/test/fetch.test.mjs's budget/fallback section.
 
 Uses the local FaultServer (no external network) with the target resolved via
-``_http.LLM_HOST_PROVIDERS`` (monkeypatched to map the loopback host to
-``llm:openai`` for the duration of each test, since the frozen provider-host
-map only knows the real provider hostnames)."""
+the stub backend's ``resolve_target`` (monkeypatched, PER BACKEND INSTANCE, to
+map the loopback host to ``llm:openai`` for the duration of each test, since
+the backend's real LLM host map only knows the real provider hostnames and,
+since Task 10/SP-1 moved resolution into the backend, is no longer reachable
+via a front-end-level monkeypatch)."""
 
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import requests
 from keel import _runtime
 from keel._backend import load_backend
 from keel._errors import KeelError
-from keel.adapters import _http, _llm_policy, httpx_pack, requests_pack
+from keel.adapters import _llm_policy, httpx_pack, requests_pack
 
 from .faultserver import FaultServer, fail, ok
 
@@ -33,9 +35,11 @@ def _openai_usage_body(reply: str = "hi") -> bytes:
 
 
 class _LlmSeamBase(unittest.TestCase):
-    """Shared fixture: registers the loopback host as `llm:openai` for the
-    duration of the test (frozen `_http.LLM_HOST_PROVIDERS` only knows real
-    provider hostnames), configures a stub backend, and installs a pack."""
+    """Shared fixture: registers the loopback host as `llm:openai` on THIS
+    TEST'S backend instance (the backend's real LLM host map only knows real
+    provider hostnames, and — since Task 10/SP-1 — is baked into the backend
+    itself, not a front-end dict a test can monkeypatch process-wide), then
+    configures the stub backend and installs a pack."""
 
     pack = None  # set by subclasses
 
@@ -44,17 +48,24 @@ class _LlmSeamBase(unittest.TestCase):
         self._tmp = TemporaryDirectory()
         self.cwd = Path(self._tmp.name)
         self.backend = load_backend("stub")
-        self._host_patch = dict(_http.LLM_HOST_PROVIDERS)
-        _http.LLM_HOST_PROVIDERS = {**self._host_patch, "127.0.0.1": "openai"}  # type: ignore[misc]
+        self._orig_resolve_target = self.backend.resolve_target
+        self.backend.resolve_target = self._mapped_resolve_target  # type: ignore[method-assign]
         _runtime.set_runtime(self.backend, None)
         self.pack.install()
 
     def tearDown(self) -> None:
         self.pack.uninstall()
         _runtime.clear_runtime()
-        _http.LLM_HOST_PROVIDERS = self._host_patch  # type: ignore[misc]
+        self.backend.resolve_target = self._orig_resolve_target  # type: ignore[method-assign]
         self._tmp.cleanup()
         _llm_policy.reset_llm_budgets()
+
+    def _mapped_resolve_target(
+        self, method: str, host: str, *, scheme: str | None = None, port: int | None = None, path: str | None = None
+    ) -> str:
+        if host == "127.0.0.1":
+            return "llm:openai"
+        return self._orig_resolve_target(method, host, scheme=scheme, port=port, path=path)
 
     def _post(self, url: str, body: dict) -> object:
         raise NotImplementedError

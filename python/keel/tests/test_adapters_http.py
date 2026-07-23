@@ -13,64 +13,69 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from requests.models import PreparedRequest
 
-from keel import _targets
+from keel import _runtime
 from keel.adapters import _http, httpx_pack, requests_pack
+from keel_core_stub import KeelCoreStub
 
 
 class ResolveTargetTest(unittest.TestCase):
+    """`backend.resolve_target` (docs/targeting.md): the LLM host map, tested
+    directly against the pure-Python stub (Task 7/SP-1's mirror of the native
+    core's matcher; conformance scenarios 36-38 prove native == stub == Node
+    on every precedence dimension, so this offline suite exercises the stub
+    as a faithful, standalone oracle)."""
+
     def test_llm_hosts_map_to_providers(self) -> None:
-        self.assertEqual(_http.resolve_target("api.openai.com"), "llm:openai")
-        self.assertEqual(_http.resolve_target("api.anthropic.com"), "llm:anthropic")
+        backend = KeelCoreStub()
+        self.assertEqual(backend.resolve_target("GET", "api.openai.com"), "llm:openai")
+        self.assertEqual(backend.resolve_target("GET", "api.anthropic.com"), "llm:anthropic")
         self.assertEqual(
-            _http.resolve_target("generativelanguage.googleapis.com"), "llm:google-genai"
+            backend.resolve_target("GET", "generativelanguage.googleapis.com"),
+            "llm:google-genai",
         )
 
     def test_unknown_host_is_its_own_target(self) -> None:
-        self.assertEqual(_http.resolve_target("example.com"), "example.com")
-        self.assertEqual(_http.resolve_target("127.0.0.1"), "127.0.0.1")
+        backend = KeelCoreStub()
+        self.assertEqual(backend.resolve_target("GET", "example.com"), "example.com")
+        self.assertEqual(backend.resolve_target("GET", "127.0.0.1"), "127.0.0.1")
 
 
 class ResolvePolicyTargetTest(unittest.TestCase):
-    """`resolve_policy_target` (docs/targeting.md): the LLM host map first,
-    then `_targets`'s exact/pattern/default resolution, driven by whatever
-    outbound matchers are process-installed (`_targets.install_outbound_targets`,
-    as `bootstrap.install_keel` does from the effective policy)."""
+    """`backend.resolve_target` (docs/targeting.md): the LLM host map first,
+    then the configured `[target]` table's exact/pattern/default resolution —
+    driven by whatever policy the backend was `configure`d with (no separate
+    install step; the backend re-derives its matchers from the configured
+    policy on every call, per Task 10/SP-1)."""
 
-    def tearDown(self) -> None:
-        _targets.clear_outbound_targets()
+    @staticmethod
+    def _backend(policy: dict | None = None) -> KeelCoreStub:
+        backend = KeelCoreStub()
+        backend.configure(policy or {})
+        return backend
 
     def test_no_matchers_installed_matches_resolve_target(self) -> None:
-        self.assertEqual(
-            _http.resolve_policy_target("GET", "api.stripe.com"), "api.stripe.com"
-        )
-        self.assertEqual(
-            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
-        )
+        backend = self._backend()
+        self.assertEqual(backend.resolve_target("GET", "api.stripe.com"), "api.stripe.com")
+        self.assertEqual(backend.resolve_target("POST", "api.openai.com"), "llm:openai")
 
     def test_llm_host_map_wins_even_over_an_installed_pattern(self) -> None:
-        _targets.install_outbound_targets({"target": {"*.openai.com": {}}})
-        self.assertEqual(
-            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
-        )
+        backend = self._backend({"target": {"*.openai.com": {}}})
+        self.assertEqual(backend.resolve_target("POST", "api.openai.com"), "llm:openai")
 
     def test_exact_host_key_beats_an_installed_pattern(self) -> None:
-        _targets.install_outbound_targets(
-            {"target": {"api.internal": {}, "*.internal": {}}}
-        )
-        self.assertEqual(_http.resolve_policy_target("GET", "api.internal"), "api.internal")
+        backend = self._backend({"target": {"api.internal": {}, "*.internal": {}}})
+        self.assertEqual(backend.resolve_target("GET", "api.internal"), "api.internal")
 
     def test_pattern_key_selected_by_method_port_and_path(self) -> None:
-        _targets.install_outbound_targets(
-            {"target": {"GET api.catalog.internal/*": {}}}
-        )
+        backend = self._backend({"target": {"GET api.catalog.internal/*": {}}})
         self.assertEqual(
-            _http.resolve_policy_target(
+            backend.resolve_target(
                 "GET", "api.catalog.internal", scheme="https", path="/items/5"
             ),
             "GET api.catalog.internal/*",
         )
         self.assertEqual(
-            _http.resolve_policy_target(
+            backend.resolve_target(
                 "POST", "api.catalog.internal", scheme="https", path="/items/5"
             ),
             "api.catalog.internal",
@@ -78,12 +83,10 @@ class ResolvePolicyTargetTest(unittest.TestCase):
         )
 
     def test_wildcard_host_segment_matches_subdomains(self) -> None:
-        _targets.install_outbound_targets({"target": {"*.internal.corp": {}}})
+        backend = self._backend({"target": {"*.internal.corp": {}}})
+        self.assertEqual(backend.resolve_target("GET", "db.internal.corp"), "*.internal.corp")
         self.assertEqual(
-            _http.resolve_policy_target("GET", "db.internal.corp"), "*.internal.corp"
-        )
-        self.assertEqual(
-            _http.resolve_policy_target("GET", "unrelated.example.com"),
+            backend.resolve_target("GET", "unrelated.example.com"),
             "unrelated.example.com",
         )
 
@@ -222,7 +225,19 @@ class RetryAfterTest(unittest.TestCase):
 
 class CrossJudgeParityTest(unittest.TestCase):
     """A no-body GET must produce the SAME args_hash from the httpx and requests
-    judges (and match method+url with no body) — cross-adapter cache-key parity."""
+    judges (and match method+url with no body) — cross-adapter cache-key parity.
+
+    `_judge` resolves its target via `_runtime.get_backend().resolve_target`
+    (Task 10/SP-1), so calling it directly needs an active backend; a bare,
+    unconfigured `KeelCoreStub` is sufficient (this test only checks args_hash
+    parity, not target resolution itself — that's `ResolveTargetTest`/
+    `ResolvePolicyTargetTest` above)."""
+
+    def setUp(self) -> None:
+        _runtime.set_runtime(KeelCoreStub(), None)
+
+    def tearDown(self) -> None:
+        _runtime.clear_runtime()
 
     def test_no_body_get_hashes_identically_across_judges(self) -> None:
         url = "https://example.com/p"

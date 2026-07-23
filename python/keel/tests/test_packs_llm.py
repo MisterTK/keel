@@ -249,10 +249,17 @@ class ProviderPackTest(unittest.TestCase):
 
 class VertexHostResolutionTest(unittest.TestCase):
     """Vertex AI's global + regional endpoints both route to llm:google-genai
-    (Node parity: node/keel/test/judge.test.mjs)."""
+    (Node parity: node/keel/test/judge.test.mjs; native/stub parity:
+    conformance scenarios 36-38). Resolution lives on the backend since
+    Task 10/SP-1 — exercised here against the pure-Python stub directly."""
+
+    def setUp(self) -> None:
+        self.backend = KeelCoreStub()
 
     def test_global_endpoint_exact_match(self) -> None:
-        self.assertEqual(_http.resolve_target("aiplatform.googleapis.com"), "llm:google-genai")
+        self.assertEqual(
+            self.backend.resolve_target("GET", "aiplatform.googleapis.com"), "llm:google-genai"
+        )
 
     def test_regional_endpoints_via_suffix_rule(self) -> None:
         for host in (
@@ -260,22 +267,39 @@ class VertexHostResolutionTest(unittest.TestCase):
             "europe-west4-aiplatform.googleapis.com",
             "asia-northeast1-aiplatform.googleapis.com",
         ):
-            self.assertEqual(_http.resolve_target(host), "llm:google-genai", host)
+            self.assertEqual(self.backend.resolve_target("GET", host), "llm:google-genai", host)
 
     def test_lookalike_host_without_hyphen_does_not_match(self) -> None:
         # Guards the suffix rule's boundary: no hyphen before "aiplatform" means
         # it is not a documented Vertex regional host.
-        self.assertEqual(_http.resolve_target("evilaiplatform.googleapis.com"), "evilaiplatform.googleapis.com")
+        self.assertEqual(
+            self.backend.resolve_target("GET", "evilaiplatform.googleapis.com"),
+            "evilaiplatform.googleapis.com",
+        )
 
     def test_generativelanguage_still_resolves(self) -> None:
-        self.assertEqual(_http.resolve_target("generativelanguage.googleapis.com"), "llm:google-genai")
+        self.assertEqual(
+            self.backend.resolve_target("GET", "generativelanguage.googleapis.com"),
+            "llm:google-genai",
+        )
 
 
 class DevCacheArgsHashJudgeTest(unittest.TestCase):
-    """The dev-cache args_hash exception, at the judge (seam) level."""
+    """The dev-cache args_hash exception, at the judge (seam) level.
+
+    `_judge` resolves its target via `_runtime.get_backend().resolve_target`
+    (Task 10/SP-1), so calling it directly (bypassing `_run_sync`/`_run_async`,
+    which would otherwise short-circuit before ever reaching `_judge` when no
+    backend is installed) now requires an active backend. A bare, unconfigured
+    `KeelCoreStub` reproduces the exact pre-Task-10 "no backend" defaults for
+    everything else these tests check (idempotency-header resolution reads
+    `_policy.get("defaults", {})`, empty either way)."""
 
     def setUp(self) -> None:
-        _runtime.clear_runtime()  # judge reads no backend → default idempotency header
+        _runtime.set_runtime(KeelCoreStub(), None)
+
+    def tearDown(self) -> None:
+        _runtime.clear_runtime()
 
     def test_llm_post_gets_a_canonical_body_hash(self) -> None:
         req = httpx.Request(
