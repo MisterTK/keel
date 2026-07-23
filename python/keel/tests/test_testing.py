@@ -142,15 +142,20 @@ class ReplayBackendTest(unittest.TestCase):
         self.assertIsNone(backend.configure({}))
         self.assertEqual(backend.report(), {})
 
-    def test_resolve_target_falls_back_to_bare_host_with_no_resolver(self) -> None:
+    def test_resolve_target_falls_back_to_a_bare_unconfigured_stub_with_no_resolver(self) -> None:
         # Backward compatibility: every OTHER test in this file constructs
         # ReplayBackend(rec) with no second argument, so the no-resolver path
         # must keep behaving sanely (Task 10 regression: packs now call
         # backend.resolve_target(...) unconditionally — see
         # test_install_replay_delegates_resolve_target_below for the real
-        # integration path).
+        # integration path). The fallback is a bare, unconfigured stub
+        # instance (issue #53), not a literal `return host`: the LLM host map
+        # is policy-independent tier 1 (docs/targeting.md §1.2 point 1), so it
+        # still applies with no policy configured — matching Node's identical
+        # fallback (a bare `AsyncEngine()`, node/keel/src/testing.mjs).
         backend = ReplayBackend(Recording(META, []))
         self.assertEqual(backend.resolve_target("GET", "api.example.com"), "api.example.com")
+        self.assertEqual(backend.resolve_target("POST", "api.openai.com"), "llm:openai")
 
 
 class InstallReplayResolveTargetTest(unittest.TestCase):

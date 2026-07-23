@@ -93,6 +93,19 @@ class ReplayBackend:
         # packs call `_runtime.get_backend().resolve_target(...)`
         # unconditionally, so whatever backend is installed must expose it).
         self._resolver = resolver
+        # With no resolver (e.g. a bare ``ReplayBackend(rec)`` built directly),
+        # `resolve_target` falls back to this bare, never-``configure``d stub
+        # instance rather than a literal ``return host``: the LLM host map is
+        # policy-independent tier 1 (docs/targeting.md §1.2 point 1), so an
+        # unconfigured engine still applies it — matching what the real
+        # native/stub engines do for an unconfigured backend, and matching
+        # Node's identical fallback (a bare ``AsyncEngine()``,
+        # node/keel/src/testing.mjs) — issue #53 closed the divergence this
+        # left between the two languages (Node applied the LLM map, Python
+        # did not).
+        from keel_core_stub import KeelCoreStub
+
+        self._bare = KeelCoreStub()
         self._queues: dict[tuple[str, str], deque[dict[str, Any]]] = {}
         for call in recording.calls:
             key = _match_key(
@@ -126,15 +139,16 @@ class ReplayBackend:
         assuming the normal usage pattern of the same policy being in effect
         during both recording and replay. With no resolver (e.g. a bare
         ``ReplayBackend(rec)`` built directly, no policy in scope), this
-        deliberately falls back to the bare host — the same "no policy
-        configured" default the core/stub use when there's no compiled
-        `[target]` table — purely for backward compatibility with direct
-        construction; it is NOT a claim that this reproduces real target
-        resolution.
+        falls back to a bare, unconfigured stub instance — the LLM host map
+        still applies (policy-independent tier 1) but there are no
+        `[target]` patterns to match — matching Node's identical fallback
+        (issue #53); purely for backward compatibility with direct
+        construction, it is NOT a claim that this reproduces real target
+        resolution for a policy-configured engine.
         """
         if self._resolver is not None:
             return self._resolver.resolve_target(method, host, scheme=scheme, port=port, path=path)
-        return host
+        return self._bare.resolve_target(method, host, scheme=scheme, port=port, path=path)
 
     def execute(self, request: dict[str, Any], effect: Callable[[int], Any]) -> dict[str, Any]:
         del effect  # replay never invokes the real effect (that's the point)
