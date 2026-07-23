@@ -102,8 +102,11 @@ def match_flow(target: str, entrypoints: Sequence[FlowEntrypoint]) -> FlowEntryp
 
 def _glob_regex(glob: str) -> re.Pattern[str]:
     """`*`-only glob → anchored regex (`*` matches any run of characters, dots
-    included; everything else literal). The same rule as outbound target
-    patterns (`_targets._glob_regex`) — one glob dialect everywhere."""
+    included; everything else literal). The same rule the backend's
+    ``resolve_target`` applies to outbound `[target]` patterns (reused
+    verbatim by ``adapters.subprocess_pack`` for `cmd:` argv patterns since
+    Task 10/SP-1 deleted the front end's own copy) — one glob dialect
+    everywhere."""
     return re.compile("^" + ".*".join(re.escape(p) for p in glob.split("*")) + "$")
 
 

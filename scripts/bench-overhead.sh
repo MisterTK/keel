@@ -28,3 +28,31 @@ KEEL_BENCH_EMIT_JSON=1 KEEL_BENCH_OUT="$out" \
 
 echo "bench-overhead: artifact at $out"
 cat "$out"
+
+# (3) The resolve_target/layer FFI-crossing micro-bench (issue #50): (1)/(2)
+#     above measure Engine::execute's in-process path only (per support.rs's
+#     own docstring) — never the PyO3/napi call-dispatch/argument-marshalling
+#     path that now runs once per outbound HTTP call (SP-1's
+#     `_runtime.get_backend().resolve_target(...)`/`.layer(...)`). Each
+#     language's script gracefully reports "skipped: no wheel/addon" when its
+#     native module isn't built locally (this script never builds one),
+#     mirroring bench-node-startup.sh's own addon-optional convention; `cat`
+#     below still shows the artifact either way. `python3`/`node` are
+#     expected on PATH, same as every other script in this repo.
+ffi_out="$repo_root/target/bench-resolve-target-ffi.json"
+py_ffi_tmp="$(mktemp)"
+node_ffi_tmp="$(mktemp)"
+trap 'rm -f "$py_ffi_tmp" "$node_ffi_tmp"' EXIT
+python3 "$repo_root/python/keel/scripts/measure_resolve_target_ffi.py" --json "$py_ffi_tmp"
+node "$repo_root/node/keel/scripts/measure-resolve-target-ffi.mjs" --json "$node_ffi_tmp"
+python3 -c '
+import json, sys
+py_path, node_path, out_path = sys.argv[1:]
+combined = {"python": json.load(open(py_path)), "node": json.load(open(node_path))}
+with open(out_path, "w") as f:
+    json.dump(combined, f, sort_keys=True, indent=2)
+    f.write("\n")
+' "$py_ffi_tmp" "$node_ffi_tmp" "$ffi_out"
+
+echo "bench-overhead: FFI-crossing artifact at $ffi_out"
+cat "$ffi_out"

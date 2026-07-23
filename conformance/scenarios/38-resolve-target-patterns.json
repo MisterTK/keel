@@ -1,0 +1,25 @@
+{
+  "name": "resolve-target-patterns",
+  "description": "resolve_target's pattern tier in isolation (no competing bare-exact or LLM-mapped host suppresses it): method discrimination, port/scheme-default matching, path-glob matching, and the most-specific/lexicographic tie-break among competing patterns.",
+  "policy": {
+    "target": {
+      "GET api.svc.internal/*": {},
+      "POST api.svc.internal/*": {},
+      "*.svc.internal": {},
+      "api.portcheck.test:9443": {},
+      "api.pathcheck.test/allowed/*": {},
+      "api.tiebreak.test/x/*": {},
+      "api.tiebreak.test/*/y": {}
+    }
+  },
+  "steps": [
+    { "resolve": { "method": "GET", "host": "api.svc.internal" }, "expect": "GET api.svc.internal/*" },
+    { "resolve": { "method": "POST", "host": "api.svc.internal" }, "expect": "POST api.svc.internal/*" },
+    { "resolve": { "method": "DELETE", "host": "api.svc.internal" }, "expect": "*.svc.internal" },
+    { "resolve": { "method": "GET", "host": "api.portcheck.test", "scheme": "https" }, "expect": "api.portcheck.test" },
+    { "resolve": { "method": "GET", "host": "api.portcheck.test", "port": 9443 }, "expect": "api.portcheck.test:9443" },
+    { "resolve": { "method": "GET", "host": "api.pathcheck.test", "path": "/allowed/x" }, "expect": "api.pathcheck.test/allowed/*" },
+    { "resolve": { "method": "GET", "host": "api.pathcheck.test", "path": "/other" }, "expect": "api.pathcheck.test" },
+    { "resolve": { "method": "GET", "host": "api.tiebreak.test", "path": "/x/y" }, "expect": "api.tiebreak.test/*/y" }
+  ]
+}

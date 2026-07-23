@@ -8,8 +8,8 @@
  * attempt — never `execute`'s return value, so a scripted failure is
  * genuinely retried/backed-off/breaker-tripped by the real backend's own
  * resilience logic, exactly like a real failure would be. Every other
- * `Backend` member (`report`, `layer`, `persistent`) delegates straight
- * through, mirroring `record.mjs`'s `RecordingBackend`.
+ * `Backend` member (`report`, `layer`, `resolveTarget`, `persistent`)
+ * delegates straight through, mirroring `record.mjs`'s `RecordingBackend`.
  */
 
 import { readFileSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
@@ -120,7 +120,9 @@ async function sleep(ms) {
  * `effect` closure so a scripted fault plan can inject a failure/latency/
  * crash into one Tier 1 attempt without `inner` ever seeing anything but a
  * normal (possibly synthetic) attempt outcome — its own retry/backoff/
- * breaker/cache decisions run for real over it.
+ * breaker/cache decisions run for real over it. Every other `Backend` member
+ * (`report`, `layer`, `resolveTarget`, `persistent`) delegates straight
+ * through.
  */
 export class SimBackend {
   #inner;
@@ -155,6 +157,9 @@ export class SimBackend {
   }
   layer(target, key) {
     return this.#inner.layer(target, key);
+  }
+  resolveTarget(method, host, scheme, port, path) {
+    return this.#inner.resolveTarget(method, host, scheme, port, path);
   }
   flushEvents() {
     this.#inner.flushEvents?.();

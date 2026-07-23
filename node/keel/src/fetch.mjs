@@ -35,7 +35,6 @@
 
 import {
   normalizeRequest,
-  resolvePolicyTarget,
   isIdempotent,
   resolveIdempotencyInjection,
   defaultMintIdempotencyKey,
@@ -88,7 +87,6 @@ export function installFetch(
   {
     globalObj = globalThis,
     mintIdempotencyKey = defaultMintIdempotencyKey,
-    outboundTargets = null,
   } = {},
 ) {
   const original = globalObj.fetch;
@@ -105,17 +103,18 @@ export function installFetch(
       return original.call(this, input, init);
     }
     const hostname = parsed.hostname;
-    // Pattern-aware target selection (docs/targeting.md): exact host key, else
-    // the most specific matching host/URL pattern key, else the bare host.
-    // `outboundTargets` is `compileOutboundMatchers(policy)`, compiled once at
-    // install time; with none installed this is exactly the old `resolveTarget`.
-    const target = resolvePolicyTarget(outboundTargets, {
+    // Pattern-aware target selection (docs/targeting.md): the LLM host map,
+    // else an exact host key, else the most specific matching host/URL
+    // pattern key, else the bare host — resolved by the backend (native core
+    // or the Node stub-backed AsyncEngine), proven identical across both by
+    // conformance scenarios 36–38.
+    const target = backend.resolveTarget(
       method,
       hostname,
-      scheme: parsed.protocol.replace(/:$/, ""),
-      port: parsed.port ? Number(parsed.port) : null,
-      path: parsed.pathname,
-    });
+      parsed.protocol.replace(/:$/, ""),
+      parsed.port ? Number(parsed.port) : null,
+      parsed.pathname,
+    );
     const idemHeader = readIdempotencyHeader(backend, target);
     // The FIRST hop's args_hash, derived here (ahead of the hop loop below)
     // purely so the Tier 2 step key it feeds is known before deciding what to

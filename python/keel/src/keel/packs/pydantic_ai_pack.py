@@ -16,8 +16,9 @@ retry-prompt loop behaves exactly as without Keel.
 
 LLM legs: pydantic-ai model requests ride the provider SDKs (openai /
 anthropic / google-genai / …) over httpx, so the transport seam
-(``adapters._http.LLM_HOST_PROVIDERS``) already maps them to
-``llm:<provider>`` — this pack owns no model-call seam (see ``targets()``).
+(the backend's ``resolve_target`` LLM host map, ``docs/targeting.md``)
+already maps them to ``llm:<provider>`` — this pack owns no model-call seam
+(see ``targets()``).
 
 Certified against pydantic-ai 2.9.0 (``pydantic-ai-slim``); the ``call_tool``
 signature is the v1/v2 toolsets contract. ``install`` shape-checks the seam
@@ -104,8 +105,9 @@ def targets() -> list[TargetDecl]:
             idempotency_rule=(
                 "model requests ride the provider SDK (openai/anthropic/"
                 "google-genai/…) over httpx; the transport seam maps known "
-                "provider hosts (adapters._http.LLM_HOST_PROVIDERS) to "
-                "llm:<provider> — this pack owns no model-call seam"
+                "provider hosts (the backend's resolve_target host map, "
+                "docs/targeting.md) to llm:<provider> — this pack owns no "
+                "model-call seam"
             ),
             args_hash_rule=(
                 "as the transport seam derives it: sha256 over (method, url, "

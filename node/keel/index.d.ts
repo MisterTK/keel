@@ -81,6 +81,10 @@ export interface Backend {
   configure(policy: Record<string, unknown>): void;
   execute(request: Request, effect: (attempt: number) => Promise<AttemptResult>): Promise<Outcome>;
   layer(target: string, key: string): unknown;
+  /** Resolve the policy target key for one outbound request (the LLM host
+   *  map, Vertex regional suffix, and `[target]` host/URL-pattern matching —
+   *  see `docs/targeting.md`). */
+  resolveTarget(method: string, host: string, scheme?: string | null, port?: number | null, path?: string | null): string;
   report(): { v: number; clock_ms: number; targets: Record<string, Record<string, unknown>> };
 }
 
@@ -110,7 +114,6 @@ export declare function parseToml(text: string): Record<string, unknown>;
 export declare function extractFunctionTargets(policy: Record<string, unknown>): FunctionTarget[];
 export declare function level0Defaults(): Record<string, unknown>;
 export declare function applyPackDefaults(policy: Record<string, unknown>): Record<string, unknown>;
-export declare const LLM_HOST_PROVIDERS: Readonly<Record<string, string>>;
 
 /** The `llm:` provider defaults pack (adapter-pack contract). */
 export declare const llmPack: AdapterPack;

@@ -130,8 +130,8 @@ import time
 from typing import Any, Callable, NamedTuple, Sequence
 
 from .. import _runtime
+from .._flow import _glob_regex
 from .._policy import CmdFlow
-from .._targets import _glob_regex
 from ._pack import Detection, Seam, TargetDecl
 
 MODULE = "subprocess"
@@ -300,8 +300,10 @@ def _compile(cmd_flows: dict[str, CmdFlow]) -> "tuple[_CompiledCmd, ...]":
     A rule with EMPTY ``argv_patterns`` (a ``cmd:`` entrypoint with no
     ``[flows.match]`` rule) matches nothing in-process and is dropped — the
     interceptor requires an explicit argv rule to fire. Specificity tie-break
-    reuses ``_targets``' outbound ordering (fewest ``*``, then most literal
-    chars, then key lexicographic) minus the HTTP method tier."""
+    reuses the outbound target specificity ordering (fewest ``*``, then most
+    literal chars, then key lexicographic) minus the HTTP method tier — the
+    same tie-break the backend's ``resolve_target`` applies to ``[target]``
+    patterns."""
     out: list[_CompiledCmd] = []
     for flow in cmd_flows.values():
         if not flow.argv_patterns:

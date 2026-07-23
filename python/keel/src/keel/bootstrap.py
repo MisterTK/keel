@@ -36,7 +36,6 @@ from ._runtime import (
     set_flow_entrypoints,
     set_runtime,
 )
-from ._targets import clear_outbound_targets, install_outbound_targets
 from .adapters import Detection, install_adapters, uninstall_adapters
 from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
 
@@ -102,11 +101,6 @@ def install_keel(
     discovery = Discovery(cwd, known_targets)
     _STATE.discovery = discovery
     set_runtime(backend, discovery)
-    # Outbound host/URL-pattern matchers (docs/targeting.md), compiled from the
-    # same effective policy the backend was configured with: the HTTP packs'
-    # target judgment consults these so `[target."*.internal.corp"]`-style keys
-    # actually select requests. The core still sees one exact key per call.
-    install_outbound_targets(policy)
 
     targets = extract_function_targets(policy)
     _STATE.finder = install_import_hook(targets)
@@ -191,7 +185,6 @@ def uninstall_keel() -> None:
     if _STATE.discovery is not None:
         _STATE.discovery.close()
         _STATE.discovery = None
-    clear_outbound_targets()
     clear_runtime()
     _STATE.installed = False
     _STATE.state = None

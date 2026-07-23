@@ -1,0 +1,17 @@
+{
+  "name": "resolve-target",
+  "description": "resolve_target picks the policy key per docs/targeting.md: exact beats pattern, most-specific-by-literal, method/port/path, LLM host map + Vertex suffix.",
+  "policy": { "target": {
+    "api.example.com": {}, "*.example.com": {}, "GET api.example.com/*": {},
+    "*.internal.corp": {}, "api.example.com:443": {}, "*.openai.com": {}
+  } },
+  "steps": [
+    { "resolve": { "method": "GET", "host": "api.example.com" }, "expect": "api.example.com" },
+    { "resolve": { "method": "GET", "host": "svc.example.com" }, "expect": "*.example.com" },
+    { "resolve": { "method": "GET", "host": "api.example.com", "path": "/v1/x" }, "expect": "api.example.com" },
+    { "resolve": { "method": "GET", "host": "a.b.internal.corp" }, "expect": "*.internal.corp" },
+    { "resolve": { "method": "GET", "host": "api.example.com", "scheme": "https" }, "expect": "api.example.com" },
+    { "resolve": { "method": "POST", "host": "api.openai.com" }, "expect": "llm:openai" },
+    { "resolve": { "method": "POST", "host": "us-central1-aiplatform.googleapis.com" }, "expect": "llm:google-genai" }
+  ]
+}

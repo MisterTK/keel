@@ -135,6 +135,16 @@ def run_scenario(scenario: dict[str, Any], make_core, error_cls) -> list[str]:
                     f"{label}: effect script not fully consumed "
                     f"({consumed}/{len(script)} attempts used)"
                 )
+        elif "resolve" in step:
+            r = step["resolve"]
+            got = core.resolve_target(r["method"], r["host"], r.get("scheme"), r.get("port"), r.get("path"))
+            if got != step["expect"]:
+                failures.append(f"{label}: resolve got {got!r}, want {step['expect']!r}")
+        elif "layer" in step:
+            l = step["layer"]
+            got = core.layer(l["target"], l["key"])
+            if got != step["expect"]:
+                failures.append(f"{label}: layer got {got!r}, want {step['expect']!r}")
         else:
             failures.append(f"{label}: unknown step {sorted(step)}")
     return failures

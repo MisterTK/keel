@@ -99,7 +99,6 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import MappingProxyType
 from typing import Any
 from unittest import mock
 
@@ -124,7 +123,6 @@ if FARM:  # real imports only in farm mode — never at fast-path collection tim
 from keel import _runtime
 from keel._backend import load_backend
 from keel._discovery import Discovery
-from keel.adapters import _http
 from keel.bootstrap import install_keel, uninstall_keel
 from keel.packs import adk_pack, mcp_pack
 
@@ -364,17 +362,26 @@ class GeminiBonusLegTest(unittest.TestCase):
         self._tmp.cleanup()
 
     @staticmethod
-    def map_host(host: str, provider: str):
-        merged = {**dict(_http.LLM_HOST_PROVIDERS), host: provider}
-        return mock.patch.object(_http, "LLM_HOST_PROVIDERS", MappingProxyType(merged))
+    def map_host(backend: Any, host: str, provider: str):
+        """Map `host` to `llm:<provider>` on THIS `backend` instance only
+        (target resolution lives on the backend since Task 10/SP-1, so a
+        front-end-level monkeypatch no longer reaches it — see the identical
+        pattern in ``test_packs_llm_e2e.py``)."""
+        orig = backend.resolve_target
+
+        def mapped(method: str, h: str, *, scheme: str | None = None, port: int | None = None, path: str | None = None) -> str:
+            if h == host:
+                return f"llm:{provider}"
+            return orig(method, h, scheme=scheme, port=port, path=path)
+
+        return mock.patch.object(backend, "resolve_target", mapped)
 
     def test_gemini_base_url_reaches_llm_google_genai_target(self) -> None:
         with mock.patch.dict(os.environ, {"GOOGLE_API_KEY": "farm-fixture-fake-key"}):
-            with self.map_host("127.0.0.1", "google-genai"):
-                with FaultServer([ok(_GEMINI_BODY, _JSON)]) as srv:
-                    result = install_keel(cwd=self.cwd, env={"KEEL_BACKEND": "stub", "KEEL_QUIET": "1"})
-                    backend = result["backend"]
-
+            with FaultServer([ok(_GEMINI_BODY, _JSON)]) as srv:
+                result = install_keel(cwd=self.cwd, env={"KEEL_BACKEND": "stub", "KEEL_QUIET": "1"})
+                backend = result["backend"]
+                with self.map_host(backend, "127.0.0.1", "google-genai"):
                     model = Gemini(model="gemini-2.5-flash", base_url=srv.url(""))
                     req = LlmRequest(
                         model="gemini-2.5-flash",

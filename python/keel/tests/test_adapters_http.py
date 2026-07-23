@@ -13,64 +13,120 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from requests.models import PreparedRequest
 
-from keel import _targets
+from keel import _runtime
 from keel.adapters import _http, httpx_pack, requests_pack
+from keel_core_stub import KeelCoreStub
+
+try:
+    import keel_core  # noqa: F401
+
+    _NATIVE = True
+except ImportError:
+    _NATIVE = False
 
 
 class ResolveTargetTest(unittest.TestCase):
+    """`backend.resolve_target` (docs/targeting.md): the LLM host map, tested
+    directly against the pure-Python stub (Task 7/SP-1's mirror of the native
+    core's matcher; conformance scenarios 36-38 prove native == stub == Node
+    on every precedence dimension, so this offline suite exercises the stub
+    as a faithful, standalone oracle)."""
+
     def test_llm_hosts_map_to_providers(self) -> None:
-        self.assertEqual(_http.resolve_target("api.openai.com"), "llm:openai")
-        self.assertEqual(_http.resolve_target("api.anthropic.com"), "llm:anthropic")
+        backend = KeelCoreStub()
+        self.assertEqual(backend.resolve_target("GET", "api.openai.com"), "llm:openai")
+        self.assertEqual(backend.resolve_target("GET", "api.anthropic.com"), "llm:anthropic")
         self.assertEqual(
-            _http.resolve_target("generativelanguage.googleapis.com"), "llm:google-genai"
+            backend.resolve_target("GET", "generativelanguage.googleapis.com"),
+            "llm:google-genai",
         )
 
     def test_unknown_host_is_its_own_target(self) -> None:
-        self.assertEqual(_http.resolve_target("example.com"), "example.com")
-        self.assertEqual(_http.resolve_target("127.0.0.1"), "127.0.0.1")
+        backend = KeelCoreStub()
+        self.assertEqual(backend.resolve_target("GET", "example.com"), "example.com")
+        self.assertEqual(backend.resolve_target("GET", "127.0.0.1"), "127.0.0.1")
+
+
+class KnownLlmHostsTest(unittest.TestCase):
+    """`_http.known_llm_hosts()` (issue #49): the enumeration twin of
+    `resolve_target`'s single-lookup form, delegating to the always-available
+    pure-Python stub rather than `_runtime.get_backend()` (no live runtime is
+    required to enumerate — see the function's own docstring)."""
+
+    def test_delegates_to_the_stubs_enumeration(self) -> None:
+        self.assertEqual(_http.known_llm_hosts(), KeelCoreStub.known_llm_hosts())
+
+    def test_every_llm_host_resolve_target_maps_appears_in_the_enumeration(self) -> None:
+        # The enumeration and the single-lookup form must agree: every pair
+        # `known_llm_hosts()` lists must resolve to `llm:<provider>` via
+        # `resolve_target`, and vice versa (no drift between the two forms).
+        backend = KeelCoreStub()
+        hosts = _http.known_llm_hosts()
+        host_set = {h for h, _ in hosts}
+        for host in ("api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com"):
+            self.assertIn(host, host_set)
+        for host, provider in hosts:
+            self.assertEqual(backend.resolve_target("GET", host), f"llm:{provider}")
+
+    def test_no_active_runtime_required(self) -> None:
+        # targets() (keel doctor/keel init) may enumerate before any backend
+        # is installed — this must not raise, regardless of what another
+        # test in this process happened to install.
+        _runtime.clear_runtime()
+        self.assertIsNone(_runtime.get_backend())
+        self.assertTrue(len(_http.known_llm_hosts()) > 0)
+
+    @unittest.skipUnless(_NATIVE, "keel_core native module not built (maturin develop in crates/keel-py)")
+    def test_matches_the_native_core_when_built(self) -> None:
+        # The stub's table is one of THREE copies kept in parity by
+        # convention (Rust authoritative + Python stub + Node stub) — this
+        # cross-checks the stub against the real Rust source of truth
+        # whenever the native wheel is available (offline runs skip; a
+        # native-leg CI run does not), closing the gap the review of issue
+        # #49 identified: nothing previously compared the tables to each
+        # other, only each to its own resolve_target.
+        self.assertEqual(
+            sorted(_http.known_llm_hosts()),
+            sorted(keel_core.KeelCore.known_llm_hosts()),
+        )
 
 
 class ResolvePolicyTargetTest(unittest.TestCase):
-    """`resolve_policy_target` (docs/targeting.md): the LLM host map first,
-    then `_targets`'s exact/pattern/default resolution, driven by whatever
-    outbound matchers are process-installed (`_targets.install_outbound_targets`,
-    as `bootstrap.install_keel` does from the effective policy)."""
+    """`backend.resolve_target` (docs/targeting.md): the LLM host map first,
+    then the configured `[target]` table's exact/pattern/default resolution —
+    driven by whatever policy the backend was `configure`d with (no separate
+    install step; the backend re-derives its matchers from the configured
+    policy on every call, per Task 10/SP-1)."""
 
-    def tearDown(self) -> None:
-        _targets.clear_outbound_targets()
+    @staticmethod
+    def _backend(policy: dict | None = None) -> KeelCoreStub:
+        backend = KeelCoreStub()
+        backend.configure(policy or {})
+        return backend
 
     def test_no_matchers_installed_matches_resolve_target(self) -> None:
-        self.assertEqual(
-            _http.resolve_policy_target("GET", "api.stripe.com"), "api.stripe.com"
-        )
-        self.assertEqual(
-            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
-        )
+        backend = self._backend()
+        self.assertEqual(backend.resolve_target("GET", "api.stripe.com"), "api.stripe.com")
+        self.assertEqual(backend.resolve_target("POST", "api.openai.com"), "llm:openai")
 
     def test_llm_host_map_wins_even_over_an_installed_pattern(self) -> None:
-        _targets.install_outbound_targets({"target": {"*.openai.com": {}}})
-        self.assertEqual(
-            _http.resolve_policy_target("POST", "api.openai.com"), "llm:openai"
-        )
+        backend = self._backend({"target": {"*.openai.com": {}}})
+        self.assertEqual(backend.resolve_target("POST", "api.openai.com"), "llm:openai")
 
     def test_exact_host_key_beats_an_installed_pattern(self) -> None:
-        _targets.install_outbound_targets(
-            {"target": {"api.internal": {}, "*.internal": {}}}
-        )
-        self.assertEqual(_http.resolve_policy_target("GET", "api.internal"), "api.internal")
+        backend = self._backend({"target": {"api.internal": {}, "*.internal": {}}})
+        self.assertEqual(backend.resolve_target("GET", "api.internal"), "api.internal")
 
     def test_pattern_key_selected_by_method_port_and_path(self) -> None:
-        _targets.install_outbound_targets(
-            {"target": {"GET api.catalog.internal/*": {}}}
-        )
+        backend = self._backend({"target": {"GET api.catalog.internal/*": {}}})
         self.assertEqual(
-            _http.resolve_policy_target(
+            backend.resolve_target(
                 "GET", "api.catalog.internal", scheme="https", path="/items/5"
             ),
             "GET api.catalog.internal/*",
         )
         self.assertEqual(
-            _http.resolve_policy_target(
+            backend.resolve_target(
                 "POST", "api.catalog.internal", scheme="https", path="/items/5"
             ),
             "api.catalog.internal",
@@ -78,12 +134,10 @@ class ResolvePolicyTargetTest(unittest.TestCase):
         )
 
     def test_wildcard_host_segment_matches_subdomains(self) -> None:
-        _targets.install_outbound_targets({"target": {"*.internal.corp": {}}})
+        backend = self._backend({"target": {"*.internal.corp": {}}})
+        self.assertEqual(backend.resolve_target("GET", "db.internal.corp"), "*.internal.corp")
         self.assertEqual(
-            _http.resolve_policy_target("GET", "db.internal.corp"), "*.internal.corp"
-        )
-        self.assertEqual(
-            _http.resolve_policy_target("GET", "unrelated.example.com"),
+            backend.resolve_target("GET", "unrelated.example.com"),
             "unrelated.example.com",
         )
 
@@ -222,7 +276,19 @@ class RetryAfterTest(unittest.TestCase):
 
 class CrossJudgeParityTest(unittest.TestCase):
     """A no-body GET must produce the SAME args_hash from the httpx and requests
-    judges (and match method+url with no body) — cross-adapter cache-key parity."""
+    judges (and match method+url with no body) — cross-adapter cache-key parity.
+
+    `_judge` resolves its target via `_runtime.get_backend().resolve_target`
+    (Task 10/SP-1), so calling it directly needs an active backend; a bare,
+    unconfigured `KeelCoreStub` is sufficient (this test only checks args_hash
+    parity, not target resolution itself — that's `ResolveTargetTest`/
+    `ResolvePolicyTargetTest` above)."""
+
+    def setUp(self) -> None:
+        _runtime.set_runtime(KeelCoreStub(), None)
+
+    def tearDown(self) -> None:
+        _runtime.clear_runtime()
 
     def test_no_body_get_hashes_identically_across_judges(self) -> None:
         url = "https://example.com/p"

@@ -21,29 +21,24 @@ const NATIVE_CANDIDATES = [
   "../../keel-core-native/index.mjs", // in-repo sibling of node/keel (worktree), when built
 ];
 
-function isTable(v) {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-
 /**
  * Front-end adapter over the napi `KeelCore`. The native surface differs from
- * the front end's contract in two ways, bridged here (Task 14 "the swap"):
+ * the front end's contract in one way, bridged here (Task 14 "the swap"):
  *   - the front end drives an ASYNC effect and `await`s `execute`; the native
  *     equivalent is `executeAsync` (tokio↔libuv). We map one to the other.
- *   - the front end reads policy layers via `layer(target, key)`; the native
- *     core does not expose it, so we resolve it here from the configured policy
- *     with the exact rule `AsyncEngine#layer` / the stub use (parity).
- * `persistent` reflects the native journal (the dev-cache `scope=persistent`).
+ * `layer(target, key)` and `resolveTarget(...)` are thin delegations to the
+ * native core's own bindings (Task 11/SP-1: the core exposes both directly
+ * now, so this wrapper no longer re-derives them from a locally-held policy
+ * copy). `persistent` reflects the native journal (the dev-cache
+ * `scope=persistent`).
  */
 class NativeBackend {
   kind = "native";
   #core;
-  #policy = {};
   constructor(core) {
     this.#core = core;
   }
   configure(policy) {
-    this.#policy = isTable(policy) ? policy : {};
     this.#core.configure(policy);
   }
   execute(request, effect, idempotencyKey) {
@@ -81,12 +76,16 @@ class NativeBackend {
     return this.#core.journalRandom(key, data);
   }
   layer(target, key) {
-    const t = this.#policy.target;
-    if (isTable(t) && isTable(t[target]) && t[target][key] !== undefined) return t[target][key];
-    const defaults = this.#policy.defaults ?? {};
-    if (target.startsWith("llm:") && isTable(defaults.llm) && defaults.llm[key] !== undefined)
-      return defaults.llm[key];
-    return isTable(defaults.outbound) ? defaults.outbound[key] : undefined;
+    return this.#core.layer(target, key);
+  }
+  /** Resolve the policy target key for one outbound request — delegates to
+   *  the native core's own `resolveTarget` (the LLM host map, Vertex
+   *  regional suffix, and `[target]` host/URL-pattern matching,
+   *  `docs/targeting.md`), proven identical to the stub backends by
+   *  conformance scenarios 36–38. The front ends' `backend.resolveTarget(...)`
+   *  reader. */
+  resolveTarget(method, host, scheme, port, path) {
+    return this.#core.resolveTarget(method, host, scheme, port, path);
   }
   /** Flush the native engine's live NDJSON event feed (`.keel/events/`) —
    * see `KeelCoreNative::flush_events`'s doc comment. A no-op on an addon

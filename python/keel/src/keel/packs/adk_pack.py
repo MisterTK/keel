@@ -17,8 +17,9 @@ Two Keel target classes come out of this pack, split by where the seam lives:
 * ``llm:google-genai`` — **needs no transport code here.** ADK's Gemini model
   backend rides the ``google-genai`` SDK, which rides ``httpx``; ``keel.
   adapters.httpx_pack`` already intercepts every ``httpx.Client``/
-  ``AsyncClient`` request and ``adapters._http.LLM_HOST_PROVIDERS`` already
-  host-maps ``generativelanguage.googleapis.com`` → ``llm:google-genai``. This
+  ``AsyncClient`` request and the backend's ``resolve_target`` LLM host map
+  (``docs/targeting.md``) already host-maps
+  ``generativelanguage.googleapis.com`` → ``llm:google-genai``. This
   pack declares the target (below) for documentation/doctor visibility, the
   same "declared but not owned" pattern ``openai_pack``/``anthropic_pack`` use
   for their own ``llm:<provider>`` targets — EXCEPT for one seam the
@@ -275,10 +276,11 @@ def targets() -> list[TargetDecl]:
                 "not produced by this pack: ADK's Gemini model backend rides "
                 "the google-genai SDK, which rides httpx — already "
                 "intercepted by keel.adapters.httpx_pack's transport seam and "
-                "host-mapped to llm:google-genai (adapters/_http.py "
-                "LLM_HOST_PROVIDERS). This pack owns no model-call seam of "
-                "its own; declared here for doctor/documentation visibility, "
-                "mirroring openai_pack/anthropic_pack. It DOES additionally "
+                "host-mapped to llm:google-genai (the backend's "
+                "resolve_target, docs/targeting.md). This pack owns no "
+                "model-call seam of its own; declared here for "
+                "doctor/documentation visibility, mirroring "
+                "openai_pack/anthropic_pack. It DOES additionally "
                 "enforce this target's `fallback` chain at the plugin level "
                 "(`on_model_error_callback`) for genuinely cross-provider "
                 "hops — the one Python call site that can construct a "

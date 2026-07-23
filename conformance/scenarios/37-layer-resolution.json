@@ -1,0 +1,14 @@
+{
+  "name": "layer-resolution",
+  "description": "layer(target,key) resolves target entry -> defaults.llm (llm:*) -> defaults.outbound, per-layer wholesale.",
+  "policy": {
+    "defaults": { "outbound": { "timeout": "30s" }, "llm": { "timeout": "120s" } },
+    "target": { "api.x": { "idempotency": { "header": "Idempotency-Key" } } }
+  },
+  "steps": [
+    { "layer": { "target": "api.x", "key": "idempotency" }, "expect": { "header": "Idempotency-Key" } },
+    { "layer": { "target": "api.x", "key": "retry" }, "expect": null },
+    { "layer": { "target": "llm:openai", "key": "timeout" }, "expect": "120s" },
+    { "layer": { "target": "api.y", "key": "timeout" }, "expect": "30s" }
+  ]
+}

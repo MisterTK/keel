@@ -123,7 +123,7 @@ def targets() -> list[TargetDecl]:
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule="sha256(method + url) for idempotent GET; None otherwise",
         )
-        for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
+        for host_name, provider in _http.known_llm_hosts()
     ]
     return [host, *llm]
 
@@ -193,7 +193,10 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
         method = "POST" if data is not None else "GET"
     parts = urlsplit(url)
     host = parts.hostname or ""
-    target = _http.resolve_policy_target(
+    # Pattern-aware target selection (docs/targeting.md): exact host key, else
+    # the most specific matching host/URL pattern key, else the bare host —
+    # resolved by the backend (native core or stub; see Task 7/SP-1).
+    target = _runtime.get_backend().resolve_target(  # type: ignore[union-attr]
         method, host, scheme=parts.scheme, port=parts.port, path=parts.path
     )
     op = f"{method} {host}{parts.path}"

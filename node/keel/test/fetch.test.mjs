@@ -8,7 +8,6 @@ import http from "node:http";
 import { AsyncEngine, virtualClock } from "../src/engine.mjs";
 import { installFetch } from "../src/fetch.mjs";
 import { level0Defaults } from "../src/defaults.mjs";
-import { compileOutboundMatchers } from "../src/judge.mjs";
 import { resetLlmBudgets, recordSpend, spentCents } from "../src/llm-policy.mjs";
 
 /** Start a server whose handler is a scripted function of (req, hitCount). */
@@ -224,6 +223,9 @@ test("args_hash is derived only for idempotent GET requests", async () => {
     layer() {
       return undefined;
     },
+    resolveTarget(method, host) {
+      return host;
+    },
     report() {
       return { v: 1, clock_ms: 0, targets: {} };
     },
@@ -269,12 +271,19 @@ test("non-transient 4xx passes through unchanged (success path)", async () => {
   });
 });
 
-/** A fake backend that records each request envelope and forwards the effect. */
-function captureBackend(captured) {
+/** A fake backend that records each request envelope and forwards the effect.
+ *  `layer`/`resolveTarget` delegate to a real `AsyncEngine` configured with
+ *  `policy` (default empty), so target resolution in these tests exercises
+ *  the actual backend algorithm — not a re-derived test double — while
+ *  `execute` stays a simple capture-and-forward. */
+function captureBackend(captured, policy = {}) {
+  const engine = new AsyncEngine(virtualClock());
+  engine.configure(policy);
   return {
     kind: "fake",
     configure() {},
-    layer: () => undefined,
+    layer: (target, key) => engine.layer(target, key),
+    resolveTarget: (method, host, scheme, port, path) => engine.resolveTarget(method, host, scheme, port, path),
     report: () => ({ v: 1, clock_ms: 0, targets: {} }),
     async execute(request, effect) {
       captured.push(request);
@@ -417,14 +426,19 @@ test("an idempotent request with an unbuffered stream body is observed, not retr
 });
 
 // --- outbound host/URL-pattern targets (docs/targeting.md) -------------------
+//
+// Target resolution itself (the LLM host map, exact/pattern `[target]` keys,
+// precedence, tie-break) is now the BACKEND's job (`backend.resolveTarget`,
+// proven identical across native/stub/both front ends by conformance
+// scenarios 36–38) — these tests pin only that `fetch.mjs` actually calls
+// through to it with the right request fields and uses the result verbatim
+// as the call's target.
 
 test("installFetch: a policy pattern key becomes the call's target, verbatim", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
-  const outboundTargets = compileOutboundMatchers({
-    target: { "GET api.catalog.internal/*": {} },
-  });
-  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+  const policy = { target: { "GET api.catalog.internal/*": {} } };
+  installFetch(captureBackend(captured, policy), null, { globalObj });
 
   await globalObj.fetch("https://api.catalog.internal/items/42");
 
@@ -434,10 +448,8 @@ test("installFetch: a policy pattern key becomes the call's target, verbatim", a
 test("installFetch: no matching pattern falls back to the bare host (unchanged behavior)", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
-  const outboundTargets = compileOutboundMatchers({
-    target: { "other.example.com": {} },
-  });
-  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+  const policy = { target: { "other.example.com": {} } };
+  installFetch(captureBackend(captured, policy), null, { globalObj });
 
   await globalObj.fetch("https://api.example.com/x");
 
@@ -447,8 +459,8 @@ test("installFetch: no matching pattern falls back to the bare host (unchanged b
 test("installFetch: the llm: host map still wins over an installed pattern", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
-  const outboundTargets = compileOutboundMatchers({ target: { "*.openai.com": {} } });
-  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+  const policy = { target: { "*.openai.com": {} } };
+  installFetch(captureBackend(captured, policy), null, { globalObj });
 
   await globalObj.fetch("https://api.openai.com/v1/chat/completions", { method: "POST" });
 
@@ -458,17 +470,15 @@ test("installFetch: the llm: host map still wins over an installed pattern", asy
 test("installFetch: an exact host key wins over a matching pattern", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
-  const outboundTargets = compileOutboundMatchers({
-    target: { "api.internal": {}, "*.internal": {} },
-  });
-  installFetch(captureBackend(captured), null, { globalObj, outboundTargets });
+  const policy = { target: { "api.internal": {}, "*.internal": {} } };
+  installFetch(captureBackend(captured, policy), null, { globalObj });
 
   await globalObj.fetch("https://api.internal/anything");
 
   assert.equal(captured[0].target, "api.internal");
 });
 
-test("installFetch: without any outboundTargets, resolution is unchanged (bare host)", async () => {
+test("installFetch: with no [target] patterns configured, resolution is unchanged (bare host)", async () => {
   const captured = [];
   const globalObj = { fetch: async () => new Response("ok", { status: 200 }) };
   installFetch(captureBackend(captured), null, { globalObj });

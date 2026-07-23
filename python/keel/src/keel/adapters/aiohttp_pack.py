@@ -104,7 +104,7 @@ def targets() -> list[TargetDecl]:
                 "(dev-cache replay); None otherwise"
             ),
         )
-        for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
+        for host_name, provider in _http.known_llm_hosts()
     ]
     return [host, *llm]
 
@@ -201,7 +201,16 @@ def _judge(session: Any, method: str, str_or_url: Any, kwargs: dict[str, Any]) -
     url = _resolve_url(session, str_or_url)
     host = getattr(url, "host", None) or ""
     path = getattr(url, "path", None) or ""
-    target = _http.resolve_target(host)
+    scheme = getattr(url, "scheme", None)
+    port = getattr(url, "port", None)
+    # Pattern-aware target selection (docs/targeting.md): exact host key, else
+    # the most specific matching host/URL pattern key, else the bare host —
+    # resolved by the backend (native core or stub; see Task 7/SP-1). Was
+    # host-only before Task 10; now gains pattern + Vertex-suffix support like
+    # every other HTTP pack (intended behavior change).
+    target = _runtime.get_backend().resolve_target(  # type: ignore[union-attr]
+        method, host, scheme=scheme, port=port, path=path
+    )
     op = f"{method} {host}{path}"
     idem_header = _http.idempotency_header(target)
     idempotent = _http.is_idempotent(method, _header_names(kwargs.get("headers")), idem_header)

@@ -556,6 +556,55 @@ mod bindings {
                 .and_then(|handle| handle.recorded_idempotency_key(&step_key))
         }
 
+        /// Resolve the policy target key for one outbound request — the
+        /// front ends' `backend.resolveTarget(...)` reader, backed by
+        /// [`Engine::resolve_target`] (SP-1: LLM host map, exact bare-host
+        /// `[target]` key, most-specific pattern match, then the bare host).
+        /// Plain, synchronous, read-only: reads the policy lock directly,
+        /// never `active_flow` or the tokio runtime, so this needs no
+        /// `lock_recover`/`block_on` dance.
+        #[napi]
+        #[allow(clippy::needless_pass_by_value, reason = "napi decodes owned strings")]
+        pub fn resolve_target(
+            &self,
+            method: String,
+            host: String,
+            scheme: Option<String>,
+            port: Option<u16>,
+            path: Option<String>,
+        ) -> String {
+            self.engine
+                .resolve_target(&method, &host, scheme.as_deref(), port, path.as_deref())
+        }
+
+        /// One resolved layer value for `target`/`key`, or `null` when
+        /// unset — the front ends' `backend.layer(target, key)` reader,
+        /// backed by [`Engine::layer`]. Walks the raw configured JSON
+        /// (never a typed re-serialization), so a literal like `"120s"`
+        /// round-trips as the JS string `"120s"`, not a re-serialized
+        /// number. Plain, synchronous, read-only — same no-`block_on`
+        /// rationale as `resolve_target` above.
+        #[napi]
+        #[allow(clippy::needless_pass_by_value, reason = "napi decodes owned strings")]
+        pub fn layer(&self, target: String, key: String) -> Value {
+            self.engine.layer(&target, &key)
+        }
+
+        /// Every host the LLM host map (`resolveTarget`'s tier 1) knows
+        /// about, as `[host, provider]` pairs — a class-level enumeration
+        /// accessor, not tied to any instance (the map is a hardcoded
+        /// constant, identical for every `KeelCore`). Lets front-end packs'
+        /// `targets()` (`keel doctor`/`keel init` documentation output)
+        /// enumerate every known LLM provider host without holding their
+        /// own copy (issue #49).
+        #[napi]
+        pub fn known_llm_hosts() -> Vec<Vec<String>> {
+            Engine::known_llm_hosts()
+                .into_iter()
+                .map(|(host, provider)| vec![host.to_owned(), provider.to_owned()])
+                .collect()
+        }
+
         /// The deterministic per-target metrics/discovery report. Read inside the
         /// handle runtime so `clock_ms` reflects its (possibly paused) clock.
         #[napi]

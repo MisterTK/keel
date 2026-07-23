@@ -175,10 +175,10 @@ class _JsonlWriter:
 class RecordingBackend:
     """A transparent tee over ``inner`` (a ``Backend``): ``execute`` and
     ``execute_async`` are forwarded unchanged and their outcome is appended to
-    a recording; every other attribute (``report``, ``layer``, the Tier 2 flow
-    surface, …) delegates straight through via ``__getattr__``, exactly like
-    ``_backend._NativeBackend``. Recording is a pure observer — it never
-    alters what the wrapped call receives."""
+    a recording; every other attribute (``report``, ``layer``,
+    ``resolve_target``, the Tier 2 flow surface, …) delegates straight through
+    via ``__getattr__``, exactly like ``_sim.SimBackend``. Recording is a pure
+    observer — it never alters what the wrapped call receives."""
 
     def __init__(self, inner: Any, writer: _JsonlWriter, redact: frozenset[str]) -> None:
         self._inner = inner

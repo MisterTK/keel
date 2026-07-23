@@ -126,7 +126,7 @@ def targets() -> list[TargetDecl]:
                 "(dev-cache replay); None otherwise"
             ),
         )
-        for host_name, provider in _http.LLM_HOST_PROVIDERS.items()
+        for host_name, provider in _http.known_llm_hosts()
     ]
     return [host, *llm]
 
@@ -194,8 +194,9 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None, str | None]:
     url = request.url
     host = url.host
     # Pattern-aware target selection (docs/targeting.md): exact host key, else
-    # the most specific matching host/URL pattern key, else the bare host.
-    target = _http.resolve_policy_target(
+    # the most specific matching host/URL pattern key, else the bare host —
+    # resolved by the backend (native core or stub; see Task 7/SP-1).
+    target = _runtime.get_backend().resolve_target(  # type: ignore[union-attr]
         method, host, scheme=url.scheme, port=url.port, path=url.path
     )
     op = f"{method} {host}{url.path}"

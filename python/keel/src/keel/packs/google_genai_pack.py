@@ -2,11 +2,11 @@
 
 The official ``google-genai`` Python SDK (``pip install google-genai``, import
 name ``google.genai``) rides httpx for both its sync and async request paths,
-so Task 10's transport seam already intercepts its calls — the host map
-(``adapters._http.LLM_HOST_PROVIDERS``) maps both the Gemini Developer API
-(``generativelanguage.googleapis.com``) and Vertex AI's global endpoint
-(``aiplatform.googleapis.com``, plus any REGIONAL ``<location>-aiplatform.
-googleapis.com`` endpoint via ``adapters._http``'s suffix rule) to
+so Task 10's transport seam already intercepts its calls — the backend's
+``resolve_target`` LLM host map (``docs/targeting.md``) maps both the Gemini
+Developer API (``generativelanguage.googleapis.com``) and Vertex AI's global
+endpoint (``aiplatform.googleapis.com``, plus any REGIONAL ``<location>-
+aiplatform.googleapis.com`` endpoint via its suffix rule) to
 ``llm:google-genai``. Like the openai/anthropic packs, this pack owns no seam
 of its own; it declares the ``llm:google-genai`` target for both host
 families and the generic ``[defaults.llm]`` fragment (Retry-After-aware retry
