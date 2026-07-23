@@ -545,8 +545,9 @@ pub(crate) fn scan_orchestration_text(rel: &str, text: &str) -> Vec<Orchestratio
 /// v1 limits, stated honestly because the finding's text promises this reach:
 /// `Jenkinsfile`, `Dockerfile` entrypoint wrappers, crontab files, and CI
 /// systems beyond GitHub Actions / GitLab / CircleCI are not read. Extensionless
-/// scripts are read only under [`ORCH_SCRIPT_DIRS`] and only with a shell
-/// shebang. Non-UTF8 and >512 KiB files are skipped.
+/// files are read only when named an [`ORCH_NAMES`] Makefile variant, or under
+/// [`ORCH_SCRIPT_DIRS`] with a shell shebang. Non-UTF8 and >512 KiB files are
+/// skipped.
 pub(crate) fn scan_orchestration(project: &Path) -> Vec<OrchestrationSighting> {
     const MAX_BYTES: u64 = 512 * 1024;
 
