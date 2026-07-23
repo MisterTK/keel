@@ -88,7 +88,7 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
 
 When asked whether/how Keel should cover a project — a fresh adoption or an
 audit of an existing one — do NOT stop at grepping for HTTP libraries. Work
-the four phases in order; the static scan is evidence, not the verdict.
+the five phases in order; the static scan is evidence, not the verdict.
 
 1. **Scope.** Enumerate every process that does I/O, not just the entrypoint:
    the main app, MCP servers in `.mcp.json`, shell-script launchers, cron
@@ -112,7 +112,20 @@ the four phases in order; the static scan is evidence, not the verdict.
    facts awaiting a decision. Codes are a closed set: `url-no-transport`,
    `subprocess-blind-spot`, `dependency-averse-excluded`,
    `preexisting-resilience`, `code-hash-stale`.
-4. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
+   Then read `findings` — it carries `warn` items that are not follow-up codes.
+4. **Baseline before you mutate.** Before proposing any *behavior-changing*
+   policy — retry, breaker, or a timeout that alters an outcome, as opposed to
+   a pure simplification swap like a poll loop → `poll` policy — measure what
+   actually fails. Wrap the candidate targets in observe mode (`keel record
+   run <entry>`, or a `[target]` with no resilience knobs set — a no-knob
+   wrap is pure passthrough plus events) and read the real failure-class
+   distribution from `keel status --json` / the event sink. Retry only helps
+   genuinely-transient classes (conn/timeout/5xx/429); an auth or validation
+   4xx returns KEEL-E015 and is never retried, so wrapping it in retry buys
+   latency, not resilience. Non-idempotent calls are `KEEL-E014` "observed,
+   not retried" by default — confirm the transient hypothesis with evidence
+   before recommending a behavior change.
+5. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
    yet: retry loops with sleeps, poll-until-status loops, `mkdir`-style
    mutexes, per-day guard files, broad `except: return None` swallows. Each
    is either replaced by policy (note which `keel.toml` key) or explicitly
