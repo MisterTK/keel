@@ -943,6 +943,248 @@ impl Policy {
     }
 }
 
+// --- outbound target resolution (SP-1) ---------------------------------
+//
+// Ported from the front-end duplicates `python/keel/src/keel/_targets.py`
+// (the `[target]` host/URL-pattern matcher) and
+// `python/keel/src/keel/adapters/_http.py` (`LLM_HOST_PROVIDERS`,
+// `VERTEX_REGIONAL_SUFFIX`, `resolve_policy_target`), unified into one core
+// function. The two front-end functions this replaces each had a gap the
+// other didn't: the old host-only `resolve_target` never consulted the
+// `[target]` pattern tier, and the old `resolve_policy_target` checked the
+// LLM host map by exact host only, missing the Vertex regional-endpoint
+// suffix rule. `Policy::resolve_target` below applies both on every call.
+//
+// Precedence, per `docs/targeting.md` (the cross-language parity contract
+// with the Node twin's `judge.mjs`):
+//   1. LLM host map — exact provider host, or a Vertex regional endpoint via
+//      the `-aiplatform.googleapis.com` suffix rule.
+//   2. Exact bare-host `[target]` key (no method/port/path/`*`).
+//   3. The most specific matching host/URL pattern key: fewest `*`, then most
+//      literal characters, then method-prefixed over unprefixed, then
+//      lexicographically smallest key (a total, deterministic tie-break).
+//   4. The bare host (falls through to `[defaults.outbound]` as before).
+
+/// Methods the frozen targetKey grammar admits as a key prefix.
+const OUTBOUND_METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// Non-outbound target classes (function + semantic targets) — never host keys.
+const CLASS_PREFIXES: [&str; 6] = ["py:", "ts:", "rs:", "llm:", "tool:", "mcp:"];
+
+/// Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
+/// `us-central1-aiplatform.googleapis.com`. Parity contract with the Python
+/// (`adapters/_http.py`) and Node (`judge.mjs`) twins' identical suffix check.
+const VERTEX_REGIONAL_SUFFIX: &str = "-aiplatform.googleapis.com";
+
+/// Host → LLM provider. Ported verbatim from `adapters/_http.py:61-68`
+/// (`LLM_HOST_PROVIDERS`) — a cross-language parity contract with the Node
+/// front end (`LLM_HOST_PROVIDERS` in `judge.mjs`); extend in lockstep across
+/// languages, since adding a host here changes which default pack applies.
+const LLM_HOST_PROVIDERS: &[(&str, &str)] = &[
+    ("api.openai.com", "openai"),
+    ("api.anthropic.com", "anthropic"),
+    ("generativelanguage.googleapis.com", "google-genai"),
+    ("aiplatform.googleapis.com", "google-genai"),
+];
+
+/// Default port for a `:port`-less key, by scheme (parity with the Python
+/// `_SCHEME_PORTS` / Node twin). `None` for anything else (or no scheme).
+fn scheme_port(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some("http") => Some(80),
+        Some("https") => Some(443),
+        _ => None,
+    }
+}
+
+/// `*`-only wildcard match, anchored end-to-end: `*` matches any byte
+/// sequence (including `.` in hosts and `/` in paths), every other byte is
+/// literal. Byte-for-byte equivalent to the Python `_glob_regex` (`^` +
+/// `re.escape`-parts joined by `.*` + `$`) without a regex dependency —
+/// classic two-pointer wildcard matching with backtracking (correct for a
+/// `*`-only alphabet: on a literal mismatch, retry the most recent `*` one
+/// character further into the text).
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// (method, host, port, path) parsed out of one outbound-shaped `[target]`
+/// key, per the frozen grammar — mirrors `_parse_outbound_key`. `None` when
+/// the key is not outbound-shaped (an empty host after stripping method/
+/// port/path; defensive, since the schema validates keys before this ever
+/// runs).
+#[allow(clippy::type_complexity)]
+fn parse_outbound_key(key: &str) -> Option<(Option<String>, String, Option<u16>, Option<String>)> {
+    let mut method: Option<String> = None;
+    let mut rest = key;
+    for m in OUTBOUND_METHODS {
+        if let Some(stripped) = rest.strip_prefix(m).and_then(|s| s.strip_prefix(' ')) {
+            method = Some(m.to_owned());
+            rest = stripped;
+            break;
+        }
+    }
+    let mut path: Option<String> = None;
+    if let Some(slash) = rest.find('/') {
+        path = Some(rest[slash..].to_owned());
+        rest = &rest[..slash];
+    }
+    let (mut host, mut port) = (rest.to_owned(), None);
+    if let Some((head, tail)) = rest.rsplit_once(':')
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(n) = tail.parse::<u16>()
+    {
+        head.clone_into(&mut host);
+        port = Some(n);
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some((method, host, port, path))
+}
+
+/// True iff `key` is a bare host — an outbound-shaped key with no method
+/// prefix, port, path, or `*` — the tier-1 "exact" classification `_targets.
+/// compile_outbound_targets` applies once per key, used identically here for
+/// both the exact-match short-circuit and excluding these keys from the
+/// pattern tier.
+fn is_bare_host_key(key: &str) -> bool {
+    !key.contains('*')
+        && parse_outbound_key(key)
+            .is_some_and(|(m, _, port, path)| m.is_none() && port.is_none() && path.is_none())
+}
+
+/// One compiled pattern-tier `[target]` key. Mirrors the Python
+/// `OutboundPattern` NamedTuple.
+struct OutboundPattern {
+    key: String,
+    method: Option<String>,
+    host_glob: String, // lowercased; matched with glob_match
+    port: Option<u16>,
+    path_glob: Option<String>,
+    wildcards: usize,
+    literal: usize,
+}
+
+impl Policy {
+    /// The policy target key for one outbound request. See the module-level
+    /// precedence comment above `OUTBOUND_METHODS` for the four tiers.
+    #[must_use]
+    pub fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        // 1. LLM host map (exact host, then the Vertex regional suffix rule).
+        let provider = LLM_HOST_PROVIDERS
+            .iter()
+            .find(|(h, _)| *h == host)
+            .map(|(_, p)| *p)
+            .or_else(|| {
+                host.ends_with(VERTEX_REGIONAL_SUFFIX)
+                    .then_some("google-genai")
+            });
+        if let Some(p) = provider {
+            return format!("llm:{p}");
+        }
+        // 2. Exact bare-host [target] key.
+        if !CLASS_PREFIXES.iter().any(|c| host.starts_with(c))
+            && self.target.contains_key(host)
+            && is_bare_host_key(host)
+        {
+            return host.to_owned();
+        }
+        // 3. Compile the pattern tier and pick the most specific match.
+        let mut patterns: Vec<OutboundPattern> = Vec::new();
+        for key in self.target.keys() {
+            if CLASS_PREFIXES.iter().any(|c| key.starts_with(c)) || is_bare_host_key(key) {
+                continue;
+            }
+            let Some((m, h, pt, pa)) = parse_outbound_key(key) else {
+                continue;
+            };
+            let wildcards = key.matches('*').count();
+            patterns.push(OutboundPattern {
+                key: key.clone(),
+                method: m,
+                host_glob: h.to_lowercase(),
+                port: pt,
+                path_glob: pa,
+                wildcards,
+                literal: key.chars().count() - wildcards,
+            });
+        }
+        // Most specific first, then a total lexicographic tail:
+        // (wildcards asc, literal desc, method-prefixed first, key asc).
+        patterns.sort_by(|a, b| {
+            a.wildcards
+                .cmp(&b.wildcards)
+                .then(b.literal.cmp(&a.literal))
+                .then(a.method.is_none().cmp(&b.method.is_none()))
+                .then(a.key.cmp(&b.key))
+        });
+        let effective_port = port.or_else(|| scheme_port(scheme));
+        let host_l = host.to_lowercase();
+        let method_u = if method.is_empty() {
+            "GET".to_owned()
+        } else {
+            method.to_uppercase()
+        };
+        let path_n = match path {
+            Some(p) if !p.is_empty() => p,
+            _ => "/",
+        };
+        for p in &patterns {
+            if let Some(m) = &p.method
+                && *m != method_u
+            {
+                continue;
+            }
+            if !glob_match(p.host_glob.as_bytes(), host_l.as_bytes()) {
+                continue;
+            }
+            if let Some(pt) = p.port
+                && Some(pt) != effective_port
+            {
+                continue;
+            }
+            if let Some(pg) = &p.path_glob
+                && !glob_match(pg.as_bytes(), path_n.as_bytes())
+            {
+                continue;
+            }
+            return p.key.clone();
+        }
+        // 4. No pattern matched: fall through to the bare host.
+        host.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,6 +1658,165 @@ mod tests {
                 "flows": { "match": { "cmd:x": { "argv": ["a"], "bogus": 1 } } }
             }))
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_target_tests {
+    use super::*;
+
+    fn policy(keys: &[&str]) -> Policy {
+        let mut p = Policy::default();
+        for k in keys {
+            p.target.insert((*k).to_owned(), TargetPolicy::default());
+        }
+        p
+    }
+
+    #[test]
+    fn no_table_returns_bare_host() {
+        assert_eq!(
+            Policy::default().resolve_target("GET", "api.example.com", None, None, None),
+            "api.example.com"
+        );
+    }
+    #[test]
+    fn exact_beats_pattern() {
+        let p = policy(&["api.example.com", "*.example.com"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, None),
+            "api.example.com"
+        );
+    }
+    #[test]
+    fn host_wildcard_crosses_dots() {
+        let p = policy(&["*.internal.corp"]);
+        assert_eq!(
+            p.resolve_target("GET", "a.b.internal.corp", None, None, None),
+            "*.internal.corp"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "internal.corp", None, None, None),
+            "internal.corp"
+        );
+    }
+    #[test]
+    fn host_is_case_insensitive() {
+        let p = policy(&["*.Internal.Corp"]);
+        assert_eq!(
+            p.resolve_target("GET", "DB.INTERNAL.CORP", None, None, None),
+            "*.Internal.Corp"
+        );
+    }
+    #[test]
+    fn path_glob_crosses_slashes_case_sensitive() {
+        let p = policy(&["api.catalog.internal/*"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.catalog.internal", None, None, Some("/a/b/c")),
+            "api.catalog.internal/*"
+        );
+        let p2 = policy(&["api.x/A/*"]);
+        assert_eq!(
+            p2.resolve_target("GET", "api.x", None, None, Some("/a/y")),
+            "api.x"
+        );
+    }
+    #[test]
+    fn missing_path_normalizes_to_slash() {
+        let p = policy(&["api.x/*"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.x", None, None, None),
+            "api.x/*"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "api.x", None, None, Some("")),
+            "api.x/*"
+        );
+    }
+    #[test]
+    fn method_prefix_must_match() {
+        let p = policy(&["POST api.example.com"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, None),
+            "api.example.com"
+        );
+        assert_eq!(
+            p.resolve_target("POST", "api.example.com", None, None, None),
+            "POST api.example.com"
+        );
+        assert_eq!(
+            p.resolve_target("post", "api.example.com", None, None, None),
+            "POST api.example.com"
+        );
+    }
+    #[test]
+    fn port_uses_scheme_default() {
+        let p = policy(&["api.example.com:443"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", Some("https"), None, None),
+            "api.example.com:443"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", Some("http"), None, None),
+            "api.example.com"
+        );
+    }
+    #[test]
+    fn explicit_port_overrides_scheme() {
+        let p = policy(&["api.example.com:8443"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", Some("https"), Some(8443), None),
+            "api.example.com:8443"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", Some("https"), Some(443), None),
+            "api.example.com"
+        );
+    }
+    #[test]
+    fn most_specific_by_literal_length() {
+        let p = policy(&["*.example.com", "GET api.example.com/*"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, Some("/v1/x")),
+            "GET api.example.com/*"
+        );
+    }
+    #[test]
+    fn lexicographic_tie_break_is_total() {
+        let p = policy(&["api.example.com/x/*", "api.example.com/*/y"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, Some("/x/y")),
+            "api.example.com/*/y"
+        );
+    }
+    #[test]
+    fn class_prefixed_keys_are_not_hosts() {
+        let p = policy(&["py:pkg.mod.fn", "llm:openai"]);
+        assert_eq!(
+            p.resolve_target("GET", "py:pkg.mod.fn", None, None, None),
+            "py:pkg.mod.fn"
+        );
+    }
+    #[test]
+    fn llm_host_map_wins_over_patterns() {
+        let p = policy(&["*.openai.com"]);
+        assert_eq!(
+            p.resolve_target("POST", "api.openai.com", None, None, None),
+            "llm:openai"
+        );
+    }
+    #[test]
+    fn vertex_regional_suffix_maps_to_google_genai() {
+        assert_eq!(
+            Policy::default().resolve_target(
+                "POST",
+                "us-central1-aiplatform.googleapis.com",
+                None,
+                None,
+                None
+            ),
+            "llm:google-genai"
         );
     }
 }
