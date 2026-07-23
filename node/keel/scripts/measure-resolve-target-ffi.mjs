@@ -49,8 +49,34 @@ function medianNs(op) {
   return samples[Math.floor(SAMPLES / 2)];
 }
 
-/** `{nativeLoaded, resolveTargetNs, layerNs}` — the latter two `null` when
- *  the native addon isn't built (nothing to measure). */
+const NULL_MEASURES = {
+  nativeLoaded: false,
+  resolveTargetLlmHostNs: null,
+  resolveTargetPatternNs: null,
+  layerNullNs: null,
+  layerPopulatedNs: null,
+};
+
+/**
+ * `{nativeLoaded, resolveTargetLlmHostNs, resolveTargetPatternNs,
+ * layerNullNs, layerPopulatedNs}` — all four `null` when the native addon
+ * isn't built. Two distinct shapes per method, not one, because a single
+ * "LLM host, unconfigured engine" case would only ever exercise
+ * resolveTarget's cheapest branch (tier 1's exact host-map hit
+ * short-circuits before tier 3's pattern-collection/sort ever runs) and
+ * layer's cheapest return (three straight `undefined` misses to `null`) —
+ * neither is representative of a typical non-LLM call against a policy
+ * with configured `[target]` patterns, which is the common case every
+ * generic HTTP pack's judgment logic actually hits:
+ *
+ *   - `*LlmHostNs`: an unconfigured engine, host `api.openai.com` — the
+ *     tier-1 LLM-host-map short-circuit; `layer` reads straight to `null`.
+ *   - `*PatternNs`: an engine `configure`d with a `[target."*.example.com"]`
+ *     pattern (a non-LLM host), resolving `api.example.com` — must fall
+ *     through tiers 1/2 and run tier 3's sort/glob-match; `layer` reads the
+ *     matched key's own populated `retry` config, a real nested value
+ *     crossing the FFI boundary rather than a trivial `null`.
+ */
 export async function measureResolveTargetFfi() {
   let KeelCore;
   let loaded = false;
@@ -59,18 +85,33 @@ export async function measureResolveTargetFfi() {
   } catch {
     loaded = false; // keel-core-native has no package.json export outside the workspace checkout
   }
-  if (!loaded) {
-    return { nativeLoaded: false, resolveTargetNs: null, layerNs: null };
-  }
-  const core = new KeelCore();
-  const resolveTargetNs = medianNs(() => core.resolveTarget("GET", "api.openai.com"));
-  const layerNs = medianNs(() => core.layer("llm:openai", "retry"));
-  return { nativeLoaded: true, resolveTargetNs, layerNs };
+  if (!loaded) return NULL_MEASURES;
+
+  const bare = new KeelCore();
+  const resolveTargetLlmHostNs = medianNs(() => bare.resolveTarget("GET", "api.openai.com"));
+  const layerNullNs = medianNs(() => bare.layer("llm:openai", "retry"));
+
+  const configured = new KeelCore();
+  configured.configure({ target: { "*.example.com": { retry: { attempts: 3 } } } });
+  const resolveTargetPatternNs = medianNs(() => configured.resolveTarget("GET", "api.example.com"));
+  const layerPopulatedNs = medianNs(() => configured.layer("*.example.com", "retry"));
+
+  return {
+    nativeLoaded: true,
+    resolveTargetLlmHostNs,
+    resolveTargetPatternNs,
+    layerNullNs,
+    layerPopulatedNs,
+  };
 }
 
-export function formatSummary({ nativeLoaded, resolveTargetNs, layerNs }) {
-  if (!nativeLoaded) return "[resolve_target ffi] node native (skipped: no addon)";
-  return `[resolve_target ffi] node resolveTarget ${resolveTargetNs} ns | layer ${layerNs} ns`;
+export function formatSummary(result) {
+  if (!result.nativeLoaded) return "[resolve_target ffi] node native (skipped: no addon)";
+  const { resolveTargetLlmHostNs, resolveTargetPatternNs, layerNullNs, layerPopulatedNs } = result;
+  return (
+    `[resolve_target ffi] node resolveTarget llm_host=${resolveTargetLlmHostNs}ns ` +
+    `pattern=${resolveTargetPatternNs}ns | layer null=${layerNullNs}ns populated=${layerPopulatedNs}ns`
+  );
 }
 
 async function main() {

@@ -42,6 +42,7 @@ cat "$out"
 ffi_out="$repo_root/target/bench-resolve-target-ffi.json"
 py_ffi_tmp="$(mktemp)"
 node_ffi_tmp="$(mktemp)"
+trap 'rm -f "$py_ffi_tmp" "$node_ffi_tmp"' EXIT
 python3 "$repo_root/python/keel/scripts/measure_resolve_target_ffi.py" --json "$py_ffi_tmp"
 node "$repo_root/node/keel/scripts/measure-resolve-target-ffi.mjs" --json "$node_ffi_tmp"
 python3 -c '
@@ -52,7 +53,6 @@ with open(out_path, "w") as f:
     json.dump(combined, f, sort_keys=True, indent=2)
     f.write("\n")
 ' "$py_ffi_tmp" "$node_ffi_tmp" "$ffi_out"
-rm -f "$py_ffi_tmp" "$node_ffi_tmp"
 
 echo "bench-overhead: FFI-crossing artifact at $ffi_out"
 cat "$ffi_out"
