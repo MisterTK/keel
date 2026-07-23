@@ -217,12 +217,18 @@ export function compileCmdMatchers(cmdFlows) {
   return rules;
 }
 
-/** The most-specific compiled rule whose per-position patterns all match
- *  `argv` (exact arity), or `null`. A single `*` item matches one position, so
- *  arity must be exact — v1 has no variadic/`**` item (the frozen dialect). */
+/** The most-specific compiled rule whose per-position patterns all match the
+ *  LEADING `rule.arity` positions of `argv`, or `null`. A PREFIX match, not
+ *  exact arity: the observed argv must have AT LEAST as many elements as the
+ *  rule's patterns, and trailing observed args beyond the declared prefix are
+ *  unconstrained (CCR-5 / the chunk-8 design doc §2.2, mirroring Python's
+ *  `_match` in `subprocess_pack.py` exactly). A single `*` item still matches
+ *  exactly one position — this is not a variadic/`**` item, just an
+ *  unconstrained tail; issue #55 fixed this function's prior exact-arity
+ *  divergence from that spec. */
 export function matchArgv(compiled, argv) {
   for (const rule of compiled) {
-    if (rule.arity !== argv.length) continue;
+    if (argv.length < rule.arity) continue;
     let ok = true;
     for (let i = 0; i < rule.arity; i++) {
       if (!rule.regexes[i].test(argv[i])) {

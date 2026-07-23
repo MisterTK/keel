@@ -135,7 +135,11 @@ test("ReplayBackend exposes layer()/resolveTarget()/persistent so fetch.mjs's un
   // No recorded policy to pattern-match against: the LLM host map/Vertex
   // suffix rule still applies (policy-independent), everything else falls
   // back to the bare host — matching pre-Task-11 behavior (installReplay
-  // never installed `[target]` pattern matchers either).
+  // never installed `[target]` pattern matchers either). Python's
+  // `ReplayBackend` matches this exactly too as of issue #53 (it used to
+  // return the bare host unconditionally, with no LLM mapping) — parity with
+  // `test_testing.py`'s
+  // `test_resolve_target_falls_back_to_a_bare_unconfigured_stub_with_no_resolver`.
   assert.equal(backend.resolveTarget("POST", "api.openai.com"), "llm:openai");
   assert.equal(backend.resolveTarget("GET", "api.example.com"), "api.example.com");
 });

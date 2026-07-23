@@ -90,11 +90,18 @@ test("matchArgv: positive exact + literal segments", () => {
   assert.equal(matchArgv(c, ["python", "etl.py"])?.name, "cmd:etl");
 });
 
-test("matchArgv: negative (value mismatch) and arity mismatch never match", () => {
+test("matchArgv: negative (value mismatch), prefix match (trailing args unconstrained), too-short never matches", () => {
+  // issue #55: this pins the CCR-5-specified PREFIX match (not exact arity) —
+  // parity with Python's subprocess_pack._match / test_adapters_subprocess.py's
+  // MatchTest.test_positive_negative_and_positional_length.
   const c = compileCmdMatchers({ "cmd:etl": { name: "cmd:etl", argvPatterns: ["python", "etl.py"], onBusy: "skip" } });
-  assert.equal(matchArgv(c, ["python", "other.py"]), null);
-  assert.equal(matchArgv(c, ["python", "etl.py", "--flag"]), null, "a * matches ONE position — arity is exact");
-  assert.equal(matchArgv(c, ["python"]), null);
+  assert.equal(matchArgv(c, ["python", "other.py"]), null, "a listed position differs");
+  assert.equal(
+    matchArgv(c, ["python", "etl.py", "--flag"])?.name,
+    "cmd:etl",
+    "trailing observed args beyond the declared prefix are unconstrained"
+  );
+  assert.equal(matchArgv(c, ["python"]), null, "too short: fewer observed than pattern positions");
 });
 
 test("matchArgv: single-* wildcard matches any value in that position", () => {
