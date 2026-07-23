@@ -7,6 +7,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { KeelCoreStub } from "../index.mjs";
+import { KeelCore, loaded as nativeLoaded } from "../../keel-core-native/index.mjs";
+
+const gate = nativeLoaded
+  ? {}
+  : { skip: "keel-core-native binary absent — build with `cargo build -p keel-node --release`" };
 
 test("knownLlmHosts is a static, no-instance-required accessor", () => {
   const hosts = KeelCoreStub.knownLlmHosts();
@@ -26,4 +31,15 @@ test("every knownLlmHosts pair agrees with resolveTarget's single-lookup form", 
   for (const [host, provider] of KeelCoreStub.knownLlmHosts()) {
     assert.equal(core.resolveTarget("GET", host), `llm:${provider}`);
   }
+});
+
+// The stub's table is one of THREE copies kept in parity by convention
+// (Rust authoritative + Python stub + Node stub) — this cross-checks the
+// stub against the real Rust source of truth whenever the native addon is
+// built (offline runs skip; a native-leg CI run does not), closing the gap
+// the review of issue #49 identified: nothing previously compared the
+// tables to each other, only each to its own resolveTarget.
+test("matches the native core's knownLlmHosts when built", gate, () => {
+  const sortPairs = (pairs) => [...pairs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  assert.deepEqual(sortPairs(KeelCoreStub.knownLlmHosts()), sortPairs(KeelCore.knownLlmHosts()));
 });

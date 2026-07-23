@@ -17,6 +17,13 @@ from keel import _runtime
 from keel.adapters import _http, httpx_pack, requests_pack
 from keel_core_stub import KeelCoreStub
 
+try:
+    import keel_core  # noqa: F401
+
+    _NATIVE = True
+except ImportError:
+    _NATIVE = False
+
 
 class ResolveTargetTest(unittest.TestCase):
     """`backend.resolve_target` (docs/targeting.md): the LLM host map, tested
@@ -68,6 +75,20 @@ class KnownLlmHostsTest(unittest.TestCase):
         _runtime.clear_runtime()
         self.assertIsNone(_runtime.get_backend())
         self.assertTrue(len(_http.known_llm_hosts()) > 0)
+
+    @unittest.skipUnless(_NATIVE, "keel_core native module not built (maturin develop in crates/keel-py)")
+    def test_matches_the_native_core_when_built(self) -> None:
+        # The stub's table is one of THREE copies kept in parity by
+        # convention (Rust authoritative + Python stub + Node stub) — this
+        # cross-checks the stub against the real Rust source of truth
+        # whenever the native wheel is available (offline runs skip; a
+        # native-leg CI run does not), closing the gap the review of issue
+        # #49 identified: nothing previously compared the tables to each
+        # other, only each to its own resolve_target.
+        self.assertEqual(
+            sorted(_http.known_llm_hosts()),
+            sorted(keel_core.KeelCore.known_llm_hosts()),
+        )
 
 
 class ResolvePolicyTargetTest(unittest.TestCase):
