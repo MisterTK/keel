@@ -27,7 +27,10 @@ from __future__ import annotations
 import json
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
+
+if TYPE_CHECKING:
+    from ._backend import Backend
 
 
 class UnmatchedEffect(RuntimeError):
@@ -81,7 +84,15 @@ class ReplayBackend:
     NEVER invoked — a match is served purely from the recording, and a miss
     raises :class:`UnmatchedEffect` rather than falling through to it."""
 
-    def __init__(self, recording: Recording) -> None:
+    def __init__(self, recording: Recording, resolver: "Backend | None" = None) -> None:
+        # `resolver` is the real backend that was active immediately before
+        # `install_replay` swapped this one in (see there). `resolve_target`/
+        # `layer` delegate to it when present, since a from-scratch replay has
+        # no compiled policy of its own to answer either from — see both
+        # methods below for why this matters (Task 10 regression, issue: HTTP
+        # packs call `_runtime.get_backend().resolve_target(...)`
+        # unconditionally, so whatever backend is installed must expose it).
+        self._resolver = resolver
         self._queues: dict[tuple[str, str], deque[dict[str, Any]]] = {}
         for call in recording.calls:
             key = _match_key(
@@ -92,8 +103,38 @@ class ReplayBackend:
     def configure(self, policy: dict[str, Any]) -> None:  # noqa: ARG002 - Backend protocol
         return None
 
-    def layer(self, target: str, key: str) -> Any:  # noqa: ARG002 - Backend protocol
+    def layer(self, target: str, key: str) -> Any:
+        # No resolver: unchanged from before — a harmless no-op (pinned by
+        # test_layer_and_configure_and_report_are_harmless_no_ops).
+        if self._resolver is not None:
+            return self._resolver.layer(target, key)
         return None
+
+    def resolve_target(
+        self,
+        method: str,
+        host: str,
+        scheme: str | None = None,
+        port: int | None = None,
+        path: str | None = None,
+    ) -> str:
+        """The policy target key a live HTTP pack call resolves to during
+        replay. Delegates to the pre-replay backend (`resolver`) when one was
+        supplied, so a recording made under a given `keel.toml` replays
+        against the SAME target the original call computed
+        (docs/recording-format.md rule 1: `target` must match exactly) —
+        assuming the normal usage pattern of the same policy being in effect
+        during both recording and replay. With no resolver (e.g. a bare
+        ``ReplayBackend(rec)`` built directly, no policy in scope), this
+        deliberately falls back to the bare host — the same "no policy
+        configured" default the core/stub use when there's no compiled
+        `[target]` table — purely for backward compatibility with direct
+        construction; it is NOT a claim that this reproduces real target
+        resolution.
+        """
+        if self._resolver is not None:
+            return self._resolver.resolve_target(method, host, scheme=scheme, port=port, path=path)
+        return host
 
     def execute(self, request: dict[str, Any], effect: Callable[[int], Any]) -> dict[str, Any]:
         del effect  # replay never invokes the real effect (that's the point)
@@ -138,7 +179,12 @@ def install_replay(path: str | Path) -> Callable[[], None]:
     install_adapters()  # idempotent; arms present libraries lazily
     previous_backend = _runtime.get_backend()
     previous_discovery = _runtime.get_discovery()
-    _runtime.set_runtime(ReplayBackend(Recording.load(path)), previous_discovery)
+    # `resolver=previous_backend`: resolve_target/layer delegate to whatever
+    # backend was active before this swap (see ReplayBackend.resolve_target's
+    # docstring for why this is required, not optional).
+    _runtime.set_runtime(
+        ReplayBackend(Recording.load(path), resolver=previous_backend), previous_discovery
+    )
 
     def _uninstall() -> None:
         _runtime.set_runtime(previous_backend, previous_discovery)

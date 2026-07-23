@@ -142,6 +142,56 @@ class ReplayBackendTest(unittest.TestCase):
         self.assertIsNone(backend.configure({}))
         self.assertEqual(backend.report(), {})
 
+    def test_resolve_target_falls_back_to_bare_host_with_no_resolver(self) -> None:
+        # Backward compatibility: every OTHER test in this file constructs
+        # ReplayBackend(rec) with no second argument, so the no-resolver path
+        # must keep behaving sanely (Task 10 regression: packs now call
+        # backend.resolve_target(...) unconditionally — see
+        # test_install_replay_delegates_resolve_target_below for the real
+        # integration path).
+        backend = ReplayBackend(Recording(META, []))
+        self.assertEqual(backend.resolve_target("GET", "api.example.com"), "api.example.com")
+
+
+class InstallReplayResolveTargetTest(unittest.TestCase):
+    """Reproduces and pins the Task 10 regression: `install_replay` swaps a
+    `ReplayBackend` in as the process runtime backend, so any HTTP pack's
+    `_judge()` calling `_runtime.get_backend().resolve_target(...)` must reach
+    a `ReplayBackend` that actually has that method — and it must reproduce
+    the SAME target the real backend active before the swap would have
+    computed (docs/recording-format.md rule 1: `target` must match exactly),
+    not just a bare host."""
+
+    def tearDown(self) -> None:
+        from keel import _runtime
+
+        _runtime.clear_runtime()
+
+    def test_install_replay_delegates_resolve_target_to_previous_backend(self) -> None:
+        from keel import _runtime
+        from keel.testing import install_replay
+        from keel_core_stub import KeelCoreStub
+
+        real = KeelCoreStub()
+        real.configure({"target": {"api.*.example.com": {"retry": {"attempts": 2}}}})
+        # Sanity: this case is NOT the bare-host fallback — it exercises the
+        # real `[target]` pattern-matching logic, so a passing test below
+        # actually proves delegation reaches it.
+        expected = real.resolve_target("GET", "api.foo.example.com")
+        self.assertEqual(expected, "api.*.example.com")
+
+        _runtime.set_runtime(real, None)
+        with TemporaryDirectory() as d:
+            path = write_recording(Path(d), [META])
+            uninstall = install_replay(path)
+            try:
+                backend = _runtime.get_backend()
+                self.assertIsInstance(backend, ReplayBackend)
+                got = backend.resolve_target("GET", "api.foo.example.com")  # type: ignore[union-attr]
+                self.assertEqual(got, expected)
+            finally:
+                uninstall()
+
 
 if __name__ == "__main__":
     unittest.main()
