@@ -7,7 +7,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Recording, ReplayBackend, UnmatchedEffectError } from "../src/testing.mjs";
+import { Recording, ReplayBackend, UnmatchedEffectError, installReplay } from "../src/testing.mjs";
+import { AsyncEngine } from "../src/engine.mjs";
+import { setRuntime, getBackend } from "../src/runtime.mjs";
 
 function writeRecording(lines) {
   const dir = mkdtempSync(join(tmpdir(), "keel-testing-"));
@@ -136,4 +138,52 @@ test("ReplayBackend exposes layer()/resolveTarget()/persistent so fetch.mjs's un
   // never installed `[target]` pattern matchers either).
   assert.equal(backend.resolveTarget("POST", "api.openai.com"), "llm:openai");
   assert.equal(backend.resolveTarget("GET", "api.example.com"), "api.example.com");
+});
+
+// Reproduces and pins the issue #51 fix: `installReplay` must thread the
+// backend active immediately before the swap into `ReplayBackend` as a
+// `resolver`, so a recording made under a policy with `[target]` pattern
+// keys replays against the SAME target the original resolver would have
+// computed (docs/recording-format.md rule 1) — not an unconfigured engine's
+// pattern-blind reduction. Parity with the Python twin's
+// `InstallReplayResolveTargetTest`.
+test("installReplay delegates resolveTarget to the previously-active backend, patterns included", async () => {
+  const real = new AsyncEngine();
+  real.configure({ target: { "api.*.example.com": { retry: { attempts: 2 } } } });
+  // Sanity: this is NOT the bare-host/LLM-map fallback — it exercises the
+  // real `[target]` pattern-matching logic, so a passing assertion below
+  // actually proves delegation reaches it.
+  const expected = real.resolveTarget("GET", "api.foo.example.com");
+  assert.equal(expected, "api.*.example.com");
+
+  setRuntime({ enabled: true, backend: real, discovery: null });
+  const { dir, path } = writeRecording([META]);
+  const uninstall = installReplay(path);
+  try {
+    const backend = getBackend();
+    assert.ok(backend instanceof ReplayBackend);
+    assert.equal(backend.resolveTarget("GET", "api.foo.example.com"), expected);
+  } finally {
+    uninstall();
+    setRuntime({ enabled: false, backend: null, discovery: null });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("installReplay delegates layer() to the previously-active backend too", async () => {
+  const real = new AsyncEngine();
+  real.configure({ target: { "api.example.com": { retry: { attempts: 3 } } } });
+  const expected = real.layer("api.example.com", "retry");
+
+  setRuntime({ enabled: true, backend: real, discovery: null });
+  const { dir, path } = writeRecording([META]);
+  const uninstall = installReplay(path);
+  try {
+    const backend = getBackend();
+    assert.deepEqual(backend.layer("api.example.com", "retry"), expected);
+  } finally {
+    uninstall();
+    setRuntime({ enabled: false, backend: null, discovery: null });
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

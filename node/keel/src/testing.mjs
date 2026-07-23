@@ -66,21 +66,30 @@ export class Recording {
 /**
  * A `Backend` (see `backend.mjs`) that serves `execute` calls from a
  * `Recording` instead of running real effects. `configure`/`report` are
- * no-ops and `layer` always returns `undefined` (`fetch.mjs` calls
- * `backend.layer(...)` unconditionally, so this must exist even though
- * replay never consults policy). `resolveTarget` delegates to a bare,
- * never-`configure`d `AsyncEngine` — replay has no recorded policy to
- * pattern-match against, so this reduces to exactly the LLM host map /
- * Vertex regional suffix rule (an empty policy has no `[target]` patterns),
- * matching `installReplay`'s pre-Task-11/SP-1 behavior of never installing
- * `outboundTargets`. The caller's real effect is NEVER invoked — a match is
- * served purely from the recording, and a miss throws
- * `UnmatchedEffectError` rather than falling through to it.
+ * no-ops. `resolver` is the real backend that was active immediately before
+ * `installReplay` swapped this one in (see there): `layer`/`resolveTarget`
+ * delegate to it when present, since a from-scratch replay has no compiled
+ * policy of its own to answer either from (Python parity — see
+ * `python/keel/src/keel/testing.py`'s `ReplayBackend`; issue #51 closed the
+ * fidelity gap this left between the two languages). With no resolver (e.g.
+ * a bare `new ReplayBackend(rec)` built directly, no policy in scope) —
+ * `layer` is a harmless no-op (`fetch.mjs` calls `backend.layer(...)`
+ * unconditionally, so this must exist even though replay never consults
+ * policy) and `resolveTarget` falls back to a bare, never-`configure`d
+ * `AsyncEngine`, which reduces to exactly the LLM host map / Vertex regional
+ * suffix rule (an empty policy has no `[target]` patterns) — unchanged from
+ * before, purely for backward compatibility with direct construction; it is
+ * NOT a claim that this reproduces real target resolution. The caller's
+ * real effect is NEVER invoked — a match is served purely from the
+ * recording, and a miss throws `UnmatchedEffectError` rather than falling
+ * through to it.
  */
 export class ReplayBackend {
   #queues = new Map();
   #engine = new AsyncEngine();
-  constructor(recording) {
+  #resolver;
+  constructor(recording, resolver = null) {
+    this.#resolver = resolver;
     for (const call of recording.calls) {
       const key = matchKey(String(call.target ?? ""), String(call.op ?? ""), call.args_hash ?? null);
       if (!this.#queues.has(key)) this.#queues.set(key, []);
@@ -88,10 +97,12 @@ export class ReplayBackend {
     }
   }
   configure() {}
-  layer() {
+  layer(target, key) {
+    if (this.#resolver) return this.#resolver.layer(target, key);
     return undefined;
   }
   resolveTarget(method, host, scheme, port, path) {
+    if (this.#resolver) return this.#resolver.resolveTarget(method, host, scheme, port, path);
     return this.#engine.resolveTarget(method, host, scheme, port, path);
   }
   get persistent() {
@@ -144,9 +155,12 @@ export class ReplayBackend {
  * test glue (`keel record test`) targets the bare-`node:test` case only.
  */
 export function installReplay(path) {
-  const backend = new ReplayBackend(Recording.load(path));
   const previousBackend = getBackend();
   const previousDiscovery = getDiscovery();
+  // `resolver: previousBackend` — layer/resolveTarget delegate to whatever
+  // backend was active before this swap (see ReplayBackend's docstring for
+  // why this is required, not optional: issue #51).
+  const backend = new ReplayBackend(Recording.load(path), previousBackend);
   const uninstallFetch = installFetch(backend, previousDiscovery ?? null, {});
   setRuntime({ enabled: true, backend, discovery: previousDiscovery });
   return function uninstall() {
