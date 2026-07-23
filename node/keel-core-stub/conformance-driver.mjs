@@ -93,6 +93,24 @@ export function runScenario(core, isKeelError, scenario) {
       failures.push(
         ...subsetMismatches(outcome, call.expect ?? {}).map((m) => `${label} outcome: ${m}`)
       );
+    } else if ("resolve" in step) {
+      const r = step.resolve;
+      const got = core.resolveTarget(r.method, r.host, r.scheme ?? null, r.port ?? null, r.path ?? null);
+      if (got !== step.expect)
+        failures.push(`${label}: resolve got ${JSON.stringify(got)}, want ${JSON.stringify(step.expect)}`);
+    } else if ("layer" in step) {
+      const l = step.layer;
+      // The Node stub returns `undefined` (not `null`) for an unset layer key;
+      // scenario JSON's `"expect": null` parses to JS `null` via JSON.parse.
+      // Normalize before comparing or `layer` steps expecting `null` spuriously
+      // fail (`undefined !== null`). `expect` can also be an object (e.g. an
+      // idempotency table), so compare deeply rather than with `!==`.
+      const got = core.layer(l.target, l.key) ?? null;
+      try {
+        assert.deepStrictEqual(got, step.expect);
+      } catch {
+        failures.push(`${label}: layer got ${JSON.stringify(got)}, want ${JSON.stringify(step.expect)}`);
+      }
     } else {
       failures.push(`${label}: unknown step ${JSON.stringify(Object.keys(step))}`);
     }

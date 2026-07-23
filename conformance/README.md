@@ -50,6 +50,23 @@ every stub harness skips them. Tier 1 scenarios carry no `tier` field.
   given keys to match (recursively), arrays must match exactly, scalars must
   be equal. Unlisted Outcome fields are unconstrained.
 
+Two more step types drive policy *resolution* rather than execution (SP-1;
+scenarios 36–37), each asserting an exact (not subset) match against `expect`:
+
+- `{ "resolve": { "method", "host", "scheme"?, "port"?, "path"? }, "expect": "<key>" }`
+  — resolves the request to its `[target]` policy key and asserts it equals
+  `expect` exactly. Selection follows `docs/targeting.md`: the LLM host map
+  (exact host, then the Vertex regional suffix) first, else the `[target]`
+  table's bare-host **exact** key (checked unconditionally, regardless of the
+  request's path), else the most specific matching pattern key
+  (method/host-glob/port/path-glob), else the bare host.
+- `{ "layer": { "target", "key" }, "expect": <json value> }` — resolves one
+  policy layer value for `target`/`key` (an exact `[target]` entry, else
+  `defaults.llm` for an `llm:*` target, else `defaults.outbound`, else JSON
+  `null`) and asserts it equals `expect` exactly, preserving the configured
+  JSON shape verbatim (e.g. a duration stays the literal string `"30s"`, never
+  a re-serialized number).
+
 ## Execution semantics (normative for every implementation)
 
 Layer order per call: **cache → rate → breaker → poll → retry** (timeout sits
