@@ -114,6 +114,19 @@ pub struct SimplificationSighting {
     pub targets: Vec<String>,
 }
 
+/// One hand-rolled orchestration construct sighted in a file the language
+/// passes never parse — shell scripts, `Makefile`s, CI workflows. Coarse by
+/// design: a substring line match, not a parse, so it is a *lead* to inspect,
+/// never a verdict. `kind` is a closed set: "lockfile-mutex" | "guard-file" |
+/// "pid-check". Field order is sort order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrchestrationSighting {
+    pub file: String,
+    pub line: u32,
+    pub kind: String,
+    pub snippet: String,
+}
+
 /// One file the scan judged dependency-averse: stdlib-only imports plus a
 /// risk/gate/guard/auth/valid/safety/kill name or docstring signal, or an
 /// explicit `# keel: exclude` marker. Markers win in both directions: an
@@ -235,6 +248,11 @@ pub struct ScanResult {
     /// attribution, sorted by (file, line, kind) — deterministic across
     /// runs.
     pub simplifications: Vec<SimplificationSighting>,
+    /// Hand-rolled orchestration sighted in unparsed shell/Makefile/CI files,
+    /// sorted by (file, line, kind) — deterministic across runs. Coarse
+    /// substring leads, never a parse; `keel doctor` surfaces them as the
+    /// place to look for at-most-once dispatch a `cmd:` flow could replace.
+    pub orchestration: Vec<OrchestrationSighting>,
 }
 
 impl ScanResult {
@@ -267,6 +285,8 @@ pub fn scan(project: &Path) -> ScanResult {
     result.files_scanned += js.files_scanned;
     merge_lang(&mut result, &js.findings);
     result.functions.extend(js.functions);
+
+    result.orchestration = scan_orchestration(project);
 
     result
         .functions
@@ -368,12 +388,19 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "target",
 ];
 
-/// Recursively collect files under `dir` whose extension is one of
-/// `extensions`, skipping [`SKIP_DIRS`] and dot-prefixed directories. The
-/// one walker for "find source files by extension" in this crate — shared
-/// by the JS/TS scanner ([`js`]), `keel init`'s Python-file check, and
-/// `keel run`'s directory-entry resolution.
-pub(crate) fn collect_files(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+/// The one filesystem walker in this crate: recurse from `dir`, skipping
+/// [`SKIP_DIRS`] and dot-prefixed directories except those named in
+/// `descend_dot_dirs`, pushing every file `keep` accepts. [`collect_files`] is
+/// the by-extension front door (JS/TS scan, `keel init`'s Python-file check,
+/// `keel run`'s directory-entry resolution); [`scan_orchestration`] passes its
+/// own predicate and needs `.github`/`.circleci`. One walker so the SKIP_DIRS
+/// logic never drifts into copies again.
+pub(crate) fn collect_matching(
+    dir: &Path,
+    keep: &dyn Fn(&Path) -> bool,
+    descend_dot_dirs: &[&str],
+    out: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -382,18 +409,184 @@ pub(crate) fn collect_files(dir: &Path, extensions: &[&str], out: &mut Vec<PathB
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
+            if SKIP_DIRS.contains(&name.as_ref())
+                || (name.starts_with('.') && !descend_dot_dirs.contains(&name.as_ref()))
+            {
                 continue;
             }
-            collect_files(&path, extensions, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| extensions.contains(&e))
-        {
+            collect_matching(&path, keep, descend_dot_dirs, out);
+        } else if keep(&path) {
             out.push(path);
         }
     }
+}
+
+/// Recursively collect files under `dir` whose extension is one of
+/// `extensions`, skipping [`SKIP_DIRS`] and dot-prefixed directories.
+pub(crate) fn collect_files(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+    collect_matching(
+        dir,
+        &|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.contains(&e))
+        },
+        &[],
+        out,
+    );
+}
+
+/// Extensions whose files are always orchestration candidates.
+const ORCH_EXTS: &[&str] = &["sh", "bash", "zsh", "mk"];
+/// Exact file names that are orchestration candidates anywhere in the tree.
+const ORCH_NAMES: &[&str] = &["Makefile", "makefile", "GNUmakefile"];
+/// Project-relative CI files that live outside `.github/workflows/`.
+const ORCH_CI_PATHS: &[&str] = &[".gitlab-ci.yml", ".circleci/config.yml"];
+/// Directories whose extensionless files are treated as shell candidates,
+/// shebang-verified when read. Bounded on purpose: sniffing every extensionless
+/// file in a tree would read LICENSEs, fixtures, and binaries.
+const ORCH_SCRIPT_DIRS: &[&str] = &["bin", "script", "scripts", "tools", "hooks"];
+
+/// True for a file the orchestration pass should read. Deliberately narrow —
+/// see [`scan_orchestration`] for the v1 limits this leaves open.
+fn is_orchestration_file(path: &Path, project: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str());
+    if ext.is_some_and(|e| ORCH_EXTS.contains(&e)) {
+        return true;
+    }
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| ORCH_NAMES.contains(&n))
+    {
+        return true;
+    }
+    if ext.is_none()
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| ORCH_SCRIPT_DIRS.contains(&n))
+    {
+        return true; // shebang-verified at read time
+    }
+    let Ok(rel) = path.strip_prefix(project) else {
+        return false;
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if ORCH_CI_PATHS.contains(&rel.as_str()) {
+        return true;
+    }
+    rel.starts_with(".github/workflows/") && matches!(ext, Some("yml" | "yaml"))
+}
+
+/// True when `text`'s first line is a shebang naming a POSIX-ish shell.
+fn is_shell_shebang(text: &str) -> bool {
+    text.lines().next().is_some_and(|first| {
+        first.starts_with("#!")
+            && ["sh", "bash", "zsh", "dash", "ksh"]
+                .iter()
+                .any(|s| first.contains(s))
+    })
+}
+
+/// Coarse, dependency-free detection of the at-most-once-dispatch signature in
+/// an unparsed orchestration file. One sighting per matching line; the caller
+/// sorts.
+///
+/// Precision over recall, on purpose: this feeds a `warn` finding, and a
+/// false positive here is exactly the kind [`crate::doctor`]'s
+/// `resilience_finding` argues erodes trust in doctor's real findings. In
+/// particular a file test only counts when it is *guard-shaped* — either the
+/// path looks like a lock/guard/pid/stamp, or the line short-circuits with
+/// `exit 0`. `[ -f .env ] && . .env` and `[ -f "$CFG" ] || exit 1` are ordinary
+/// shell, not at-most-once dispatch, and must stay silent.
+pub(crate) fn scan_orchestration_text(rel: &str, text: &str) -> Vec<OrchestrationSighting> {
+    const FILE_TESTS: &[&str] = &["[ -f ", "[ -e ", "[[ -f ", "[[ -e ", "test -f ", "test -e "];
+    const GUARDISH: &[&str] = &["lock", "guard", ".pid", "stamp", "sentinel", "already"];
+
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let l = raw.trim_start();
+        if l.starts_with('#') {
+            continue; // shell / yaml / make comment — the shebang included
+        }
+        let lower = l.to_ascii_lowercase();
+        let kind = if lower.contains("flock")
+            || lower.contains("lockfile")
+            || lower.contains("setlock")
+            || (lower.contains("mkdir") && lower.contains("lock"))
+        {
+            Some("lockfile-mutex")
+        } else if lower.contains("kill -0") || lower.contains("kill -s 0") {
+            Some("pid-check")
+        } else if FILE_TESTS.iter().any(|t| l.contains(t))
+            && (GUARDISH.iter().any(|g| lower.contains(g)) || lower.contains("exit 0"))
+        {
+            Some("guard-file")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            out.push(OrchestrationSighting {
+                file: rel.to_owned(),
+                line: u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1),
+                kind: kind.to_owned(),
+                snippet: raw.trim().chars().take(120).collect(),
+            });
+        }
+    }
+    out
+}
+
+/// The orchestration pass: read every file [`is_orchestration_file`] accepts and
+/// collect its coarse leads, sorted by (file, line, kind).
+///
+/// v1 limits, stated honestly because the finding's text promises this reach:
+/// `Jenkinsfile`, `Dockerfile` entrypoint wrappers, crontab files, and CI
+/// systems beyond GitHub Actions / GitLab / CircleCI are not read. Extensionless
+/// files are read only when named an [`ORCH_NAMES`] Makefile variant, or under
+/// [`ORCH_SCRIPT_DIRS`] with a shell shebang. Non-UTF8 and >512 KiB files are
+/// skipped.
+pub(crate) fn scan_orchestration(project: &Path) -> Vec<OrchestrationSighting> {
+    const MAX_BYTES: u64 = 512 * 1024;
+
+    let mut files = Vec::new();
+    collect_matching(
+        project,
+        &|p| is_orchestration_file(p, project),
+        &[".github", ".circleci"],
+        &mut files,
+    );
+    files.sort();
+
+    let mut out = Vec::new();
+    for f in files {
+        if std::fs::metadata(&f).is_ok_and(|m| m.len() > MAX_BYTES) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue; // non-UTF8 or unreadable — not a script we can read
+        };
+        // The shebang gate is for ORCH_SCRIPT_DIRS' extensionless candidates
+        // only — an extensionless file already accepted by exact name (a
+        // Makefile variant) is unambiguous and needs no shebang check.
+        let is_named_makefile = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| ORCH_NAMES.contains(&n));
+        if f.extension().is_none() && !is_named_makefile && !is_shell_shebang(&text) {
+            continue;
+        }
+        let rel = f
+            .strip_prefix(project)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.extend(scan_orchestration_text(&rel, &text));
+    }
+    out.sort();
+    out
 }
 
 /// Extract the host from a `scheme://host[:port][/…]` literal, lowercased and
@@ -427,6 +620,8 @@ pub(crate) fn host_from_url(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn host_extraction_strips_port_userinfo_and_path() {
@@ -442,5 +637,112 @@ mod tests {
         assert_eq!(host_from_url("not a url"), None);
         assert_eq!(host_from_url("://nohost"), None);
         assert_eq!(host_from_url("1bad://x"), None);
+    }
+
+    #[test]
+    fn orchestration_text_flags_the_at_most_once_signature() {
+        let text = "\
+#!/usr/bin/env bash
+set -euo pipefail
+flock -n /tmp/run.lock || exit 0
+if [ -f /var/run/autonomous.guard ]; then exit 0; fi
+kill -0 \"$PID\" 2>/dev/null && echo running
+echo work
+";
+        let hits = scan_orchestration_text("scripts/run_autonomous.sh", text);
+        let kinds: BTreeSet<&str> = hits.iter().map(|h| h.kind.as_str()).collect();
+        assert!(kinds.contains("lockfile-mutex"), "kinds: {kinds:?}");
+        assert!(kinds.contains("guard-file"), "kinds: {kinds:?}");
+        assert!(kinds.contains("pid-check"), "kinds: {kinds:?}");
+        // Line anchoring: flock is on line 3 (the shebang is line 1).
+        let lock = hits.iter().find(|h| h.kind == "lockfile-mutex").unwrap();
+        assert_eq!(lock.line, 3, "flock line");
+    }
+
+    /// The precision test that matters: ordinary shell must stay silent. Every
+    /// line here contains a file test or a lock-ish word and none of them is
+    /// at-most-once dispatch. A `warn` finding on any of these would be the
+    /// false positive `resilience_finding` argues erodes trust in real findings.
+    #[test]
+    fn orchestration_text_is_quiet_on_ordinary_scripts() {
+        let text = "\
+#!/bin/sh
+echo hello
+cp a b
+[ -f .env ] && . .env
+test -f target/release/keel || cargo build
+[ -f \"$CONFIG\" ] || exit 1
+if [ -e node_modules ]; then echo deps; fi
+npm ci --package-lock-only
+";
+        let hits = scan_orchestration_text("build.sh", text);
+        assert!(hits.is_empty(), "false positives: {hits:?}");
+    }
+
+    /// Comments never count — including the shebang.
+    #[test]
+    fn orchestration_text_skips_comments() {
+        let text = "# flock -n /tmp/x.lock || exit 0\n\t# kill -0 $PID\n";
+        assert!(scan_orchestration_text("Makefile", text).is_empty());
+    }
+
+    #[test]
+    fn scan_sights_shell_makefile_and_ci_orchestrators_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::write(
+            dir.path().join("scripts/run_autonomous.sh"),
+            "#!/bin/bash\nflock -n /tmp/x.lock || exit 0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "deploy:\n\tkill -0 $$(cat run.pid) && exit 0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        fs::write(
+            dir.path().join(".github/workflows/cron.yml"),
+            "jobs:\n  x:\n    steps:\n      - run: flock -n /tmp/ci.lock -c ./deploy.sh\n",
+        )
+        .unwrap();
+
+        let scan = scan(dir.path());
+        let files: BTreeSet<&str> = scan.orchestration.iter().map(|o| o.file.as_str()).collect();
+        assert!(files.contains("scripts/run_autonomous.sh"), "{files:?}");
+        assert!(files.contains("Makefile"), "{files:?}");
+        assert!(files.contains(".github/workflows/cron.yml"), "{files:?}");
+        // Sorted by (file, line, kind) — the doctor finding's dedup relies on it.
+        let mut sorted = scan.orchestration.clone();
+        sorted.sort();
+        assert_eq!(sorted, scan.orchestration);
+    }
+
+    /// Extensionless `bin/`-style scripts count only when the shebang says so —
+    /// otherwise the walk would read every LICENSE and README in the tree.
+    #[test]
+    fn extensionless_scripts_need_a_shell_shebang() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        fs::write(
+            dir.path().join("bin/deploy"),
+            "#!/bin/sh\nflock -n /tmp/d.lock\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("bin/NOTES"), "flock is used here\n").unwrap();
+        let scan = scan(dir.path());
+        let files: BTreeSet<&str> = scan.orchestration.iter().map(|o| o.file.as_str()).collect();
+        assert!(files.contains("bin/deploy"), "{files:?}");
+        assert!(!files.contains("bin/NOTES"), "{files:?}");
+    }
+
+    #[test]
+    fn orchestration_walk_skips_vendored_and_build_dirs() {
+        let dir = TempDir::new().unwrap();
+        for d in ["node_modules", "target", ".venv"] {
+            fs::create_dir_all(dir.path().join(d)).unwrap();
+            fs::write(dir.path().join(d).join("x.sh"), "flock -n /tmp/x.lock\n").unwrap();
+        }
+        assert!(scan(dir.path()).orchestration.is_empty());
     }
 }

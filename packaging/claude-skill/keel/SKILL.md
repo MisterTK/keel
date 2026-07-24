@@ -1,6 +1,6 @@
 ---
 name: keel
-description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project — or when working in a repo that already uses Keel (a `keel.toml` file, or an AGENTS.md "Keel" section, is present). Covers installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server for agent-driven diagnosis, and reading `keel status`/`keel trace` output. Do not use for building a workflow-engine/queue-based system from scratch, for languages Keel does not support yet (only Python/Node/Rust), or for one-off retry logic in a codebase that has no interest in adopting Keel as a dependency.
+description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project; when evaluating, reviewing, or auditing whether and how Keel should cover a project, including a repo with no `keel.toml` yet; or when working in a repo that already uses Keel (a `keel.toml`, or an AGENTS.md "Keel" section, is present). Covers assessing fit, installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server, and reading `keel status`/`keel trace`. Invoke this before calling the `keel` MCP tools (`get_doctor_report`, `get_status`, `propose_policy`, `get_trace`, `list_flows`, `explain_error`) — they are diagnostic primitives this skill orchestrates. Do not use for building a workflow engine or queue system from scratch, for unsupported languages (only Python/Node/Rust), or for one-off retry logic in a codebase that has declined to adopt Keel.
 ---
 
 # Keel
@@ -88,7 +88,7 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
 
 When asked whether/how Keel should cover a project — a fresh adoption or an
 audit of an existing one — do NOT stop at grepping for HTTP libraries. Work
-the four phases in order; the static scan is evidence, not the verdict.
+the five phases in order; the static scan is evidence, not the verdict.
 
 1. **Scope.** Enumerate every process that does I/O, not just the entrypoint:
    the main app, MCP servers in `.mcp.json`, shell-script launchers, cron
@@ -110,9 +110,25 @@ the four phases in order; the static scan is evidence, not the verdict.
    `follow_ups` strictly top-down: it is ranked with rank 1 = the claim Keel
    is least able to verify itself (an unattributed URL) down to mechanical
    facts awaiting a decision. Codes are a closed set: `url-no-transport`,
-   `subprocess-blind-spot`, `dependency-averse-excluded`,
-   `preexisting-resilience`, `code-hash-stale`.
-4. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
+   `orchestration-blind-spot`, `subprocess-blind-spot`,
+   `dependency-averse-excluded`, `preexisting-resilience`, `code-hash-stale`.
+   Then read `boundaries` — it names what this report could not parse (source
+   languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
+   prose) — and `findings`, which carries `warn` items that are not follow-up
+   codes.
+4. **Baseline before you mutate.** Before proposing any *behavior-changing*
+   policy — retry, breaker, or a timeout that alters an outcome, as opposed to
+   a pure simplification swap like a poll loop → `poll` policy — measure what
+   actually fails. Wrap the candidate targets in observe mode (`keel record
+   run <entry>`, or a `[target]` with no resilience knobs set — a no-knob
+   wrap is pure passthrough plus events) and read the real failure-class
+   distribution from `keel status --json` / the event sink. Retry only helps
+   genuinely-transient classes (conn/timeout/5xx/429); an auth or validation
+   4xx returns KEEL-E015 and is never retried, so wrapping it in retry buys
+   latency, not resilience. Non-idempotent calls are `KEEL-E014` "observed,
+   not retried" by default — confirm the transient hypothesis with evidence
+   before recommending a behavior change.
+5. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
    yet: retry loops with sleeps, poll-until-status loops, `mkdir`-style
    mutexes, per-day guard files, broad `except: return None` swallows. Each
    is either replaced by policy (note which `keel.toml` key) or explicitly

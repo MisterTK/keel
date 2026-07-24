@@ -6,6 +6,9 @@ call boundaries with **zero code changes**. Policy lives in one file: `keel.toml
 
 Before changing any resilience behavior:
 - Run `keel doctor --json` to see what is wrapped, what is not, and why.
+- Baseline before you mutate: wrap in observe mode (`keel record run <entry>`, or a
+  `[target]` with no resilience knobs) and read the real failure classes before adding
+  retry or a breaker — retry only helps conn/timeout/5xx/429.
 - Propose policy edits as a diff: `keel init --diff` shows adds/removes from evidence.
 - Every command has a `--json` twin with deterministic, sorted output — diff it to detect change.
 
