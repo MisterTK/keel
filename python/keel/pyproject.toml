@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 # distribution name changes.
 name = "keelrun"
 license = "Apache-2.0"
-version = "0.4.0"
+version = "0.4.1"
 description = "Keel — resilience as a zero-config Python front end (Tier 1 bootstrap, import hook, discovery)."
 requires-python = ">=3.11"
 # The native core wheel (import name `keel_core`, distribution name
@@ -19,7 +19,7 @@ requires-python = ">=3.11"
 # over, so there is never a compile. Beyond that, runtime is stdlib-only:
 # adapters activate only when their library is already present in the
 # environment, and never import an absent one.
-dependencies = ["keelrun-core==0.4.0"]
+dependencies = ["keelrun-core==0.4.1"]
 
 # Test-only dependencies (the adapter contract-test farm). Install with
 # `pip install -e '.[dev]'` or `uv pip install httpx requests`. The library
