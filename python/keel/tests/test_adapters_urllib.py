@@ -13,6 +13,7 @@ composition in both directions."""
 
 from __future__ import annotations
 
+import gzip
 import http.client
 import sqlite3
 import unittest
@@ -308,6 +309,32 @@ class CacheReplayTest(UrllibBase):
             self.assertTrue(second.exception.keel_outcome["from_cache"])
             self.assertEqual(second.exception.code, 404)
             self.assertEqual(second.exception.read(), b"gone")
+        self.assertEqual(srv.served, 1)
+
+    def test_gzip_body_replays_raw_with_truthful_headers(self) -> None:
+        # issue #66: urllib never decompresses (module docs) — the captured
+        # envelope body is the RAW wire bytes, so replaying it with the
+        # ORIGINAL, untouched headers stays truthful. Deliberately does NOT
+        # use `_http.replay_headers` (no production change for this pack;
+        # pins the consistency contract that helper's docstring documents).
+        self.backend.configure(
+            {**level0_defaults(), "target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+        )
+        body = gzip.compress(b'{"a":1}')
+        with FaultServer(
+            [ok(body, {"Content-Type": "application/json", "Content-Encoding": "gzip"})]
+        ) as srv:
+            with urllib.request.urlopen(srv.url("/gen")) as first:
+                self.assertFalse(first.keel_outcome["from_cache"])
+                first_body = first.read()
+                self.assertEqual(gzip.decompress(first_body), b'{"a":1}')
+                self.assertEqual(first.headers.get("Content-Encoding"), "gzip")
+            with urllib.request.urlopen(srv.url("/gen")) as second:
+                self.assertTrue(second.keel_outcome["from_cache"])
+                second_body = second.read()
+                self.assertEqual(second_body, first_body)
+                self.assertEqual(second.headers.get("Content-Encoding"), "gzip")
+                self.assertEqual(second.headers.get("Content-Type"), "application/json")
         self.assertEqual(srv.served, 1)
 
 

@@ -339,6 +339,35 @@ class CacheReplayTest(AiohttpTestBase):
 
         self.run_async(go())
 
+    def test_gzip_response_replays_with_stripped_headers(self) -> None:
+        # issue #66: real aiohttp auto-decompresses — `read()`/`.json()` on
+        # the live response already return the DECODED bytes even though
+        # `.headers` still reports the original `Content-Encoding` (verified
+        # against real aiohttp 3.14 during Task 1/#60's httpx work; the fake
+        # reproduces that observed shape by returning already-decoded body
+        # bytes alongside the as-served headers, rather than performing a
+        # real gzip round-trip itself). A rebuilt `_ReplayedResponse` that
+        # still declared `Content-Encoding: gzip` over that decoded body
+        # would misdescribe it exactly like the httpx/#60 and requests/#66
+        # siblings.
+        self.backend.configure({**level0_defaults(), "target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}})
+
+        async def go() -> None:
+            session = _ScriptedSession(
+                [_FakeResponse(200, b'{"a":1}', headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})]
+            )
+            first = await session.get("http://127.0.0.1/gen")
+            self.assertFalse(first.keel_outcome["from_cache"])
+            self.assertEqual(await first.read(), b'{"a":1}')  # byte-transparency: live call
+            second = await session.get("http://127.0.0.1/gen")
+            self.assertTrue(second.keel_outcome["from_cache"])
+            self.assertEqual(await second.read(), b'{"a":1}')
+            self.assertEqual(await second.json(), {"a": 1})
+            self.assertIsNone(second.headers.get("Content-Encoding"))
+            self.assertEqual(second.headers.get("Content-Type"), "application/json")
+
+        self.run_async(go())
+
 
 class DisableTest(AiohttpTestBase):
     def test_keel_disable_is_transparent(self) -> None:

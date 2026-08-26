@@ -5,6 +5,7 @@ Same invariant + resilience matrix as the httpx suite, through the
 
 from __future__ import annotations
 
+import gzip
 import sqlite3
 import unittest
 from pathlib import Path
@@ -212,6 +213,31 @@ class IdempotencyInjectionTest(RequestsBase):
             self.assertEqual(srv.served, 1)
             self.assertNotIn("idempotency-key", srv.headers[0])
             self.assertEqual(srv.served, 1)
+
+
+class CacheReplayTest(RequestsBase):
+    """No cache-hit gzip test existed for requests; issue #66 (the httpx-#60
+    sibling bug: a rebuilt response kept declaring the wire encoding of a
+    body that is already decoded)."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+
+    def test_gzip_response_replays_from_cache_intact(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        body = gzip.compress(b'{"a":1}')
+        with FaultServer(
+            [ok(body, {"Content-Type": "application/json", "Content-Encoding": "gzip"})]
+        ) as srv:
+            first = requests.get(srv.url("/gen"))
+            self.assertFalse(first.keel_outcome["from_cache"])
+            self.assertEqual(first.json(), {"a": 1})  # byte-transparency: live call
+            second = requests.get(srv.url("/gen"))
+            self.assertTrue(second.keel_outcome["from_cache"])
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json(), {"a": 1})
+            self.assertNotIn("Content-Encoding", second.headers)
+            self.assertEqual(second.headers["Content-Type"], "application/json")
+        self.assertEqual(srv.served, 1)
 
 
 class DiscoveryTest(RequestsBase):

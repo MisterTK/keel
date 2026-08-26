@@ -325,9 +325,13 @@ class _ReplayedResponse:
 
 
 def _rebuild(payload: Any) -> Any:
+    """Rebuild a `_ReplayedResponse` from an envelope (a cache-hit replay).
+    Wire-encoding headers are stripped (`_http.replay_headers`): the envelope
+    body is already-decoded bytes (aiohttp transparently decompresses), so a
+    stale `Content-Encoding`/`Content-Length` would misdescribe it (#66)."""
     p = payload if isinstance(payload, dict) else {}
     body = base64.b64decode(p["body_b64"]) if isinstance(p.get("body_b64"), str) else b""
-    return _ReplayedResponse(int(p.get("status", 200)), p.get("headers", []), body)
+    return _ReplayedResponse(int(p.get("status", 200)), _http.replay_headers(p.get("headers")), body)
 
 
 async def _release(resp: Any) -> None:

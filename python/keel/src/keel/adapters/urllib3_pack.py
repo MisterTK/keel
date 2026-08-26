@@ -226,14 +226,17 @@ def _rebuild(payload: Any) -> Any:
     """Rebuild a ``urllib3.HTTPResponse`` from an envelope (a cache-hit
     replay), via its public, documented constructor — unlike some client
     response types (see ``aiohttp_pack``), this one is meant to be built by
-    hand (urllib3's own test suite does exactly this)."""
+    hand (urllib3's own test suite does exactly this). Wire-encoding headers
+    are stripped (`_http.replay_headers`): the envelope body is already
+    decoded (urllib3's own `.data` ran the decoder on capture), so a stale
+    `Content-Encoding`/`Content-Length` would misdescribe it (#66)."""
     import urllib3
 
     p = payload if isinstance(payload, dict) else {}
     body = _b64decode(p.get("body_b64"))
     return urllib3.HTTPResponse(
         body=body,
-        headers=p.get("headers", []),
+        headers=_http.replay_headers(p.get("headers")),
         status=int(p.get("status", 200)),
         preload_content=True,
     )
