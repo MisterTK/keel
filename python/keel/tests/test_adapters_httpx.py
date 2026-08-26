@@ -9,6 +9,7 @@ canonical discovery row."""
 from __future__ import annotations
 
 import asyncio
+import gzip
 import sqlite3
 import unittest
 from pathlib import Path
@@ -279,6 +280,50 @@ class CustomTransportTest(HttpxBase):
         self.assertEqual(r.content, b"second")
         self.assertEqual(calls["n"], 2)  # retried through the custom transport
         self.assertTrue(getattr(transport.handle_request, "__keel_wrapped__", False))
+
+
+class CacheReplayTest(HttpxBase):
+    """No cache-hit test existed for httpx at all; issue #60's crash lived here."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+
+    def test_gzip_response_replays_from_cache_intact(self) -> None:
+        # Before the fix: the rebuilt response kept Content-Encoding: gzip over
+        # the DECODED body and httpx.Response.__init__ re-ran the gzip decoder →
+        # httpx.DecodingError: Error -3 ... incorrect header check.
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        body = gzip.compress(b'{"candidates": []}')
+        with FaultServer(
+            [ok(body, {"Content-Type": "application/json", "Content-Encoding": "gzip"})]
+        ) as srv:
+            first = httpx.get(srv.url("/gen"))
+            self.assertFalse(first.keel_outcome["from_cache"])
+            self.assertEqual(first.json(), {"candidates": []})
+            second = httpx.get(srv.url("/gen"))
+            self.assertTrue(second.keel_outcome["from_cache"])
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json(), {"candidates": []})
+            self.assertNotIn("content-encoding", second.headers)
+            # httpx.Response(content=...) always (re)populates Content-Length
+            # itself (its own `_prepare` docstring: "Using content=... implies
+            # automatically populated content headers"), so the stripped, STALE
+            # wire-length (the gzip-compressed size) doesn't survive — it's
+            # replaced by the true decoded length, not left absent.
+            self.assertEqual(second.headers["content-length"], str(len(b'{"candidates": []}')))
+            self.assertEqual(second.headers["content-type"], "application/json")
+        self.assertEqual(srv.served, 1)
+
+    def test_uncompressed_replay_keeps_all_other_headers(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer(
+            [ok(b'{"a":1}', {"Content-Type": "application/json", "X-Trace": "t1"})]
+        ) as srv:
+            httpx.get(srv.url("/x"))
+            second = httpx.get(srv.url("/x"))
+            self.assertTrue(second.keel_outcome["from_cache"])
+            self.assertEqual(second.json(), {"a": 1})
+            self.assertEqual(second.headers["x-trace"], "t1")
+        self.assertEqual(srv.served, 1)
 
 
 class DiscoveryTest(HttpxBase):

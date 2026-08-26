@@ -412,6 +412,32 @@ def response_envelope(
     return env
 
 
+#: Headers that describe the WIRE encoding of the original response body.
+REPLAY_STRIPPED_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+
+
+def replay_headers(headers: Any) -> list[list[str]]:
+    """Envelope headers minus the wire-encoding trio, for cache-hit rebuilds.
+
+    Envelope bodies hold the bytes the CALLER sees — decoded, for clients that
+    transparently decompress (httpx/requests/urllib3/aiohttp). A rebuilt
+    response must therefore not re-declare the wire encoding: httpx and urllib3
+    would run the decoder again over already-decoded bytes (DecodingError), and
+    content-length/transfer-encoding describe framing that no longer exists.
+    urllib_pack deliberately does NOT use this helper — urllib never
+    decompresses, so its envelope body is raw wire bytes and its captured
+    headers stay truthful on replay."""
+    out: list[list[str]] = []
+    for pair in headers or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        k, v = pair
+        if str(k).lower() in REPLAY_STRIPPED_HEADERS:
+            continue
+        out.append([str(k), str(v)])
+    return out
+
+
 def transient_error(http_status: int, retry_after: str | None) -> dict[str, Any]:
     """An ``AttemptResult`` error for a transient HTTP response (5xx/429). The
     live response is kept side-band by the pack (not sent through the core, which
@@ -507,6 +533,8 @@ __all__ = [
     "is_transient_status",
     "build_request",
     "response_envelope",
+    "REPLAY_STRIPPED_HEADERS",
+    "replay_headers",
     "transient_error",
     "thrown_error",
     "attach_outcome",
