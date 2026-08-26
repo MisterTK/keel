@@ -62,6 +62,12 @@ pub enum RunError {
     /// die inside Node's own ESM loader with a raw, unbranded
     /// `ERR_MODULE_NOT_FOUND`, so this is caught before exec'ing at all.
     MissingKeelrun { target: String },
+    /// The Python interpreter that `keel run` dispatches to cannot import OUR
+    /// `keel` package (`import keel._run`) — either `keelrun` is not installed,
+    /// or the UNRELATED PyPI package also named `keel` (an ncurses process
+    /// killer) is shadowing it. Without this pre-flight the user gets a raw
+    /// "No module named keel.__main__" two steps after `pip install keel`.
+    MissingPythonKeelrun { target: String },
 }
 
 impl RunError {
@@ -104,6 +110,19 @@ impl RunError {
                     .to_owned(),
                 "Run `npm install keelrun` alongside `keelrun-cli` in this project.".to_owned(),
                 "missing-keelrun",
+            ),
+            Self::MissingPythonKeelrun { target } => (
+                format!("Cannot run `{target}`: the `keelrun` package is not importable."),
+                "Python targets are dispatched via `python3 -m keel run`, which needs the \
+                 `keelrun` PyPI package (import name `keel`). Either it is not installed, \
+                 or an unrelated package also named `keel` is installed instead — \
+                 `pip install keel` is a different project's process-killer utility, not \
+                 this tool."
+                    .to_owned(),
+                "Run `pip install keelrun` — NOT `pip install keel` — in this project's \
+                 Python environment."
+                    .to_owned(),
+                "missing-keelrun-py",
             ),
         };
         let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
@@ -392,6 +411,38 @@ pub(crate) fn exec_with(
     }
 }
 
+/// `python3 -c` probe: exit 0 iff our package is importable. `find_spec`
+/// resolves without importing, so the foreign `keel==0.1` (no `_run`
+/// submodule) and a missing install both exit non-zero.
+const PY_KEELRUN_PROBE: &str =
+    "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('keel._run') else 3)";
+
+fn keelrun_importable(python: &str) -> bool {
+    Command::new(python)
+        .args(["-c", PY_KEELRUN_PROBE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        // Interpreter missing/unspawnable: not this error's job — fall through
+        // so exec_with's spawn-failed path reports it with its install hint.
+        .map_or(true, |s| s.success())
+}
+
+/// Pre-flight for Python plans, mirroring the Node `MissingKeelrun` walk:
+/// catch the wrong-`keel`-package trap before exec'ing (#61). ~one python
+/// startup (tens of ms), only on the run/record paths.
+pub(crate) fn python_preflight(target: &str, plan: &RunPlan) -> Option<Rendered> {
+    if plan.program == "python3" && !keelrun_importable(&plan.program) {
+        return Some(
+            RunError::MissingPythonKeelrun {
+                target: target.to_owned(),
+            }
+            .render(),
+        );
+    }
+    None
+}
+
 /// The whole `keel run` command: plan, then exec. On a dispatch error render it;
 /// on success return the child's exit code.
 pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i32) {
@@ -401,13 +452,19 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
             let code = r.exit;
             (Some(r), code)
         }
-        Ok(plan) => match exec(&plan) {
-            Ok(code) => (None, code),
-            Err(r) => {
+        Ok(plan) => {
+            if let Some(r) = python_preflight(target, &plan) {
                 let code = r.exit;
-                (Some(r), code)
+                return (Some(r), code);
             }
-        },
+            match exec(&plan) {
+                Ok(code) => (None, code),
+                Err(r) => {
+                    let code = r.exit;
+                    (Some(r), code)
+                }
+            }
+        }
     }
 }
 
@@ -655,6 +712,41 @@ mod tests {
         })
         .expect("sh should spawn");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn missing_python_keelrun_is_a_precise_error() {
+        let r = RunError::MissingPythonKeelrun {
+            target: "app.py".to_owned(),
+        }
+        .render();
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.to_stderr);
+        assert!(r.human.contains("pip install keelrun"));
+        assert!(r.human.contains("not `keel`") || r.human.contains("NOT `pip install keel`"));
+        assert_eq!(r.json["error"], "missing-keelrun-py");
+    }
+
+    #[test]
+    fn keelrun_probe_trusts_a_zero_exit_and_distrusts_nonzero() {
+        // The probe passes ["-c", <code>] to the interpreter; a shim that ignores
+        // its args and exits 0/1 exercises the plumbing without needing python.
+        let dir = TempDir::new().unwrap();
+        let ok = dir.path().join("ok.sh");
+        fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
+        let bad = dir.path().join("bad.sh");
+        fs::write(&bad, "#!/bin/sh\nexit 3\n").unwrap();
+        for p in [&ok, &bad] {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            fs::set_permissions(p, perms).unwrap();
+        }
+        assert!(keelrun_importable(ok.to_str().unwrap()));
+        assert!(!keelrun_importable(bad.to_str().unwrap()));
+        // A missing interpreter is NOT this error's job — spawn failure reports it.
+        assert!(keelrun_importable(
+            dir.path().join("absent").to_str().unwrap()
+        ));
     }
 
     #[test]

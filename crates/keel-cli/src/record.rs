@@ -67,6 +67,10 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
             return (Some(r), code);
         }
     };
+    if let Some(r) = run::python_preflight(target, &plan) {
+        let code = r.exit;
+        return (Some(r), code);
+    }
     let dir = recordings_dir(project);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         return (
