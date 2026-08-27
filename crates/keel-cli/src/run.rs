@@ -727,6 +727,7 @@ mod tests {
         assert_eq!(r.json["error"], "missing-keelrun-py");
     }
 
+    #[cfg(unix)]
     #[test]
     fn keelrun_probe_trusts_a_zero_exit_and_distrusts_nonzero() {
         // The probe passes ["-c", <code>] to the interpreter; a shim that ignores
