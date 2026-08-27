@@ -54,6 +54,12 @@ def run_target(
                 raise SystemExit(1) from exc
             raise
 
+    if state is not None and state.get("enabled", True):
+        # Children this script spawns self-activate via the wheel's .pth
+        # (KEEL_ENABLE gate) and resolve the same config root (#63).
+        os.environ.setdefault("KEEL_ENABLE", "1")
+        os.environ.setdefault("KEEL_CWD", str(cwd or os.getcwd()))
+
     # Mirror CPython's `python <target>` semantics exactly. runpy.run_path
     # does NOT put the script's directory on sys.path for a file target, but a
     # direct interpreter launch does — so without this, sibling imports

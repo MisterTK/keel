@@ -14,8 +14,12 @@
 //! - anything else              → a precise what/why/next error, exit 2
 //!
 //! The child inherits the environment (so every `KEEL_*` var passes through);
-//! `--disable` layers `KEEL_DISABLE=1` on top. The child's exit code is the
-//! process's exit code — wrapping is invisible on the success path.
+//! `--disable` layers `KEEL_DISABLE=1` on top. On top of that, `keel run`
+//! also layers `KEEL_ENABLE=1`/`KEEL_CWD` (set-if-absent — see
+//! [`activation_env`]) so any subprocess the child itself spawns
+//! self-activates via the keelrun wheel's `.pth` (#63); `--disable` skips
+//! this too. The child's exit code is the process's exit code — wrapping is
+//! invisible on the success path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -443,6 +447,27 @@ pub(crate) fn python_preflight(target: &str, plan: &RunPlan) -> Option<Rendered>
     None
 }
 
+/// Env pairs that make CHILD processes of the wrapped program self-activate
+/// via the keelrun wheel's `.pth` (`KEEL_ENABLE` gate) — the zero-effort
+/// subprocess-inheritance path (#63). Set-if-absent: a user's explicit value
+/// (including a falsy one) always wins; `--disable` exports nothing (the
+/// child env already carries KEEL_DISABLE=1, which beats KEEL_ENABLE anyway).
+pub(crate) fn activation_env(plan: &RunPlan) -> Vec<(String, String)> {
+    if plan.disable {
+        return Vec::new();
+    }
+    let mut env = Vec::new();
+    if std::env::var_os("KEEL_ENABLE").is_none() {
+        env.push(("KEEL_ENABLE".to_owned(), "1".to_owned()));
+    }
+    if std::env::var_os("KEEL_CWD").is_none()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        env.push(("KEEL_CWD".to_owned(), cwd.to_string_lossy().into_owned()));
+    }
+    env
+}
+
 /// The whole `keel run` command: plan, then exec. On a dispatch error render it;
 /// on success return the child's exit code.
 pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i32) {
@@ -457,7 +482,9 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
                 let code = r.exit;
                 return (Some(r), code);
             }
-            match exec(&plan) {
+            match exec_with(&plan, |cmd| {
+                cmd.envs(activation_env(&plan));
+            }) {
                 Ok(code) => (None, code),
                 Err(r) => {
                     let code = r.exit;
@@ -748,6 +775,65 @@ mod tests {
         assert!(keelrun_importable(
             dir.path().join("absent").to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn activation_env_is_layered_onto_children_unless_disabled() {
+        // `activation_env` reads KEEL_ENABLE/KEEL_CWD from the real process
+        // environment (set-if-absent semantics) — guard against ambient
+        // values and concurrent env mutation from other tests in this binary
+        // (cargo runs tests in threads within one process; env is global).
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_enable = std::env::var("KEEL_ENABLE").ok();
+        let saved_cwd = std::env::var("KEEL_CWD").ok();
+        // SAFETY: serialized by ENV_LOCK above; no other test in this binary
+        // touches KEEL_ENABLE/KEEL_CWD.
+        unsafe {
+            std::env::remove_var("KEEL_ENABLE");
+            std::env::remove_var("KEEL_CWD");
+        }
+
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![
+                "-c".to_owned(),
+                r#"[ "$KEEL_ENABLE" = "1" ] && [ -n "$KEEL_CWD" ] && exit 0 || exit 9"#.to_owned(),
+            ],
+            disable: false,
+        };
+        let mut cmd_env = activation_env(&plan);
+        cmd_env.sort();
+        let keys: Vec<&str> = cmd_env.iter().map(|(k, _)| k.as_str()).collect();
+        let result = exec_with(&plan, |cmd| {
+            cmd.envs(activation_env(&plan));
+        });
+
+        // SAFETY: still serialized by ENV_LOCK; restores whatever this
+        // process actually had before the test ran.
+        unsafe {
+            match saved_enable {
+                Some(v) => std::env::set_var("KEEL_ENABLE", v),
+                None => std::env::remove_var("KEEL_ENABLE"),
+            }
+            match saved_cwd {
+                Some(v) => std::env::set_var("KEEL_CWD", v),
+                None => std::env::remove_var("KEEL_CWD"),
+            }
+        }
+
+        assert_eq!(keys, vec!["KEEL_CWD", "KEEL_ENABLE"]);
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn disable_suppresses_activation_env() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: true,
+        };
+        assert!(activation_env(&plan).is_empty());
     }
 
     #[test]

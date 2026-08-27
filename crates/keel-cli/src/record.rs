@@ -6,9 +6,10 @@
 //!
 //! - `keel record run <script> [args…]` — exactly `keel run <script>
 //!   [args…]` (same dispatch via [`run::plan`]/[`run::exec_with`], same
-//!   exit-code passthrough), plus `KEEL_RECORD=<fresh path>` in the child's
-//!   environment. The front end (not this binary) does the actual capture —
-//!   see `python/keel/src/keel/_record.py`, `node/keel/src/record.mjs`.
+//!   exit-code passthrough and [`run::activation_env`] layering), plus
+//!   `KEEL_RECORD=<fresh path>` in the child's environment. The front end
+//!   (not this binary) does the actual capture — see
+//!   `python/keel/src/keel/_record.py`, `node/keel/src/record.mjs`.
 //! - `keel record list` — recordings under `.keel/recordings/`, newest first.
 //! - `keel record test <recording> [--out DIR]` — generate a pytest fixture
 //!   (Python recording) or `node:test` file (Node recording) from a
@@ -85,6 +86,7 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
     let path_str = path.to_string_lossy().into_owned();
     match run::exec_with(&plan, |cmd| {
         cmd.env("KEEL_RECORD", &path_str);
+        cmd.envs(run::activation_env(&plan));
     }) {
         Ok(code) => (None, code),
         Err(r) => {

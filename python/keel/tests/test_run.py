@@ -25,6 +25,7 @@ ECHO = str(FIXTURES / "echo_argv.py")
 ENRICH = str(FIXTURES / "enrich_app.py")
 NOOP = str(FIXTURES / "noop_app.py")
 SUBDIR_APP = str(FIXTURES / "subdir_app" / "app.py")
+SPAWN_PROBE = str(FIXTURES / "spawn_probe.py")
 
 
 def _run(cmd: list[str], *, env: dict[str, str], cwd: str) -> subprocess.CompletedProcess[bytes]:
@@ -145,6 +146,50 @@ class FullPipelineTest(unittest.TestCase):
             row = rows["py:sample_targets.enrich_*"]
             self.assertEqual(row["calls"], 1)
             self.assertEqual(row["successes"], 1)
+
+
+class ChildActivationEnvTest(unittest.TestCase):
+    """#63: a `keel run`-wrapped script's own subprocess children see
+    KEEL_ENABLE/KEEL_CWD so they self-activate via the wheel's `.pth`,
+    unless disabled or already set by the user."""
+
+    def test_children_inherit_keel_enable_and_cwd(self) -> None:
+        with TemporaryDirectory() as d:
+            out = subprocess.run(
+                [sys.executable, "-m", "keel", "run", SPAWN_PROBE],
+                capture_output=True,
+                text=True,
+                env=child_env(),
+                cwd=d,
+                check=True,
+            )
+        enable, _, cwd = out.stdout.strip().partition("|")
+        self.assertEqual(enable, "1")
+        self.assertTrue(cwd)  # points at the activation root
+
+    def test_disabled_run_exports_nothing(self) -> None:
+        with TemporaryDirectory() as d:
+            out = subprocess.run(
+                [sys.executable, "-m", "keel", "run", SPAWN_PROBE],
+                capture_output=True,
+                text=True,
+                env=child_env(KEEL_DISABLE="1"),
+                cwd=d,
+                check=True,
+            )
+        self.assertEqual(out.stdout.strip(), "|")
+
+    def test_user_set_keel_enable_is_not_stomped(self) -> None:
+        with TemporaryDirectory() as d:
+            out = subprocess.run(
+                [sys.executable, "-m", "keel", "run", SPAWN_PROBE],
+                capture_output=True,
+                text=True,
+                env=child_env(KEEL_ENABLE="yes"),
+                cwd=d,
+                check=True,
+            )
+        self.assertEqual(out.stdout.strip().split("|")[0], "yes")
 
 
 class StartupBudgetTest(unittest.TestCase):
