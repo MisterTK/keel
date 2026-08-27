@@ -264,8 +264,28 @@ fn command_plan(target: &str, args: &[String], disable: bool) -> Option<RunPlan>
     if matches!(ext, Some("py")) || ext.is_some_and(|e| NODE_EXTS.contains(&e)) {
         return None;
     }
-    let found = std::env::split_paths(&std::env::var_os("PATH")?)
-        .any(|dir| !dir.as_os_str().is_empty() && dir.join(target).is_file());
+    // #68: on Windows, `dir.join(target).is_file()` alone misses a bare
+    // command name that only exists with a PATHEXT extension (`uvicorn` ->
+    // `uvicorn.exe`) — command mode would silently degrade to NotFound even
+    // though the OS's own search (and Rust's `Command::new` spawn below)
+    // would find it fine. `cfg!(windows)` is a compile-time constant, so
+    // this is dead-code-eliminated on non-Windows builds.
+    let found = std::env::split_paths(&std::env::var_os("PATH")?).any(|dir| {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        if dir.join(target).is_file() {
+            return true;
+        }
+        cfg!(windows)
+            && Path::new(target).extension().is_none()
+            && pathext_candidates(
+                target,
+                &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()),
+            )
+            .iter()
+            .any(|c| dir.join(c).is_file())
+    });
     if !found {
         return None;
     }
@@ -275,6 +295,20 @@ fn command_plan(target: &str, args: &[String], disable: bool) -> Option<RunPlan>
         disable,
         command_mode: true,
     })
+}
+
+/// Extensions Windows' `PATHEXT` search would try for a bare command name
+/// (e.g. `uvicorn` -> `uvicorn.EXE`). Not `cfg(windows)`-gated so it is
+/// unit-testable on any host — only its call site above is Windows-only;
+/// PATHEXT does not exist as a concept on Unix, where an exact-name match
+/// is already correct.
+fn pathext_candidates(target: &str, pathext: &str) -> Vec<String> {
+    pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| format!("{target}{ext}"))
+        .collect()
 }
 
 /// Whether `keelrun` would resolve from `target`, mirroring Node's own
@@ -570,6 +604,49 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn pathext_candidates_appends_each_extension() {
+        assert_eq!(
+            pathext_candidates("uvicorn", ".COM;.EXE;.BAT;.CMD"),
+            vec!["uvicorn.COM", "uvicorn.EXE", "uvicorn.BAT", "uvicorn.CMD"]
+        );
+    }
+
+    #[test]
+    fn pathext_candidates_ignores_empty_segments() {
+        assert_eq!(
+            pathext_candidates("x", ";.EXE;;.BAT;"),
+            vec!["x.EXE", "x.BAT"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_plan_finds_a_bare_name_via_pathext() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("uvicorn.EXE"), b"").unwrap();
+        let orig_path = std::env::var_os("PATH");
+        // SAFETY: test-local env mutation, restored immediately after.
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+        let plan = command_plan("uvicorn", &[], false);
+        unsafe {
+            match orig_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(
+            plan.is_some(),
+            "PATHEXT-extended name must be found on PATH"
+        );
+        assert!(plan.unwrap().command_mode);
+    }
 
     #[test]
     fn python_target_dispatches_to_python_module() {

@@ -357,6 +357,10 @@ fn resume_one(
         }
     };
     announce(&row, &script, args);
+    if let Some(r) = run::python_preflight(&script.to_string_lossy(), &plan) {
+        let code = r.exit;
+        return (Some(r), code);
+    }
     match run::exec_with(&plan, |cmd| {
         cmd.envs(run::activation_env(&plan));
     }) {
@@ -430,6 +434,16 @@ fn resume_all(project: &Path, conn: &Connection, now_ms: i64) -> (Option<Rendere
                     }
                 };
                 announce(&row, &script, &[]);
+                if let Some(r) = run::python_preflight(&script.to_string_lossy(), &plan) {
+                    eprint!("{}", r.human);
+                    attempted.push(AttemptEntry {
+                        exit_code: r.exit,
+                        progressed: false,
+                        flow_id: row.flow_id,
+                        script: script.display().to_string(),
+                    });
+                    continue;
+                }
                 let exit_code = match run::exec_with(&plan, |cmd| {
                     cmd.envs(run::activation_env(&plan));
                 }) {
@@ -846,6 +860,60 @@ mod tests {
         assert_eq!(plan.argv[2], "run");
         assert!(plan.argv[3].ends_with("retry.py"));
         assert_eq!(plan.argv[4], "--x");
+    }
+
+    /// #68: `resume_one`/`resume_all` now call `run::python_preflight` —
+    /// the same gate `run::run`/`record::run` already run before exec'ing a
+    /// Python plan (#61) — so a shadowed/foreign `keel` PyPI package
+    /// surfaces the branded `missing-keelrun-py` error on resume too,
+    /// rather than a raw, unbranded traceback two steps later. The exact
+    /// wiring is a straight mechanical copy of `run.rs`'s/`record.rs`'s
+    /// already-shipped call sites — see the `if let Some(r) =
+    /// run::python_preflight(...)` early-return in both `resume_one` and
+    /// `resume_all` above.
+    ///
+    /// This test proves only the SAFE side of that gate: calling
+    /// `python_preflight` directly (already `pub(crate)`, no journal/
+    /// fixture machinery needed) with a `python3`-programmed plan does not
+    /// regress the happy path. The OTHER branch — `keelrun_importable`
+    /// returning `false` — was never end-to-end-testable anywhere in this
+    /// crate even before this task: it is gated on the literal
+    /// `plan.program == "python3"`, and forcing that call to fail
+    /// deterministically requires shadowing the real process `PATH`, which
+    /// is unsound (`std::env::set_var` is documented-UB against ANY other
+    /// thread's concurrent `std::env::var` read in the same process — not
+    /// just other PATH-mutators). This was tried and empirically confirmed:
+    /// it broke 10 unrelated `scan::python::tests::*` tests when the full
+    /// suite ran with default parallelism (reproduced 2/2; clean tree
+    /// 394/394 both times), and only passed under `RUST_TEST_THREADS=1`.
+    /// `run.rs`'s own pre-existing `keelrun_probe_trusts_a_zero_exit_and_
+    /// distrusts_nonzero` sidesteps this the same way this test does: it
+    /// unit-tests `keelrun_importable` in isolation via absolute paths to
+    /// fake shell scripts, never through a bare `"python3"` PATH lookup.
+    #[test]
+    fn python_preflight_is_a_noop_when_keelrun_is_importable() {
+        let plan = run::RunPlan {
+            program: "python3".to_owned(),
+            argv: vec![],
+            disable: false,
+            command_mode: false,
+        };
+        match run::python_preflight("app.py", &plan) {
+            None => {}
+            Some(r) => {
+                // Ambient `python3` on this machine's PATH has no `keelrun`
+                // installed at all (common on a bare dev shell that never
+                // ran `pip install -e python/keel` into its system
+                // interpreter) — matches this crate's existing
+                // `python3_present()`-style graceful skip convention rather
+                // than hard-failing on an environment precondition this
+                // test does not control.
+                eprintln!(
+                    "skip: ambient `python3` does not have `keelrun` importable ({})",
+                    r.json["error"]
+                );
+            }
+        }
     }
 
     #[test]
