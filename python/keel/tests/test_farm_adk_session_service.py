@@ -371,28 +371,32 @@ class RealSessionServiceCrashResumeConvergenceTest(_KeelSessionServiceFarmTestBa
     resume-identity technique, applied here with a REAL ``Runner`` + REAL
     ``KeelSessionService`` + REAL native journal.
 
-    RESULT — DIVERGED (see ``FARM CERTIFICATION SUMMARY`` in the shipping
-    commit for the authoritative write-up): ``Session.state`` and the
-    SUBSTANTIVE content of every event (author, text, tool-call
-    name/args/response) converge exactly, as does the FULL fingerprint
-    (id/timestamp/invocation_id/content) of every event that was NEVER
-    replay-substituted. But for the events belonging to run 1's abandoned
-    (replay-substituted) prefix — the user message plus the first
-    function_call/function_response pair — `Event.id`/`Event.timestamp`/
-    `Event.invocation_id` (freshly, non-deterministically assigned by REAL
-    ADK code on every construction, never virtualized by Keel) diverge
-    between the LIVE session object and the journal reconstruction, and so
-    does the RAW content of the function_call/function_response pair
-    specifically (ADK assigns its own `function_call.id`/
-    `function_response.id` correlation id fresh on every redrive too — this
-    is NOT the same as the underlying tool's own `execute()` outcome, which
-    Keel DOES correctly substitute and which is proven identical below).
-    This is a REAL correctness gap relative to design §3.2a's stated goal;
-    see this class's own assertions below for the exact, verified shape,
-    and the shipping commit's FARM CERTIFICATION SUMMARY for the
-    recommended next step. If a future ADK/Keel change makes any of these
-    assertions start failing differently, that is real signal, not a
-    flaky test.
+    RESULT — CONVERGED (issue #44 pt.2; see ``FARM CERTIFICATION SUMMARY`` in
+    the shipping commit for the authoritative write-up): ``Session.state``
+    and the FULL fingerprint (id/timestamp/invocation_id/content) of EVERY
+    event converge exactly between the LIVE session object and the journal
+    reconstruction — including the events belonging to run 1's abandoned
+    (replay-substituted) prefix (the user message plus the first
+    function_call/function_response pair), where `Event.id`/
+    `Event.timestamp`/`Event.invocation_id` (freshly, non-deterministically
+    assigned by REAL ADK code on every construction) and the RAW content of
+    the function_call/function_response pair (ADK assigns its own
+    `function_call.id`/`function_response.id` correlation id fresh on every
+    redrive too) previously diverged between the LIVE session object and the
+    journal reconstruction. Issue #44's original finding: Keel's replay
+    machinery correctly substitutes the underlying tool's own `execute()`
+    outcome, but `KeelSessionService.append_event` discarded
+    `_record_session_step`'s return value entirely, so it had no way to
+    virtualize these ADK-internal ids — assigned deep inside
+    `Runner.run_async`'s own post-processing, entirely outside any
+    Keel-wrapped call boundary. The fix (issue #44 pt.2): `append_event` now
+    reads that return value back and, when the underlying `backend.
+    execute()` call reports `replayed: True`, overwrites the live event's
+    freshly-assigned id/timestamp/invocation_id (and per-part
+    function_call.id/function_response.id) with the RECORDED ones — closing
+    the gap this class's assertions previously pinned. If a future ADK/Keel
+    change makes any of these assertions start failing again, that is real
+    signal, not a flaky test.
     """
 
     def test_crash_mid_turn_then_resume_converges_with_the_journal_reconstruction(self) -> None:
@@ -524,66 +528,22 @@ class RealSessionServiceCrashResumeConvergenceTest(_KeelSessionServiceFarmTestBa
         live_fp = _fingerprint(live_session)
         reconstructed_fp = _fingerprint(reconstructed)
 
-        def _strip_function_ids(content: dict[str, Any] | None) -> dict[str, Any] | None:
-            """Strip ADK's own internally-assigned `function_call.id`/
-            `function_response.id` correlation ids (see the CONFIRMED
-            DIVERGENCE comment block below) so the SUBSTANTIVE tool-call
-            value — `name`/`args`/`response` — can be compared on its own,
-            separately from that correlation id."""
-            if content is None:
-                return None
-            stripped: dict[str, Any] = {"role": content.get("role"), "parts": []}
-            for part in content.get("parts") or []:
-                part = dict(part)
-                for key in ("function_call", "function_response"):
-                    if isinstance(part.get(key), dict):
-                        inner = dict(part[key])
-                        inner.pop("id", None)
-                        part[key] = inner
-                stripped["parts"].append(part)
-            return stripped
-
         live_content = [fp["content"] for fp in live_fp]
         reconstructed_content = [fp["content"] for fp in reconstructed_fp]
 
-        # Events 0, 3, 4, 5 (index 0: the user's own plain-text message,
-        # which was replay-substituted but carries no ADK-internal
-        # correlation id to diverge on; indices 3-5: never substituted at
-        # all) converge EXACTLY, content included.
-        for i in (0, 3, 4, 5):
+        # Issue #44 pt.2: EVERY event's content now converges exactly,
+        # including events 1, 2 (the REPLAY-SUBSTITUTED function_call/
+        # function_response pair) — `append_event`'s id-overwrite logic (see
+        # class docstring) restores ADK's own `function_call.id`/
+        # `function_response.id` correlation ids from the recorded payload
+        # too, not just the substantive name/args/response value (already
+        # proven identical before this fix, via the separately-substituted
+        # `tool:` effect step).
+        for i in range(len(live_content)):
             self.assertEqual(
                 live_content[i],
                 reconstructed_content[i],
-                f"event[{i}] content must converge exactly (design §3.2a)",
-            )
-
-        # Events 1, 2 (the REPLAY-SUBSTITUTED function_call/function_response
-        # pair): CONFIRMED DIVERGENCE in the raw content dict — but the
-        # SUBSTANTIVE tool-call value (name/args, and the response payload,
-        # which comes from the SEPARATELY-substituted `tool:` effect step
-        # and is therefore itself frozen/correct) still converges once
-        # ADK's own `function_call.id`/`function_response.id` correlation
-        # id is excluded. Root cause: ADK assigns these ids fresh
-        # (`adk-<uuid>`) during ITS OWN event-construction pipeline on
-        # EVERY invocation, including the redrive inside a resumed Tier 2
-        # attempt — Keel's replay machinery virtualizes the TOOL's own
-        # `execute()` outcome (proven identical: see the `response` field
-        # below), but has no mechanism to virtualize this ADK-internal id,
-        # since it is assigned deep inside `Runner.run_async`'s own
-        # post-processing, entirely outside any Keel-wrapped call boundary.
-        for i in (1, 2):
-            self.assertNotEqual(
-                live_content[i],
-                reconstructed_content[i],
-                f"CONFIRMED DIVERGENCE: event[{i}]'s raw content differs (ADK's own "
-                "function_call/function_response correlation id — see this method's "
-                "comments above)",
-            )
-            self.assertEqual(
-                _strip_function_ids(live_content[i]),
-                _strip_function_ids(reconstructed_content[i]),
-                f"event[{i}]'s SUBSTANTIVE tool-call value (name/args/response) still "
-                "converges once ADK's own correlation id is excluded",
+                f"event[{i}] content must converge exactly (design §3.2a, issue #44 pt.2)",
             )
 
         live_authors = [fp["author"] for fp in live_fp]
@@ -601,70 +561,52 @@ class RealSessionServiceCrashResumeConvergenceTest(_KeelSessionServiceFarmTestBa
             "resumed LIVE Session.state must converge to the journal reconstruction (design §3.2a)",
         )
 
-        # `event.id`/`event.timestamp` (and, for events sharing run 1's
-        # invocation, `event.invocation_id`) are a REAL, CONFIRMED
-        # divergence for the THREE REPLAY-SUBSTITUTED events (index 0, 1, 2:
-        # the user message plus the function_call/function_response pair,
-        # all recorded during the abandoned attempt 1) — NOT a false
-        # positive from comparing untracked fields (see `_fingerprint`'s own
-        # docstring above): these ARE part of the documented §3.1 payload
-        # schema and ARE what `_decode_event` reconstructs. Root cause:
-        # `Event.id` is a random uuid assigned in `model_post_init`
-        # whenever an `Event` is constructed with no explicit `id` (confirmed against
-        # `google/adk/events/event.py`'s own "Generates a random ID for the
-        # event" comment), and `Event.timestamp` is
-        # `Field(default_factory=lambda: platform_time.get_time())` — i.e.
-        # BOTH are freshly, non-deterministically generated by the REAL ADK
-        # code on EVERY construction, including the redrive inside attempt
-        # 2. `KeelSessionService.append_event`'s LIVE mutation
+        # `event.id`/`event.timestamp`/`event.invocation_id` now converge for
+        # EVERY event — NOT a false positive from comparing untracked fields
+        # (see `_fingerprint`'s own docstring above): these ARE part of the
+        # documented §3.1 payload schema and ARE what `_decode_event`
+        # reconstructs. Before issue #44 pt.2's fix, events 0, 1, 2 (the
+        # THREE REPLAY-SUBSTITUTED events: the user message plus the
+        # function_call/function_response pair, all recorded during the
+        # abandoned attempt 1) diverged, because `Event.id`/`Event.
+        # timestamp` are freshly, non-deterministically generated by the
+        # REAL ADK code on EVERY construction (`model_post_init`'s random
+        # uuid; `Field(default_factory=lambda: platform_time.get_time())`),
+        # including the redrive inside attempt 2, and
+        # `KeelSessionService.append_event`'s LIVE mutation
         # (`session.events.append(event)`, inside the inherited
-        # `super().append_event()`) always uses THIS attempt's freshly
-        # constructed `event` object, unconditionally — it does not consult
-        # what `_record_session_step`'s underlying `backend.execute()` call
-        # returns (whether fresh or replay-substituted), because that
-        # return value is discarded (`_record_session_step` doesn't return
-        # anything `append_event` reads). Meanwhile the JOURNAL's own copy
-        # of the first two events' `tool:adk.session_event` steps IS
-        # replay-substituted on resume (matching
-        # `EndToEndRecoveryTest`'s independently-proven "exactly one
-        # journal row per effect, ever — no duplicate for the substituted
-        # one" behavior for the SAME `execute()` mechanism) — so it still
-        # carries attempt 1's ORIGINAL `id`/`timestamp`/`invocation_id` for
-        # those two events, not attempt 2's. This is a REAL correctness gap
-        # relative to design §3.2a's stated goal ("If they ever diverge,
-        # that is a real bug to fix") — reported precisely here rather than
-        # silently avoided; see the shipping commit's FARM CERTIFICATION
-        # SUMMARY for the recommended fast-follow. The assertions below
-        # PIN the exact, verified shape of the divergence (which two
-        # events, which fields) rather than asserting false convergence.
-        for i in (0, 1, 2):
-            self.assertNotEqual(
-                live_fp[i]["id"],
-                reconstructed_fp[i]["id"],
-                f"CONFIRMED DIVERGENCE: event[{i}].id differs between the live (freshly "
-                "redriven) object and the journal-reconstructed (replay-substituted, "
-                "attempt-1-frozen) one — see this test's docstring/comments",
-            )
-            self.assertNotEqual(
-                live_fp[i]["timestamp"],
-                reconstructed_fp[i]["timestamp"],
-                f"CONFIRMED DIVERGENCE: event[{i}].timestamp likewise diverges (fresh "
-                "wall-clock value vs. attempt-1's frozen one)",
-            )
+        # `super().append_event()`) used to always keep THIS attempt's
+        # freshly constructed `event` object unconditionally, never
+        # consulting what `_record_session_step`'s underlying `backend.
+        # execute()` call returned. `append_event` now reads that return
+        # value back and, when it reports `replayed: True`, overwrites the
+        # live event's id/timestamp/invocation_id with the ORIGINALLY-
+        # journaled ones (the JOURNAL's own copy was already correctly
+        # replay-substituted on resume — matching `EndToEndRecoveryTest`'s
+        # independently-proven "exactly one journal row per effect, ever —
+        # no duplicate for the substituted one" behavior for the SAME
+        # `execute()` mechanism) — so the live object and the journal
+        # reconstruction now agree for these events too, closing the design
+        # §3.2a gap ("If they ever diverge, that is a real bug to fix").
         # Events 3-5 were never substituted (produced fresh exactly once,
-        # during attempt 2's own un-replayed tail) — id/timestamp DO
-        # converge for those, confirming the divergence is specifically a
-        # replay-substitution artifact, not a general encode/decode bug.
-        for i in (3, 4, 5):
+        # during attempt 2's own un-replayed tail) and converged even before
+        # this fix — included here in the same loop to confirm the fix
+        # didn't regress the un-substituted case.
+        for i in range(len(live_fp)):
             self.assertEqual(
                 live_fp[i]["id"],
                 reconstructed_fp[i]["id"],
-                f"event[{i}] was never replay-substituted — id must converge",
+                f"event[{i}].id must converge (issue #44 pt.2)",
             )
             self.assertEqual(
                 live_fp[i]["timestamp"],
                 reconstructed_fp[i]["timestamp"],
-                f"event[{i}] was never replay-substituted — timestamp must converge",
+                f"event[{i}].timestamp must converge (issue #44 pt.2)",
+            )
+            self.assertEqual(
+                live_fp[i]["invocation_id"],
+                reconstructed_fp[i]["invocation_id"],
+                f"event[{i}].invocation_id must converge (issue #44 pt.2)",
             )
 
 

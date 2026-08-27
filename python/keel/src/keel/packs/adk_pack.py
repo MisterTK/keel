@@ -1194,12 +1194,14 @@ def _can_read_journal(backend: Any) -> bool:
     )
 
 
-def _record_session_step(backend: Any, target: str, op: str, args_hash: str, payload: dict[str, Any]) -> None:
+def _record_session_step(
+    backend: Any, target: str, op: str, args_hash: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     """Journal one `KeelSessionService` step through the CURRENTLY open Keel
-    Tier 2 flow. Mirrors `langgraph_pack._record_step` exactly: the payload
-    is already fully known (ADK handed us a complete event/identity/delete to
-    persist), so the effect never fails and its outcome is never read back —
-    durability + `keel trace` visibility are the only reasons to journal."""
+    Tier 2 flow. Mirrors `langgraph_pack._record_step`, with one difference
+    (issue #44): the outcome IS read back now, because a replay-substituted
+    step's recorded payload carries the ORIGINAL event identity a caller
+    needs to virtualize ADK's freshly-reassigned ids against."""
     request = {
         "v": ENVELOPE_VERSION,
         "target": target,
@@ -1207,7 +1209,7 @@ def _record_session_step(backend: Any, target: str, op: str, args_hash: str, pay
         "idempotent": False,
         "args_hash": args_hash,
     }
-    backend.execute(request, lambda _attempt: {"status": "ok", "payload": payload})
+    return backend.execute(request, lambda _attempt: {"status": "ok", "payload": payload})
 
 
 def _copy_session_light(session: Any) -> Any:
@@ -1423,22 +1425,54 @@ def _base_session_service_cls() -> type:
                     _session_event_seq += 1
                     seq = _session_event_seq
                     state_delta = dict(event.actions.state_delta) if event.actions else {}
+                    parts = list(getattr(event.content, "parts", None) or [])
+                    correlation_ids = [
+                        {
+                            "function_call_id": getattr(getattr(p, "function_call", None), "id", None),
+                            "function_response_id": getattr(getattr(p, "function_response", None), "id", None),
+                        }
+                        for p in parts
+                    ]
                     payload = {
                         "event_id": event.id,
                         "author": event.author,
                         "invocation_id": event.invocation_id,
                         "timestamp": event.timestamp,
                         "content": _encode_content(event.content),
+                        "correlation_ids": correlation_ids,
                         "state_delta": {k: _json_safe(v) for k, v in state_delta.items()},
                         "partial": event.partial,
                     }
-                    _record_session_step(
+                    step_outcome = _record_session_step(
                         backend,
                         SESSION_EVENT_TARGET,
                         f"adk session_event session={session.id} seq={seq}",
                         f"{session.id}:{seq}",
                         payload,
                     )
+                    # Issue #44: on a replay-substitution (mid-turn crash +
+                    # resume), `step_outcome["payload"]` is the ORIGINALLY-
+                    # journaled payload, not what this live re-run just
+                    # computed above — overwrite the live event's freshly
+                    # ADK-assigned ids with the recorded ones so the live
+                    # session and a fresh journal reconstruction converge
+                    # exactly. A live (non-replayed) run never touches
+                    # `event` here. (`result`, above, is the base
+                    # `append_event`'s own return value — this uses a
+                    # DIFFERENT name deliberately so it is never shadowed.)
+                    if isinstance(step_outcome, dict) and step_outcome.get("replayed"):
+                        recorded = step_outcome.get("payload") or {}
+                        event.id = recorded.get("event_id", event.id)
+                        event.timestamp = recorded.get("timestamp", event.timestamp)
+                        event.invocation_id = recorded.get("invocation_id", event.invocation_id)
+                        recorded_correlations = recorded.get("correlation_ids") or []
+                        for part, corr in zip(parts, recorded_correlations):
+                            fc = getattr(part, "function_call", None)
+                            if fc is not None and corr.get("function_call_id") is not None:
+                                fc.id = corr["function_call_id"]
+                            fr = getattr(part, "function_response", None)
+                            if fr is not None and corr.get("function_response_id") is not None:
+                                fr.id = corr["function_response_id"]
             self._cache[(session.app_name, session.user_id, session.id)] = session
             return result
 

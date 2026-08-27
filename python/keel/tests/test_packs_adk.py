@@ -40,6 +40,7 @@ from fake_adk import (
     FakeContent,
     FakeEvent,
     FakeEventActions,
+    FakeFunctionCall,
     FakeGemini,
     FakeGetSessionConfig,
     FakeInMemoryRunner,
@@ -2040,6 +2041,96 @@ class KeelSessionServiceWritePathTest(AdkTestBase):
             asyncio.run(svc.delete_session(app_name="app", user_id="u1", session_id="s1"))
         steps = self.backend.steps_for_flow(self.backend.last_flow_id)
         self.assertEqual([s["step_key"] for s in steps], [f"{adk_pack.SESSION_DELETE_TARGET}#s1"])
+
+
+class _FakeScriptedExecuteBackend:
+    """A backend whose `execute()` returns a pre-scripted result rather than
+    threading through a real flow journal (unlike
+    `_FakeSessionJournalBackend`, which this test class deliberately does
+    NOT reuse — issue #44's id-overwrite logic only cares about what
+    `execute()` returns, not journal bookkeeping). Enough surface for
+    `_write_gate`'s honesty check (`_runtime.in_active_flow()` +
+    `_active_session_identity` are module/runtime state, not backend
+    methods) plus `_record_session_step`'s `backend.execute(request,
+    effect)` call.
+
+    Mirrors the real Task-3 contract: `effect` is always invoked (the
+    payload the live call just computed is never skipped), but on a
+    replay-substitution the RETURNED `payload` is a separately-scripted
+    "originally journaled" dict, not the live effect's own payload — the
+    exact shape issue #44's fix (`append_event`) has to virtualize against.
+    """
+
+    def __init__(self, *, replayed: bool, recorded_payload: dict[str, Any] | None = None) -> None:
+        self.replayed = replayed
+        self.recorded_payload = recorded_payload
+        self.execute_calls: list[dict[str, Any]] = []
+
+    def execute(self, request: dict[str, Any], effect: Any) -> dict[str, Any]:
+        self.execute_calls.append(request)
+        live_result = effect(0)
+        payload = self.recorded_payload if (self.replayed and self.recorded_payload is not None) else live_result["payload"]
+        return {"result": live_result.get("status", "ok"), "payload": payload, "replayed": self.replayed}
+
+
+class KeelSessionServiceReplayIdentityTest(AdkTestBase):
+    """Issue #44 pt.2: on a replay-substituted `append_event` (mid-turn
+    crash + resume), the live event's freshly ADK-assigned `id`/`timestamp`/
+    `invocation_id` (and per-part `function_call`/`function_response`
+    correlation ids) must be overwritten with the RECORDED values so the
+    live session and a fresh journal reconstruction converge exactly. A
+    live (non-replayed) run must leave the event completely untouched."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        entry = FlowEntrypoint(
+            raw=adk_pack.RUNNER_FLOW_ENTRYPOINT, module="google.adk.runners", function="Runner.run_async"
+        )
+        _runtime.set_flow_entrypoints([entry])
+        adk_pack._active_session_identity = ("app", "u1", "s1")
+        _runtime.set_flow_active(True)
+
+    def test_live_run_leaves_event_identity_unchanged(self) -> None:
+        backend = _FakeScriptedExecuteBackend(replayed=False)
+        _runtime.set_runtime(backend, None)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            event = _fake_event(event_id="live-id", invocation_id="live-inv", timestamp=5.0)
+            returned = asyncio.run(svc.append_event(session, event))
+        self.assertEqual(event.id, "live-id")
+        self.assertEqual(event.timestamp, 5.0)
+        self.assertEqual(event.invocation_id, "live-inv")
+        # `append_event` must still return the REAL base method's own
+        # return value (the appended event) — not the journal step's
+        # bookkeeping outcome dict (a `result`/`step_outcome` naming
+        # collision inside the method would silently swap these).
+        self.assertIs(returned, event)
+
+    def test_replay_substitution_overwrites_event_identity_and_correlation_ids(self) -> None:
+        recorded_payload = {
+            "event_id": "recorded-id",
+            "timestamp": 123.0,
+            "invocation_id": "recorded-inv",
+            "correlation_ids": [{"function_call_id": "recorded-fc", "function_response_id": None}],
+        }
+        backend = _FakeScriptedExecuteBackend(replayed=True, recorded_payload=recorded_payload)
+        _runtime.set_runtime(backend, None)
+        with FakeAdkModules():
+            svc = adk_pack.KeelSessionService(app_name="app")
+            session = _fake_session("app", "u1", "s1")
+            function_call = FakeFunctionCall(id="live-fc", name="search")
+            part = FakePart(function_call=function_call)
+            content = FakeContent(role="model", parts=[part])
+            event = _fake_event(
+                event_id="live-id", invocation_id="live-inv", timestamp=5.0, content=content
+            )
+            returned = asyncio.run(svc.append_event(session, event))
+        self.assertEqual(event.id, "recorded-id")
+        self.assertEqual(event.timestamp, 123.0)
+        self.assertEqual(event.invocation_id, "recorded-inv")
+        self.assertEqual(function_call.id, "recorded-fc")
+        self.assertIs(returned, event, "append_event must still return the base method's own return value")
 
 
 class KeelSessionServiceStepOrderingTest(AdkTestBase):
