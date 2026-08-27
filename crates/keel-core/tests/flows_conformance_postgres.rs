@@ -202,7 +202,7 @@ async fn run_flow_scenario(scn: &FlowScenario, journal: Arc<dyn Journal>) -> Vec
             };
             let effect = step.effect.clone();
             let calls_effect = Arc::clone(&calls);
-            let outcome = handle
+            let (outcome, _replayed) = handle
                 .execute_step_with_idempotency_key(
                     &request,
                     step.idempotency_key.as_deref(),

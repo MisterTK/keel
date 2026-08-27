@@ -514,6 +514,7 @@ mod bindings {
                             effect_fn,
                         )
                         .await
+                        .0
                 } else {
                     drop(guard);
                     engine.execute(&request, effect_fn).await

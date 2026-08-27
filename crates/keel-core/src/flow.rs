@@ -618,6 +618,7 @@ impl FlowHandle {
     {
         self.execute_step_with_idempotency_key(request, None, effect)
             .await
+            .0
     }
 
     /// [`execute_step`](Self::execute_step), carrying the idempotency key the
@@ -628,12 +629,20 @@ impl FlowHandle {
     /// inject the SAME key — making the at-least-once re-execution deduplicable
     /// on the provider side. The key never feeds the step key (`args_hash` is
     /// unchanged by injection), so replay matching is unaffected.
+    ///
+    /// Returns the outcome plus whether it was substituted from a completed
+    /// flow's journal (`true`) rather than freshly executed (`false` — either
+    /// a live run, or a replay-only handle hitting an unrecorded step, which
+    /// is a nondeterminism error, not a real substitution). This bit is
+    /// `keel-core`-internal, never serialized into the frozen `Outcome`
+    /// envelope (`contracts/core_api.rs`) — front ends that need it (issue
+    /// #44) thread it through their OWN binding layer.
     pub async fn execute_step_with_idempotency_key<F>(
         &mut self,
         request: &Request,
         idempotency_key: Option<&str>,
         effect: F,
-    ) -> Outcome
+    ) -> (Outcome, bool)
     where
         F: AsyncFnMut(u32) -> keel_core_api::AttemptResult,
     {
@@ -646,17 +655,18 @@ impl FlowHandle {
         // grew or changed a step since the flow completed) rather than firing it.
         if self.replay_only {
             return match plan {
-                StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
-                _ => replay_miss_outcome(&self.flow_id, seq, &key),
+                StepPlan::Replay(outcome) => (replay_outcome(&self.flow_id, seq, &outcome), true),
+                _ => (replay_miss_outcome(&self.flow_id, seq, &key), false),
             };
         }
         match plan {
-            StepPlan::Replay(outcome) => replay_outcome(&self.flow_id, seq, &outcome),
-            StepPlan::Diverged { recorded } => {
+            StepPlan::Replay(outcome) => (replay_outcome(&self.flow_id, seq, &outcome), true),
+            StepPlan::Diverged { recorded } => (
                 self.on_divergence(seq, &recorded, &key, request, idempotency_key, effect)
-                    .await
-            }
-            StepPlan::Live => {
+                    .await,
+                false,
+            ),
+            StepPlan::Live => (
                 self.run_live(
                     seq,
                     &key,
@@ -665,8 +675,9 @@ impl FlowHandle {
                     idempotency_key,
                     effect,
                 )
-                .await
-            }
+                .await,
+                false,
+            ),
         }
     }
 

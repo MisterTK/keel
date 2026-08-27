@@ -265,7 +265,7 @@ async fn run_effect_step(
         .clone()
         .unwrap_or_else(|| panic!("run[{ri}] step[{si}]: an effect step needs `effect`"));
     let calls_effect = Arc::clone(calls);
-    let outcome = handle
+    let (outcome, _replayed) = handle
         .execute_step_with_idempotency_key(
             &request(target, step.args_hash.as_deref()),
             step.idempotency_key.as_deref(),

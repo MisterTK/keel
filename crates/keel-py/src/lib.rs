@@ -261,6 +261,24 @@ fn outcome_to_py(py: Python<'_>, outcome: &Outcome) -> PyResult<Py<PyAny>> {
         .map_err(|e| keel_error(py, "KEEL-E040", &format!("outcome not encodable: {e}")))
 }
 
+/// [`outcome_to_py`]'s flow-aware twin: adds one additive `replayed` key
+/// (issue #44) — `true` when this step's outcome was substituted from a
+/// completed flow's journal rather than freshly executed. Only flow-aware
+/// call sites (an open `FlowHandle`) ever call this; the bare-engine path
+/// keeps calling plain `outcome_to_py`, so non-flow callers see the exact
+/// same dict shape as before this issue.
+fn flow_outcome_to_py(py: Python<'_>, outcome: &Outcome, replayed: bool) -> PyResult<Py<PyAny>> {
+    #[derive(serde::Serialize)]
+    struct FlowOutcome<'a> {
+        #[serde(flatten)]
+        outcome: &'a Outcome,
+        replayed: bool,
+    }
+    pythonize(py, &FlowOutcome { outcome, replayed })
+        .map(Bound::unbind)
+        .map_err(|e| keel_error(py, "KEEL-E040", &format!("outcome not encodable: {e}")))
+}
+
 /// Invoke the synchronous Python effect for one attempt (GIL held here). Any
 /// Python-side error or undecodable result degrades to `Error { class: other }`.
 fn invoke_sync_effect(py: Python<'_>, effect: &Py<PyAny>, attempt: u32) -> AttemptResult {
@@ -587,7 +605,7 @@ impl KeelCore {
         // replayable; otherwise run the bare engine (identical to before). The
         // effect runs under an `InEffectGuard` so any re-entrant intercepted call
         // or time/random read it triggers passes through instead of deadlocking.
-        let outcome = py.detach(move || {
+        let (outcome, replayed) = py.detach(move || {
             let guard = lock_recover(runtime);
             // `blocking_lock` (never the async `.lock().await`, which would need
             // an executor polling us) — safe here because we already released
@@ -602,15 +620,22 @@ impl KeelCore {
                 })
             };
             match flow.as_mut() {
-                Some(handle) => guard.block_on(handle.execute_step_with_idempotency_key(
-                    &request,
-                    idempotency_key.as_deref(),
-                    effect_fn,
-                )),
-                None => guard.block_on(engine.execute(&request, effect_fn)),
+                Some(handle) => {
+                    let (outcome, replayed) =
+                        guard.block_on(handle.execute_step_with_idempotency_key(
+                            &request,
+                            idempotency_key.as_deref(),
+                            effect_fn,
+                        ));
+                    (outcome, Some(replayed))
+                }
+                None => (guard.block_on(engine.execute(&request, effect_fn)), None),
             }
         });
-        outcome_to_py(py, &outcome)
+        match replayed {
+            Some(r) => flow_outcome_to_py(py, &outcome, r),
+            None => outcome_to_py(py, &outcome),
+        }
     }
 
     /// Run one intercepted call asynchronously, returning an awaitable that
@@ -685,19 +710,23 @@ impl KeelCore {
             // immediately so unrelated concurrent calls are never serialized by a
             // flow that isn't theirs.
             let mut guard = active_flow.lock().await;
-            let outcome = if let Some(handle) = guard.as_mut() {
-                handle
+            let (outcome, replayed) = if let Some(handle) = guard.as_mut() {
+                let (outcome, replayed) = handle
                     .execute_step_with_idempotency_key(
                         &request,
                         idempotency_key.as_deref(),
                         effect_fn,
                     )
-                    .await
+                    .await;
+                (outcome, Some(replayed))
             } else {
                 drop(guard);
-                engine.execute(&request, effect_fn).await
+                (engine.execute(&request, effect_fn).await, None)
             };
-            Python::attach(|py| outcome_to_py(py, &outcome))
+            Python::attach(|py| match replayed {
+                Some(r) => flow_outcome_to_py(py, &outcome, r),
+                None => outcome_to_py(py, &outcome),
+            })
         })
     }
 
