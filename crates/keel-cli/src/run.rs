@@ -44,6 +44,12 @@ pub struct RunPlan {
     pub argv: Vec<String>,
     /// Whether to set `KEEL_DISABLE=1` in the child.
     pub disable: bool,
+    /// Whether this plan is command mode (#62): an arbitrary PATH-resolvable
+    /// command exec'd directly, rather than a script Keel dispatches into a
+    /// language front end. Command-mode children skip the Python pre-flight
+    /// (the program isn't `python3 -m keel`) — they self-activate purely via
+    /// `activation_env`.
+    pub command_mode: bool,
 }
 
 /// Why a target could not be dispatched — each rendered as what/why/next.
@@ -80,13 +86,13 @@ impl RunError {
             Self::NotFound { target } => (
                 format!("Cannot run `{target}`: no such file or directory."),
                 "The path does not exist relative to the current directory.".to_owned(),
-                "Check the path; `keel run` takes a script file, a package.json, or a project directory.".to_owned(),
+                "Check the path; `keel run` takes a script file, a package.json, a project directory, or a PATH-resolvable command (`keel run -- uvicorn app:app`).".to_owned(),
                 "not-found",
             ),
             Self::UnknownKind { target } => (
                 format!("Cannot run `{target}`: unrecognized program type."),
                 "`keel run` dispatches Python (.py) and Node (.mjs/.js/.ts/.cjs/.mts/.cts/.jsx/.tsx, or a package.json main); this target is neither.".to_owned(),
-                "Rename to a supported extension, point at the project's package.json, or invoke the interpreter directly.".to_owned(),
+                "Rename to a supported extension, point at the project's package.json, or invoke the interpreter directly, or launch via the activation env: `KEEL_ENABLE=1 <your command>` with the `keelrun` package installed.".to_owned(),
                 "unknown-kind",
             ),
             Self::NoEntry { target } => (
@@ -174,6 +180,9 @@ pub fn plan(target: &str, args: &[String], disable: bool) -> Result<RunPlan, Run
         return resolve_directory(target, path, args, disable);
     }
     if !path.exists() {
+        if let Some(command) = command_plan(target, args, disable) {
+            return Ok(command);
+        }
         return Err(RunError::NotFound {
             target: target.to_owned(),
         });
@@ -200,6 +209,7 @@ fn python_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
         program: "python3".to_owned(),
         argv,
         disable,
+        command_mode: false,
     }
 }
 
@@ -235,6 +245,35 @@ fn node_plan(target: &str, extra: &[String], disable: bool) -> Result<RunPlan, R
         program: "node".to_owned(),
         argv,
         disable,
+        command_mode: false,
+    })
+}
+
+/// Command mode (#62): `keel run <cmd> [args…]` (also reachable as
+/// `keel run -- <cmd> …` — clap strips the `--`). The target must be a bare
+/// word (no path separator), must NOT carry a known script extension (a
+/// typo'd `app.py` stays a NotFound, never a surprise exec), and must resolve
+/// on PATH. Keel wraps nothing in-process here; children self-activate via
+/// `activation_env` + the keelrun wheel's `.pth`, which covers console
+/// scripts (`uvicorn`), `uv run …`, and `python -m pkg` launches.
+fn command_plan(target: &str, args: &[String], disable: bool) -> Option<RunPlan> {
+    if target.contains(std::path::MAIN_SEPARATOR) || target.contains('/') {
+        return None;
+    }
+    let ext = Path::new(target).extension().and_then(|e| e.to_str());
+    if matches!(ext, Some("py")) || ext.is_some_and(|e| NODE_EXTS.contains(&e)) {
+        return None;
+    }
+    let found = std::env::split_paths(&std::env::var_os("PATH")?)
+        .any(|dir| !dir.as_os_str().is_empty() && dir.join(target).is_file());
+    if !found {
+        return None;
+    }
+    Some(RunPlan {
+        program: target.to_owned(),
+        argv: args.to_vec(),
+        disable,
+        command_mode: true,
     })
 }
 
@@ -478,7 +517,13 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
             (Some(r), code)
         }
         Ok(plan) => {
-            if let Some(r) = python_preflight(target, &plan) {
+            if plan.command_mode {
+                eprintln!(
+                    "keel \u{25b8} command mode: exec `{target}` with KEEL_ENABLE=1 \u{2014} Python \
+                     children self-activate via the `keelrun` wheel (pip install keelrun); Node \
+                     children need NODE_OPTIONS=\"--import keelrun/register\"."
+                );
+            } else if let Some(r) = python_preflight(target, &plan) {
                 let code = r.exit;
                 return (Some(r), code);
             }
@@ -609,6 +654,41 @@ mod tests {
     }
 
     #[test]
+    fn path_resolvable_bare_word_enters_command_mode() {
+        // `sh` exists on PATH everywhere we test.
+        let plan = plan("sh", &["-c".to_owned(), "exit 0".to_owned()], false).unwrap();
+        assert!(plan.command_mode);
+        assert_eq!(plan.program, "sh");
+        assert_eq!(plan.argv, vec!["-c", "exit 0"]);
+    }
+
+    #[test]
+    fn nonexistent_word_not_on_path_is_still_not_found() {
+        let err = plan("definitely-not-a-real-binary-xyz", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn nonexistent_script_extension_never_enters_command_mode() {
+        // A typo'd script name must stay a NotFound, even if a same-named binary
+        // could exist: known extensions always mean "script mode intended".
+        let err = plan("missing.py", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn path_separator_targets_never_enter_command_mode() {
+        let err = plan("./no/such/dir", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn command_mode_exit_code_propagates() {
+        let plan = plan("sh", &["-c".to_owned(), "exit 7".to_owned()], false).unwrap();
+        assert_eq!(exec(&plan).unwrap(), 7);
+    }
+
+    #[test]
     fn missing_file_is_not_found() {
         assert_eq!(
             plan("does-not-exist.py", &[], false),
@@ -717,6 +797,7 @@ mod tests {
             program: "sh".to_owned(),
             argv: vec!["-c".to_owned(), "exit 7".to_owned()],
             disable: false,
+            command_mode: false,
         };
         assert_eq!(exec(&plan).expect("sh should spawn"), 7);
     }
@@ -733,6 +814,7 @@ mod tests {
                 "[ \"$KEEL_RECORD_TEST\" = \"marker\" ] && exit 0 || exit 9".to_owned(),
             ],
             disable: false,
+            command_mode: false,
         };
         let code = exec_with(&plan, |cmd| {
             cmd.env("KEEL_RECORD_TEST", "marker");
@@ -844,6 +926,7 @@ mod tests {
                 r#"[ "$KEEL_ENABLE" = "1" ] && [ -n "$KEEL_CWD" ] && exit 0 || exit 9"#.to_owned(),
             ],
             disable: false,
+            command_mode: false,
         };
         let mut cmd_env = activation_env(&plan);
         cmd_env.sort();
@@ -866,6 +949,7 @@ mod tests {
             program: "sh".to_owned(),
             argv: vec![],
             disable: true,
+            command_mode: false,
         };
         assert!(activation_env(&plan).is_empty());
     }
@@ -878,6 +962,7 @@ mod tests {
             program: "keel-nonexistent-program-9f3a".to_owned(),
             argv: vec![],
             disable: false,
+            command_mode: false,
         };
         let rendered = exec(&plan).expect_err("nonexistent program cannot spawn");
 

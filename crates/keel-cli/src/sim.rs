@@ -584,6 +584,7 @@ mod tests {
             program: dir.path().join("ok.sh").to_string_lossy().into_owned(),
             argv: vec![],
             disable: false,
+            command_mode: false,
         };
         let result = drive(&run_plan, &plan, 4, None, &|_cmd| {});
         assert_eq!(result.exit_code, 0);
@@ -612,6 +613,7 @@ mod tests {
             program: script.to_string_lossy().into_owned(),
             argv: vec![],
             disable: false,
+            command_mode: false,
         };
         let result = drive(&run_plan, &plan, 4, None, &|_cmd| {});
         assert_eq!(result.exit_code, 0);
@@ -628,6 +630,7 @@ mod tests {
             program: script.to_string_lossy().into_owned(),
             argv: vec![],
             disable: false,
+            command_mode: false,
         };
         let result = drive(&run_plan, &plan, 2, None, &|_cmd| {});
         assert_eq!(result.restarts, 2);

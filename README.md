@@ -134,6 +134,18 @@ Without the native module, the front end falls back to a pure-Python core:
 Tier 1 resilience still works, but there's no persistent cache and no
 durable flows.
 
+`keel run` also wraps launch commands that aren't script files — console
+scripts, `uv run`, `python -m`:
+
+```bash
+keel run -- uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080
+```
+
+Keel execs the command with `KEEL_ENABLE=1` set, and every Python process in
+the tree (the command itself, and any subprocess it spawns) self-activates
+through the `keelrun` wheel — the same policy, journal, and discovery root
+throughout. Requires `pip install keelrun` in that environment.
+
 ## See it work
 
 Five runnable, deterministic demos — no real network involved
