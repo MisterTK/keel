@@ -777,22 +777,65 @@ mod tests {
         ));
     }
 
+    /// RAII guard: removes `KEEL_ENABLE`/`KEEL_CWD` from the process
+    /// environment on construction, restores whatever was there before on
+    /// drop — including when the test body panics in between (an
+    /// `unwrap`/`assert_eq!` failure must never leak mutated env state to
+    /// every later test in this binary, since cargo runs tests in threads
+    /// within one process and unwinding still runs `Drop`). Holds a
+    /// process-wide lock for its whole lifetime so no concurrent test can
+    /// observe the vars mid-mutation.
+    struct EnvVarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_enable: Option<String>,
+        saved_cwd: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset_activation_vars() -> Self {
+            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved_enable = std::env::var("KEEL_ENABLE").ok();
+            let saved_cwd = std::env::var("KEEL_CWD").ok();
+            // SAFETY: serialized by ENV_LOCK, held for this guard's whole
+            // lifetime; no other test in this binary touches these two vars.
+            unsafe {
+                std::env::remove_var("KEEL_ENABLE");
+                std::env::remove_var("KEEL_CWD");
+            }
+            Self {
+                _lock: lock,
+                saved_enable,
+                saved_cwd,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by `_lock`, released only after this
+            // runs (fields drop in declaration order after `drop()` returns).
+            unsafe {
+                match self.saved_enable.take() {
+                    Some(v) => std::env::set_var("KEEL_ENABLE", v),
+                    None => std::env::remove_var("KEEL_ENABLE"),
+                }
+                match self.saved_cwd.take() {
+                    Some(v) => std::env::set_var("KEEL_CWD", v),
+                    None => std::env::remove_var("KEEL_CWD"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn activation_env_is_layered_onto_children_unless_disabled() {
         // `activation_env` reads KEEL_ENABLE/KEEL_CWD from the real process
-        // environment (set-if-absent semantics) — guard against ambient
-        // values and concurrent env mutation from other tests in this binary
-        // (cargo runs tests in threads within one process; env is global).
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved_enable = std::env::var("KEEL_ENABLE").ok();
-        let saved_cwd = std::env::var("KEEL_CWD").ok();
-        // SAFETY: serialized by ENV_LOCK above; no other test in this binary
-        // touches KEEL_ENABLE/KEEL_CWD.
-        unsafe {
-            std::env::remove_var("KEEL_ENABLE");
-            std::env::remove_var("KEEL_CWD");
-        }
+        // environment (set-if-absent semantics) — the guard clears ambient
+        // values for the duration and restores them (panic-safe) on drop.
+        let _guard = EnvVarGuard::unset_activation_vars();
 
         let plan = RunPlan {
             program: "sh".to_owned(),
@@ -804,26 +847,17 @@ mod tests {
         };
         let mut cmd_env = activation_env(&plan);
         cmd_env.sort();
-        let keys: Vec<&str> = cmd_env.iter().map(|(k, _)| k.as_str()).collect();
-        let result = exec_with(&plan, |cmd| {
-            cmd.envs(activation_env(&plan));
-        });
-
-        // SAFETY: still serialized by ENV_LOCK; restores whatever this
-        // process actually had before the test ran.
-        unsafe {
-            match saved_enable {
-                Some(v) => std::env::set_var("KEEL_ENABLE", v),
-                None => std::env::remove_var("KEEL_ENABLE"),
-            }
-            match saved_cwd {
-                Some(v) => std::env::set_var("KEEL_CWD", v),
-                None => std::env::remove_var("KEEL_CWD"),
-            }
-        }
-
-        assert_eq!(keys, vec!["KEEL_CWD", "KEEL_ENABLE"]);
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            cmd_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["KEEL_CWD", "KEEL_ENABLE"]
+        );
+        assert_eq!(
+            exec_with(&plan, |cmd| {
+                cmd.envs(activation_env(&plan));
+            })
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
