@@ -109,14 +109,16 @@ the five phases in order; the static scan is evidence, not the verdict.
 3. **Collect.** Run `keel doctor --json` (or the `get_doctor_report` MCP
    tool). Read `topology` first — every sighted host lands in exactly one of
    `wrappable` ("wrap it"), `unreachable` ("can't reach it, here's why"), or
-   `excluded` ("shouldn't reach it — seen only in a dependency-averse gate
-   file; the exclusion is deliberate and overridable with `# keel: include`"),
-   plus `external_processes` for the sibling-process blind spots. Then work
-   `follow_ups` strictly top-down: it is ranked with rank 1 = the claim Keel
-   is least able to verify itself (an unattributed URL) down to mechanical
-   facts awaiting a decision. Codes are a closed set: `url-no-transport`,
-   `orchestration-blind-spot`, `subprocess-blind-spot`,
-   `dependency-averse-excluded`, `preexisting-resilience`, `code-hash-stale`.
+   `excluded` ("shouldn't reach it — seen only in dependency-averse gate
+   files, or a local/loopback host; the dependency-averse kind is deliberate
+   and overridable with `# keel: include`, the local/loopback kind is not a
+   real dependency at all"), plus `external_processes` for the
+   sibling-process blind spots. Then work `follow_ups` strictly top-down: it
+   is ranked with rank 1 = the claim Keel is least able to verify itself (an
+   unattributed URL) down to mechanical facts awaiting a decision. Codes are
+   a closed set: `url-no-transport`, `orchestration-blind-spot`,
+   `subprocess-blind-spot`, `dependency-averse-excluded`,
+   `local-host-excluded`, `preexisting-resilience`, `code-hash-stale`.
    Then read `boundaries` — it names what this report could not parse (source
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
