@@ -305,11 +305,17 @@ impl JournalReport {
 }
 
 /// One host `keel doctor` judged excluded or unreachable, with the honest
-/// reason why — see [`Topology`]. `pub(crate)`: `init.rs` reuses
-/// [`classify_topology`] to skip proposals for excluded hosts and print why.
+/// reason why — see [`Topology`]. `kind` is a short, stable category tag
+/// (`"local/loopback"`, `"dependency-averse"`, `"untracked-transport"`,
+/// `"unknown-transport"`) a renderer can label the entry with directly,
+/// rather than parsing `reason` prose to guess the category (#64 — a
+/// generic hardcoded label was actively wrong once a second `excluded`
+/// category existed). `pub(crate)`: `init.rs` reuses [`classify_topology`]
+/// to skip proposals for excluded hosts and print why.
 #[derive(Debug, Serialize)]
 pub(crate) struct TopologyEntry {
     pub(crate) host: String,
+    pub(crate) kind: &'static str,
     pub(crate) reason: String,
 }
 
@@ -1097,8 +1103,9 @@ pub(crate) fn classify_topology(
         if local_only {
             excluded.push(TopologyEntry {
                 host: target.clone(),
-                reason: "local/loopback host — excluded from proposed policy; run under \
-                         keel to gather runtime evidence, or add it to keel.toml explicitly"
+                kind: "local/loopback",
+                reason: "local/loopback host — run under keel to gather runtime evidence, or \
+                         add it to keel.toml explicitly"
                     .to_owned(),
             });
             continue;
@@ -1112,9 +1119,10 @@ pub(crate) fn classify_topology(
             let files: BTreeSet<&str> = ev.sightings.iter().map(|s| s.file.as_str()).collect();
             excluded.push(TopologyEntry {
                 host: target.clone(),
+                kind: "dependency-averse",
                 reason: format!(
-                    "seen only in dependency-averse file(s) {} — excluded from proposed policy; \
-                     add `# keel: include` to override",
+                    "seen only in dependency-averse file(s) {} — add `# keel: include` to \
+                     override",
                     files.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             });
@@ -1129,6 +1137,7 @@ pub(crate) fn classify_topology(
             TransportClass::Tracked => wrappable.push(target.clone()),
             TransportClass::UntrackedKnown => unreachable.push(TopologyEntry {
                 host: target.clone(),
+                kind: "untracked-transport",
                 reason: "reached via a stdlib transport Keel does not adapt (http.client, or \
                          urllib without urllib.request; Python's urllib.request itself is \
                          adapted)"
@@ -1136,6 +1145,7 @@ pub(crate) fn classify_topology(
             }),
             TransportClass::Unknown => unreachable.push(TopologyEntry {
                 host: target.clone(),
+                kind: "unknown-transport",
                 reason: "URL literal with no tracked transport in reach — trace how this request \
                           is dispatched"
                     .to_owned(),
@@ -1575,6 +1585,10 @@ mod tests {
         assert_eq!(r.topology.excluded.len(), 1);
         assert_eq!(r.topology.excluded[0].host, "api.broker.com");
         assert!(r.topology.excluded[0].reason.contains("risk_gate.py"));
+        assert_eq!(
+            r.topology.excluded[0].kind, "dependency-averse",
+            "#64: kind must be the dependency-averse category, not loopback or any other"
+        );
         assert_eq!(r.topology.external_processes.len(), 1);
         assert_eq!(
             r.topology.external_processes[0].command,
@@ -2119,6 +2133,10 @@ mod tests {
             entry.reason.contains("local/loopback"),
             "reason: {}",
             entry.reason
+        );
+        assert_eq!(
+            entry.kind, "local/loopback",
+            "#64: kind must be the loopback category, not dependency-averse or any other"
         );
 
         // Runtime evidence wins: the same host, wrapped at runtime, stays

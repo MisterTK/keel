@@ -588,9 +588,14 @@ fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
     notes
 }
 
-/// The trailing `# excluded (dependency-averse): …` and `# note: …` sections
-/// of the `--diff` human text — split out of [`diff`] to keep that function
-/// under clippy's line-count gate.
+/// The trailing `# excluded (<kind>): …` and `# note: …` sections of the
+/// `--diff` human text — split out of [`diff`] to keep that function under
+/// clippy's line-count gate. `<kind>` is each entry's own
+/// [`TopologyEntry::kind`](crate::doctor::TopologyEntry) (`"dependency-
+/// averse"`, `"local/loopback"`, …) rather than a single hardcoded label —
+/// #64: a `keel init --diff`-proposed loopback exclusion must not be mislabeled
+/// "dependency-averse" just because that was the only category that existed
+/// when this trailer was first written.
 fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[String]) -> String {
     let mut out = String::new();
     if !excluded.is_empty() {
@@ -603,8 +608,8 @@ fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[Strin
         out.push('\n');
         for entry in excluded {
             let line = format!(
-                "# excluded (dependency-averse): {} — {}\n",
-                entry.host, entry.reason
+                "# excluded ({}): {} — {}\n",
+                entry.kind, entry.host, entry.reason
             );
             out.push_str(&line);
         }
@@ -628,8 +633,9 @@ fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[Strin
 /// (`--- /dev/null`).
 ///
 /// Never proposes a NEW policy block for a host [`doctor::classify_topology`]
-/// puts in the excluded (dependency-averse) bucket — the same classification
-/// `keel doctor` reports, reused directly so the two surfaces never disagree
+/// puts in the `excluded` bucket (dependency-averse-only-sighted,
+/// local/loopback, …) — the same classification `keel doctor` reports,
+/// reused directly so the two surfaces never disagree
 /// about which hosts get policy proposed (dx-spec §2's honesty triad). An
 /// excluded host the user already declared in their own `keel.toml` is left
 /// alone (neither added nor removed); the diff's human text explains every
@@ -1414,6 +1420,12 @@ timeout = \"5s\"
             text.contains("excluded (dependency-averse): api.broker.com"),
             "{text}"
         );
+        // #64: the label names the actual category — never the loopback kind
+        // from a wholly different exclusion reason.
+        assert!(
+            !text.contains("excluded (local/loopback): api.broker.com"),
+            "dependency-averse exclusion must not be mislabeled loopback: {text}"
+        );
         // The structured `added` list must agree with the human text.
         let added = r.json["added"].as_array().unwrap();
         assert!(added.iter().any(|v| v == "api.normal.com"));
@@ -1458,8 +1470,14 @@ timeout = \"5s\"
             "no policy for the loopback host: {text}"
         );
         assert!(
-            text.contains("127.0.0.1") && text.contains("local/loopback"),
-            "trailer explains the exclusion: {text}"
+            text.contains("excluded (local/loopback): 127.0.0.1"),
+            "trailer labels the exclusion by its real category: {text}"
+        );
+        // #64: the label names the actual category — never the dependency-
+        // averse kind from a wholly different exclusion reason.
+        assert!(
+            !text.contains("excluded (dependency-averse): 127.0.0.1"),
+            "loopback exclusion must not be mislabeled dependency-averse: {text}"
         );
         let added = r.json["added"].as_array().unwrap();
         assert!(added.iter().any(|v| v == "api.normal.com"));
