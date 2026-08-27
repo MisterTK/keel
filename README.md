@@ -343,7 +343,7 @@ No `keel` on PATH (only installed via `uvx`)? Swap in
 Three steps, no code changes:
 
 1. **Dependency** — `uv add keelrun` (or start from the keel-enabled
-   template: `agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`).
+   template: `agents-cli scaffold create my-agent -a MisterTK/keel/packaging/agents-cli-template`).
 2. **Activate** — `KEEL_ENABLE=1` in your project `.env` (agents-cli
    propagates it to local runs, eval, and every deploy target).
 3. **Policy** — `keel init` writes `keel.toml` into your agent directory

@@ -4,7 +4,7 @@
 # from the template using its LOCAL path, and asserts the generated project
 # actually carries Keel's resilience wiring. This is the certification the
 # WS4 plan calls for before the template path
-# (`agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template`)
+# (`agents-cli scaffold create my-agent -a MisterTK/keel/packaging/agents-cli-template`)
 # ships in any docs.
 #
 # --- local@ semantics, verified against the installed package -------------
@@ -34,7 +34,7 @@
 # nothing here.
 #
 # Working invocation (verified locally, see below):
-#   agents-cli create smoke-agent \
+#   agents-cli scaffold create smoke-agent \
 #     -a "local@<abs path to packaging/agents-cli-template>" \
 #     --skip-deps --auto-approve --skip-checks --prototype \
 #     --skip-welcome --deployment-target none
@@ -75,7 +75,7 @@ source "${venv_dir}/bin/activate"
 
 echo "smoke-agents-cli-template: installing google-agents-cli..."
 pip install --quiet --upgrade pip
-# uv too: `agents-cli create` hard-requires it on PATH ("Error: 'uv' is not
+# uv too: `agents-cli scaffold create` hard-requires it on PATH ("Error: 'uv' is not
 # installed or not on PATH") — present on dev machines, absent on CI runners.
 pip install --quiet google-agents-cli uv
 
@@ -95,7 +95,7 @@ mkdir -p "${project_dir}"
 echo "smoke-agents-cli-template: scaffolding from local template..."
 (
   cd "${project_dir}"
-  agents-cli create smoke-agent \
+  agents-cli scaffold create smoke-agent \
     -a "local@${template_dir}" \
     --skip-deps \
     --auto-approve \

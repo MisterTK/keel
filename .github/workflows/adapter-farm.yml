@@ -360,7 +360,7 @@ jobs:
   # keelrun + the base template's own deps in pyproject.toml, and
   # KEEL_ENABLE=1 in .env.example. This is the same "layer verbatim over the
   # rendered base template" mechanism a real
-  # `agents-cli create -a MisterTK/keel/packaging/agents-cli-template` would
+  # `agents-cli scaffold create -a MisterTK/keel/packaging/agents-cli-template` would
   # use, just fed a local path instead of a git fetch — needs network for pip
   # (google-agents-cli itself), not for the scaffold step.
   # ---------------------------------------------------------------------------

@@ -6,7 +6,15 @@ settings:
   extra_dependencies:
     # Deep-merge REPLACES this list (it does not append), so the base adk
     # template's own dependencies must be repeated here alongside keelrun.
-    - "google-adk[gcp]>=2.0.0,<3.0.0"
-    - "a2a-sdk[http-server]~=0.3.22"
+    # Pins verified 2026-08-27 against agents-cli v1.4.1's own "adk" base
+    # template + its scaffold-time dependency reconciliation (a stale pin
+    # here is silently upgraded by that reconciliation today, but should
+    # not be relied on) — re-verify against a fresh `scaffold create` when
+    # bumping agents-cli's own pinned floor.
+    - "google-adk[gcp,otel-gcp]>=2.6.0,<3.0.0"
+    - "a2a-sdk[http-server]>=1.0,<2"
     - "aiohttp>=3.13.4"
+    - "google-cloud-logging>=3.12.0,<4.0.0"
+    - "opentelemetry-resourcedetector-gcp<=1.12.0a0"
+    - "gcsfs>=2024.11.0"
     - "keelrun>=0.2.0"

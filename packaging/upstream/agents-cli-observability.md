@@ -1,5 +1,47 @@
 # Upstream contribution: add Keel to agents-cli's observability skill
 
+> **STALE as of 2026-08-27 — do not send as-is.** Re-checked against a local
+> `google/agents-cli` checkout at v1.4.1 (`/Users/tk/dev/agents-cli`) during
+> the agents-cli certification pass. Both target tables in this skill have
+> moved since this doc was written, and neither is actually the right place
+> for Keel anymore:
+>
+> 1. **"Third-Party Integrations" table** (`SKILL.md` ~line 122, current
+>    v1.4.1) is now explicitly sourced from an EXTERNAL, Google-curated page
+>    — `https://adk.dev/integrations/` — the skill's own local table is only
+>    a 7-row excerpt of it (AgentOps, Arize AX, Phoenix, MLflow, Monocle,
+>    Weave, Freeplay), all genuine **tracing/observability SaaS or
+>    self-hosted platforms**. A PR adding a row here, in `agents-cli`'s repo,
+>    would be editing the wrong copy even if accepted — the authoritative
+>    list lives elsewhere. It's also a weak category fit: Keel is a
+>    resilience library with an NDJSON side-channel, not a tracing/eval
+>    platform in the same class as the existing rows.
+> 2. **"Deep Dive: ADK Docs (WebFetch URLs)" table** (`SKILL.md` ~line 148,
+>    current v1.4.1) has NARROWED since this doc was written — every row is
+>    now an `adk.dev`-hosted doc page (observability overview, logging,
+>    Cloud Trace, BigQuery Agent Analytics). It is no longer a general
+>    "external deep dive" table; a `github.com/MisterTK/keel` row would be
+>    the only non-`adk.dev` entry and doesn't fit the table's current scope.
+>
+> **Real next step**: find whatever repo hosts `adk.dev/integrations/`'s
+> content (not `google/agents-cli`, not `google/adk-python` — checked both
+> locally, neither contains it) and follow ITS submission process instead.
+> That is a fresh investigation, not something this doc's content can be
+> resubmitted into. The historical draft below is kept for its verified
+> claims about Keel's own observability surface (event stream, CLI
+> introspection, OTel export) — reusable prose for whatever the real
+> submission turns out to need — but the two insertion points and the PR
+> body's table-row framing are obsolete.
+>
+> Separately, the SAME certification pass found a genuinely current,
+> correctly-targeted gap in the **scaffold** skill (not observability):
+> `google-agents-cli-scaffold`'s "adk is the only template" framing gives no
+> indication that `--agent`/`-a` also accepts a remote Git spec for
+> layering a vendor add-on (the exact mechanism Keel's own template uses) —
+> drafted and staged as a real fix, see
+> `add-keel-scaffold-addon-discoverability-2026-08` branch in the local
+> `/Users/tk/dev/agents-cli` checkout (2 files, 1 commit, not pushed).
+
 Target: `google/agents-cli`, file
 `skills/google-agents-cli-observability/SKILL.md`.
 
