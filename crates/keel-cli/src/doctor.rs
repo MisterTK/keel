@@ -2236,6 +2236,56 @@ mod tests {
         );
     }
 
+    /// #67: `host_from_url` now unwraps a bracketed IPv6 authority before the
+    /// port split, so the scanner can extract a bare `::1` from `http://[::1]:PORT/…`.
+    /// This pins that `classify_topology`'s existing loopback demotion (#64)
+    /// already covers the resulting bare IPv6 string with no doctor.rs code
+    /// change — `IpAddr::is_loopback` is true for `::1` just as it is for
+    /// `127.0.0.1`.
+    #[test]
+    fn ipv6_loopback_host_is_excluded_as_local_loopback() {
+        use crate::scan::TransportClass;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.targets.insert(
+            "::1".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("::1".into(), TransportClass::Tracked);
+
+        let topology = classify_topology(&scan, &BTreeSet::new(), &BTreeMap::new());
+        assert!(
+            !topology.wrappable.contains(&"::1".to_owned()),
+            "a statically-seen IPv6 loopback host must not be wrappable: {topology:?}"
+        );
+        let entry = topology
+            .excluded
+            .iter()
+            .find(|e| e.host == "::1")
+            .unwrap_or_else(|| panic!("::1 must land in excluded: {topology:?}"));
+        assert_eq!(
+            entry.kind, "local/loopback",
+            "#67/#64: kind must be the loopback category, not dependency-averse or any other"
+        );
+        assert!(
+            entry.reason.contains("local/loopback"),
+            "reason: {}",
+            entry.reason
+        );
+    }
+
     /// The six agent-framework packs + google-genai are registered adapters:
     /// detected, pinned, and their `target` matches each pack's own declared
     /// `TargetDecl.pattern` — so importing them is coverage, not an

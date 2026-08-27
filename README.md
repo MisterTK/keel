@@ -238,13 +238,15 @@ as for `keel exec`. Shell-string commands are never matched (`shell=True`,
 Node's `execSync`, `{ shell: true }`) — the shell, not the argv, decides what
 runs.
 
-The two front ends differ on **replay** today: **Python** gets full
-replay-skip — a re-dispatched completed identity returns the recorded result
-without respawning. **Node** gets at-most-once *dispatch* only; because its
-`spawnSync`/`execFileSync` are synchronous they cannot reach the async replay
-path (KEEL-E005), so a re-dispatch of a completed identity raises rather than
-replays — `keel exec`/`keel flows` remain the replay workaround. Tracked in
-[#42](https://github.com/MisterTK/keel/issues/42).
+Both front ends get full **replay-skip**: a re-dispatched completed identity
+returns the recorded result — Python's `CompletedProcess`/returncode, Node's
+`spawnSync` result object or `execFileSync` stdout (re-throwing the recorded
+error for a recorded nonzero exit) — without respawning the command. The one
+case that refuses loudly in both is a recorded LAUNCH failure (the command
+never ran, so there is nothing to substitute): change the argv/cwd for a fresh
+identity, or re-drive it with `keel exec`. (Node reached parity in
+[#42](https://github.com/MisterTK/keel/issues/42); before that it fenced the
+re-dispatch with an error instead of replaying.)
 
 Both tiers run on the same native Rust core via a C ABI, so the Python and
 Node front ends share identical semantics — verified by a shared

@@ -38,6 +38,7 @@ pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 # One dict<->serde mechanism (no JSON-string round-trip): preserves value types
 # and surfaces serde error paths for diagnostic fidelity.
 pythonize = "0.29"
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Current-thread runtime + time driver (the engine needs the timer wheel, never
 # IO). `test-util` is always on: the paused clock + `advance_clock` are exposed

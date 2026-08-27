@@ -337,6 +337,45 @@ class FakePart:
         return f"FakePart({vars(self)!r})"
 
 
+class FakeFunctionCall:
+    """Structural twin of ``google.genai.types.FunctionCall``: unlike
+    ``FakePart``'s own ``function_call``/``function_response`` constructor
+    args (plain dicts, sufficient for the ``_encode_part``/``_decode_part``
+    ``model_dump`` round-trip tests), the real type is a pydantic object
+    with a MUTABLE ``.id`` — needed by issue #44's replay-substitution
+    id-overwrite logic, which assigns ``fc.id = <recorded id>`` directly."""
+
+    def __init__(self, *, id: str | None = None, name: str | None = None, **extra: Any) -> None:
+        self.id = id
+        self.name = name
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeFunctionCall) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeFunctionCall({vars(self)!r})"
+
+
+class FakeFunctionResponse:
+    """Structural twin of ``google.genai.types.FunctionResponse`` — see
+    ``FakeFunctionCall``'s docstring for why this exists alongside
+    ``FakePart``'s dict-shaped default."""
+
+    def __init__(self, *, id: str | None = None, name: str | None = None, **extra: Any) -> None:
+        self.id = id
+        self.name = name
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeFunctionResponse) and vars(self) == vars(other)
+
+    def __repr__(self) -> str:
+        return f"FakeFunctionResponse({vars(self)!r})"
+
+
 class FakeContent:
     """Structural twin of ``google.genai.types.Content``: ``role`` + a list
     of ``Part``-shaped objects."""

@@ -37,30 +37,42 @@
  * documented limit of any monkey-patch seam (the test suite pins all four
  * shapes so this constraint can never silently regress — design §3.2).
  *
- * # Why this is at-most-once DISPATCH, not result-replay (the v1 FFI limit)
+ * # Replay-skip: at-most-once dispatch AND result substitution (issue #42)
  *
- * Open Question 1, resolved empirically (see the chunk report / probe scripts):
- * an already-`Completed` flow's `execute()`/`executeAsync()` DOES substitute the
- * recorded step outcome without re-firing the effect — but only via the ASYNC
- * `executeAsync` path. The native core REFUSES the synchronous `execute()` while
- * a flow is open (KEEL-E005 — "Node effects are async-only", see
- * `crates/keel-node/src/lib.rs`). `spawnSync`/`execFileSync` are synchronous:
- * their return value must be produced on the same tick, so they cannot await
- * `executeAsync` and therefore cannot record OR substitute a journaled step.
- * Recording the command result for later replay-substitution needs a
- * synchronous-execute-in-flow FFI that is not exposed to Node in v1 (deferred).
+ * A matched call runs its real `spawnSync`/`execFileSync` *inside* a journaled
+ * effect step — `backend.executeSync(request, effect)` between `enterFlow` and
+ * `exitFlow` — which is the exact shape Python's
+ * `subprocess_pack.py::_dispatch` uses. Two properties fall out of that one
+ * decision, and both are the core's, not this pack's:
  *
- * So this pack drives the flow bracket with the two SYNCHRONOUS operations the
- * core does expose inside a flow — `enterFlow` / `exitFlow` — and records no
- * command step. That still delivers the load-bearing guarantee: a `Completed`
- * flow is fenced from re-dispatch, a live holder is fenced or waited per
- * `[flows] on_busy`, and a dead/exhausted flow refuses (KEEL-E032). What it
- * cannot do is hand back the RECORDED result of a completed prior run — so on
- * `enterFlow`'s `replay === true` (the flow already completed) it throws
- * {@link KeelCmdFlowReplayUnsupportedError} rather than re-run the command
- * (violating at-most-once) or fabricate a result. Loud, documented, never
- * silent. The CLI-level `keel exec` / `keel flows` DO replay the recorded
- * outcome (the Rust path drives the journal directly); that is the workaround.
+ *   1. **Live run** — the effect fires, the command runs for real, and its
+ *      outcome is recorded as the flow's step-1 payload.
+ *   2. **Re-dispatch of the same identity** — the core substitutes that
+ *      recorded step and NEVER fires the effect, so the command does not run a
+ *      second time; this pack rebuilds the caller-facing return value from the
+ *      recorded payload ({@link rebuildSpawnSync} / {@link rebuildExecFileSync}).
+ *
+ * "The effect never fired" is how the two cases are told apart (the `live`
+ * side-band below — Python's twin does the same), NOT `enterFlow`'s `replay`
+ * flag: a flow this pack stamped `failed` (a nonzero exit) re-enters as a
+ * *resume*, whose recorded terminal step the core substitutes just the same.
+ *
+ * Until v0.6 this pack recorded no step at all and threw
+ * `KeelCmdFlowReplayUnsupportedError` on a completed re-dispatch, because the
+ * native core refused the synchronous `execute()` inside any open flow
+ * (KEEL-E005 — "Node effects are async-only"). That guard was relaxed for the
+ * flow-handle path in `crates/keel-node/src/lib.rs::execute`: a synchronous
+ * effect never yields to the event loop, so it needs no async bridge, and
+ * routing it through the open `FlowHandle` (rather than the bare engine) is
+ * precisely what the guard existed to require. `spawnSync`/`execFileSync` now
+ * have full Python parity.
+ *
+ * What still refuses loudly is a re-dispatch the core answers with a terminal
+ * ERROR — a recorded LAUNCH failure (the command never ran), or no recorded
+ * step at all (KEEL-E031, e.g. a journal written before this pack recorded
+ * steps). Neither can be turned into a caller-facing result honestly, so
+ * {@link KeelCmdFlowFailedError} is raised rather than re-running or
+ * fabricating a success — the same stance as Python's `KeelCmdFlowFailed`.
  *
  * # Identity (diverges from `keel exec` — TK sign-off, CCR-5)
  *
@@ -78,31 +90,45 @@
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { Buffer } from "node:buffer";
 import { join } from "node:path";
 import { getBackend, flowScopeActive } from "../runtime.mjs";
 
 // --- error types (propagate to the caller's spawnSync/execFileSync) ---------
 
 /**
- * A matched `cmd:` flow already completed in a prior run, so re-dispatching it
- * would violate at-most-once — but in-process replay-skip of the RECORDED
- * result needs native FFI not exposed to Node in v1 (see the module docs). We
- * refuse loudly instead of re-running or fabricating. `keel exec`/`keel flows`
- * replay the recorded outcome at the CLI level.
+ * A re-dispatch the core answered with a terminal ERROR instead of a
+ * substitutable result. Two shapes, both refused loudly rather than re-run or
+ * fabricated (the exact stance of Python's `subprocess_pack.KeelCmdFlowFailed`):
+ *
+ *   * the recorded step IS a launch failure — the command never ran (ENOENT, a
+ *     `timeout`/`ETIMEDOUT` kill), so there is no result to hand back and
+ *     re-attempting it in-process would break at-most-once dispatch;
+ *   * `KEEL-E031` — the identity is Completed but carries NO recorded step for
+ *     this command (a journal written by a Keel older than #42's replay-skip,
+ *     or completed out-of-process by `keel exec`). Nothing to substitute.
+ *
+ * `KEEL-E005` (unsupported-configuration): a capability the in-process seam
+ * does not provide, not a policy or runtime error. It is the same code the
+ * removed `KeelCmdFlowReplayUnsupportedError` carried, now scoped to the two
+ * cases that genuinely still refuse.
  */
-export class KeelCmdFlowReplayUnsupportedError extends Error {
-  constructor(entrypoint, flowId) {
+export class KeelCmdFlowFailedError extends Error {
+  constructor(entrypoint, outcomeError) {
+    const detail = outcomeError?.message ?? "no substitutable result was recorded";
+    const cause =
+      outcomeError?.code === "KEEL-E031"
+        ? "completed with NO recorded step for this command (journaled before in-process " +
+          "replay-skip existed, or completed by `keel exec`)"
+        : "previously failed to LAUNCH — the command never ran";
     super(
-      `KEEL-E005: ${entrypoint} [${flowId}] already completed in a prior run; in-process ` +
-        `replay-skip of a cmd: flow's recorded result needs native FFI not yet exposed to ` +
-        `Node (a documented v1 limit). The command was NOT re-run (at-most-once dispatch). ` +
-        `Use \`keel exec --flow ${entrypoint.slice(4)} -- <argv>\` (or \`keel flows\`) for ` +
-        `CLI-level durable replay, or remove [flows.match."${entrypoint}"] to run it unwrapped.`
+      `KEEL-E005: ${entrypoint} ${cause}, so there is nothing to replay: ${detail}. The command ` +
+        `was NOT re-run (at-most-once dispatch). Change the argv/cwd (a new identity), or ` +
+        `re-drive it with \`keel exec --flow ${entrypoint.slice(4)} -- <argv>\`.`
     );
-    this.name = "KeelCmdFlowReplayUnsupportedError";
+    this.name = "KeelCmdFlowFailedError";
     this.code = "KEEL-E005";
     this.entrypoint = entrypoint;
-    this.flowId = flowId;
   }
 }
 
@@ -258,6 +284,125 @@ function optsOf(args) {
   return args[1] && typeof args[1] === "object" ? args[1] : null;
 }
 
+// --- step payload (de)serialization for replay-substitution ------------------
+
+/** A readable `op` for the journal/trace (display only; never part of the step
+ *  key). Byte-identical to Python's `subprocess_pack._op_string`. */
+function opString(argv) {
+  const joined = "cmd " + argv.join(" ");
+  return joined.length <= 200 ? joined : joined.slice(0, 197) + "...";
+}
+
+/**
+ * A JSON-safe envelope for a captured stdout/stderr so a substituted result is
+ * byte-identical to the recorded one: a `Buffer`/`Uint8Array` (the default, no
+ * `encoding`) round-trips through base64, a string (`{ encoding: "utf8" }`)
+ * verbatim, and an absent stream (`stdio: "inherit"`, or a spawn failure) as
+ * `null`. The `{t,v}` shape is Python's `_encode_stream`, deliberately — the
+ * two packs journal the same envelope.
+ */
+function encodeStream(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return { t: "s", v: value };
+  if (ArrayBuffer.isView(value)) {
+    return {
+      t: "b",
+      v: Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64"),
+    };
+  }
+  return { t: "s", v: String(value) };
+}
+
+function decodeStream(env) {
+  if (!env || typeof env !== "object") return null;
+  if (env.t === "b") return Buffer.from(String(env.v ?? ""), "base64");
+  return env.v ?? null;
+}
+
+/** The recorded shape of one `spawnSync` outcome (a run that reached an exit
+ *  status or a signal — a spawn failure takes the error branch instead). */
+function payloadSpawnSync(result) {
+  return {
+    kind: "spawnSync",
+    status: result?.status ?? null,
+    signal: result?.signal ?? null,
+    pid: typeof result?.pid === "number" ? result.pid : null,
+    stdout: encodeStream(result?.stdout),
+    stderr: encodeStream(result?.stderr),
+  };
+}
+
+/** Rebuild the object `spawnSync` would have returned, key order included
+ *  (`status, signal, output, pid, stdout, stderr` — what Node itself emits for
+ *  a run that produced an exit status). `output` shares the very same
+ *  stdout/stderr values, exactly as the real result does. */
+export function rebuildSpawnSync(payload) {
+  const stdout = decodeStream(payload?.stdout);
+  const stderr = decodeStream(payload?.stderr);
+  return {
+    status: payload?.status ?? null,
+    signal: payload?.signal ?? null,
+    output: [null, stdout, stderr],
+    pid: payload?.pid ?? 0,
+    stdout,
+    stderr,
+  };
+}
+
+/** The recorded shape of an `execFileSync` that RETURNED (stdout, or `null`
+ *  under `stdio: "inherit"`). */
+function payloadExecFileOk(stdout) {
+  return { kind: "execFileSync", threw: false, stdout: encodeStream(stdout) };
+}
+
+/** The recorded shape of an `execFileSync` that THREW after the command
+ *  actually ran (a nonzero exit / a signal): everything Node hangs off that
+ *  error, so the replayed throw carries the same diagnostics. */
+function payloadExecFileThrew(err) {
+  return {
+    kind: "execFileSync",
+    threw: true,
+    status: err?.status ?? null,
+    signal: err?.signal ?? null,
+    pid: typeof err?.pid === "number" ? err.pid : null,
+    stdout: encodeStream(err?.stdout),
+    stderr: encodeStream(err?.stderr),
+    message: String(err?.message ?? "Command failed"),
+  };
+}
+
+/** Rebuild `execFileSync`'s caller-facing outcome: RETURN the recorded stdout,
+ *  or THROW a reconstructed error carrying the recorded `status`/`signal`/
+ *  `stdout`/`stderr`/`output`/`pid` — `execFileSync`'s nonzero-exit throw is
+ *  part of its contract, so replay must reproduce it (the same reason Python's
+ *  `_rebuild_run` re-raises a recorded `CalledProcessError`). */
+export function rebuildExecFileSync(payload) {
+  const stdout = decodeStream(payload?.stdout);
+  if (!payload?.threw) return stdout;
+  const stderr = decodeStream(payload?.stderr);
+  const err = new Error(payload.message ?? "Command failed");
+  err.status = payload.status ?? null;
+  err.signal = payload.signal ?? null;
+  err.pid = payload.pid ?? 0;
+  err.output = [null, stdout, stderr];
+  err.stdout = stdout;
+  err.stderr = stderr;
+  throw err;
+}
+
+/**
+ * True when Node failed to run the child to completion — a spawn failure
+ * (`ENOENT`) or a `timeout` kill (`ETIMEDOUT`). Both carry the libuv
+ * `errno`/`syscall` pair; a plain nonzero EXIT carries neither (it has a
+ * numeric `status`). This is the Node spelling of Python's
+ * `OSError`-vs-`CalledProcessError` split in `_run_wrapper`, and it decides
+ * whether the journaled step is a terminal ERROR (never ran → a re-dispatch
+ * refuses) or a terminal OK (ran → a re-dispatch substitutes).
+ */
+function isLaunchFailure(err) {
+  return err != null && err.errno !== undefined && err.syscall !== undefined;
+}
+
 // --- synchronous, bounded wait (for on_busy = wait) --------------------------
 
 /** Poll cadence for `on_busy = wait`, matching `exec.rs`'s 500ms. */
@@ -306,12 +451,16 @@ function exitFlowOrWarn(backend, status) {
 }
 
 /**
- * Open the durable flow for one matched call, handling on_busy / dead / replay.
- * Returns `{ passthrough: true }` when the caller should run the command
- * UNWRAPPED (on_busy = skip), or `{ open: true }` when a live flow was entered
- * and the caller must run the command then call {@link endFlow}. Throws
- * {@link KeelCmdFlowReplayUnsupportedError} / {@link KeelCmdFlowBusyError} /
- * {@link KeelCmdFlowDeadError} for the refusal cases (see module docs).
+ * Open (or resume/replay) the durable flow for one matched call, handling
+ * on_busy and dead. Returns `{ passthrough: true }` when the caller should run
+ * the command UNWRAPPED (on_busy = skip), or `{ open: true, replay }` when a
+ * handle was acquired and the caller must drive the step then close the flow.
+ * Throws {@link KeelCmdFlowBusyError} / {@link KeelCmdFlowDeadError} for the
+ * refusal cases (see module docs).
+ *
+ * `replay` is reported for debugging only — it is NOT the live-vs-substituted
+ * signal (see {@link dispatch}): a flow this pack stamped `failed` re-enters
+ * with `replay === false` and still has its terminal step substituted.
  */
 function beginFlow(backend, rule, argv, cwd, env) {
   const entrypoint = rule.name;
@@ -353,12 +502,9 @@ function beginFlow(backend, rule, argv, cwd, env) {
       throw err;
     }
     if (info.replay) {
-      // Already completed: release the handle we just entered, then refuse
-      // (branch B — see module docs). Never re-run, never fabricate.
-      exitFlowOrWarn(backend, "completed");
-      throw new KeelCmdFlowReplayUnsupportedError(entrypoint, info.flow_id);
+      debug(env, `cmd: ${entrypoint} [${info.flow_id}] already completed; substituting the recorded result.`);
     }
-    return { open: true };
+    return { open: true, replay: Boolean(info.replay) };
   }
 }
 
@@ -366,6 +512,64 @@ function beginFlow(backend, rule, argv, cwd, env) {
  *  succeeded (exit 0, no signal, no spawn error). */
 function endFlow(backend, ok) {
   exitFlowOrWarn(backend, ok ? "completed" : "failed");
+}
+
+/**
+ * Drive one matched call through the enter → execute → exit bracket, the exact
+ * shape of Python's `subprocess_pack._dispatch`.
+ *
+ * `live` is the per-primitive side-band the effect closure fills in
+ * (`fired`/`ok`/`result`/`throwErr`), plus `runUnwrapped` (the on_busy = skip
+ * escape) and `fromPayload` (rebuild the caller-facing value from a substituted
+ * step). `live.fired` — NOT `enterFlow`'s `replay` flag — is what distinguishes
+ * a real run from a core-substituted one: the core simply never calls the
+ * effect when it has a recorded terminal step for this `(seq, step_key)`.
+ */
+function dispatch(backend, decision, env, live) {
+  const { rule, argv, cwd } = decision;
+  const flow = beginFlow(backend, rule, argv, cwd, env);
+  if (flow.passthrough) return live.runUnwrapped();
+  const request = {
+    v: 1,
+    target: rule.name,
+    op: opString(argv),
+    args_hash: argsHashWithCwd(argv, cwd),
+    idempotent: false,
+  };
+  let outcome;
+  try {
+    outcome = backend.executeSync(request, live.effect);
+  } catch (err) {
+    // The core refused the step (e.g. a native addon older than the KEEL-E005
+    // guard relaxation this parity depends on). The effect never fired, so the
+    // command did not run: release the handle and surface it — never silently
+    // run unwrapped, which on a completed identity would be the at-most-once
+    // violation this whole pack exists to prevent.
+    exitFlowOrWarn(backend, "failed");
+    throw err;
+  }
+  if (live.fired) {
+    // A real run: the terminal status and the caller-facing value are exactly
+    // what they were before the step was journaled (issue #42's no-regression
+    // requirement) — `spawnSync` returns its result object even for a nonzero
+    // exit or a spawn error, `execFileSync` re-throws the ORIGINAL error.
+    endFlow(backend, live.ok);
+    if (live.throwErr !== null) throw live.throwErr;
+    return live.result;
+  }
+  // Substituted from the journal — the command did NOT run a second time.
+  if (outcome?.result === "error") {
+    // Either the recorded step is a terminal error (the command never
+    // launched) or there is no recorded step at all (KEEL-E031). Neither can be
+    // turned into a caller-facing result honestly — refuse, never re-run.
+    exitFlowOrWarn(backend, "failed");
+    throw new KeelCmdFlowFailedError(rule.name, outcome?.error);
+  }
+  // "completed", never a status derived from the recorded exit code: stamping
+  // `failed` here would DOWNGRADE an already-Completed flow in the journal.
+  // Python's `_dispatch` closes the substituted path the same way.
+  exitFlowOrWarn(backend, "completed");
+  return live.fromPayload(outcome?.payload ?? {});
 }
 
 /**
@@ -394,10 +598,13 @@ function precheck(backend, compiled, args) {
 /**
  * Wrap `spawnSync`. `spawnSync` NEVER throws for a normal outcome — it returns
  * `{ status, signal, error, stdout, stderr, … }` (a nonzero exit is `status !==
- * 0`; a spawn failure like ENOENT is in `error`). So we run it, read the
- * outcome object, stamp the flow terminal status, and return the object
- * unchanged (the caller still sees `error`/`status`/`signal` exactly as
- * before). `deps.backend` overrides the global (tests/embedding).
+ * 0`; a spawn failure like ENOENT is in `error`). So the effect runs it, reads
+ * the outcome object, and journals it; the wrapper stamps the flow terminal
+ * status and returns the object unchanged (the caller still sees
+ * `error`/`status`/`signal` exactly as before). A re-dispatch of the same
+ * identity returns {@link rebuildSpawnSync}'s reconstruction of the RECORDED
+ * result without running anything. `deps.backend` overrides the global
+ * (tests/embedding).
  */
 export function makeWrappedSpawnSync(original, deps = {}) {
   const { compiled = [], env = process.env } = deps;
@@ -405,12 +612,41 @@ export function makeWrappedSpawnSync(original, deps = {}) {
     const backend = deps.backend ?? getBackend();
     const decision = precheck(backend, compiled, args);
     if (!decision) return original.apply(this, args);
-    const flow = beginFlow(backend, decision.rule, decision.argv, decision.cwd, env);
-    if (flow.passthrough) return original.apply(this, args);
-    const result = original.apply(this, args);
-    const ok = !result?.error && result?.status === 0 && result?.signal == null;
-    endFlow(backend, ok);
-    return result;
+    const self = this;
+    const live = {
+      fired: false,
+      ok: false,
+      result: null,
+      throwErr: null,
+      runUnwrapped: () => original.apply(self, args),
+      fromPayload: rebuildSpawnSync,
+      effect: () => {
+        live.fired = true;
+        let result;
+        try {
+          result = original.apply(self, args);
+        } catch (err) {
+          // `spawnSync` does not throw for a child outcome, but it does for a
+          // bad argument/option. Keep the ORIGINAL exception (never swallowed
+          // into the outcome envelope) and journal a terminal error step.
+          live.throwErr = err;
+          return { status: "error", class: "other", message: String(err?.message ?? err) };
+        }
+        live.result = result;
+        live.ok = !result?.error && result?.status === 0 && result?.signal == null;
+        if (result?.error) {
+          // The child never ran to completion (ENOENT / a `timeout` kill): a
+          // terminal ERROR step, exactly like Python's `OSError` branch.
+          return {
+            status: "error",
+            class: "other",
+            message: String(result.error?.message ?? result.error),
+          };
+        }
+        return { status: "ok", payload: payloadSpawnSync(result) };
+      },
+    };
+    return dispatch(backend, decision, env, live);
   };
 }
 
@@ -418,10 +654,14 @@ export function makeWrappedSpawnSync(original, deps = {}) {
  * Wrap `execFileSync`. UNLIKE `spawnSync`, `execFileSync` THROWS on a nonzero
  * exit (an Error carrying `.status`/`.signal`/`.stdout`/`.stderr`) AND on a
  * spawn failure (an Error carrying `.code = 'ENOENT'`, `.status = null`); on
- * success it RETURNS stdout. So we record success/failure by catching: a throw
- * → `exitFlow("failed")` then re-throw the ORIGINAL error unchanged (never
- * swallowed — the caller sees the exact same exception, whether a nonzero exit
- * or a launch failure); a return → `exitFlow("completed")` then return stdout.
+ * success it RETURNS stdout. The effect records success/failure by catching: a
+ * throw → the ORIGINAL error is re-thrown unchanged (never swallowed — the
+ * caller sees the exact same exception) after `exitFlow("failed")`; a return →
+ * `exitFlow("completed")` then return stdout. The two throw KINDS journal
+ * differently, which is what makes replay honest: a nonzero exit RAN, so it is
+ * a terminal OK step whose recorded throw is reproduced by
+ * {@link rebuildExecFileSync}; a launch failure never ran, so it is a terminal
+ * ERROR step and a re-dispatch refuses with {@link KeelCmdFlowFailedError}.
  */
 export function makeWrappedExecFileSync(original, deps = {}) {
   const { compiled = [], env = process.env } = deps;
@@ -429,17 +669,32 @@ export function makeWrappedExecFileSync(original, deps = {}) {
     const backend = deps.backend ?? getBackend();
     const decision = precheck(backend, compiled, args);
     if (!decision) return original.apply(this, args);
-    const flow = beginFlow(backend, decision.rule, decision.argv, decision.cwd, env);
-    if (flow.passthrough) return original.apply(this, args);
-    let out;
-    try {
-      out = original.apply(this, args);
-    } catch (err) {
-      endFlow(backend, false);
-      throw err;
-    }
-    endFlow(backend, true);
-    return out;
+    const self = this;
+    const live = {
+      fired: false,
+      ok: false,
+      result: null,
+      throwErr: null,
+      runUnwrapped: () => original.apply(self, args),
+      fromPayload: rebuildExecFileSync,
+      effect: () => {
+        live.fired = true;
+        let out;
+        try {
+          out = original.apply(self, args);
+        } catch (err) {
+          live.throwErr = err;
+          if (isLaunchFailure(err)) {
+            return { status: "error", class: "other", message: String(err?.message ?? err) };
+          }
+          return { status: "ok", payload: payloadExecFileThrew(err) };
+        }
+        live.result = out;
+        live.ok = true;
+        return { status: "ok", payload: payloadExecFileOk(out) };
+      },
+    };
+    return dispatch(backend, decision, env, live);
   };
 }
 
@@ -472,11 +727,14 @@ export function patchChildProcess(cp, deps = {}) {
 }
 
 /** True iff `backend` can drive a Tier-2 flow (native surface + attached
- *  journal). Inlined rather than importing `flow.mjs` to avoid coupling. */
+ *  journal). Inlined rather than importing `flow.mjs` to avoid coupling.
+ *  `executeSync` is required too: without it a matched command could be
+ *  admission-fenced but never journaled, i.e. no replay-substitution (#42). */
 function supportsFlows(backend) {
   return (
     typeof backend?.enterFlow === "function" &&
     typeof backend?.exitFlow === "function" &&
+    typeof backend?.executeSync === "function" &&
     backend?.persistent === true
   );
 }

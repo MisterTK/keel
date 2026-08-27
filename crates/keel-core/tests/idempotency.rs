@@ -123,7 +123,7 @@ async fn run1_completes_then_crashes_mid_step(fx: &Fixture) {
         None,
         "a fresh step has no recorded key"
     );
-    let out = handle
+    let (out, replayed) = handle
         .execute_step_with_idempotency_key(
             &request("api.pay.example", "c1"),
             Some("ik-1"),
@@ -135,6 +135,7 @@ async fn run1_completes_then_crashes_mid_step(fx: &Fixture) {
         )
         .await;
     assert_eq!(out.result, "ok");
+    assert!(!replayed, "a fresh step must not report replayed");
 
     {
         let req = request("api.pay.example", "c2");
@@ -174,7 +175,7 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
     let mut handle = fx.manager.enter_flow(&fx.desc).expect("resume");
     let effect_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&effect_calls);
-    let out = handle
+    let (out, replayed) = handle
         .execute_step_with_idempotency_key(
             &request("api.pay.example", "c1"),
             Some("ik-unused"),
@@ -191,6 +192,10 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
         .await;
     assert_eq!(out.result, "ok");
     assert_eq!(out.payload, Some(json!({ "charge": "ch_1" })));
+    assert!(
+        replayed,
+        "c1 completed in run 1; resuming must substitute it from the journal"
+    );
     assert_eq!(
         effect_calls.load(Ordering::SeqCst),
         0,
@@ -210,7 +215,7 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
         Some("ik-2")
     );
 
-    let out = handle
+    let (out, replayed) = handle
         .execute_step_with_idempotency_key(
             &request("api.pay.example", "c2"),
             Some("ik-2"), // what the adapter injects, having read the peek
@@ -223,6 +228,10 @@ async fn crashed_running_step_journals_and_resurfaces_its_key() {
         .await;
     assert_eq!(out.result, "ok");
     assert_eq!(out.attempts, 1);
+    assert!(
+        !replayed,
+        "c2 never completed in run 1; resuming must execute it live"
+    );
     handle.complete_success().unwrap();
 
     // The step is now terminal; its payload is the outcome, and the peek no
