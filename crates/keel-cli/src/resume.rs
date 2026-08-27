@@ -357,7 +357,9 @@ fn resume_one(
         }
     };
     announce(&row, &script, args);
-    match run::exec(&plan) {
+    match run::exec_with(&plan, |cmd| {
+        cmd.envs(run::activation_env(&plan));
+    }) {
         Ok(code) => {
             if code == EXIT_OK && !progressed(conn, &row) {
                 eprintln!(
@@ -428,7 +430,9 @@ fn resume_all(project: &Path, conn: &Connection, now_ms: i64) -> (Option<Rendere
                     }
                 };
                 announce(&row, &script, &[]);
-                let exit_code = match run::exec(&plan) {
+                let exit_code = match run::exec_with(&plan, |cmd| {
+                    cmd.envs(run::activation_env(&plan));
+                }) {
                     Ok(code) => code,
                     Err(rendered) => {
                         eprint!("{}", rendered.human);

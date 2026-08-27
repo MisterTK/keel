@@ -11,6 +11,7 @@ import {
   parseRetryAfter,
   resolveIdempotencyInjection,
   defaultMintIdempotencyKey,
+  replayHeaders,
 } from "../src/judge.mjs";
 
 test("parseRetryAfter: delta-seconds, RFC 5322 date, and ISO 8601 date (Python parity)", () => {
@@ -73,5 +74,19 @@ test("defaultMintIdempotencyKey mints distinct opaque values", () => {
   const b = defaultMintIdempotencyKey();
   assert.notEqual(a, b);
   assert.ok(a);
+});
+
+// --- replayHeaders (twin of Python _http.replay_headers, #66) -----------
+
+test("replayHeaders strips the wire-encoding trio case-insensitively", () => {
+  const out = replayHeaders([
+    ["Content-Type", "application/json"],
+    ["Content-Encoding", "gzip"],
+    ["content-length", "999"],
+    ["Transfer-Encoding", "chunked"],
+    ["X-Request-Id", "abc"],
+  ]);
+  assert.deepEqual(out, [["Content-Type", "application/json"], ["X-Request-Id", "abc"]]);
+  assert.deepEqual(replayHeaders(undefined), []);
 });
 

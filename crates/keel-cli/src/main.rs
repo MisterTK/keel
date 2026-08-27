@@ -40,8 +40,9 @@ enum Command {
         /// detection). Also skippable via `KEEL_SKIP_PREFLIGHT=1`.
         #[arg(long)]
         no_preflight: bool,
-        /// The script (`.py`, `.mjs`/`.js`/`.ts`…), a `package.json`, or a
-        /// project directory to run.
+        /// The script (`.py`, `.mjs`/`.js`/`.ts`…), a `package.json`, a
+        /// project directory, or a PATH-resolvable command to exec with
+        /// Keel's activation env.
         target: String,
         /// Arguments passed through to the program unchanged.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

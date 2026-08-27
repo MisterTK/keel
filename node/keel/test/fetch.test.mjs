@@ -5,6 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import zlib from "node:zlib";
 import { AsyncEngine, virtualClock } from "../src/engine.mjs";
 import { installFetch } from "../src/fetch.mjs";
 import { level0Defaults } from "../src/defaults.mjs";
@@ -332,6 +333,46 @@ test("LLM POST dev-cache replays an identical prompt through the fetch seam (0 e
   assert.equal(hits, 1, "the repeated LLM POST makes NO second API call");
   assert.deepEqual(await r2.json(), { reply: "hi", served: 1 });
 });
+
+// --- rebuildResponse must not re-declare the original wire encoding (#66) ---
+
+test("gzip response replays without a stale content-encoding header", async () => {
+  const gz = zlib.gzipSync(JSON.stringify({ a: 1 }));
+  const server = await startServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "content-encoding": "gzip" });
+    res.end(gz);
+  });
+  await withKeel2(server, { target: { "127.0.0.1": { cache: { ttl: "24h" } } } }, async () => {
+    // undici's live fetch decodes gzip transparently, so the first response
+    // works regardless of the bug: the header lie only shows up on replay.
+    const first = await fetch(server.url());
+    assert.equal(first.keelOutcome.from_cache, false);
+    assert.deepEqual(await first.json(), { a: 1 });
+
+    const second = await fetch(server.url());
+    assert.equal(second.keelOutcome.from_cache, true, "identical GET replays from the dev cache");
+    assert.equal(second.keelOutcome.attempts, 0, "a cache hit runs zero attempts");
+    assert.deepEqual(await second.json(), { a: 1 });
+    assert.equal(
+      second.headers.get("content-encoding"),
+      null,
+      "the replayed body is already decoded — a wire content-encoding header would be a lie",
+    );
+  });
+});
+
+/** Like withKeel, but with a caller-supplied policy (for cache-config tests). */
+async function withKeel2(server, policy, fn) {
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ ...level0Defaults(), ...policy });
+  const uninstall = installFetch(backend, null);
+  try {
+    return await fn(backend);
+  } finally {
+    uninstall();
+    await server.close();
+  }
+}
 
 test("LLM POST derives a canonical args_hash yet stays non-idempotent; non-LLM POST gets none", async () => {
   const captured = [];

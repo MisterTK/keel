@@ -8,6 +8,7 @@ by the requests pack must be judged (and retried) exactly once, not once by
 
 from __future__ import annotations
 
+import gzip
 import sqlite3
 import unittest
 from pathlib import Path
@@ -182,6 +183,30 @@ class CacheReplayTest(Urllib3Base):
         self.assertIsInstance(second, urllib3.HTTPResponse)
         self.assertEqual(second.data, b'{"a":1}')
         self.assertEqual(second.status, 200)
+
+    def test_gzip_response_replays_from_cache_intact(self) -> None:
+        # issue #66: the envelope body is captured post-decode (urllib3's own
+        # `resp.data` already ran the gzip decoder), so a rebuilt response
+        # that still declares `Content-Encoding: gzip` misdescribes its own
+        # (already decoded) body — pinned here alongside the crasher-shaped
+        # siblings (httpx/#60) even though this pack's own constructor
+        # doesn't re-run the decoder itself (verified empirically: a bytes
+        # `body=` bypasses `HTTPResponse`'s preload-decode path entirely).
+        self.backend.configure({**level0_defaults(), "target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}})
+        body = gzip.compress(b'{"a":1}')
+        with FaultServer(
+            [ok(body, {"Content-Type": "application/json", "Content-Encoding": "gzip"})]
+        ) as srv:
+            first = self.pool.urlopen("GET", srv.url("/gen"))
+            self.assertFalse(first.keel_outcome["from_cache"])
+            self.assertEqual(first.data, b'{"a":1}')
+            second = self.pool.urlopen("GET", srv.url("/gen"))
+            self.assertTrue(second.keel_outcome["from_cache"])
+            self.assertEqual(second.status, 200)
+            self.assertEqual(second.data, b'{"a":1}')
+            self.assertNotIn("Content-Encoding", second.headers)
+            self.assertEqual(second.headers["Content-Type"], "application/json")
+        self.assertEqual(srv.served, 1)
 
 
 class DoubleWrapGuardTest(unittest.TestCase):

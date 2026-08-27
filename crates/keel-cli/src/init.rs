@@ -26,6 +26,16 @@ use crate::{EXIT_USAGE, Rendered, evidence, scan};
 /// Column at which trailing `#` comments begin, when the line is shorter.
 const COMMENT_COL: usize = 37;
 
+/// #65: the observe-first nudge — printed by both `keel init`'s write-path
+/// human line and `keel init --diff`'s `notes` (human + JSON) whenever
+/// `.keel/discovery.db` is empty (no observed runs yet). An external
+/// evaluator's static-only `keel init --diff` produced mostly-noise policy
+/// where a single `keel run <entry>` would have surfaced the one real
+/// target — this steers toward the evidence-tuned path dx-spec already
+/// prefers, rather than leaving it undiscoverable.
+const OBSERVE_FIRST_NUDGE: &str = "no observed runs yet — `keel run <entry>` records real \
+     traffic into .keel/discovery.db and makes proposals evidence-tuned";
+
 /// Options parsed from the `keel init` flags.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
@@ -166,15 +176,14 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     };
 
     let stamp = opts.stamp.then(today_utc);
-    let content = render_keel_toml(&scan, &discovery, stamp.as_deref());
-    let targets = merged_targets(&scan, &discovery);
+    let generated = merged_targets(&scan, &discovery);
 
     let agents_cli_path = agents_cli_toml_path(project);
     let toml_path = agents_cli_path
         .clone()
         .unwrap_or_else(|| evidence::keel_toml(project));
     if opts.diff {
-        return diff(&toml_path, &scan, &discovery, &targets, stamp.as_deref());
+        return diff(&toml_path, &scan, &discovery, &generated, stamp.as_deref());
     }
     if toml_path.exists() {
         return config_error(&format!(
@@ -182,6 +191,22 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
             toml_path.display()
         ));
     }
+
+    // #64: never write a policy block for a host `classify_topology` puts in
+    // `excluded` (dependency-averse-only-sighted, local/loopback, …) — unify
+    // with `--diff` and `keel doctor`, which already refuse to propose one.
+    // `wrapped_targets` is built the same way `diff()` builds it, so a host
+    // discovery actually observed at runtime (evidence wins) still gets
+    // written even if it happens to be a loopback address.
+    let wrapped_targets: BTreeSet<String> = discovery.iter().map(|s| s.target.clone()).collect();
+    let topology = crate::doctor::classify_topology(&scan, &wrapped_targets, &BTreeMap::new());
+    let excluded_hosts: BTreeSet<&str> =
+        topology.excluded.iter().map(|e| e.host.as_str()).collect();
+    let targets: Vec<String> = generated
+        .into_iter()
+        .filter(|t| !excluded_hosts.contains(t.as_str()))
+        .collect();
+    let content = render_keel_toml_for_targets(&scan, &discovery, &targets, stamp.as_deref());
 
     if let Err(e) = std::fs::write(&toml_path, &content) {
         return config_error(&format!("could not write {}: {e}", toml_path.display()));
@@ -207,7 +232,7 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     }
 
     let observed_runs = u32::from(!discovery.is_empty());
-    let human = format!(
+    let mut human = format!(
         "keel \u{25b8} wrote {} ({} target{}) from {} static scan{} + {} observed run{}.{}",
         toml_path.display(),
         targets.len(),
@@ -222,6 +247,15 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
             warnings
         }
     );
+    if observed_runs == 0 {
+        human.push_str("\nkeel \u{25b8} note: ");
+        human.push_str(OBSERVE_FIRST_NUDGE);
+        human.push('\n');
+    }
+    // #64: explain every skipped host with the same `# excluded (<kind>): …`
+    // vocabulary `--diff`'s trailer uses — the write path silently dropping a
+    // host from the file would be a dx-spec §2 honesty violation of its own.
+    human.push_str(&render_diff_trailer(&topology.excluded, &[]));
     let report = WroteReport {
         gitignore_updated,
         observed_runs,
@@ -550,8 +584,11 @@ fn pad_comment(line: &str, comment: &str) -> String {
 /// (file, line, kind)-ordered), plus one pre-existing-resilience note when
 /// the project imports a resilience library alongside at least one lib Keel
 /// wraps (the same compounding gate as doctor's `preexisting-resilience`
-/// finding, via [`crate::doctor::registry_libs`]).
-fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
+/// finding, via [`crate::doctor::registry_libs`]), plus #65's observe-first
+/// nudge ([`OBSERVE_FIRST_NUDGE`]) when `discovery` is empty — a static-only
+/// `--diff` is evidence-poor, and the notes are exactly where a human/agent
+/// reading the diff would look for that caveat.
+fn diff_notes(scan: &ScanResult, added: &[String], discovery: &[TargetStats]) -> Vec<String> {
     let mut notes = Vec::new();
     let added_set: BTreeSet<&str> = added.iter().map(String::as_str).collect();
     for s in &scan.simplifications {
@@ -585,12 +622,20 @@ fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
             libs.join(", ")
         ));
     }
+    if discovery.is_empty() {
+        notes.push(OBSERVE_FIRST_NUDGE.to_owned());
+    }
     notes
 }
 
-/// The trailing `# excluded (dependency-averse): …` and `# note: …` sections
-/// of the `--diff` human text — split out of [`diff`] to keep that function
-/// under clippy's line-count gate.
+/// The trailing `# excluded (<kind>): …` and `# note: …` sections of the
+/// `--diff` human text — split out of [`diff`] to keep that function under
+/// clippy's line-count gate. `<kind>` is each entry's own
+/// [`TopologyEntry::kind`](crate::doctor::TopologyEntry) (`"dependency-
+/// averse"`, `"local/loopback"`, …) rather than a single hardcoded label —
+/// #64: a `keel init --diff`-proposed loopback exclusion must not be mislabeled
+/// "dependency-averse" just because that was the only category that existed
+/// when this trailer was first written.
 fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[String]) -> String {
     let mut out = String::new();
     if !excluded.is_empty() {
@@ -603,8 +648,8 @@ fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[Strin
         out.push('\n');
         for entry in excluded {
             let line = format!(
-                "# excluded (dependency-averse): {} — {}\n",
-                entry.host, entry.reason
+                "# excluded ({}): {} — {}\n",
+                entry.kind, entry.host, entry.reason
             );
             out.push_str(&line);
         }
@@ -628,8 +673,9 @@ fn render_diff_trailer(excluded: &[crate::doctor::TopologyEntry], notes: &[Strin
 /// (`--- /dev/null`).
 ///
 /// Never proposes a NEW policy block for a host [`doctor::classify_topology`]
-/// puts in the excluded (dependency-averse) bucket — the same classification
-/// `keel doctor` reports, reused directly so the two surfaces never disagree
+/// puts in the `excluded` bucket (dependency-averse-only-sighted,
+/// local/loopback, …) — the same classification `keel doctor` reports,
+/// reused directly so the two surfaces never disagree
 /// about which hosts get policy proposed (dx-spec §2's honesty triad). An
 /// excluded host the user already declared in their own `keel.toml` is left
 /// alone (neither added nor removed); the diff's human text explains every
@@ -679,7 +725,7 @@ fn diff(
         .filter(|t| existing.contains(**t))
         .map(|t| (*t).to_owned())
         .collect();
-    let notes = diff_notes(scan, &added);
+    let notes = diff_notes(scan, &added, discovery);
 
     let ops = if existing_text.is_none() {
         // No file yet: the patch creates the generated keel.toml (header
@@ -1146,6 +1192,135 @@ mod tests {
         );
     }
 
+    /// #64: a plain `keel init` (no `--diff`) must not write a policy block
+    /// for a statically-seen loopback host — unifying with what `--diff` and
+    /// `keel doctor` already refuse to propose. Before this fix, the write
+    /// path never consulted `classify_topology` at all.
+    #[test]
+    fn plain_init_skips_loopback_only_hosts_and_explains_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\nL = \"http://127.0.0.1:8000\"\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"api.normal.com\"]"),
+            "normal host written: {content}"
+        );
+        assert!(
+            !content.contains("127.0.0.1"),
+            "loopback host must not be written: {content}"
+        );
+        assert!(
+            r.human.contains("excluded (local/loopback): 127.0.0.1"),
+            "the write-path human text explains the exclusion: {}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "api.normal.com"));
+        assert!(!targets.iter().any(|v| v == "127.0.0.1"));
+    }
+
+    /// #64: the same unification for the dependency-averse exclusion kind —
+    /// deliberately changes the pre-existing write-path behavior (it used to
+    /// write dependency-averse-only hosts; `--diff` and `keel doctor` never
+    /// did).
+    #[test]
+    fn plain_init_skips_dependency_averse_only_hosts_and_explains_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"risk gate. stdlib only.\"\"\"\nimport urllib.request\nU = \"https://api.broker.com/v2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"api.normal.com\"]"),
+            "normal host written: {content}"
+        );
+        assert!(
+            !content.contains("[target.\"api.broker.com\"]"),
+            "no policy for the gate-file host: {content}"
+        );
+        assert!(
+            r.human
+                .contains("excluded (dependency-averse): api.broker.com"),
+            "{}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "api.normal.com"));
+        assert!(!targets.iter().any(|v| v == "api.broker.com"));
+    }
+
+    /// #64: evidence wins — a loopback host that discovery.db shows as
+    /// actually observed at runtime (wrapped) IS written, the same override
+    /// `classify_topology`'s precedence already grants `keel doctor`/`--diff`.
+    #[test]
+    fn plain_init_writes_a_runtime_observed_loopback_host() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "127.0.0.1".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"127.0.0.1\"]"),
+            "a runtime-observed loopback host must still be written: {content}"
+        );
+        assert!(
+            !r.human.contains("excluded (local/loopback): 127.0.0.1"),
+            "must not also be explained as excluded: {}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "127.0.0.1"));
+    }
+
     // ---- agents-cli layout redirection ----
 
     /// An `agents-cli` project (manifest + agent dir at the root) gets its
@@ -1296,6 +1471,151 @@ mod tests {
         );
     }
 
+    /// #65: a `--diff` run against a project with no `.keel/discovery.db` (the
+    /// common first-run state) nudges toward `keel run` in both the human
+    /// text and the structured `notes` — the exact sentence external
+    /// evaluators need, since a static-only scan alone produced mostly-noise
+    /// policy for one (issue #65).
+    #[test]
+    fn empty_discovery_nudges_toward_an_observed_run_in_diff() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+        // No .keel/discovery.db is created — discovery is empty.
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text carries the nudge: {}",
+            r.human
+        );
+        let json = serde_json::to_string(&r.json).unwrap();
+        assert!(
+            json.contains(OBSERVE_FIRST_NUDGE),
+            "DiffReport.notes carries the nudge: {json}"
+        );
+    }
+
+    /// The mirror of the test above: once a project has real observed
+    /// traffic (`.keel/discovery.db` non-empty), the nudge disappears from
+    /// both surfaces — it would be actively wrong to keep telling someone to
+    /// run `keel run` when they already have.
+    #[test]
+    fn observed_discovery_suppresses_the_diff_nudge() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "api.example.com".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            !r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text must not nudge once traffic is observed: {}",
+            r.human
+        );
+        let json = serde_json::to_string(&r.json).unwrap();
+        assert!(
+            !json.contains(OBSERVE_FIRST_NUDGE),
+            "DiffReport.notes must not nudge once traffic is observed: {json}"
+        );
+    }
+
+    /// The write-path twin: a plain `keel init` (no `--diff`) with no
+    /// observed traffic also nudges, in its human line.
+    #[test]
+    fn empty_discovery_nudges_toward_an_observed_run_on_write() {
+        let dir = TempDir::new().unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text carries the nudge: {}",
+            r.human
+        );
+    }
+
+    /// And its suppression once there is real observed traffic.
+    #[test]
+    fn observed_discovery_suppresses_the_write_path_nudge() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "api.example.com".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            !r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text must not nudge once traffic is observed: {}",
+            r.human
+        );
+    }
+
     /// dx-spec §5 (diffs as the lingua franca): `--diff` emits an applyable
     /// patch. Applying it removes stale blocks and appends evidence-cited new
     /// ones while user tuning outside the touched blocks survives byte-for-byte.
@@ -1414,10 +1734,68 @@ timeout = \"5s\"
             text.contains("excluded (dependency-averse): api.broker.com"),
             "{text}"
         );
+        // #64: the label names the actual category — never the loopback kind
+        // from a wholly different exclusion reason.
+        assert!(
+            !text.contains("excluded (local/loopback): api.broker.com"),
+            "dependency-averse exclusion must not be mislabeled loopback: {text}"
+        );
         // The structured `added` list must agree with the human text.
         let added = r.json["added"].as_array().unwrap();
         assert!(added.iter().any(|v| v == "api.normal.com"));
         assert!(!added.iter().any(|v| v == "api.broker.com"));
+    }
+
+    /// #64: a statically-seen loopback host (the scanner's plausibility gate,
+    /// `scan::plausible_host`, still lets it through — loopback IPs parse as
+    /// valid `IpAddr`s — but `classify_topology`'s loopback demotion excludes
+    /// it) must never get a proposed policy block, mirroring the
+    /// dependency-averse case above.
+    #[test]
+    fn diff_skips_loopback_only_hosts_and_says_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\nL = \"http://127.0.0.1:8000\"\n",
+        )
+        .unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let text = &r.human;
+        assert!(
+            text.contains("api.normal.com"),
+            "normal host proposed: {text}"
+        );
+        assert!(
+            !text.contains("[target.\"127.0.0.1\"]"),
+            "no policy for the loopback host: {text}"
+        );
+        assert!(
+            text.contains("excluded (local/loopback): 127.0.0.1"),
+            "trailer labels the exclusion by its real category: {text}"
+        );
+        // #64: the label names the actual category — never the dependency-
+        // averse kind from a wholly different exclusion reason.
+        assert!(
+            !text.contains("excluded (dependency-averse): 127.0.0.1"),
+            "loopback exclusion must not be mislabeled dependency-averse: {text}"
+        );
+        let added = r.json["added"].as_array().unwrap();
+        assert!(added.iter().any(|v| v == "api.normal.com"));
+        assert!(!added.iter().any(|v| v == "127.0.0.1"));
     }
 
     /// WS3: `keel init --diff` annotates proposals with what becomes deletable —

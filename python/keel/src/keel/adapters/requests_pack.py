@@ -211,7 +211,10 @@ def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
 
 
 def _rebuild(payload: Any) -> Any:
-    """Rebuild a requests.Response from an envelope (a cache-hit replay)."""
+    """Rebuild a requests.Response from an envelope (a cache-hit replay).
+    Wire-encoding headers are stripped (`_http.replay_headers`): the envelope
+    body is already-decoded bytes, so a stale `Content-Encoding`/
+    `Content-Length` would misdescribe it (#66)."""
     import requests
     from requests.structures import CaseInsensitiveDict
 
@@ -219,7 +222,7 @@ def _rebuild(payload: Any) -> Any:
     resp = requests.Response()
     resp.status_code = int(p.get("status", 200))
     resp._content = base64.b64decode(p["body_b64"]) if isinstance(p.get("body_b64"), str) else b""
-    resp.headers = CaseInsensitiveDict(dict(p.get("headers", [])))
+    resp.headers = CaseInsensitiveDict(_http.replay_headers(p.get("headers")))
     resp.encoding = requests.utils.get_encoding_from_headers(resp.headers)
     return resp
 

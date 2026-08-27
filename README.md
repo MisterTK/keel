@@ -134,6 +134,32 @@ Without the native module, the front end falls back to a pure-Python core:
 Tier 1 resilience still works, but there's no persistent cache and no
 durable flows.
 
+`keel run` also wraps launch commands that aren't script files — console
+scripts, `uv run`, `python -m`:
+
+```bash
+keel run -- uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8080
+```
+
+Keel execs the command with `KEEL_ENABLE=1` set, and every Python process in
+the tree (the command itself, and any subprocess it spawns) self-activates
+through the `keelrun` wheel — the same policy, journal, and discovery root
+throughout. Requires `pip install keelrun` in that environment.
+
+### First run → evidence → policy
+
+Every run under `keel run` also records real traffic — calls, error rates,
+latencies per target — into `.keel/discovery.db`. Use that before writing any
+policy:
+
+1. `keel run your_app.py` — zero config, and exercise the app a little (or
+   run your test suite under it).
+2. `keel init` — writes `keel.toml` from the observed evidence plus the
+   static scan. Policy tuned to traffic you actually saw ("headroom over
+   your observed mean") beats template guesses; with no observed runs the
+   static scan alone still works, just with more conservative proposals.
+3. `keel init --diff` — preview what any new evidence would change, any time.
+
 ## See it work
 
 Five runnable, deterministic demos — no real network involved

@@ -263,10 +263,28 @@ export async function responseEnvelope(resp, { withBody = false } = {}) {
 // Statuses that WHATWG forbids a body on; rebuild them with a null body.
 const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
 
+// Headers describing the WIRE encoding of the original body. Envelope bodies
+// are the caller-visible (decoded) bytes — undici fetch decompresses before
+// clone().arrayBuffer() — so a rebuilt Response must not re-declare the wire
+// encoding (stale content-length included). Twin of Python
+// _http.replay_headers; the strip list must stay identical (#66).
+const REPLAY_STRIPPED_HEADERS = new Set(["content-encoding", "content-length", "transfer-encoding"]);
+
+export function replayHeaders(headers) {
+  const out = [];
+  for (const pair of Array.isArray(headers) ? headers : []) {
+    if (!Array.isArray(pair) || pair.length !== 2) continue;
+    const [k, v] = pair;
+    if (REPLAY_STRIPPED_HEADERS.has(String(k).toLowerCase())) continue;
+    out.push([String(k), String(v)]);
+  }
+  return out;
+}
+
 /** Rebuild a `Response` from an envelope (cache-hit replay). */
 export function rebuildResponse(env) {
   const status = env?.status ?? 200;
-  const headers = Array.isArray(env?.headers) ? env.headers : [];
+  const headers = replayHeaders(env?.headers);
   const bytes = env?.body_b64 != null ? Buffer.from(env.body_b64, "base64") : null;
   const body = NULL_BODY_STATUS.has(status) || !bytes || bytes.length === 0 ? null : bytes;
   return new Response(body, { status, statusText: env?.status_text ?? "", headers });

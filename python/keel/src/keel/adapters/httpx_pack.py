@@ -283,12 +283,19 @@ def _headers(resp: Any) -> list[tuple[str, str]]:
 
 
 def _rebuild(payload: Any) -> Any:
-    """Rebuild an httpx.Response from an envelope (a cache-hit replay)."""
+    """Rebuild an httpx.Response from an envelope (a cache-hit replay). Wire-
+    encoding headers are stripped (`_http.replay_headers`): the envelope body is
+    the decoded bytes, and httpx.Response eagerly re-decodes per
+    Content-Encoding — keeping the header corrupts every gzip replay (#60)."""
     import httpx
 
     p = payload if isinstance(payload, dict) else {}
     body = base64.b64decode(p["body_b64"]) if isinstance(p.get("body_b64"), str) else b""
-    return httpx.Response(status_code=int(p.get("status", 200)), headers=p.get("headers", []), content=body)
+    return httpx.Response(
+        status_code=int(p.get("status", 200)),
+        headers=_http.replay_headers(p.get("headers")),
+        content=body,
+    )
 
 
 # --- LLM budget + fallback helpers (shared by the sync and async seams) -----

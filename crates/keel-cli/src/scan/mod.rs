@@ -614,7 +614,32 @@ pub(crate) fn host_from_url(s: &str) -> Option<String> {
     if host.is_empty() || host.contains(|c: char| c.is_whitespace()) {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+    let host = host.to_ascii_lowercase();
+    plausible_host(&host).then_some(host)
+}
+
+/// Whether an extracted authority is plausibly a real network host (#64).
+/// URL-shaped literals like `s3://bucket/key` or `redis://session` otherwise
+/// flood proposals with bare identifiers; template fragments (`{b}`, `%s`)
+/// are never hosts. The embedded Python walker implements the same rules —
+/// the shared case table in both test suites keeps them aligned.
+pub(crate) fn plausible_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    if host.contains(['{', '}', '$', '%', '(', ')', '<', '>']) {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 #[cfg(test)]
@@ -637,6 +662,31 @@ mod tests {
         assert_eq!(host_from_url("not a url"), None);
         assert_eq!(host_from_url("://nohost"), None);
         assert_eq!(host_from_url("1bad://x"), None);
+    }
+
+    #[test]
+    fn implausible_hosts_are_rejected_at_extraction() {
+        // Case table shared verbatim with python.rs's walker test — keep in sync.
+        for junk in [
+            "s3://b/k",
+            "s3://bucket/key",
+            "gs://artifact/x",
+            "redis://session",
+            "https://{b}/x",
+            "http://%s/x",
+        ] {
+            assert_eq!(host_from_url(junk), None, "{junk}");
+        }
+        for (url, host) in [
+            ("https://api.stripe.com/v1", "api.stripe.com"),
+            ("postgres://db.internal:5432/app", "db.internal"),
+            ("http://127.0.0.1:8000", "127.0.0.1"),
+            ("http://0.0.0.0:8080", "0.0.0.0"),
+            ("http://localhost:3000", "localhost"),
+            ("https://google.github.io/adk-docs/", "google.github.io"),
+        ] {
+            assert_eq!(host_from_url(url).as_deref(), Some(host), "{url}");
+        }
     }
 
     #[test]

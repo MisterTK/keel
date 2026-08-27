@@ -14,8 +14,12 @@
 //! - anything else              → a precise what/why/next error, exit 2
 //!
 //! The child inherits the environment (so every `KEEL_*` var passes through);
-//! `--disable` layers `KEEL_DISABLE=1` on top. The child's exit code is the
-//! process's exit code — wrapping is invisible on the success path.
+//! `--disable` layers `KEEL_DISABLE=1` on top. On top of that, `keel run`
+//! also layers `KEEL_ENABLE=1`/`KEEL_CWD` (set-if-absent — see
+//! [`activation_env`]) so any subprocess the child itself spawns
+//! self-activates via the keelrun wheel's `.pth` (#63); `--disable` skips
+//! this too. The child's exit code is the process's exit code — wrapping is
+//! invisible on the success path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,6 +44,12 @@ pub struct RunPlan {
     pub argv: Vec<String>,
     /// Whether to set `KEEL_DISABLE=1` in the child.
     pub disable: bool,
+    /// Whether this plan is command mode (#62): an arbitrary PATH-resolvable
+    /// command exec'd directly, rather than a script Keel dispatches into a
+    /// language front end. Command-mode children skip the Python pre-flight
+    /// (the program isn't `python3 -m keel`) — they self-activate purely via
+    /// `activation_env`.
+    pub command_mode: bool,
 }
 
 /// Why a target could not be dispatched — each rendered as what/why/next.
@@ -62,6 +72,12 @@ pub enum RunError {
     /// die inside Node's own ESM loader with a raw, unbranded
     /// `ERR_MODULE_NOT_FOUND`, so this is caught before exec'ing at all.
     MissingKeelrun { target: String },
+    /// The Python interpreter that `keel run` dispatches to cannot import OUR
+    /// `keel` package (`import keel._run`) — either `keelrun` is not installed,
+    /// or the UNRELATED PyPI package also named `keel` (an ncurses process
+    /// killer) is shadowing it. Without this pre-flight the user gets a raw
+    /// "No module named keel.__main__" two steps after `pip install keel`.
+    MissingPythonKeelrun { target: String },
 }
 
 impl RunError {
@@ -70,13 +86,13 @@ impl RunError {
             Self::NotFound { target } => (
                 format!("Cannot run `{target}`: no such file or directory."),
                 "The path does not exist relative to the current directory.".to_owned(),
-                "Check the path; `keel run` takes a script file, a package.json, or a project directory.".to_owned(),
+                "Check the path; `keel run` takes a script file, a package.json, a project directory, or a PATH-resolvable command (`keel run -- uvicorn app:app`).".to_owned(),
                 "not-found",
             ),
             Self::UnknownKind { target } => (
                 format!("Cannot run `{target}`: unrecognized program type."),
                 "`keel run` dispatches Python (.py) and Node (.mjs/.js/.ts/.cjs/.mts/.cts/.jsx/.tsx, or a package.json main); this target is neither.".to_owned(),
-                "Rename to a supported extension, point at the project's package.json, or invoke the interpreter directly.".to_owned(),
+                "Rename to a supported extension, point at the project's package.json, or invoke the interpreter directly, or launch via the activation env: `KEEL_ENABLE=1 <your command>` with the `keelrun` package installed.".to_owned(),
                 "unknown-kind",
             ),
             Self::NoEntry { target } => (
@@ -104,6 +120,19 @@ impl RunError {
                     .to_owned(),
                 "Run `npm install keelrun` alongside `keelrun-cli` in this project.".to_owned(),
                 "missing-keelrun",
+            ),
+            Self::MissingPythonKeelrun { target } => (
+                format!("Cannot run `{target}`: the `keelrun` package is not importable."),
+                "Python targets are dispatched via `python3 -m keel run`, which needs the \
+                 `keelrun` PyPI package (import name `keel`). Either it is not installed, \
+                 or an unrelated package also named `keel` is installed instead — \
+                 `pip install keel` is a different project's process-killer utility, not \
+                 this tool."
+                    .to_owned(),
+                "Run `pip install keelrun` — NOT `pip install keel` — in this project's \
+                 Python environment."
+                    .to_owned(),
+                "missing-keelrun-py",
             ),
         };
         let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
@@ -151,6 +180,9 @@ pub fn plan(target: &str, args: &[String], disable: bool) -> Result<RunPlan, Run
         return resolve_directory(target, path, args, disable);
     }
     if !path.exists() {
+        if let Some(command) = command_plan(target, args, disable) {
+            return Ok(command);
+        }
         return Err(RunError::NotFound {
             target: target.to_owned(),
         });
@@ -177,6 +209,7 @@ fn python_plan(target: &str, extra: &[String], disable: bool) -> RunPlan {
         program: "python3".to_owned(),
         argv,
         disable,
+        command_mode: false,
     }
 }
 
@@ -212,6 +245,35 @@ fn node_plan(target: &str, extra: &[String], disable: bool) -> Result<RunPlan, R
         program: "node".to_owned(),
         argv,
         disable,
+        command_mode: false,
+    })
+}
+
+/// Command mode (#62): `keel run <cmd> [args…]` (also reachable as
+/// `keel run -- <cmd> …` — clap strips the `--`). The target must be a bare
+/// word (no path separator), must NOT carry a known script extension (a
+/// typo'd `app.py` stays a NotFound, never a surprise exec), and must resolve
+/// on PATH. Keel wraps nothing in-process here; children self-activate via
+/// `activation_env` + the keelrun wheel's `.pth`, which covers console
+/// scripts (`uvicorn`), `uv run …`, and `python -m pkg` launches.
+fn command_plan(target: &str, args: &[String], disable: bool) -> Option<RunPlan> {
+    if target.contains(std::path::MAIN_SEPARATOR) || target.contains('/') {
+        return None;
+    }
+    let ext = Path::new(target).extension().and_then(|e| e.to_str());
+    if matches!(ext, Some("py")) || ext.is_some_and(|e| NODE_EXTS.contains(&e)) {
+        return None;
+    }
+    let found = std::env::split_paths(&std::env::var_os("PATH")?)
+        .any(|dir| !dir.as_os_str().is_empty() && dir.join(target).is_file());
+    if !found {
+        return None;
+    }
+    Some(RunPlan {
+        program: target.to_owned(),
+        argv: args.to_vec(),
+        disable,
+        command_mode: true,
     })
 }
 
@@ -370,15 +432,25 @@ pub(crate) fn exec_with(
                 "`{}` was not found on PATH or could not be started.",
                 plan.program
             );
-            let next = if plan.program == "python3" {
-                "Install Python 3 and the `keelrun` package (`pip install keelrun`)."
+            // #62/finding 4: command mode execs `plan.program` directly (no
+            // Python/Node dispatch involved at all) — the install hint below
+            // only applies to the two interpreters `keel run` itself
+            // dispatches into.
+            let next: String = if plan.command_mode {
+                format!(
+                    "`{}` is not installed, not on PATH, or not executable — check the command \
+                     name and permissions.",
+                    plan.program
+                )
+            } else if plan.program == "python3" {
+                "Install Python 3 and the `keelrun` package (`pip install keelrun`).".to_owned()
             } else {
-                "Install Node.js and the `keelrun` package (`npm i -D keelrun`)."
+                "Install Node.js and the `keelrun` package (`npm i -D keelrun`).".to_owned()
             };
             let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
             let report = RunErrorReport {
                 error: "spawn-failed",
-                next,
+                next: &next,
                 what: &what,
                 why: &why,
             };
@@ -392,6 +464,76 @@ pub(crate) fn exec_with(
     }
 }
 
+/// `python3 -c` probe: exit 0 iff our package is importable. `find_spec`
+/// resolves without importing, so the foreign `keel==0.1` (no `_run`
+/// submodule) and a missing install both exit non-zero.
+const PY_KEELRUN_PROBE: &str =
+    "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('keel._run') else 3)";
+
+fn keelrun_importable(python: &str) -> bool {
+    Command::new(python)
+        .args(["-c", PY_KEELRUN_PROBE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        // Interpreter missing/unspawnable: not this error's job — fall through
+        // so exec_with's spawn-failed path reports it with its install hint.
+        .map_or(true, |s| s.success())
+}
+
+/// Pre-flight for Python plans, mirroring the Node `MissingKeelrun` walk:
+/// catch the wrong-`keel`-package trap before exec'ing (#61). ~one python
+/// startup (tens of ms), only on the run/record paths.
+pub(crate) fn python_preflight(target: &str, plan: &RunPlan) -> Option<Rendered> {
+    if plan.program == "python3" && !keelrun_importable(&plan.program) {
+        return Some(
+            RunError::MissingPythonKeelrun {
+                target: target.to_owned(),
+            }
+            .render(),
+        );
+    }
+    None
+}
+
+/// Env pairs that make CHILD processes of the wrapped program self-activate
+/// via the keelrun wheel's `.pth` (`KEEL_ENABLE` gate) — the zero-effort
+/// subprocess-inheritance path (#63). Set-if-absent: a user's explicit value
+/// (including a falsy one) always wins; `--disable` exports nothing (the
+/// child env already carries KEEL_DISABLE=1, which beats KEEL_ENABLE anyway).
+pub(crate) fn activation_env(plan: &RunPlan) -> Vec<(String, String)> {
+    if plan.disable {
+        return Vec::new();
+    }
+    let mut env = Vec::new();
+    if std::env::var_os("KEEL_ENABLE").is_none() {
+        env.push(("KEEL_ENABLE".to_owned(), "1".to_owned()));
+    }
+    if std::env::var_os("KEEL_CWD").is_none()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        env.push(("KEEL_CWD".to_owned(), cwd.to_string_lossy().into_owned()));
+    }
+    env
+}
+
+/// The stderr banner `keel run` prints once a plan resolves to command mode
+/// (#62): which self-activation mechanism the exec'd child gets. `None`
+/// under `plan.disable` — `--disable` makes [`activation_env`] export
+/// nothing (no `KEEL_ENABLE=1` reaches the child; `exec_with` sets
+/// `KEEL_DISABLE=1` instead), so claiming `KEEL_ENABLE=1` there would be
+/// actively wrong, not just incomplete.
+fn command_mode_banner(target: &str, plan: &RunPlan) -> Option<String> {
+    if plan.disable {
+        return None;
+    }
+    Some(format!(
+        "keel \u{25b8} command mode: exec `{target}` with KEEL_ENABLE=1 \u{2014} Python \
+         children self-activate via the `keelrun` wheel (pip install keelrun); Node \
+         children need NODE_OPTIONS=\"--import keelrun/register\"."
+    ))
+}
+
 /// The whole `keel run` command: plan, then exec. On a dispatch error render it;
 /// on success return the child's exit code.
 pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i32) {
@@ -401,13 +543,25 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
             let code = r.exit;
             (Some(r), code)
         }
-        Ok(plan) => match exec(&plan) {
-            Ok(code) => (None, code),
-            Err(r) => {
+        Ok(plan) => {
+            if plan.command_mode {
+                if let Some(banner) = command_mode_banner(target, &plan) {
+                    eprintln!("{banner}");
+                }
+            } else if let Some(r) = python_preflight(target, &plan) {
                 let code = r.exit;
-                (Some(r), code)
+                return (Some(r), code);
             }
-        },
+            match exec_with(&plan, |cmd| {
+                cmd.envs(activation_env(&plan));
+            }) {
+                Ok(code) => (None, code),
+                Err(r) => {
+                    let code = r.exit;
+                    (Some(r), code)
+                }
+            }
+        }
     }
 }
 
@@ -525,6 +679,41 @@ mod tests {
     }
 
     #[test]
+    fn path_resolvable_bare_word_enters_command_mode() {
+        // `sh` exists on PATH everywhere we test.
+        let plan = plan("sh", &["-c".to_owned(), "exit 0".to_owned()], false).unwrap();
+        assert!(plan.command_mode);
+        assert_eq!(plan.program, "sh");
+        assert_eq!(plan.argv, vec!["-c", "exit 0"]);
+    }
+
+    #[test]
+    fn nonexistent_word_not_on_path_is_still_not_found() {
+        let err = plan("definitely-not-a-real-binary-xyz", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn nonexistent_script_extension_never_enters_command_mode() {
+        // A typo'd script name must stay a NotFound, even if a same-named binary
+        // could exist: known extensions always mean "script mode intended".
+        let err = plan("missing.py", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn path_separator_targets_never_enter_command_mode() {
+        let err = plan("./no/such/dir", &[], false).unwrap_err();
+        assert!(matches!(err, RunError::NotFound { .. }));
+    }
+
+    #[test]
+    fn command_mode_exit_code_propagates() {
+        let plan = plan("sh", &["-c".to_owned(), "exit 7".to_owned()], false).unwrap();
+        assert_eq!(exec(&plan).unwrap(), 7);
+    }
+
+    #[test]
     fn missing_file_is_not_found() {
         assert_eq!(
             plan("does-not-exist.py", &[], false),
@@ -633,6 +822,7 @@ mod tests {
             program: "sh".to_owned(),
             argv: vec!["-c".to_owned(), "exit 7".to_owned()],
             disable: false,
+            command_mode: false,
         };
         assert_eq!(exec(&plan).expect("sh should spawn"), 7);
     }
@@ -649,12 +839,144 @@ mod tests {
                 "[ \"$KEEL_RECORD_TEST\" = \"marker\" ] && exit 0 || exit 9".to_owned(),
             ],
             disable: false,
+            command_mode: false,
         };
         let code = exec_with(&plan, |cmd| {
             cmd.env("KEEL_RECORD_TEST", "marker");
         })
         .expect("sh should spawn");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn missing_python_keelrun_is_a_precise_error() {
+        let r = RunError::MissingPythonKeelrun {
+            target: "app.py".to_owned(),
+        }
+        .render();
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.to_stderr);
+        assert!(r.human.contains("pip install keelrun"));
+        assert!(r.human.contains("not `keel`") || r.human.contains("NOT `pip install keel`"));
+        assert_eq!(r.json["error"], "missing-keelrun-py");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keelrun_probe_trusts_a_zero_exit_and_distrusts_nonzero() {
+        // The probe passes ["-c", <code>] to the interpreter; a shim that ignores
+        // its args and exits 0/1 exercises the plumbing without needing python.
+        let dir = TempDir::new().unwrap();
+        let ok = dir.path().join("ok.sh");
+        fs::write(&ok, "#!/bin/sh\nexit 0\n").unwrap();
+        let bad = dir.path().join("bad.sh");
+        fs::write(&bad, "#!/bin/sh\nexit 3\n").unwrap();
+        for p in [&ok, &bad] {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            fs::set_permissions(p, perms).unwrap();
+        }
+        assert!(keelrun_importable(ok.to_str().unwrap()));
+        assert!(!keelrun_importable(bad.to_str().unwrap()));
+        // A missing interpreter is NOT this error's job — spawn failure reports it.
+        assert!(keelrun_importable(
+            dir.path().join("absent").to_str().unwrap()
+        ));
+    }
+
+    /// RAII guard: removes `KEEL_ENABLE`/`KEEL_CWD` from the process
+    /// environment on construction, restores whatever was there before on
+    /// drop — including when the test body panics in between (an
+    /// `unwrap`/`assert_eq!` failure must never leak mutated env state to
+    /// every later test in this binary, since cargo runs tests in threads
+    /// within one process and unwinding still runs `Drop`). Holds a
+    /// process-wide lock for its whole lifetime so no concurrent test can
+    /// observe the vars mid-mutation.
+    struct EnvVarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_enable: Option<String>,
+        saved_cwd: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset_activation_vars() -> Self {
+            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved_enable = std::env::var("KEEL_ENABLE").ok();
+            let saved_cwd = std::env::var("KEEL_CWD").ok();
+            // SAFETY: serialized by ENV_LOCK, held for this guard's whole
+            // lifetime; no other test in this binary touches these two vars.
+            unsafe {
+                std::env::remove_var("KEEL_ENABLE");
+                std::env::remove_var("KEEL_CWD");
+            }
+            Self {
+                _lock: lock,
+                saved_enable,
+                saved_cwd,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by `_lock`, released only after this
+            // runs (fields drop in declaration order after `drop()` returns).
+            unsafe {
+                match self.saved_enable.take() {
+                    Some(v) => std::env::set_var("KEEL_ENABLE", v),
+                    None => std::env::remove_var("KEEL_ENABLE"),
+                }
+                match self.saved_cwd.take() {
+                    Some(v) => std::env::set_var("KEEL_CWD", v),
+                    None => std::env::remove_var("KEEL_CWD"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activation_env_is_layered_onto_children_unless_disabled() {
+        // `activation_env` reads KEEL_ENABLE/KEEL_CWD from the real process
+        // environment (set-if-absent semantics) — the guard clears ambient
+        // values for the duration and restores them (panic-safe) on drop.
+        let _guard = EnvVarGuard::unset_activation_vars();
+
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![
+                "-c".to_owned(),
+                r#"[ "$KEEL_ENABLE" = "1" ] && [ -n "$KEEL_CWD" ] && exit 0 || exit 9"#.to_owned(),
+            ],
+            disable: false,
+            command_mode: false,
+        };
+        let mut cmd_env = activation_env(&plan);
+        cmd_env.sort();
+        assert_eq!(
+            cmd_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["KEEL_CWD", "KEEL_ENABLE"]
+        );
+        assert_eq!(
+            exec_with(&plan, |cmd| {
+                cmd.envs(activation_env(&plan));
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn disable_suppresses_activation_env() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: true,
+            command_mode: false,
+        };
+        assert!(activation_env(&plan).is_empty());
     }
 
     #[test]
@@ -665,6 +987,7 @@ mod tests {
             program: "keel-nonexistent-program-9f3a".to_owned(),
             argv: vec![],
             disable: false,
+            command_mode: false,
         };
         let rendered = exec(&plan).expect_err("nonexistent program cannot spawn");
 
@@ -676,5 +999,70 @@ mod tests {
         assert!(rendered.human.contains("keel-nonexistent-program-9f3a"));
         assert!(rendered.human.contains("why:"));
         assert!(rendered.human.contains("next:"));
+    }
+
+    /// #62/finding 4: a command-mode plan's spawn failure is a missing/
+    /// non-executable command on PATH — not the Python/Node dispatch failure
+    /// `exec_with`'s hint used to assume unconditionally, which told a user
+    /// to `pip install keelrun` for what is really a typo'd binary name.
+    #[test]
+    fn spawn_failure_hint_is_command_accurate_in_command_mode() {
+        let plan = RunPlan {
+            program: "keel-nonexistent-program-9f3a".to_owned(),
+            argv: vec![],
+            disable: false,
+            command_mode: true,
+        };
+        let rendered = exec(&plan).expect_err("nonexistent program cannot spawn");
+
+        assert_eq!(rendered.json["error"], "spawn-failed");
+        assert!(rendered.human.contains("next:"));
+        assert!(
+            !rendered.human.contains("pip install keelrun"),
+            "command mode must not suggest the Python dispatch fix: {}",
+            rendered.human
+        );
+        assert!(
+            !rendered.human.contains("npm i -D keelrun"),
+            "command mode must not suggest the Node dispatch fix: {}",
+            rendered.human
+        );
+        assert!(
+            rendered.human.contains("PATH"),
+            "command mode's hint should point at PATH/executability: {}",
+            rendered.human
+        );
+    }
+
+    /// #62/finding 3: the command-mode banner claims the child gets
+    /// `KEEL_ENABLE=1` — true only when [`activation_env`] actually exports
+    /// it, which `--disable` suppresses entirely (and sets `KEEL_DISABLE=1`
+    /// instead). The banner must not make that claim under `--disable`.
+    #[test]
+    fn command_mode_banner_names_the_activation_mechanism_when_enabled() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: false,
+            command_mode: true,
+        };
+        let banner = command_mode_banner("mytool", &plan).expect("banner shown when enabled");
+        assert!(banner.contains("KEEL_ENABLE=1"));
+        assert!(banner.contains("mytool"));
+    }
+
+    #[test]
+    fn command_mode_banner_is_suppressed_under_disable() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: true,
+            command_mode: true,
+        };
+        assert_eq!(
+            command_mode_banner("mytool", &plan),
+            None,
+            "must not claim KEEL_ENABLE=1 under --disable, where activation_env exports nothing"
+        );
     }
 }

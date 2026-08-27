@@ -311,5 +311,27 @@ class TransientStatusTest(unittest.TestCase):
             self.assertFalse(_http.is_transient_status(s), s)
 
 
+class ReplayHeadersTest(unittest.TestCase):
+    """Issue #60: envelope bodies are the caller-visible (decoded) bytes, so a
+    rebuilt response must not re-declare the wire encoding."""
+
+    def test_strips_wire_encoding_trio_case_insensitively(self) -> None:
+        headers = [
+            ["Content-Type", "application/json"],
+            ["Content-Encoding", "gzip"],
+            ["content-length", "999"],
+            ["Transfer-Encoding", "chunked"],
+            ["X-Request-Id", "abc"],
+        ]
+        self.assertEqual(
+            _http.replay_headers(headers),
+            [["Content-Type", "application/json"], ["X-Request-Id", "abc"]],
+        )
+
+    def test_tolerates_none_and_malformed_pairs(self) -> None:
+        self.assertEqual(_http.replay_headers(None), [])
+        self.assertEqual(_http.replay_headers([["only-key"], ["k", "v", "extra"]]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
