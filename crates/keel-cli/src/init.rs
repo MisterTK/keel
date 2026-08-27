@@ -176,15 +176,14 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     };
 
     let stamp = opts.stamp.then(today_utc);
-    let content = render_keel_toml(&scan, &discovery, stamp.as_deref());
-    let targets = merged_targets(&scan, &discovery);
+    let generated = merged_targets(&scan, &discovery);
 
     let agents_cli_path = agents_cli_toml_path(project);
     let toml_path = agents_cli_path
         .clone()
         .unwrap_or_else(|| evidence::keel_toml(project));
     if opts.diff {
-        return diff(&toml_path, &scan, &discovery, &targets, stamp.as_deref());
+        return diff(&toml_path, &scan, &discovery, &generated, stamp.as_deref());
     }
     if toml_path.exists() {
         return config_error(&format!(
@@ -192,6 +191,22 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
             toml_path.display()
         ));
     }
+
+    // #64: never write a policy block for a host `classify_topology` puts in
+    // `excluded` (dependency-averse-only-sighted, local/loopback, …) — unify
+    // with `--diff` and `keel doctor`, which already refuse to propose one.
+    // `wrapped_targets` is built the same way `diff()` builds it, so a host
+    // discovery actually observed at runtime (evidence wins) still gets
+    // written even if it happens to be a loopback address.
+    let wrapped_targets: BTreeSet<String> = discovery.iter().map(|s| s.target.clone()).collect();
+    let topology = crate::doctor::classify_topology(&scan, &wrapped_targets, &BTreeMap::new());
+    let excluded_hosts: BTreeSet<&str> =
+        topology.excluded.iter().map(|e| e.host.as_str()).collect();
+    let targets: Vec<String> = generated
+        .into_iter()
+        .filter(|t| !excluded_hosts.contains(t.as_str()))
+        .collect();
+    let content = render_keel_toml_for_targets(&scan, &discovery, &targets, stamp.as_deref());
 
     if let Err(e) = std::fs::write(&toml_path, &content) {
         return config_error(&format!("could not write {}: {e}", toml_path.display()));
@@ -237,6 +252,10 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
         human.push_str(OBSERVE_FIRST_NUDGE);
         human.push('\n');
     }
+    // #64: explain every skipped host with the same `# excluded (<kind>): …`
+    // vocabulary `--diff`'s trailer uses — the write path silently dropping a
+    // host from the file would be a dx-spec §2 honesty violation of its own.
+    human.push_str(&render_diff_trailer(&topology.excluded, &[]));
     let report = WroteReport {
         gitignore_updated,
         observed_runs,
@@ -1171,6 +1190,135 @@ mod tests {
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             "# hand-written\n"
         );
+    }
+
+    /// #64: a plain `keel init` (no `--diff`) must not write a policy block
+    /// for a statically-seen loopback host — unifying with what `--diff` and
+    /// `keel doctor` already refuse to propose. Before this fix, the write
+    /// path never consulted `classify_topology` at all.
+    #[test]
+    fn plain_init_skips_loopback_only_hosts_and_explains_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\nL = \"http://127.0.0.1:8000\"\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"api.normal.com\"]"),
+            "normal host written: {content}"
+        );
+        assert!(
+            !content.contains("127.0.0.1"),
+            "loopback host must not be written: {content}"
+        );
+        assert!(
+            r.human.contains("excluded (local/loopback): 127.0.0.1"),
+            "the write-path human text explains the exclusion: {}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "api.normal.com"));
+        assert!(!targets.iter().any(|v| v == "127.0.0.1"));
+    }
+
+    /// #64: the same unification for the dependency-averse exclusion kind —
+    /// deliberately changes the pre-existing write-path behavior (it used to
+    /// write dependency-averse-only hosts; `--diff` and `keel doctor` never
+    /// did).
+    #[test]
+    fn plain_init_skips_dependency_averse_only_hosts_and_explains_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("risk_gate.py"),
+            "\"\"\"risk gate. stdlib only.\"\"\"\nimport urllib.request\nU = \"https://api.broker.com/v2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\n",
+        )
+        .unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"api.normal.com\"]"),
+            "normal host written: {content}"
+        );
+        assert!(
+            !content.contains("[target.\"api.broker.com\"]"),
+            "no policy for the gate-file host: {content}"
+        );
+        assert!(
+            r.human
+                .contains("excluded (dependency-averse): api.broker.com"),
+            "{}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "api.normal.com"));
+        assert!(!targets.iter().any(|v| v == "api.broker.com"));
+    }
+
+    /// #64: evidence wins — a loopback host that discovery.db shows as
+    /// actually observed at runtime (wrapped) IS written, the same override
+    /// `classify_topology`'s precedence already grants `keel doctor`/`--diff`.
+    #[test]
+    fn plain_init_writes_a_runtime_observed_loopback_host() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "127.0.0.1".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let content = fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+        assert!(
+            content.contains("[target.\"127.0.0.1\"]"),
+            "a runtime-observed loopback host must still be written: {content}"
+        );
+        assert!(
+            !r.human.contains("excluded (local/loopback): 127.0.0.1"),
+            "must not also be explained as excluded: {}",
+            r.human
+        );
+        let targets = r.json["targets"].as_array().unwrap();
+        assert!(targets.iter().any(|v| v == "127.0.0.1"));
     }
 
     // ---- agents-cli layout redirection ----
