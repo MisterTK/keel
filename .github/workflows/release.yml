@@ -833,7 +833,7 @@ jobs:
         # stakes than the build-only steps elsewhere in this workflow.
         # SHA is release/v1's tip as of 2026-07-14; bump deliberately (e.g. via
         # Dependabot's github-actions ecosystem) rather than silently drifting.
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, 2026-07-28 (twine 7 — accepts Metadata-Version 2.5, which new hatchling emits)
         with:
           packages-dir: pypi-dist
           # Makes re-running this workflow for the same version idempotent:
@@ -867,7 +867,7 @@ jobs:
           cp dist/keelrun_cli-*.whl pypi-dist/
           ls -la pypi-dist
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, 2026-07-28 (twine 7 — accepts Metadata-Version 2.5, which new hatchling emits)
         with:
           packages-dir: pypi-dist
           # Makes re-running this workflow for the same version idempotent:
@@ -906,7 +906,7 @@ jobs:
           cp dist/keelrun-*.whl dist/keelrun-*.tar.gz pypi-dist/
           ls -la pypi-dist
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, 2026-07-14
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, 2026-07-28 (twine 7 — accepts Metadata-Version 2.5, which new hatchling emits)
         with:
           packages-dir: pypi-dist
           # Makes re-running this workflow for the same version idempotent:
