@@ -507,6 +507,7 @@ class NativeFlowReplayTest(unittest.TestCase):
                     eff,
                 )
                 self.assertEqual(out["result"], "ok")
+                self.assertFalse(out.get("replayed", False), "a live step must not report replayed")
             t = core.journal_time("py:time.time#-", 1783728000)
             core.exit_flow("completed")
             return t
@@ -527,10 +528,20 @@ class NativeFlowReplayTest(unittest.TestCase):
                 eff,
             )
             self.assertEqual(out["payload"], {"i": i + 1})
+            self.assertTrue(out["replayed"], "a substituted step must report replayed")
         replayed_time = core.journal_time("py:time.time#-", 9999)
         core.exit_flow("completed")
         self.assertEqual(fires["n"], 3, "replay fired no effects")
         self.assertEqual(replayed_time, 1783728000, "time replayed")
+
+    def test_bare_execute_outside_a_flow_has_no_replayed_key(self) -> None:
+        core = self._core()
+        out = core.execute(
+            {"v": 1, "target": "api.x", "op": "api.x", "args_hash": "h0", "idempotent": True},
+            lambda _attempt: {"status": "ok", "payload": {"i": 1}},
+        )
+        self.assertEqual(out["result"], "ok")
+        self.assertNotIn("replayed", out, "a non-flow call must not gain the additive replayed key")
 
     def test_idempotency_key_recorded_on_crash_survives_resume(self) -> None:
         """contracts/adapter-pack.md "Idempotency-key injection" rule 3,
@@ -644,6 +655,7 @@ class NativeFlowReplayTest(unittest.TestCase):
                     eff,
                 )
                 self.assertEqual(out["result"], "ok")
+                self.assertFalse(out.get("replayed", False), "a live step must not report replayed")
             core.exit_flow("completed")
 
         asyncio.run(run_once())
@@ -664,6 +676,7 @@ class NativeFlowReplayTest(unittest.TestCase):
                     },
                     eff,
                 )
+                self.assertTrue(out["replayed"], "a substituted step must report replayed")
                 payloads.append(out["payload"])
             core.exit_flow("completed")
             return payloads
