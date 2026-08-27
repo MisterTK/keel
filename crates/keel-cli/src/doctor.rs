@@ -261,10 +261,10 @@ struct Finding {
 /// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
 /// agent/human reading the report to work top-down. `code` is a CLOSED set —
 /// url-no-transport | orchestration-blind-spot | subprocess-blind-spot |
-/// dependency-averse-excluded | preexisting-resilience | code-hash-stale —
-/// ranked lowest-Keel-confidence first (rank 1 = Keel knows least, investigate
-/// first). Text is entirely keel-authored; only hostnames, file paths, and lib
-/// names are interpolated.
+/// dependency-averse-excluded | local-host-excluded | preexisting-resilience |
+/// code-hash-stale — ranked lowest-Keel-confidence first (rank 1 = Keel knows
+/// least, investigate first). Text is entirely keel-authored; only hostnames,
+/// file paths, and lib names are interpolated.
 #[derive(Debug, Serialize)]
 struct FollowUp {
     code: &'static str,
@@ -520,8 +520,11 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
 /// The three honesty findings that carry [`Topology`]'s buckets into the
 /// findings list: one `url-no-transport` warning per unreachable host, one
 /// `subprocess-blind-spot` warning naming every externally-launched process
-/// (if any), and one `dependency-averse-excluded` info per excluded host.
-/// None of these are configuration errors — they never affect `ok`.
+/// (if any), and one info per excluded host — topic and action keyed off
+/// [`TopologyEntry::kind`](TopologyEntry) so a loopback exclusion (#64)
+/// never gets the dependency-averse-specific `# keel: include` advice, which
+/// does not apply to it. None of these are configuration errors — they
+/// never affect `ok`.
 fn topology_findings(topology: &Topology) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in &topology.unreachable {
@@ -594,17 +597,46 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
         });
     }
     for entry in &topology.excluded {
+        let action = match entry.kind {
+            "local/loopback" => {
+                "Confirm this is a local/test target, not a real dependency; \
+                                  run under keel to gather runtime evidence, or add it to \
+                                  keel.toml explicitly."
+            }
+            _ => {
+                "Confirm the exclusion is intended; add `# keel: include` to the file to \
+                  override."
+            }
+        };
         findings.push(Finding {
-            action: "Confirm the exclusion is intended; add `# keel: include` to the file to \
-                      override."
-                .to_owned(),
+            action: action.to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
             level: "info",
-            topic: "dependency-averse-excluded",
+            topic: excluded_kind_topic(entry.kind),
         });
     }
     findings
+}
+
+/// The finding `topic` / follow-up `code` for a
+/// [`TopologyEntry::kind`](TopologyEntry) landing in `topology.excluded`
+/// (#64) — shared between [`topology_findings`] and [`build_follow_ups`] so
+/// the two surfaces never disagree about an excluded host's category slug.
+/// `"dependency-averse"` is the pre-#64 default: any kind other than the
+/// loopback one added here falls back to it, with a debug-build assertion
+/// (not a release panic) catching genuine `classify_topology` drift.
+fn excluded_kind_topic(kind: &str) -> &'static str {
+    match kind {
+        "local/loopback" => "local-host-excluded",
+        other => {
+            debug_assert!(
+                other == "dependency-averse",
+                "classify_topology emitted an unknown excluded kind: {other}"
+            );
+            "dependency-averse-excluded"
+        }
+    }
 }
 
 /// The WS3 simplification findings: each hand-rolled pattern the scan
@@ -687,15 +719,18 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
 /// (orchestration-blind-spot) is a coarse substring match on a file Keel
 /// cannot parse at all — strictly less verifiable than rank 3
 /// (subprocess-blind-spot), which comes from an AST sighting of a real call
-/// — so it sorts above it. Rank 6 (code-hash-stale, reserved for the WS6
-/// emitter) is a mechanical, fully-verified fact that merely awaits a human
-/// decision.
+/// — so it sorts above it. Rank 4 covers BOTH `topology.excluded` kinds
+/// (dependency-averse-excluded and, since #64, local-host-excluded) — same
+/// confidence tier, "Keel saw why this was excluded and just wants it
+/// confirmed", ties broken by `code` then `subject`. Rank 6 (code-hash-stale,
+/// reserved for the WS6 emitter) is a mechanical, fully-verified fact that
+/// merely awaits a human decision.
 fn follow_up_rank(code: &str) -> u32 {
     match code {
         "url-no-transport" => 1,
         "orchestration-blind-spot" => 2,
         "subprocess-blind-spot" => 3,
-        "dependency-averse-excluded" => 4,
+        "dependency-averse-excluded" | "local-host-excluded" => 4,
         "preexisting-resilience" => 5,
         _ => 6, // code-hash-stale (WS6)
     }
@@ -761,13 +796,14 @@ fn build_follow_ups(
         });
     }
     for entry in &topology.excluded {
+        let code = excluded_kind_topic(entry.kind);
         ups.push(FollowUp {
-            code: "dependency-averse-excluded",
+            code,
             detail: format!(
                 "`{}` was excluded from proposed policy — {}. Confirm the exclusion is intended.",
                 entry.host, entry.reason
             ),
-            rank: follow_up_rank("dependency-averse-excluded"),
+            rank: follow_up_rank(code),
             subject: entry.host.clone(),
         });
     }
@@ -2087,6 +2123,8 @@ mod tests {
     /// evidence (`wrapped_targets`) says otherwise, which still wins per the
     /// precedence documented on [`classify_topology`].
     #[test]
+    #[allow(clippy::too_many_lines)] // fixture setup + the round-1/round-2 finding/follow-up
+    // assertions this test now carries (#64) are the legitimate length, not new plumbing.
     fn loopback_hosts_are_excluded_unless_runtime_wrapped() {
         use crate::scan::TransportClass;
         let mut scan = ScanResult {
@@ -2137,6 +2175,42 @@ mod tests {
         assert_eq!(
             entry.kind, "local/loopback",
             "#64: kind must be the loopback category, not dependency-averse or any other"
+        );
+        // #64: the `keel doctor` finding and follow-up must carry
+        // category-accurate topic/action/code — never the dependency-averse
+        // `# keel: include` advice, which is meaningless for a loopback host.
+        let finding = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "local-host-excluded")
+            .unwrap_or_else(|| panic!("no local-host-excluded finding: {:?}", r.findings));
+        assert_eq!(finding.level, "info");
+        assert!(
+            !finding.action.contains("keel: include"),
+            "loopback action must not carry dependency-averse advice: {}",
+            finding.action
+        );
+        assert!(
+            finding.action.contains("run under keel"),
+            "loopback action should point at runtime evidence: {}",
+            finding.action
+        );
+        assert!(
+            !r.findings
+                .iter()
+                .any(|f| f.topic == "dependency-averse-excluded"),
+            "must not also carry the dependency-averse topic: {:?}",
+            r.findings
+        );
+        let follow_up = r
+            .follow_ups
+            .iter()
+            .find(|f| f.subject == "127.0.0.1")
+            .unwrap_or_else(|| panic!("no follow-up for 127.0.0.1: {:?}", r.follow_ups));
+        assert_eq!(follow_up.code, "local-host-excluded");
+        assert_eq!(
+            follow_up.rank, 4,
+            "same confidence tier as dependency-averse-excluded"
         );
 
         // Runtime evidence wins: the same host, wrapped at runtime, stays
