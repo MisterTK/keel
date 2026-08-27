@@ -10,6 +10,11 @@
 //!   `KEEL_RECORD=<fresh path>` in the child's environment. The front end
 //!   (not this binary) does the actual capture — see
 //!   `python/keel/src/keel/_record.py`, `node/keel/src/record.mjs`.
+//!   Command-mode targets (#62 — an arbitrary PATH-resolvable command, not a
+//!   script `keel run` dispatches into a language front end) are rejected
+//!   up front: their env-based `KEEL_ENABLE` activation never wires
+//!   `KEEL_RECORD`, so exec'ing one here would silently produce an empty
+//!   recording rather than a useful error.
 //! - `keel record list` — recordings under `.keel/recordings/`, newest first.
 //! - `keel record test <recording> [--out DIR]` — generate a pytest fixture
 //!   (Python recording) or `node:test` file (Node recording) from a
@@ -68,6 +73,11 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
             return (Some(r), code);
         }
     };
+    if plan.command_mode {
+        let r = command_mode_not_recordable(target);
+        let code = r.exit;
+        return (Some(r), code);
+    }
     if let Some(r) = run::python_preflight(target, &plan) {
         let code = r.exit;
         return (Some(r), code);
@@ -396,6 +406,48 @@ fn node_fixture(id: &str, recording_path: &Path, target: &str) -> String {
     )
 }
 
+/// The machine twin of [`command_mode_not_recordable`]'s human framing —
+/// mirrors `run::RunErrorReport`'s what/why/next shape.
+#[derive(Debug, Serialize)]
+struct RecordErrorReport<'a> {
+    error: &'static str,
+    next: &'a str,
+    what: &'a str,
+    why: &'a str,
+}
+
+/// `keel record run <bare-word-on-PATH>` would otherwise enter command mode
+/// via the shared `run::plan` (#62) and exec fine — but recording capture is
+/// wired entirely by the language front ends that `keel run` dispatches into
+/// (`python3 -m keel run` / `node --import keelrun/hook` set up the
+/// `KEEL_RECORD` tee); command-mode's env-based activation (`KEEL_ENABLE`)
+/// deliberately does not wire `KEEL_RECORD`, so an unrejected command-mode
+/// recording would exec successfully and silently produce an empty
+/// recording file. Reject it up front instead, in the same what/why/next
+/// `keel ▸` framing `run::RunError::render` uses.
+fn command_mode_not_recordable(target: &str) -> Rendered {
+    let what = format!("Cannot record `{target}`: command mode does not capture recordings.");
+    let why = "Recording is wired by the language front ends (`python3 -m keel run` / `node \
+               --import keelrun/hook`); env-based activation (`KEEL_ENABLE`) deliberately does \
+               not wire `KEEL_RECORD`."
+        .to_owned();
+    let next = "Point `keel record run` at a script file, a package.json, or a project directory."
+        .to_owned();
+    let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
+    let report = RecordErrorReport {
+        error: "command-mode-not-recordable",
+        next: &next,
+        what: &what,
+        why: &why,
+    };
+    Rendered {
+        human,
+        json: to_json(&report),
+        exit: EXIT_USAGE,
+        to_stderr: true,
+    }
+}
+
 /// A precise, non-fatal-to-the-process guidance error (exit 1, stderr) —
 /// mirrors `crate::flows::soft_error`.
 fn soft_error(message: &str) -> Rendered {
@@ -644,6 +696,25 @@ mod tests {
         assert_eq!(code, EXIT_USAGE);
         assert!(r.human.contains("no such file or directory"));
         // No recordings directory was created for a target that never dispatched.
+        assert!(!dir.path().join(".keel").join(RECORDINGS_SUBDIR).exists());
+    }
+
+    #[test]
+    fn command_mode_targets_are_rejected_not_silently_recorded() {
+        // `keel record run <bare-word-on-PATH>` would enter command mode via
+        // the shared `run::plan` (#62) — but command mode's env-based
+        // activation never wires KEEL_RECORD, so this must be a precise
+        // error, never a silently empty recording. `sh` exists on PATH
+        // everywhere we test.
+        let dir = project();
+        let (rendered, code) = run(dir.path(), "sh", &[]);
+        let r = rendered.expect("command-mode target is rejected for record run");
+        assert_eq!(code, EXIT_USAGE);
+        assert!(r.human.contains("command mode does not capture recordings"));
+        assert!(r.human.contains("why:"));
+        assert!(r.human.contains("next:"));
+        assert_eq!(r.json["error"], "command-mode-not-recordable");
+        // No recording file/dir was created — the exec never happened.
         assert!(!dir.path().join(".keel").join(RECORDINGS_SUBDIR).exists());
     }
 
