@@ -1420,6 +1420,52 @@ timeout = \"5s\"
         assert!(!added.iter().any(|v| v == "api.broker.com"));
     }
 
+    /// #64: a statically-seen loopback host (the scanner's plausibility gate,
+    /// `scan::plausible_host`, still lets it through — loopback IPs parse as
+    /// valid `IpAddr`s — but `classify_topology`'s loopback demotion excludes
+    /// it) must never get a proposed policy block, mirroring the
+    /// dependency-averse case above.
+    #[test]
+    fn diff_skips_loopback_only_hosts_and_says_why() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import httpx\nU = \"https://api.normal.com/v1\"\nL = \"http://127.0.0.1:8000\"\n",
+        )
+        .unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        let text = &r.human;
+        assert!(
+            text.contains("api.normal.com"),
+            "normal host proposed: {text}"
+        );
+        assert!(
+            !text.contains("[target.\"127.0.0.1\"]"),
+            "no policy for the loopback host: {text}"
+        );
+        assert!(
+            text.contains("127.0.0.1") && text.contains("local/loopback"),
+            "trailer explains the exclusion: {text}"
+        );
+        let added = r.json["added"].as_array().unwrap();
+        assert!(added.iter().any(|v| v == "api.normal.com"));
+        assert!(!added.iter().any(|v| v == "127.0.0.1"));
+    }
+
     /// WS3: `keel init --diff` annotates proposals with what becomes deletable —
     /// hand-rolled patterns attributed to a proposed target, and the
     /// pre-existing-resilience signal (today doctor-only) — in both the JSON

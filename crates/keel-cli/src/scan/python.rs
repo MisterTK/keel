@@ -27,7 +27,7 @@ use super::{
 /// containment: nested defs and lambdas inside a function count toward it;
 /// class methods are not flow entrypoints and are not attributed).
 const AST_WALKER: &str = r#"
-import ast, json, os, re, sys
+import ast, ipaddress, json, os, re, sys
 from urllib.parse import urlsplit
 
 HTTP_LIBS = {"httpx", "requests", "aiohttp", "urllib3", "urllib.request"}
@@ -135,6 +135,27 @@ def import_entries(node):
                 yield key, alias.asname or alias.name
 
 
+def plausible(h):
+    if h == "localhost":
+        return True
+    if any(c in h for c in "{}$%()<>"):
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    if "." not in h:
+        return False
+    return all(
+        label
+        and all(c.isalnum() or c == "-" for c in label)
+        and not label.startswith("-")
+        and not label.endswith("-")
+        for label in h.split(".")
+    )
+
+
 def host(s):
     if "://" not in s:
         return None
@@ -144,7 +165,8 @@ def host(s):
         return None
     if not parts.scheme or not parts.hostname:
         return None
-    return parts.hostname
+    # hostname is already lowercased by urlsplit.
+    return parts.hostname if plausible(parts.hostname) else None
 
 
 def call_root(f):
@@ -863,6 +885,43 @@ mod tests {
                 .hosts
                 .iter()
                 .any(|(h, s)| h == "api.example.com" && s.line == 4)
+        );
+    }
+
+    #[test]
+    fn implausible_hosts_are_rejected_at_extraction() {
+        // Case table shared verbatim with mod.rs's `host_from_url` test — keep
+        // in sync.
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "import requests\n\n\
+             A = \"s3://bucket/key\"\n\
+             B = \"redis://session\"\n\
+             C = \"https://{b}/x\".format(b=1)\n\
+             D = \"https://api.stripe.com/v1\"\n\
+             E = \"http://127.0.0.1:8000\"\n\
+             \n\
+             def f():\n    \
+             \"\"\"docstring with s3://b/k and gs://artifact/x inside\"\"\"\n",
+        )
+        .unwrap();
+        let scan = scan(dir.path());
+        assert!(scan.available);
+        let hosts: std::collections::BTreeSet<&str> = scan
+            .findings
+            .hosts
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            std::collections::BTreeSet::from(["api.stripe.com", "127.0.0.1"]),
+            "hosts: {hosts:?}"
         );
     }
 

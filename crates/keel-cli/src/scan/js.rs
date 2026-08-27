@@ -557,6 +557,27 @@ mod tests {
     }
 
     #[test]
+    fn implausible_hosts_are_rejected_at_extraction() {
+        // Case table shared verbatim with mod.rs's `host_from_url` test and
+        // python.rs's walker test — keep in sync.
+        let f = findings(
+            "async function run(b) {\n\
+             await fetch(\"s3://bucket/key\");\n\
+             await fetch(\"redis://session\");\n\
+             await fetch(\"https://{b}/x\");\n\
+             await fetch(\"https://api.stripe.com/v1\");\n\
+             await fetch(\"http://127.0.0.1:8000\");\n\
+             }\n",
+        );
+        let hosts: BTreeSet<&str> = f.hosts.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            hosts,
+            BTreeSet::from(["api.stripe.com", "127.0.0.1"]),
+            "hosts: {hosts:?}"
+        );
+    }
+
+    #[test]
     fn hosts_are_tracked_when_the_scan_saw_http_evidence_anywhere() {
         let dir = TempDir::new().unwrap();
         fs::write(

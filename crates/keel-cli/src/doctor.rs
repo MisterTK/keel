@@ -1062,10 +1062,12 @@ fn build_report(
 /// it"), plus the host-independent external-process signal. Precedence: a
 /// wrapped-at-runtime target or an `llm:*` target is wrappable by
 /// construction regardless of transport class (runtime evidence, or the LLM
-/// pack's own wrapping, beats static doubt); otherwise a target seen ONLY
-/// inside a dependency-averse file is excluded (shouldn't reach it) ahead of
-/// any transport check; otherwise the transport class decides wrappable
-/// (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
+/// pack's own wrapping, beats static doubt); otherwise a statically-seen
+/// `localhost`/loopback/unspecified target (#64 — e.g. a test server, not a
+/// real dependency) is excluded ahead of any other check; otherwise a target
+/// seen ONLY inside a dependency-averse file is excluded (shouldn't reach it)
+/// ahead of any transport check; otherwise the transport class decides
+/// wrappable (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
 /// `init.rs` reuses this directly for `keel init --diff` to skip proposing
 /// policy for excluded hosts and print why (passing an empty `cmd_match` —
 /// `--diff` never touches `external_processes`, so cross-referencing it
@@ -1086,6 +1088,19 @@ pub(crate) fn classify_topology(
     for (target, ev) in &scan.targets {
         if wrapped_targets.contains(target) || target.starts_with("llm:") {
             wrappable.push(target.clone());
+            continue;
+        }
+        let local_only = target == "localhost"
+            || target
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+        if local_only {
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                reason: "local/loopback host — excluded from proposed policy; run under \
+                         keel to gather runtime evidence, or add it to keel.toml explicitly"
+                    .to_owned(),
+            });
             continue;
         }
         let only_dep_averse = !ev.sightings.is_empty()
@@ -2050,6 +2065,82 @@ mod tests {
             r.topology.wrappable.contains(&"llm:some-model".to_owned()),
             "an llm:* target must be wrappable with zero transport evidence: {:?}",
             r.topology
+        );
+    }
+
+    /// #64: a statically-seen loopback host is demoted to `excluded` (a test
+    /// server or local dependency, not a real target) — UNLESS runtime
+    /// evidence (`wrapped_targets`) says otherwise, which still wins per the
+    /// precedence documented on [`classify_topology`].
+    #[test]
+    fn loopback_hosts_are_excluded_unless_runtime_wrapped() {
+        use crate::scan::TransportClass;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.targets.insert(
+            "127.0.0.1".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("127.0.0.1".into(), TransportClass::Tracked);
+
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        assert!(
+            !r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
+            "a statically-seen loopback host must not be wrappable: {:?}",
+            r.topology
+        );
+        let entry = r
+            .topology
+            .excluded
+            .iter()
+            .find(|e| e.host == "127.0.0.1")
+            .unwrap_or_else(|| panic!("127.0.0.1 must land in excluded: {:?}", r.topology));
+        assert!(
+            entry.reason.contains("local/loopback"),
+            "reason: {}",
+            entry.reason
+        );
+
+        // Runtime evidence wins: the same host, wrapped at runtime, stays
+        // wrappable.
+        let wrapped: BTreeSet<String> = ["127.0.0.1".to_owned()].into_iter().collect();
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        assert!(
+            r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
+            "a runtime-wrapped loopback host must stay wrappable: {:?}",
+            r.topology
+        );
+        assert!(
+            !r.topology.excluded.iter().any(|e| e.host == "127.0.0.1"),
+            "must not also land in excluded"
         );
     }
 
