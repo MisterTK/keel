@@ -905,6 +905,7 @@ mod tests {
              C = \"https://{b}/x\".format(b=1)\n\
              D = \"https://api.stripe.com/v1\"\n\
              E = \"http://127.0.0.1:8000\"\n\
+             F = \"http://[::1]:9000/x\"\n\
              \n\
              def f():\n    \
              \"\"\"docstring with s3://b/k and gs://artifact/x inside\"\"\"\n",
@@ -920,7 +921,7 @@ mod tests {
             .collect();
         assert_eq!(
             hosts,
-            std::collections::BTreeSet::from(["api.stripe.com", "127.0.0.1"]),
+            std::collections::BTreeSet::from(["api.stripe.com", "127.0.0.1", "::1"]),
             "hosts: {hosts:?}"
         );
     }

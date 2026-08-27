@@ -608,9 +608,16 @@ pub(crate) fn host_from_url(s: &str) -> Option<String> {
     }
     // authority ends at the first '/', '?', or '#'.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    // strip userinfo, then port.
+    // strip userinfo, then port. A bracketed IPv6 literal (`[::1]:8080`) must
+    // be unwrapped before the port split, or the split cuts it at the
+    // authority's own first `:` and no host ever comes out (issue #67) — the
+    // embedded Python walker already does this correctly via `urlsplit`.
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host_port.split(':').next().unwrap_or(host_port);
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
     if host.is_empty() || host.contains(|c: char| c.is_whitespace()) {
         return None;
     }
@@ -684,6 +691,8 @@ mod tests {
             ("http://0.0.0.0:8080", "0.0.0.0"),
             ("http://localhost:3000", "localhost"),
             ("https://google.github.io/adk-docs/", "google.github.io"),
+            ("http://[::1]:8080/x", "::1"),
+            ("https://[2001:db8::1]/v1", "2001:db8::1"),
         ] {
             assert_eq!(host_from_url(url).as_deref(), Some(host), "{url}");
         }

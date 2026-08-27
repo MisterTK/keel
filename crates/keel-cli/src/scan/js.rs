@@ -567,12 +567,13 @@ mod tests {
              await fetch(\"https://{b}/x\");\n\
              await fetch(\"https://api.stripe.com/v1\");\n\
              await fetch(\"http://127.0.0.1:8000\");\n\
+             await fetch(\"http://[::1]:9000/x\");\n\
              }\n",
         );
         let hosts: BTreeSet<&str> = f.hosts.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(
             hosts,
-            BTreeSet::from(["api.stripe.com", "127.0.0.1"]),
+            BTreeSet::from(["api.stripe.com", "127.0.0.1", "::1"]),
             "hosts: {hosts:?}"
         );
     }
