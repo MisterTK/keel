@@ -432,15 +432,25 @@ pub(crate) fn exec_with(
                 "`{}` was not found on PATH or could not be started.",
                 plan.program
             );
-            let next = if plan.program == "python3" {
-                "Install Python 3 and the `keelrun` package (`pip install keelrun`)."
+            // #62/finding 4: command mode execs `plan.program` directly (no
+            // Python/Node dispatch involved at all) — the install hint below
+            // only applies to the two interpreters `keel run` itself
+            // dispatches into.
+            let next: String = if plan.command_mode {
+                format!(
+                    "`{}` is not installed, not on PATH, or not executable — check the command \
+                     name and permissions.",
+                    plan.program
+                )
+            } else if plan.program == "python3" {
+                "Install Python 3 and the `keelrun` package (`pip install keelrun`).".to_owned()
             } else {
-                "Install Node.js and the `keelrun` package (`npm i -D keelrun`)."
+                "Install Node.js and the `keelrun` package (`npm i -D keelrun`).".to_owned()
             };
             let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
             let report = RunErrorReport {
                 error: "spawn-failed",
-                next,
+                next: &next,
                 what: &what,
                 why: &why,
             };
@@ -507,6 +517,23 @@ pub(crate) fn activation_env(plan: &RunPlan) -> Vec<(String, String)> {
     env
 }
 
+/// The stderr banner `keel run` prints once a plan resolves to command mode
+/// (#62): which self-activation mechanism the exec'd child gets. `None`
+/// under `plan.disable` — `--disable` makes [`activation_env`] export
+/// nothing (no `KEEL_ENABLE=1` reaches the child; `exec_with` sets
+/// `KEEL_DISABLE=1` instead), so claiming `KEEL_ENABLE=1` there would be
+/// actively wrong, not just incomplete.
+fn command_mode_banner(target: &str, plan: &RunPlan) -> Option<String> {
+    if plan.disable {
+        return None;
+    }
+    Some(format!(
+        "keel \u{25b8} command mode: exec `{target}` with KEEL_ENABLE=1 \u{2014} Python \
+         children self-activate via the `keelrun` wheel (pip install keelrun); Node \
+         children need NODE_OPTIONS=\"--import keelrun/register\"."
+    ))
+}
+
 /// The whole `keel run` command: plan, then exec. On a dispatch error render it;
 /// on success return the child's exit code.
 pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i32) {
@@ -518,11 +545,9 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
         }
         Ok(plan) => {
             if plan.command_mode {
-                eprintln!(
-                    "keel \u{25b8} command mode: exec `{target}` with KEEL_ENABLE=1 \u{2014} Python \
-                     children self-activate via the `keelrun` wheel (pip install keelrun); Node \
-                     children need NODE_OPTIONS=\"--import keelrun/register\"."
-                );
+                if let Some(banner) = command_mode_banner(target, &plan) {
+                    eprintln!("{banner}");
+                }
             } else if let Some(r) = python_preflight(target, &plan) {
                 let code = r.exit;
                 return (Some(r), code);
@@ -974,5 +999,70 @@ mod tests {
         assert!(rendered.human.contains("keel-nonexistent-program-9f3a"));
         assert!(rendered.human.contains("why:"));
         assert!(rendered.human.contains("next:"));
+    }
+
+    /// #62/finding 4: a command-mode plan's spawn failure is a missing/
+    /// non-executable command on PATH — not the Python/Node dispatch failure
+    /// `exec_with`'s hint used to assume unconditionally, which told a user
+    /// to `pip install keelrun` for what is really a typo'd binary name.
+    #[test]
+    fn spawn_failure_hint_is_command_accurate_in_command_mode() {
+        let plan = RunPlan {
+            program: "keel-nonexistent-program-9f3a".to_owned(),
+            argv: vec![],
+            disable: false,
+            command_mode: true,
+        };
+        let rendered = exec(&plan).expect_err("nonexistent program cannot spawn");
+
+        assert_eq!(rendered.json["error"], "spawn-failed");
+        assert!(rendered.human.contains("next:"));
+        assert!(
+            !rendered.human.contains("pip install keelrun"),
+            "command mode must not suggest the Python dispatch fix: {}",
+            rendered.human
+        );
+        assert!(
+            !rendered.human.contains("npm i -D keelrun"),
+            "command mode must not suggest the Node dispatch fix: {}",
+            rendered.human
+        );
+        assert!(
+            rendered.human.contains("PATH"),
+            "command mode's hint should point at PATH/executability: {}",
+            rendered.human
+        );
+    }
+
+    /// #62/finding 3: the command-mode banner claims the child gets
+    /// `KEEL_ENABLE=1` — true only when [`activation_env`] actually exports
+    /// it, which `--disable` suppresses entirely (and sets `KEEL_DISABLE=1`
+    /// instead). The banner must not make that claim under `--disable`.
+    #[test]
+    fn command_mode_banner_names_the_activation_mechanism_when_enabled() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: false,
+            command_mode: true,
+        };
+        let banner = command_mode_banner("mytool", &plan).expect("banner shown when enabled");
+        assert!(banner.contains("KEEL_ENABLE=1"));
+        assert!(banner.contains("mytool"));
+    }
+
+    #[test]
+    fn command_mode_banner_is_suppressed_under_disable() {
+        let plan = RunPlan {
+            program: "sh".to_owned(),
+            argv: vec![],
+            disable: true,
+            command_mode: true,
+        };
+        assert_eq!(
+            command_mode_banner("mytool", &plan),
+            None,
+            "must not claim KEEL_ENABLE=1 under --disable, where activation_env exports nothing"
+        );
     }
 }
