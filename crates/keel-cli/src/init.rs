@@ -26,6 +26,16 @@ use crate::{EXIT_USAGE, Rendered, evidence, scan};
 /// Column at which trailing `#` comments begin, when the line is shorter.
 const COMMENT_COL: usize = 37;
 
+/// #65: the observe-first nudge — printed by both `keel init`'s write-path
+/// human line and `keel init --diff`'s `notes` (human + JSON) whenever
+/// `.keel/discovery.db` is empty (no observed runs yet). An external
+/// evaluator's static-only `keel init --diff` produced mostly-noise policy
+/// where a single `keel run <entry>` would have surfaced the one real
+/// target — this steers toward the evidence-tuned path dx-spec already
+/// prefers, rather than leaving it undiscoverable.
+const OBSERVE_FIRST_NUDGE: &str = "no observed runs yet — `keel run <entry>` records real \
+     traffic into .keel/discovery.db and makes proposals evidence-tuned";
+
 /// Options parsed from the `keel init` flags.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InitOptions {
@@ -207,7 +217,7 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
     }
 
     let observed_runs = u32::from(!discovery.is_empty());
-    let human = format!(
+    let mut human = format!(
         "keel \u{25b8} wrote {} ({} target{}) from {} static scan{} + {} observed run{}.{}",
         toml_path.display(),
         targets.len(),
@@ -222,6 +232,11 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
             warnings
         }
     );
+    if observed_runs == 0 {
+        human.push_str("\nkeel \u{25b8} note: ");
+        human.push_str(OBSERVE_FIRST_NUDGE);
+        human.push('\n');
+    }
     let report = WroteReport {
         gitignore_updated,
         observed_runs,
@@ -550,8 +565,11 @@ fn pad_comment(line: &str, comment: &str) -> String {
 /// (file, line, kind)-ordered), plus one pre-existing-resilience note when
 /// the project imports a resilience library alongside at least one lib Keel
 /// wraps (the same compounding gate as doctor's `preexisting-resilience`
-/// finding, via [`crate::doctor::registry_libs`]).
-fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
+/// finding, via [`crate::doctor::registry_libs`]), plus #65's observe-first
+/// nudge ([`OBSERVE_FIRST_NUDGE`]) when `discovery` is empty — a static-only
+/// `--diff` is evidence-poor, and the notes are exactly where a human/agent
+/// reading the diff would look for that caveat.
+fn diff_notes(scan: &ScanResult, added: &[String], discovery: &[TargetStats]) -> Vec<String> {
     let mut notes = Vec::new();
     let added_set: BTreeSet<&str> = added.iter().map(String::as_str).collect();
     for s in &scan.simplifications {
@@ -584,6 +602,9 @@ fn diff_notes(scan: &ScanResult, added: &[String]) -> Vec<String> {
              delete the old retry/backoff or scope Keel's policy (see `keel doctor`)",
             libs.join(", ")
         ));
+    }
+    if discovery.is_empty() {
+        notes.push(OBSERVE_FIRST_NUDGE.to_owned());
     }
     notes
 }
@@ -685,7 +706,7 @@ fn diff(
         .filter(|t| existing.contains(**t))
         .map(|t| (*t).to_owned())
         .collect();
-    let notes = diff_notes(scan, &added);
+    let notes = diff_notes(scan, &added, discovery);
 
     let ops = if existing_text.is_none() {
         // No file yet: the patch creates the generated keel.toml (header
@@ -1299,6 +1320,151 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("keel.toml")).unwrap(),
             "[target.\"api.gone.example\"]\ntimeout = \"30s\"\n"
+        );
+    }
+
+    /// #65: a `--diff` run against a project with no `.keel/discovery.db` (the
+    /// common first-run state) nudges toward `keel run` in both the human
+    /// text and the structured `notes` — the exact sentence external
+    /// evaluators need, since a static-only scan alone produced mostly-noise
+    /// policy for one (issue #65).
+    #[test]
+    fn empty_discovery_nudges_toward_an_observed_run_in_diff() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+        // No .keel/discovery.db is created — discovery is empty.
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text carries the nudge: {}",
+            r.human
+        );
+        let json = serde_json::to_string(&r.json).unwrap();
+        assert!(
+            json.contains(OBSERVE_FIRST_NUDGE),
+            "DiffReport.notes carries the nudge: {json}"
+        );
+    }
+
+    /// The mirror of the test above: once a project has real observed
+    /// traffic (`.keel/discovery.db` non-empty), the nudge disappears from
+    /// both surfaces — it would be actively wrong to keep telling someone to
+    /// run `keel run` when they already have.
+    #[test]
+    fn observed_discovery_suppresses_the_diff_nudge() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "api.example.com".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            !r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text must not nudge once traffic is observed: {}",
+            r.human
+        );
+        let json = serde_json::to_string(&r.json).unwrap();
+        assert!(
+            !json.contains(OBSERVE_FIRST_NUDGE),
+            "DiffReport.notes must not nudge once traffic is observed: {json}"
+        );
+    }
+
+    /// The write-path twin: a plain `keel init` (no `--diff`) with no
+    /// observed traffic also nudges, in its human line.
+    #[test]
+    fn empty_discovery_nudges_toward_an_observed_run_on_write() {
+        let dir = TempDir::new().unwrap();
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text carries the nudge: {}",
+            r.human
+        );
+    }
+
+    /// And its suppression once there is real observed traffic.
+    #[test]
+    fn observed_discovery_suppresses_the_write_path_nudge() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".keel")).unwrap();
+        {
+            let store = keel_journal::DiscoveryStore::open(
+                dir.path().join(".keel").join("discovery.db"),
+                keel_journal::SystemClock,
+            )
+            .unwrap();
+            store
+                .record(&keel_journal::CallObservation {
+                    target: "api.example.com".to_owned(),
+                    result: keel_journal::CallResult::Success,
+                    attempts: 1,
+                    latency_ms: 10,
+                    throttled: false,
+                    breaker_opened: false,
+                    not_retried: false,
+                    wrapped: false,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let r = run(dir.path(), InitOptions::default());
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            !r.human.contains(OBSERVE_FIRST_NUDGE),
+            "human text must not nudge once traffic is observed: {}",
+            r.human
         );
     }
 
