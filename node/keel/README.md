@@ -396,13 +396,15 @@ entrypoints = ["cmd:nightly-etl"]
 argv = ["./run_etl.sh", "*"]
 ```
 
-**Replay gap** ([#42](https://github.com/MisterTK/keel/issues/42)): the
-native core's synchronous `execute()` can't reach the async replay path
-(KEEL-E005), so unlike Python's full replay-skip, a re-dispatch of an
-already-completed identity here throws
-`KeelCmdFlowReplayUnsupportedError` rather than replaying — dispatch
-parity, not replay parity. `execSync`/`{ shell: true }` calls are never
-matched. See the
+**Replay-skip** ([#42](https://github.com/MisterTK/keel/issues/42), fixed):
+the matched command runs inside a journaled step, so a re-dispatch of an
+already-recorded identity returns that recorded `status`/`stdout`/`stderr`
+(or, for `execFileSync`, re-throws the recorded nonzero-exit error) without
+spawning a second process — full parity with Python. The one case that still
+refuses loudly is a recorded LAUNCH failure (ENOENT / a `timeout` kill): the
+command never ran, so it cannot be substituted, and
+`KeelCmdFlowFailedError` (KEEL-E005) is raised instead of fabricating a
+success. `execSync`/`{ shell: true }` calls are never matched. See the
 [root README](../../README.md#in-process-cmd-interception-flowsmatch-ccr-5)
 for the shared cross-language contract, including `keel flows force`.
 

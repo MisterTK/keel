@@ -58,7 +58,11 @@ export interface KeelCoreOptions {
 export declare class KeelCore {
   constructor(options?: KeelCoreOptions);
   configure(policy: Record<string, unknown>): void;
-  /** Synchronous single call; `effect(attempt)` returns an attempt result. */
+  /**
+   * Synchronous single call; `effect(attempt)` returns an attempt result.
+   * While a durable flow is open this routes through the flow handle (the step
+   * is journaled and replay-substituted), exactly as {@link executeAsync} does.
+   */
   execute(request: Request, effect: (attempt: number) => AttemptResult): Outcome;
   /** Async single call; `effect(attempt)` is awaited on the caller's loop. */
   executeAsync(

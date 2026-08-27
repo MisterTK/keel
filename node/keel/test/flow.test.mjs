@@ -547,17 +547,39 @@ test("native: a flow requires a journal (KEEL-E040)", gate, () => {
   );
 });
 
-test("native: synchronous execute() is refused while a flow is open (KEEL-E005)", gate, async (t) => {
+// Issue #42: synchronous `execute()` used to REFUSE inside a flow (KEEL-E005),
+// on the reasoning that it ran on the bare engine and would downgrade a
+// journaled step to Tier 1. It now routes through the open handle instead —
+// same journaling, same replay substitution, as `executeAsync` — which is what
+// lets `child-process.mjs` wrap `spawnSync`/`execFileSync` (whose return value
+// must be produced on the same tick) with real replay-skip.
+test("native: synchronous execute() inside a flow is journaled and replay-substituted", gate, (t) => {
   const core = tmpJournalCore(t);
-  core.enterFlow("ts:pipeline.mjs#main", "ah-sync-refuse", "ch-1");
-  try {
-    assert.throws(
-      () => core.execute({ v: 1, target: "api.x", op: "api.x", idempotent: true }, () => ({ status: "ok" })),
-      (err) => err.code === "KEEL-E005"
-    );
-  } finally {
-    core.exitFlow("completed");
-  }
+  const req = { v: 1, target: "cmd:build", op: "cmd echo hi", args_hash: "ah-sync", idempotent: false };
+  let fires = 0;
+
+  core.enterFlow("cmd:build", "ah-sync-replay", "ch-1");
+  const out1 = core.execute(req, () => {
+    fires += 1;
+    return { status: "ok", payload: { stdout: "hi" } };
+  });
+  assert.equal(fires, 1, "the live leg runs the effect exactly once");
+  assert.equal(out1.result, "ok");
+  assert.deepEqual(out1.payload, { stdout: "hi" });
+  core.exitFlow("completed");
+
+  // Re-enter the SAME identity: the flow is Completed, so the handle is
+  // replay-only and the recorded step is substituted without firing the effect.
+  const info = core.enterFlow("cmd:build", "ah-sync-replay", "ch-1");
+  assert.equal(info.replay, true);
+  const out2 = core.execute(req, () => {
+    fires += 1;
+    return { status: "ok", payload: { stdout: "SHOULD NOT RUN" } };
+  });
+  assert.equal(fires, 1, "a replay-only handle must never fire the effect");
+  assert.equal(out2.result, "ok");
+  assert.deepEqual(out2.payload, { stdout: "hi" }, "the RECORDED payload is substituted");
+  core.exitFlow("completed");
 });
 
 test("native: concurrent effects inside one flow are serialized in await/claim order", gate, async (t) => {

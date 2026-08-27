@@ -28,7 +28,7 @@ import {
   makeWrappedExecFileSync,
   patchChildProcess,
   installChildProcessPack,
-  KeelCmdFlowReplayUnsupportedError,
+  KeelCmdFlowFailedError,
   KeelCmdFlowBusyError,
   KeelCmdFlowDeadError,
 } from "../src/packs/child-process.mjs";
@@ -42,20 +42,65 @@ function nodeECompiled(onBusy = "skip") {
   return compileCmdMatchers({ "cmd:t": { name: "cmd:t", argvPatterns: ["*", "-e", "*"], onBusy } });
 }
 
+/** An `Outcome`-shaped envelope (contracts/core_api.rs) around one attempt
+ *  result — what the real core hands back for a single-attempt step. */
+function outcomeOf(attempt) {
+  const base = {
+    v: 1,
+    attempts: 1,
+    from_cache: false,
+    waits_ms: [],
+    throttled: false,
+    throttle_wait_ms: 0,
+    breaker: "closed",
+    trace_id: "t-000001",
+  };
+  return attempt.status === "ok"
+    ? { ...base, result: "ok", payload: attempt.payload }
+    : {
+        ...base,
+        result: "error",
+        error: { code: "KEEL-E015", class: attempt.class, message: attempt.message },
+      };
+}
+
 /**
  * A scriptable Tier-2 backend. `responses` is a queue consumed one per
  * `enterFlow`: `{ replay }` returns that flow info, `{ throw: "KEEL-EXXX" }`
  * throws a coded error; an empty queue defaults to a fresh live flow.
+ *
+ * `executeSync` models the core's step machinery: by default it fires the
+ * effect and wraps its attempt result (a LIVE step). With `substitute` it
+ * returns that canned outcome and NEVER calls the effect — exactly what the
+ * core does for an already-recorded terminal step, which is the whole of
+ * issue #42's replay-skip. `throwOnExecute` models the core refusing the step.
  */
 class FakeFlowBackend {
   entered = [];
   exited = [];
+  executed = [];
+  outcomes = [];
   persistent = true;
   #responses;
   #throwOnExit;
-  constructor(responses = [], { throwOnExit = false } = {}) {
+  #substitute;
+  #throwOnExecute;
+  constructor(responses = [], { throwOnExit = false, substitute = null, throwOnExecute = null } = {}) {
     this.#responses = [...responses];
     this.#throwOnExit = throwOnExit;
+    this.#substitute = substitute;
+    this.#throwOnExecute = throwOnExecute;
+  }
+  executeSync(request, effect) {
+    this.executed.push(request);
+    if (this.#throwOnExecute) {
+      const e = new Error(`${this.#throwOnExecute}: injected`);
+      e.code = this.#throwOnExecute;
+      throw e;
+    }
+    const outcome = this.#substitute ? this.#substitute : outcomeOf(effect(1));
+    this.outcomes.push(outcome);
+    return outcome;
   }
   enterFlow(entrypoint, argsHash, opts = {}) {
     this.entered.push({ entrypoint, argsHash, opts });
@@ -278,18 +323,192 @@ test("dead flow (E032) always throws KeelCmdFlowDeadError — even under on_busy
 });
 
 // ---------------------------------------------------------------------------
-// Open Question 1: a completed flow cannot replay-substitute a sync result
+// issue #42: replay-skip parity with Python — a re-dispatch of a recorded
+// identity SUBSTITUTES the recorded result instead of re-running the command.
 // ---------------------------------------------------------------------------
 
-test("replay: a Completed flow throws KeelCmdFlowReplayUnsupportedError; command NOT re-run; handle released", () => {
-  const fake = new FakeFlowBackend([{ replay: true }]);
-  const w = makeWrappedSpawnSync(realSpawnSync, { compiled: nodeECompiled(), backend: fake, env: {} });
-  assert.throws(
-    () => w(process.execPath, ["-e", "throw new Error('should not re-run')"]),
-    (e) => e instanceof KeelCmdFlowReplayUnsupportedError && e.code === "KEEL-E005"
+/** A stand-in for the real primitive that fails the test if it is ever called —
+ *  the proof that a substituted dispatch does not spawn a second process. */
+function neverCalled(label) {
+  return function spy() {
+    assert.fail(`${label} must NOT be invoked on a substituted dispatch`);
+  };
+}
+
+/**
+ * Run `args` LIVE against a recording backend, then re-dispatch the same call
+ * against a backend that substitutes the recorded payload with a poisoned
+ * original. Returns `{ live, replayed }`, each `{ value, err }`. This is the
+ * round-trip that proves the journal payload is LOSSLESS: the two results must
+ * agree, and nothing may spawn on the second leg.
+ */
+function roundTrip(makeWrapped, original, compiled, args) {
+  const rec = new FakeFlowBackend();
+  const w1 = makeWrapped(original, { compiled, backend: rec, env: {} });
+  const live = { value: undefined, err: null };
+  try {
+    live.value = w1(...args);
+  } catch (e) {
+    live.err = e;
+  }
+  assert.equal(rec.outcomes.length, 1, "the live dispatch journaled exactly one step");
+  const sub = new FakeFlowBackend([{ replay: true }], { substitute: rec.outcomes[0] });
+  const w2 = makeWrapped(neverCalled("the real primitive"), { compiled, backend: sub, env: {} });
+  const replayed = { value: undefined, err: null };
+  try {
+    replayed.value = w2(...args);
+  } catch (e) {
+    replayed.err = e;
+  }
+  return { live, replayed, rec, sub };
+}
+
+test("spawnSync replay: a recorded identity is substituted byte-for-byte, with NO second process (utf8)", () => {
+  const args = [process.execPath, ["-e", "process.stdout.write('once')"], { encoding: "utf8" }];
+  const { live, replayed, sub } = roundTrip(makeWrappedSpawnSync, realSpawnSync, nodeECompiled(), args);
+  assert.equal(live.err, null);
+  assert.equal(live.value.stdout, "once");
+  assert.equal(replayed.err, null, "a substituted dispatch does not throw");
+  assert.equal(replayed.value.status, live.value.status);
+  assert.equal(replayed.value.signal, live.value.signal);
+  assert.equal(replayed.value.stdout, "once", "the RECORDED stdout, verbatim (string encoding preserved)");
+  assert.equal(replayed.value.stderr, live.value.stderr);
+  assert.deepEqual(replayed.value.output, [null, "once", ""], "output mirrors stdout/stderr, as Node's own does");
+  assert.deepEqual(Object.keys(replayed.value), ["status", "signal", "output", "pid", "stdout", "stderr"]);
+  assert.deepEqual(sub.exited, ["completed"]);
+});
+
+test("spawnSync replay: default (Buffer) encoding round-trips as Buffers, not strings", () => {
+  const args = [process.execPath, ["-e", "process.stdout.write('bytes')"]];
+  const { live, replayed } = roundTrip(makeWrappedSpawnSync, realSpawnSync, nodeECompiled(), args);
+  assert.ok(Buffer.isBuffer(live.value.stdout), "sanity: the live call returned a Buffer");
+  assert.ok(Buffer.isBuffer(replayed.value.stdout), "the substituted result must be a Buffer too");
+  assert.deepEqual(replayed.value.stdout, live.value.stdout);
+  assert.deepEqual(replayed.value.stderr, live.value.stderr);
+});
+
+test("spawnSync replay: a recorded NONZERO exit substitutes the same status (no re-run)", () => {
+  const args = [process.execPath, ["-e", "process.stderr.write('boom');process.exit(7)"], { encoding: "utf8" }];
+  const { live, replayed, sub } = roundTrip(makeWrappedSpawnSync, realSpawnSync, nodeECompiled(), args);
+  assert.equal(live.value.status, 7);
+  assert.equal(replayed.value.status, 7);
+  assert.equal(replayed.value.stderr, "boom");
+  // The live leg stamped `failed` (unchanged behavior); the substituted leg
+  // stamps `completed` — it must never DOWNGRADE an already-completed flow.
+  assert.deepEqual(sub.exited, ["completed"]);
+});
+
+test("spawnSync replay: a recorded LAUNCH failure refuses with KeelCmdFlowFailedError (never re-launched)", () => {
+  const compiled = compileCmdMatchers({
+    "cmd:x": { name: "cmd:x", argvPatterns: ["keel-noexist-xyz", "*"], onBusy: "skip" },
+  });
+  const { live, replayed, sub } = roundTrip(makeWrappedSpawnSync, realSpawnSync, compiled, [
+    "keel-noexist-xyz",
+    ["a"],
+  ]);
+  assert.equal(live.value.error?.code, "ENOENT", "the live leg returns the error in the result (unchanged)");
+  assert.ok(
+    replayed.err instanceof KeelCmdFlowFailedError && replayed.err.code === "KEEL-E005",
+    `expected KeelCmdFlowFailedError, got ${replayed.err}`
   );
-  // The handle we entered is released (exitFlow completed) so it does not leak.
-  assert.deepEqual(fake.exited, ["completed"]);
+  assert.deepEqual(sub.exited, ["failed"]);
+});
+
+test("execFileSync replay: recorded stdout is returned without re-running", () => {
+  const args = [process.execPath, ["-e", "process.stdout.write('hi')"], { encoding: "utf8" }];
+  const { live, replayed, sub } = roundTrip(makeWrappedExecFileSync, realExecFileSync, nodeECompiled(), args);
+  assert.equal(live.value, "hi");
+  assert.equal(replayed.err, null);
+  assert.equal(replayed.value, "hi");
+  assert.deepEqual(sub.exited, ["completed"]);
+});
+
+test("execFileSync replay: a recorded NONZERO exit re-throws an equivalent error (contract preserved)", () => {
+  const args = [process.execPath, ["-e", "process.stdout.write('o');process.stderr.write('e');process.exit(3)"]];
+  const { live, replayed } = roundTrip(makeWrappedExecFileSync, realExecFileSync, nodeECompiled(), args);
+  assert.equal(live.err?.status, 3, "sanity: execFileSync throws on a nonzero exit");
+  assert.ok(replayed.err, "the replayed dispatch must throw too — that IS execFileSync's contract");
+  assert.equal(replayed.err.status, 3);
+  assert.equal(replayed.err.signal, live.err.signal);
+  assert.deepEqual(replayed.err.stdout, live.err.stdout);
+  assert.deepEqual(replayed.err.stderr, live.err.stderr);
+  assert.equal(replayed.err.message, live.err.message);
+});
+
+test("execFileSync replay: a recorded ENOENT refuses with KeelCmdFlowFailedError (never re-launched)", () => {
+  const compiled = compileCmdMatchers({
+    "cmd:x": { name: "cmd:x", argvPatterns: ["keel-noexist-xyz", "*"], onBusy: "skip" },
+  });
+  const { live, replayed } = roundTrip(makeWrappedExecFileSync, realExecFileSync, compiled, [
+    "keel-noexist-xyz",
+    ["a"],
+  ]);
+  assert.equal(live.err?.code, "ENOENT");
+  assert.ok(replayed.err instanceof KeelCmdFlowFailedError && replayed.err.code === "KEEL-E005");
+});
+
+test("replay: a Completed identity with NO recorded step (KEEL-E031) refuses, it does not re-run", () => {
+  // The forward-compatibility case: a journal written by a Keel that fenced
+  // cmd: re-dispatch instead of journaling a step. The flow is Completed but
+  // has nothing to substitute, so the core answers with a replay-miss.
+  const miss = {
+    v: 1,
+    result: "error",
+    error: { code: "KEEL-E031", class: "other", message: "replay miss at seq 1" },
+    attempts: 1,
+    from_cache: false,
+    waits_ms: [],
+    throttled: false,
+    throttle_wait_ms: 0,
+    breaker: "closed",
+    trace_id: "t-000002",
+  };
+  const fake = new FakeFlowBackend([{ replay: true }], { substitute: miss });
+  const w = makeWrappedSpawnSync(neverCalled("spawnSync"), {
+    compiled: nodeECompiled(),
+    backend: fake,
+    env: {},
+  });
+  assert.throws(
+    () => w(process.execPath, ["-e", "process.exit(0)"]),
+    (e) =>
+      e instanceof KeelCmdFlowFailedError &&
+      e.code === "KEEL-E005" &&
+      /NO recorded step/.test(e.message) &&
+      !/failed to LAUNCH/.test(e.message)
+  );
+  assert.deepEqual(fake.exited, ["failed"]);
+});
+
+test("the journaled step carries the cmd: target, a readable op, and the flow's args_hash", () => {
+  const fake = new FakeFlowBackend();
+  const w = makeWrappedSpawnSync(realSpawnSync, { compiled: nodeECompiled(), backend: fake, env: {} });
+  w(process.execPath, ["-e", "process.exit(0)"]);
+  assert.equal(fake.executed.length, 1, "exactly one step per dispatch");
+  const req = fake.executed[0];
+  assert.equal(req.v, 1);
+  assert.equal(req.target, "cmd:t", "the step's target is the flow entrypoint (Python parity)");
+  assert.equal(req.op, `cmd ${process.execPath} -e process.exit(0)`);
+  assert.equal(req.idempotent, false, "non-idempotent: the core must never retry a command");
+  assert.equal(
+    req.args_hash,
+    fake.entered[0].argsHash,
+    "the step key reuses the flow identity hash, exactly as subprocess_pack does"
+  );
+});
+
+test("a core that REFUSES the step releases the flow and surfaces the error; the command never runs", () => {
+  const fake = new FakeFlowBackend([], { throwOnExecute: "KEEL-E005" });
+  const w = makeWrappedSpawnSync(neverCalled("spawnSync"), {
+    compiled: nodeECompiled(),
+    backend: fake,
+    env: {},
+  });
+  assert.throws(
+    () => w(process.execPath, ["-e", "process.exit(0)"]),
+    (e) => e.code === "KEEL-E005"
+  );
+  assert.deepEqual(fake.exited, ["failed"], "the handle we entered is released, not leaked");
 });
 
 // ---------------------------------------------------------------------------
@@ -445,7 +664,7 @@ test("consumer matrix (subprocess, real preload order): require, named AND defau
         `const cp = createRequire(import.meta.url)("node:child_process");\n` +
         `const compiled = compileCmdMatchers(${JSON.stringify(MATRIX_FLOWS)});\n` +
         `globalThis.__KEEL_SEEN = [];\n` +
-        `const backend = { persistent: true, enterFlow(e){ globalThis.__KEEL_SEEN.push(e); return { flow_id: "f", status: "running", replay: false }; }, exitFlow(){} };\n` +
+        `const backend = { persistent: true, enterFlow(e){ globalThis.__KEEL_SEEN.push(e); return { flow_id: "f", status: "running", replay: false }; }, exitFlow(){}, executeSync(_r, eff){ return { v: 1, result: "ok", payload: (eff(1) || {}).payload }; } };\n` +
         `patchChildProcess(cp, { compiled, backend, env: {} });\n`
     );
     writeFileSync(

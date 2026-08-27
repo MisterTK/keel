@@ -47,6 +47,21 @@ class NativeBackend {
     // on the bare-engine branch, so it is always safe to forward.
     return this.#core.executeAsync(request, effect, idempotencyKey); // returns a Promise<Outcome>
   }
+  /**
+   * Run one intercepted call SYNCHRONOUSLY, returning the outcome object (not a
+   * Promise). The native `execute` is the sync twin of `executeAsync`: it
+   * routes through the open `FlowHandle` when a flow is entered, so the step is
+   * journaled and replay-substituted just like an async one.
+   *
+   * Exists for the seams that physically cannot await — `child-process.mjs`
+   * wraps `spawnSync`/`execFileSync`, whose return value must be produced on
+   * the same tick (issue #42). Everything else must use `execute` above; a
+   * synchronous effect blocks the event loop for its whole duration, which is
+   * only acceptable when the primitive being wrapped already does.
+   */
+  executeSync(request, effect) {
+    return this.#core.execute(request, effect);
+  }
   /** Peek the idempotency key recorded for the active flow's next step
    *  (rule 3) — `null` outside a flow or when nothing is recorded, and also
    *  on an addon build too old to expose the native method (optional

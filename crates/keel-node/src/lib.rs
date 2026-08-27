@@ -399,13 +399,22 @@ mod bindings {
         /// main thread and returns an attempt-result object. Always returns an
         /// outcome object (engine-level failures are reported *in* the outcome).
         ///
-        /// Refuses (KEEL-E005) while a durable flow is open: this path runs on
-        /// the bare engine, never the open [`FlowHandle`], so it would silently
-        /// downgrade a journaled step to Tier 1. The front end never calls this
-        /// while a flow is active (Node effects are async-only — `executeAsync`
-        /// is the flow-aware path); this guard exists so a future caller cannot
-        /// reintroduce the Level-0 surprise `keel-py`'s async guard was added to
-        /// prevent (mirrored, direction reversed).
+        /// **Tier 2:** while a durable flow is open, this routes the call through
+        /// the open [`FlowHandle`] exactly as [`Self::execute_async`] does, so
+        /// the step is journaled and replay-substituted — it is NOT downgraded
+        /// to a bare-engine Tier-1 call. That is what makes Node's synchronous
+        /// `cmd:` interception (`spawnSync`/`execFileSync`, whose return value
+        /// must be produced on the same tick) reach parity with Python's
+        /// `subprocess_pack` replay-skip (issue #42). The `block_on` is the same
+        /// one the bare-engine branch already used; a synchronous effect blocks
+        /// the JS thread for its whole duration either way, which is only
+        /// acceptable because the primitive being wrapped is itself blocking.
+        ///
+        /// Still refuses (KEEL-E005) when `active_flow` is CONTENDED: another
+        /// step is mid-flight on this flow and can only complete by running JS
+        /// on this very thread, so blocking here would deadlock (the same reason
+        /// `journalTime`/`recordedIdempotencyKey` `try_lock` instead of
+        /// awaiting).
         #[allow(
             clippy::needless_pass_by_value,
             reason = "napi passes the callback as an owned Function handle; it is called by reference per attempt"
@@ -418,29 +427,35 @@ mod bindings {
             effect: Function<'_, u32, Value>,
         ) -> Result<Value> {
             let request = decode_request(env, request)?;
-            // `try_lock`: a flow, once opened, is essentially never contended at
-            // this instant from the JS thread (no effect can be admitted without
-            // going through `executeAsync`'s async path first) — a contended lock
-            // here still means a flow is open, so it also refuses.
-            if self.active_flow.try_lock().map_or(true, |g| g.is_some()) {
+            // `try_lock`, never `blocking_lock`: contention means a concurrent
+            // `executeAsync` step holds the flow across its own `.await`, and it
+            // can only resolve on this thread. Refuse rather than deadlock.
+            let Ok(mut flow_guard) = self.active_flow.try_lock() else {
                 return Err(throw_keel(
                     env,
                     "KEEL-E005",
-                    "synchronous execute() is not supported while a durable flow is open; \
-                     Node flows route intercepted calls through executeAsync so they are \
-                     journaled. This indicates a front-end bug, not a policy problem.",
+                    "synchronous execute() is not supported while another step of the open \
+                     durable flow is in flight; that step can only complete on this thread, so \
+                     waiting here would deadlock. This indicates a front-end bug, not a policy \
+                     problem.",
                 ));
-            }
+            };
             let guard = lock_recover(&self.runtime);
             // Holding the runtime mutex across the synchronous `block_on`
             // serializes calls on this handle; no `.await` is held across it.
-            let outcome = guard.block_on(self.engine.execute(&request, async |attempt: u32| {
-                match effect.call(attempt) {
-                    Ok(value) => decode_attempt(value),
-                    Err(err) => synth_other(format!("effect callback raised: {err}")),
-                }
-            }));
+            let effect_fn = async |attempt: u32| match effect.call(attempt) {
+                Ok(value) => decode_attempt(value),
+                Err(err) => synth_other(format!("effect callback raised: {err}")),
+            };
+            let outcome = if let Some(handle) = flow_guard.as_mut() {
+                guard
+                    .block_on(handle.execute_step_with_idempotency_key(&request, None, effect_fn))
+                    .0
+            } else {
+                guard.block_on(self.engine.execute(&request, effect_fn))
+            };
             drop(guard);
+            drop(flow_guard);
             serde_json::to_value(&outcome)
                 .map_err(|e| throw_keel(env, "KEEL-E040", &format!("outcome not encodable: {e}")))
         }
