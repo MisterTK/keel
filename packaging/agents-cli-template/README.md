@@ -26,7 +26,7 @@ targets — comes from the base `adk` template untouched.
 ## Use it
 
 ```
-agents-cli create my-agent -a MisterTK/keel/packaging/agents-cli-template
+agents-cli scaffold create my-agent -a MisterTK/keel/packaging/agents-cli-template
 ```
 
 This fetches the template from this repo's subdirectory and layers it over
