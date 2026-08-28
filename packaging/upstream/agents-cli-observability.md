@@ -37,10 +37,16 @@
 > correctly-targeted gap in the **scaffold** skill (not observability):
 > `google-agents-cli-scaffold`'s "adk is the only template" framing gives no
 > indication that `--agent`/`-a` also accepts a remote Git spec for
-> layering a vendor add-on (the exact mechanism Keel's own template uses) —
-> drafted and staged as a real fix, see
-> `add-keel-scaffold-addon-discoverability-2026-08` branch in the local
-> `/Users/tk/dev/agents-cli` checkout (2 files, 1 commit, not pushed).
+> layering a vendor add-on (the exact mechanism Keel's own template uses).
+> Attempted as a PR first (branch `add-keel-scaffold-addon-discoverability-2026-08`,
+> pushed to fork `MisterTK/agents-cli`) — **`google/agents-cli` has pull
+> requests disabled repo-wide**, confirmed via GitHub's own UI message ("An
+> owner of this repository has disabled the ability to open pull requests"),
+> not just the API-side `CreatePullRequest` permissions error noted above.
+> Filed as **issue #86** instead, with the proposed doc diff embedded in the
+> issue body, same day. **There is no PR path to this repo at all, browser
+> or API — any future upstream contribution here should go straight to an
+> issue with the diff inline.**
 
 Target: `google/agents-cli`, file
 `skills/google-agents-cli-observability/SKILL.md`.
