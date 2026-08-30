@@ -120,6 +120,14 @@ class ResolveDevCacheTest(unittest.TestCase):
         plain = {"target": {"svc": {"cache": {"ttl": "10s"}}}}
         self.assertEqual(resolve_dev_cache(plain, {"KEEL_ENV": "prod"}), plain)
 
+    def test_mode_off_passes_through_untouched(self) -> None:
+        # CCR-7: resolve_dev_cache only ever matches mode == "dev" — mode ==
+        # "off" is a different, core-level escape hatch and must be left
+        # exactly as-is, off-prod AND in prod.
+        off = {"target": {"llm:openai": {"cache": {"mode": "off"}}}}
+        self.assertEqual(resolve_dev_cache(off, {}), off)
+        self.assertEqual(resolve_dev_cache(off, {"KEEL_ENV": "prod"}), off)
+
     def test_does_not_mutate_input(self) -> None:
         raw = self._raw()
         resolve_dev_cache(raw, {})

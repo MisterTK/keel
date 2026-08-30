@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use keel_core_api::policy::{
-    BreakerMode, BreakerPolicy, CacheScope, DurationMs, JournalLocation, NondeterminismResponse,
-    Policy, Rate, ResolvedPolicy, RetryPolicy,
+    BreakerMode, BreakerPolicy, CacheMode, CacheScope, DurationMs, JournalLocation,
+    NondeterminismResponse, Policy, Rate, ResolvedPolicy, RetryPolicy,
 };
 use keel_core_api::{
     AttemptResult, BreakerState, ENVELOPE_VERSION, ErrorClass, ErrorCode, KeelError, Outcome,
@@ -1165,6 +1165,9 @@ impl Engine {
         else {
             return CachePlan::None;
         };
+        if cache.mode == CacheMode::Off {
+            return CachePlan::None;
+        }
         let Some(ttl) = cache.ttl else {
             return CachePlan::None;
         };

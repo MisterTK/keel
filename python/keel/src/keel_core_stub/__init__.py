@@ -693,8 +693,8 @@ class KeelCoreStub:
             if scope is not None and scope not in ("memory", "persistent"):
                 raise cls._invalid(path, "cache.scope must be memory|persistent")
             mode = cache.get("mode")
-            if mode is not None and mode not in ("always", "dev"):
-                raise cls._invalid(path, "cache.mode must be always|dev")
+            if mode is not None and mode not in ("always", "dev", "off"):
+                raise cls._invalid(path, "cache.mode must be always|dev|off")
             key = cache.get("key")
             if key is not None and key not in ("args", "url"):
                 raise cls._invalid(path, "cache.key must be args|url")
@@ -849,9 +849,10 @@ class KeelCoreStub:
         breaker_cfg = self._layer(target, "breaker")
         rate = self._layer(target, "rate")
         cache_cfg = self._layer(target, "cache")
+        cache_off = isinstance(cache_cfg, dict) and cache_cfg.get("mode") == "off"
         cache_ttl = (
             _parse_duration(cache_cfg["ttl"])
-            if isinstance(cache_cfg, dict) and "ttl" in cache_cfg
+            if not cache_off and isinstance(cache_cfg, dict) and "ttl" in cache_cfg
             else None
         )
 

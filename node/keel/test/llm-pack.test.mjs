@@ -64,6 +64,14 @@ test("resolveDevCache: mode=dev → ttl off-prod, removed in prod, explicit ttl 
   assert.deepEqual(resolveDevCache(plain, { KEEL_ENV: "prod" }), plain);
 });
 
+test("resolveDevCache: mode=off passes through untouched, off-prod and prod (CCR-7)", () => {
+  // resolveDevCache only ever matches mode === "dev" — mode === "off" is a
+  // different, core-level escape hatch and must be left exactly as-is.
+  const off = { target: { "llm:openai": { cache: { mode: "off" } } } };
+  assert.deepEqual(resolveDevCache(off, {}), off);
+  assert.deepEqual(resolveDevCache(off, { KEEL_ENV: "prod" }), off);
+});
+
 test("resolveDevCache: persistent flag adds scope=persistent off-prod (Task 14 item 1)", () => {
   const raw = () => ({ target: { "llm:openai": { cache: { mode: "dev" } } } });
   // native + journal ⇒ cross-run replay: the dev cache resolves to a persistent scope.
