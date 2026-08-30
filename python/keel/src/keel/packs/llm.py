@@ -74,9 +74,9 @@ class _LlmPack:
                     "is orthogonal to retry — it enables replay, not retry."
                 ),
                 args_hash_rule=(
-                    "sha256 over (method, url, canonicalized JSON body) for LLM "
-                    "POSTs (dev-cache replay key); sha256(method + url) for "
-                    "idempotent GET; None for unbuffered/streaming bodies"
+                    "None for GET (state queries — issue #76); sha256 over "
+                    "(method, url, canonicalized JSON body) for LLM POST "
+                    "(dev-cache replay key); None for unbuffered/streaming bodies"
                 ),
             )
         ]

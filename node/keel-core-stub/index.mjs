@@ -305,8 +305,8 @@ function validateTargetPolicy(path, v) {
     // typo like scope="persistant" must fail, not silently fall back to a default.
     if (v.cache.scope !== undefined && v.cache.scope !== "memory" && v.cache.scope !== "persistent")
       throw invalid(path, "cache.scope must be memory|persistent");
-    if (v.cache.mode !== undefined && v.cache.mode !== "always" && v.cache.mode !== "dev")
-      throw invalid(path, "cache.mode must be always|dev");
+    if (v.cache.mode !== undefined && v.cache.mode !== "always" && v.cache.mode !== "dev" && v.cache.mode !== "off")
+      throw invalid(path, "cache.mode must be always|dev|off");
     if (v.cache.key !== undefined && v.cache.key !== "args" && v.cache.key !== "url")
       throw invalid(path, "cache.key must be args|url");
   }
@@ -649,8 +649,8 @@ export class KeelCoreStub {
     const breakerCfg = this.#layer(target, "breaker");
     const rate = this.#layer(target, "rate");
     const cacheCfg = this.#layer(target, "cache");
-    const cacheTtl =
-      isTable(cacheCfg) && cacheCfg.ttl !== undefined ? parseDuration(cacheCfg.ttl) : null;
+    const cacheOff = isTable(cacheCfg) && cacheCfg.mode === "off";
+    const cacheTtl = !cacheOff && isTable(cacheCfg) && cacheCfg.ttl !== undefined ? parseDuration(cacheCfg.ttl) : null;
 
     // cache (outermost layer)
     const argsHash = request.args_hash;

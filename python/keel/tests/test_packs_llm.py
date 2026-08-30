@@ -120,6 +120,14 @@ class ResolveDevCacheTest(unittest.TestCase):
         plain = {"target": {"svc": {"cache": {"ttl": "10s"}}}}
         self.assertEqual(resolve_dev_cache(plain, {"KEEL_ENV": "prod"}), plain)
 
+    def test_mode_off_passes_through_untouched(self) -> None:
+        # CCR-7: resolve_dev_cache only ever matches mode == "dev" — mode ==
+        # "off" is a different, core-level escape hatch and must be left
+        # exactly as-is, off-prod AND in prod.
+        off = {"target": {"llm:openai": {"cache": {"mode": "off"}}}}
+        self.assertEqual(resolve_dev_cache(off, {}), off)
+        self.assertEqual(resolve_dev_cache(off, {"KEEL_ENV": "prod"}), off)
+
     def test_does_not_mutate_input(self) -> None:
         raw = self._raw()
         resolve_dev_cache(raw, {})
@@ -314,8 +322,16 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
         assert hash_ is not None
         self.assertEqual(len(hash_), 64)
 
-    def test_llm_get_hashes_method_and_url(self) -> None:
+    def test_llm_get_derives_no_hash(self) -> None:
+        # A GET on an llm:* target is a state query (operation status, file
+        # metadata) — never a prompt. Caching one silently breaks
+        # submit-then-poll loops (issue #76), so it derives no cache key.
         url = "https://api.openai.com/v1/models"
+        _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
+        self.assertIsNone(hash_)
+
+    def test_non_llm_get_still_hashes(self) -> None:
+        url = "https://api.example.com/v1/things"
         _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
         self.assertEqual(hash_, _http.args_hash("GET", url))
 

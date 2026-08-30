@@ -106,7 +106,7 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "sha256(method + url) for idempotent GET; sha256 over "
+                "None for GET (state queries — issue #76); sha256 over "
                 "(method, url, canonicalized JSON body) for LLM POST "
                 "(dev-cache replay); None otherwise"
             ),
@@ -269,10 +269,14 @@ def _run(pool: Any, do_call: Callable[[], Any], method: str, url: str, headers: 
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(pool, method, url, headers, body)
     env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl or a poll table is configured AND
-    # the caller did not ask for a streamed (unbuffered) response — never
-    # force-read a stream the caller explicitly opted out of buffering.
-    cacheable = hash_ is not None and preload_content and _http.buffer_body_configured(target)
+    # Buffer the body ONLY when a cache ttl (keyed by args_hash) or a poll
+    # table (which judges the body regardless of args_hash — an llm:* GET
+    # derives none, issue #76) is configured AND the caller did not ask for a
+    # streamed (unbuffered) response — never force-read a stream the caller
+    # explicitly opted out of buffering.
+    cacheable = preload_content and (
+        (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
+    )
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:

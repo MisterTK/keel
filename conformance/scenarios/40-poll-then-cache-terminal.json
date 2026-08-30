@@ -1,0 +1,27 @@
+{
+  "name": "poll-then-cache-terminal",
+  "description": "Poll x cache (issue #81): cache wraps the whole poll, so what gets stored is the terminal outcome — a later identical call replays the terminal payload with attempts 0, never a pending one.",
+  "policy": {
+    "target": {
+      "api.jobs.example": {
+        "cache": { "ttl": "10m" },
+        "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+      }
+    }
+  },
+  "steps": [
+    { "call": { "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "completed" } } ],
+        "expect": { "result": "ok", "payload": { "status": "completed" }, "attempts": 3, "from_cache": false } } },
+    { "call": { "target": "api.jobs.example",
+        "request": { "op": "GET api.jobs.example/research", "idempotent": true, "args_hash": "h1" },
+        "effect": [],
+        "expect": { "result": "ok", "payload": { "status": "completed" }, "from_cache": true, "attempts": 0 } } },
+    { "report_expect": { "clock_ms": 20000, "targets": {
+        "api.jobs.example": { "calls": 2, "attempts": 3, "retries": 0, "cache_hits": 1, "successes": 2, "failures": 0 } } } }
+  ]
+}

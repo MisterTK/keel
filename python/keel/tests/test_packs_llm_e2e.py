@@ -141,6 +141,31 @@ class DevCacheProdBypassTest(LlmE2EBase):
                 )
 
 
+class LlmPollLoopNotCachedTest(LlmE2EBase):
+    """Issue #76 regression: N identical status-poll GETs on an llm:* target
+    must dispatch N real requests under the default dev cache — the first
+    'still running' response must NOT be replayed to later polls."""
+
+    def test_identical_gets_never_replay_from_dev_cache(self) -> None:
+        script = [
+            ok(b'{"status":"running"}', _JSON),
+            ok(b'{"status":"running"}', _JSON),
+            ok(b'{"status":"done"}', _JSON),
+        ]
+        with FaultServer(script) as srv:
+            backend = self.install()["backend"]  # KEEL_ENV unset → dev
+            with self.map_host(backend, "127.0.0.1", "openai"):
+                with httpx.Client() as c:
+                    r1 = c.get(srv.url("/v1/operations/op-1"))
+                    r2 = c.get(srv.url("/v1/operations/op-1"))
+                    r3 = c.get(srv.url("/v1/operations/op-1"))
+                self.assertEqual(srv.served, 3, "each poll dispatches a real request")
+                self.assertFalse(r1.keel_outcome["from_cache"])
+                self.assertFalse(r2.keel_outcome["from_cache"])
+                self.assertFalse(r3.keel_outcome["from_cache"])
+                self.assertEqual(r3.json(), {"status": "done"})
+
+
 class LlmRetryStormTest(LlmE2EBase):
     def test_429_storm_with_retry_after_survives_per_llm_defaults(self) -> None:
         # A retryable llm call (POST + Idempotency-Key) rides out a 429 storm per

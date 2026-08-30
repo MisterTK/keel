@@ -201,6 +201,18 @@ Two tiers, one policy file:
   replays completed steps from the journal instead of re-firing their side
   effects, then resumes live from wherever it left off.
 
+### Keel's timeout is not the only timeout
+
+`timeout` bounds how long **Keel** waits. It does not reconfigure deadlines
+inside the SDK making the call: most clients (google-genai, openai, plain
+httpx) enforce their own client-level deadline, and the shorter one wins. If
+the SDK gives up first, Keel just sees a retryable `timeout`-class error —
+and may then retry a call that can never finish inside the SDK's own limit.
+For long-running calls, set the SDK/call-site timeout to at least the Keel
+value; for submit-then-poll APIs, prefer the `poll` policy above. `keel
+doctor` flags LRO-sized timeouts (>600s) with an `sdk-client-timeout`
+follow-up as a reminder.
+
 ### `keel exec` — durable external commands (CCR-4)
 
 Wrap any command as a journaled durable flow — at-most-once dispatch per

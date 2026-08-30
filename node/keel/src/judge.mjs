@@ -173,7 +173,8 @@ function canonicalBody(body) {
  * it. The Node twin of the Python `derive_args_hash` — the two front ends MUST
  * agree on which calls are cacheable:
  *
- *   - idempotent GET   → sha256(method + url [+ buffered body]).
+ *   - idempotent GET   → sha256(method + url [+ buffered body]) — EXCEPT on
+ *     llm:* targets, which derive null (state queries, issue #76).
  *   - LLM POST (llm:*) → the documented dev-cache exception: sha256 over
  *     (method, url, canonicalized JSON body). This enables dev-loop REPLAY of an
  *     identical prompt; it does NOT make the POST retryable — idempotency is a
@@ -182,7 +183,10 @@ function canonicalBody(body) {
  *   - everything else  → null.
  */
 export function deriveArgsHash(target, method, url, body) {
-  if (method === "GET") return argsHash(method, url, body);
+  // A GET on an llm:* target is a state query (operation status, file
+  // metadata), never a prompt — caching one replays stale state into
+  // submit-then-poll loops (issue #76).
+  if (method === "GET") return target.startsWith("llm:") ? null : argsHash(method, url, body);
   if (method === "POST" && target.startsWith("llm:")) {
     const canon = canonicalBody(body);
     return canon === null ? null : argsHash(method, url, canon);

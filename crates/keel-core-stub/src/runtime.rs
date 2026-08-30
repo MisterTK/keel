@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use keel_core_api::policy::{
-    BreakerMode, BreakerPolicy, Policy, Rate, ResolvedPolicy, RetryPolicy,
+    BreakerMode, BreakerPolicy, CacheMode, Policy, Rate, ResolvedPolicy, RetryPolicy,
 };
 
 /// The stub never sleeps: waits advance this counter and are recorded in the
@@ -533,10 +533,12 @@ impl KeelCoreStub {
 
         // cache (outermost layer)
         let cache_key = match (&resolved.cache, &request.args_hash) {
-            (Some(cache), Some(hash)) if cache.ttl.is_some() => Some(CacheKey {
-                target: target.to_owned(),
-                args_hash: hash.clone(),
-            }),
+            (Some(cache), Some(hash)) if cache.mode != CacheMode::Off && cache.ttl.is_some() => {
+                Some(CacheKey {
+                    target: target.to_owned(),
+                    args_hash: hash.clone(),
+                })
+            }
             _ => None,
         };
         if let Some(key) = &cache_key

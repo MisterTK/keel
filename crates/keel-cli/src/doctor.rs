@@ -262,9 +262,9 @@ struct Finding {
 /// agent/human reading the report to work top-down. `code` is a CLOSED set —
 /// url-no-transport | orchestration-blind-spot | subprocess-blind-spot |
 /// dependency-averse-excluded | local-host-excluded | preexisting-resilience |
-/// code-hash-stale — ranked lowest-Keel-confidence first (rank 1 = Keel knows
-/// least, investigate first). Text is entirely keel-authored; only hostnames,
-/// file paths, and lib names are interpolated.
+/// sdk-client-timeout | code-hash-stale — ranked lowest-Keel-confidence first
+/// (rank 1 = Keel knows least, investigate first). Text is entirely
+/// keel-authored; only hostnames, file paths, and lib names are interpolated.
 #[derive(Debug, Serialize)]
 struct FollowUp {
     code: &'static str,
@@ -421,6 +421,12 @@ struct PolicyValidation {
     /// when `keel.toml` is absent, invalid, or simply declares no rules
     /// (the honest default: no rules means no sighting is ever "covered").
     cmd_match: BTreeMap<String, FlowMatchRule>,
+    /// Every declared `timeout` over `LRO_TIMEOUT_MS` (issue #80), as
+    /// (subject path, timeout ms) — empty when `keel.toml` is absent,
+    /// invalid, or simply declares no LRO-sized timeout. Subject paths are
+    /// already deterministically ordered (`defaults.outbound`,
+    /// `defaults.llm`, then `policy.target`'s `BTreeMap` iteration order).
+    lro_timeouts: Vec<(String, u64)>,
     fix: Option<Proposal>,
 }
 
@@ -722,16 +728,20 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
 /// — so it sorts above it. Rank 4 covers BOTH `topology.excluded` kinds
 /// (dependency-averse-excluded and, since #64, local-host-excluded) — same
 /// confidence tier, "Keel saw why this was excluded and just wants it
-/// confirmed", ties broken by `code` then `subject`. Rank 6 (code-hash-stale,
-/// reserved for the WS6 emitter) is a mechanical, fully-verified fact that
-/// merely awaits a human decision.
+/// confirmed", ties broken by `code` then `subject`. Rank 5 also covers
+/// `sdk-client-timeout` (since #80): a mechanically-verified fact from the
+/// declared policy itself (Keel is fully confident an LRO-sized timeout is
+/// set), same tier as `preexisting-resilience`'s "Keel is confident about
+/// what it saw, a human still has to decide", ties again broken by `code`
+/// then `subject`. Rank 6 (code-hash-stale, reserved for the WS6 emitter) is
+/// a mechanical, fully-verified fact that merely awaits a human decision.
 fn follow_up_rank(code: &str) -> u32 {
     match code {
         "url-no-transport" => 1,
         "orchestration-blind-spot" => 2,
         "subprocess-blind-spot" => 3,
         "dependency-averse-excluded" | "local-host-excluded" => 4,
-        "preexisting-resilience" => 5,
+        "preexisting-resilience" | "sdk-client-timeout" => 5,
         _ => 6, // code-hash-stale (WS6)
     }
 }
@@ -739,11 +749,14 @@ fn follow_up_rank(code: &str) -> u32 {
 /// The ranked follow-up list (WS2): computed from the same structured
 /// evidence as the findings — never by parsing finding text — then sorted by
 /// the stable key (rank, code, subject).
+#[allow(clippy::too_many_lines)] // one section per follow-up code, straight-line;
+// issue #80 added the `sdk-client-timeout` section, not new complexity.
 fn build_follow_ups(
     topology: &Topology,
     resilience: Option<&Finding>,
     scan: &ScanResult,
     stale_flows: &[crate::flows::StaleFlow],
+    lro_timeouts: &[(String, u64)],
 ) -> Vec<FollowUp> {
     let mut ups = Vec::new();
     for entry in &topology.unreachable {
@@ -818,6 +831,21 @@ fn build_follow_ups(
             ),
             rank: follow_up_rank("preexisting-resilience"),
             subject: libs.join(", "),
+        });
+    }
+    for (subject, ms) in lro_timeouts {
+        ups.push(FollowUp {
+            code: "sdk-client-timeout",
+            rank: follow_up_rank("sdk-client-timeout"),
+            subject: subject.clone(),
+            detail: format!(
+                "timeout = {}s is beyond the client-default deadline most SDKs enforce (often \
+                 ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the \
+                 call site must also pass a timeout >= the Keel value, or the SDK gives up first \
+                 and Keel just sees a retryable timeout. For submit-then-poll APIs, prefer a \
+                 `poll` policy.",
+                ms / 1000
+            ),
         });
     }
     for flow in stale_flows {
@@ -949,6 +977,7 @@ fn build_report(
     let PolicyValidation {
         check: policy,
         cmd_match,
+        lro_timeouts,
         fix,
     } = policy;
     let registry_libs = registry_libs();
@@ -1076,7 +1105,13 @@ fn build_report(
         });
     }
     let resilience = resilience_finding(scan, &registry_libs);
-    let follow_ups = build_follow_ups(&topology, resilience.as_ref(), scan, stale_flows);
+    let follow_ups = build_follow_ups(
+        &topology,
+        resilience.as_ref(),
+        scan,
+        stale_flows,
+        &lro_timeouts,
+    );
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
@@ -1243,6 +1278,11 @@ fn cmd_flow_covering(
     match_argv(rules, argv).map(str::to_owned)
 }
 
+/// LRO-sized: >10min. Most SDK client-default deadlines are <=600s, so a
+/// declared `timeout` past this point is very likely to be beaten by the
+/// SDK's own deadline before Keel's ever fires (issue #80).
+const LRO_TIMEOUT_MS: u64 = 600_000;
+
 /// Validate `keel.toml` against the typed [`Policy`] model, reporting the exact
 /// field path on error (via `serde_path_to_error`) and, when a field is at
 /// fault, attaching the applyable removal fix.
@@ -1256,6 +1296,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 valid: true,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         };
     }
@@ -1277,16 +1318,40 @@ fn validate_policy(path: &Path) -> PolicyValidation {
         }
     };
     match serde_path_to_error::deserialize::<_, Policy>(&json_value) {
-        Ok(policy) => PolicyValidation {
-            check: PolicyCheck {
-                field: None,
-                message: None,
-                present: true,
-                valid: true,
-            },
-            cmd_match: policy.flows.and_then(|f| f.match_).unwrap_or_default(),
-            fix: None,
-        },
+        Ok(policy) => {
+            // Issue #80: collect every declared timeout past the LRO-sized
+            // threshold before `policy` moves — `policy.target` is a
+            // `BTreeMap`, so this iteration order is already deterministic.
+            let mut lro_timeouts: Vec<(String, u64)> = Vec::new();
+            if let Some(t) = policy.defaults.outbound.as_ref().and_then(|d| d.timeout)
+                && t.0 > LRO_TIMEOUT_MS
+            {
+                lro_timeouts.push(("defaults.outbound".to_string(), t.0));
+            }
+            if let Some(t) = policy.defaults.llm.as_ref().and_then(|d| d.timeout)
+                && t.0 > LRO_TIMEOUT_MS
+            {
+                lro_timeouts.push(("defaults.llm".to_string(), t.0));
+            }
+            for (name, tp) in &policy.target {
+                if let Some(t) = tp.timeout
+                    && t.0 > LRO_TIMEOUT_MS
+                {
+                    lro_timeouts.push((format!("target.\"{name}\""), t.0));
+                }
+            }
+            PolicyValidation {
+                check: PolicyCheck {
+                    field: None,
+                    message: None,
+                    present: true,
+                    valid: true,
+                },
+                cmd_match: policy.flows.and_then(|f| f.match_).unwrap_or_default(),
+                lro_timeouts,
+                fix: None,
+            }
+        }
         Err(e) => {
             let field = e.path().to_string();
             let fix = suggest_removal(&text, &field);
@@ -1304,6 +1369,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
             valid: false,
         },
         cmd_match: BTreeMap::new(),
+        lro_timeouts: Vec::new(),
         fix,
     }
 }
@@ -1515,6 +1581,7 @@ mod tests {
                 valid: true,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         };
         let r = build_report(
@@ -1936,11 +2003,15 @@ mod tests {
         // Pre-existing resilience alongside a wrapped lib (rank 5).
         scan.libs.insert("httpx".to_owned());
         scan.resilience_libs.insert("tenacity".to_owned());
+        // An LRO-sized timeout (also rank 5) — proves the alphabetical
+        // within-rank tie-break against `preexisting-resilience`.
+        let mut policy = default_policy();
+        policy.lro_timeouts = vec![("target.\"llm:google-genai\"".to_string(), 1_800_000)];
 
         let r = build_report(
             &scan,
             &BTreeSet::new(),
-            default_policy(),
+            policy,
             default_journal(),
             None,
             empty_boundaries(),
@@ -1964,6 +2035,7 @@ mod tests {
                 ),
                 (4, "dependency-averse-excluded", "api.broker.com"),
                 (5, "preexisting-resilience", "tenacity"),
+                (5, "sdk-client-timeout", "target.\"llm:google-genai\""),
             ]
         );
         // Every detail is non-empty keel-authored text.
@@ -1974,6 +2046,52 @@ mod tests {
         let text = human(&r);
         assert!(text.contains("follow-ups"));
         assert!(text.contains("[url-no-transport] api.alpha.com"));
+    }
+
+    /// Issue #80: a policy-declared timeout past the LRO-sized threshold
+    /// (>600s) surfaces as exactly one rank-5 `sdk-client-timeout` follow-up,
+    /// subject = the policy path, detail carrying the value in seconds.
+    #[test]
+    fn lro_sized_timeout_emits_the_sdk_client_timeout_follow_up() {
+        let scan = ScanResult::default();
+        let mut policy = default_policy();
+        policy.lro_timeouts = vec![("target.\"llm:google-genai\"".to_string(), 1_800_000)];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        let hit: Vec<_> = r
+            .follow_ups
+            .iter()
+            .filter(|f| f.code == "sdk-client-timeout")
+            .collect();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].rank, 5);
+        assert_eq!(hit[0].subject, "target.\"llm:google-genai\"");
+        assert!(hit[0].detail.contains("1800s"));
+    }
+
+    /// No `lro_timeouts` entries (the common case — `validate_policy` never
+    /// populates it for sub-threshold timeouts) means no follow-up.
+    #[test]
+    fn sub_lro_timeouts_emit_no_sdk_client_timeout_follow_up() {
+        let scan = ScanResult::default();
+        let policy = default_policy(); // lro_timeouts: Vec::new()
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            policy,
+            default_journal(),
+            None,
+            empty_boundaries(),
+            &[],
+        );
+        assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
     }
 
     /// No signals → the field is present and empty (agents can rely on the key).
@@ -2313,6 +2431,7 @@ mod tests {
                 valid: true,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         };
         let r = build_report(
@@ -2415,6 +2534,7 @@ mod tests {
                 valid: true,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         }
     }
@@ -2538,6 +2658,7 @@ mod tests {
                 valid: false,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         };
         let r = build_report(
@@ -2572,6 +2693,7 @@ mod tests {
                 valid: true,
             },
             cmd_match: BTreeMap::new(),
+            lro_timeouts: Vec::new(),
             fix: None,
         };
         let journal = JournalReport {
@@ -2770,6 +2892,43 @@ mod tests {
         let v = validate_policy(Path::new("/nonexistent/keel.toml"));
         assert!(v.check.valid);
         assert!(!v.check.present);
+    }
+
+    /// Issue #80: `validate_policy` extracts an LRO-sized timeout (>600s)
+    /// from `[target."…"]`, `[defaults.llm]`, and `[defaults.outbound]` —
+    /// but 600s exactly is NOT over the threshold (strictly greater-than).
+    #[test]
+    fn validate_policy_extracts_lro_sized_timeouts_strictly_over_threshold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keel.toml");
+        std::fs::write(
+            &path,
+            "[target.\"llm:google-genai\"]\ntimeout = \"601s\"\n\n\
+             [defaults.llm]\ntimeout = \"600s\"\n\n\
+             [defaults.outbound]\ntimeout = \"900s\"\n",
+        )
+        .unwrap();
+        let v = validate_policy(&path);
+        assert!(v.check.valid);
+        assert_eq!(
+            v.lro_timeouts,
+            vec![
+                ("defaults.outbound".to_string(), 900_000),
+                ("target.\"llm:google-genai\"".to_string(), 601_000),
+            ]
+        );
+    }
+
+    /// A `timeout` of exactly 600s (and anything under it) never extracts —
+    /// the threshold is strictly greater-than.
+    #[test]
+    fn validate_policy_extracts_no_lro_timeouts_at_or_under_threshold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keel.toml");
+        std::fs::write(&path, "[target.\"api.example.com\"]\ntimeout = \"600s\"\n").unwrap();
+        let v = validate_policy(&path);
+        assert!(v.check.valid);
+        assert!(v.lro_timeouts.is_empty());
     }
 
     /// dx-spec §5: the invalid-policy finding carries an *applyable* fix — a

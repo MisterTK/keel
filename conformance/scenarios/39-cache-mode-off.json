@@ -1,0 +1,32 @@
+{
+  "name": "cache-mode-off",
+  "description": "cache.mode=off (CCR-7): a target-level {mode:off} table shadows a defaults-level cache wholesale, and off wins even when the same table carries a ttl — identical calls never serve from cache, in every implementation.",
+  "policy": {
+    "defaults": { "llm": { "cache": { "ttl": "24h" }, "retry": { "attempts": 1 } } },
+    "target": {
+      "llm:openai": { "cache": { "mode": "off" }, "retry": { "attempts": 1 } },
+      "api.example.com": { "cache": { "mode": "off", "ttl": "10s" }, "retry": { "attempts": 1 } }
+    }
+  },
+  "steps": [
+    { "call": { "target": "llm:openai",
+        "request": { "op": "openai chat.completions gpt-4.1", "idempotent": false, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "text": "a" } } ],
+        "expect": { "result": "ok", "from_cache": false, "attempts": 1 } } },
+    { "call": { "target": "llm:openai",
+        "request": { "op": "openai chat.completions gpt-4.1", "idempotent": false, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "text": "b" } } ],
+        "expect": { "result": "ok", "payload": { "text": "b" }, "from_cache": false, "attempts": 1 } } },
+    { "call": { "target": "api.example.com",
+        "request": { "op": "GET api.example.com/x", "idempotent": true, "args_hash": "h2" },
+        "effect": [ { "status": "ok", "payload": { "n": 1 } } ],
+        "expect": { "result": "ok", "from_cache": false, "attempts": 1 } } },
+    { "call": { "target": "api.example.com",
+        "request": { "op": "GET api.example.com/x", "idempotent": true, "args_hash": "h2" },
+        "effect": [ { "status": "ok", "payload": { "n": 2 } } ],
+        "expect": { "result": "ok", "payload": { "n": 2 }, "from_cache": false, "attempts": 1 } } },
+    { "report_expect": { "targets": {
+        "llm:openai":      { "calls": 2, "attempts": 2, "cache_hits": 0, "successes": 2 },
+        "api.example.com": { "calls": 2, "attempts": 2, "cache_hits": 0, "successes": 2 } } } }
+  ]
+}

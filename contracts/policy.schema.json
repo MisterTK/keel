@@ -159,9 +159,9 @@
         },
         "mode": {
           "type": "string",
-          "enum": ["always", "dev"],
+          "enum": ["always", "dev", "off"],
           "default": "always",
-          "description": "`dev` caches only when KEEL_ENV != prod — the LLM dev-loop cache."
+          "description": "`dev` caches only when KEEL_ENV != prod — the LLM dev-loop cache. `off` never caches, even when a `ttl` is present — the per-target escape hatch from a defaults-level cache (CCR-7)."
         },
         "key": {
           "type": "string",

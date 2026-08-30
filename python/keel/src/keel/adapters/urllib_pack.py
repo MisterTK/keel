@@ -121,7 +121,11 @@ def targets() -> list[TargetDecl]:
             pattern=f"llm:{provider}",
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
-            args_hash_rule="sha256(method + url) for idempotent GET; None otherwise",
+            args_hash_rule=(
+                "None for GET (state queries — issue #76); sha256 over "
+                "(method, url, canonicalized JSON body) for LLM POST "
+                "(dev-cache replay); None otherwise"
+            ),
         )
         for host_name, provider in _http.known_llm_hosts()
     ]
@@ -297,7 +301,11 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
     current, pass_data, url, target, op, idempotent, hash_, injected = _judge(fullurl, data)
     effective_timeout = _compose_timeout(target, timeout)
     env = _http.build_request(target, op, idempotent, hash_)
-    cacheable = hash_ is not None and _http.buffer_body_configured(target)
+    # Buffer the body ONLY when a cache ttl is configured AND there is a hash
+    # to key it by (mirrors Node's fetch gate and the sibling HTTP packs), OR
+    # a poll table is configured (poll judges the body regardless of
+    # args_hash — an llm:* GET derives none, issue #76).
+    cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
     live: dict[str, Any] = {"ok": None, "exc": None}
 
     def effect(_attempt: int) -> dict[str, Any]:

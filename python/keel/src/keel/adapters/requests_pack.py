@@ -93,7 +93,7 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "sha256(method + url) for idempotent GET; sha256 over "
+                "None for GET (state queries — issue #76); sha256 over "
                 "(method, url, canonicalized JSON body) for LLM POST "
                 "(dev-cache replay); None otherwise"
             ),
@@ -328,10 +328,12 @@ def _run_send(
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        # Buffer the body ONLY when a cache ttl or a poll table is actually
-        # configured (mirrors Node's fetch gate) OR usage accounting needs it;
-        # with neither, a stream=True GET is never force-read at the seam.
-        cacheable = hash_ is not None and _http.buffer_body_configured(target)
+        # Buffer the body ONLY when a cache ttl is actually configured AND
+        # there is a hash to key it by (mirrors Node's fetch gate), OR a poll
+        # table is configured (poll judges the body regardless of args_hash —
+        # an llm:* GET derives none, issue #76), OR usage accounting needs it;
+        # with none of those, a stream=True GET is never force-read at the seam.
+        cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 

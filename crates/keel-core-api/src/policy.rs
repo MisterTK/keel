@@ -638,6 +638,8 @@ pub enum CacheMode {
     Always,
     /// Caches only when `KEEL_ENV != prod` — the LLM dev-loop cache.
     Dev,
+    /// Never caches, regardless of `ttl` — the per-target off switch (CCR-7).
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -1633,6 +1635,18 @@ mod tests {
         let plain = policy.resolve("api.example.com");
         assert_eq!(plain.retry.unwrap().attempts.get(), 3);
         assert!(plain.cache.is_none());
+    }
+
+    #[test]
+    fn cache_mode_off_parses_and_rejects_typos() {
+        // CCR-7: "off" deserializes to CacheMode::Off.
+        let doc = json!({ "target": { "x": { "cache": { "mode": "off" } } } });
+        let policy: Policy = serde_json::from_value(doc).unwrap();
+        assert_eq!(policy.resolve("x").cache.unwrap().mode, CacheMode::Off);
+
+        // A typo is a hard configure error, not a silent fallback to a default.
+        let doc = json!({ "target": { "x": { "cache": { "mode": "offf" } } } });
+        assert!(serde_json::from_value::<Policy>(doc).is_err());
     }
 
     #[test]
