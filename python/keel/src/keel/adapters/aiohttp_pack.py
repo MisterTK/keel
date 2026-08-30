@@ -99,7 +99,7 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "sha256(method + url) for idempotent GET; sha256 over "
+                "None for GET (state queries — issue #76); sha256 over "
                 "(method, url, canonicalized JSON body) for LLM POST "
                 "(dev-cache replay); None otherwise"
             ),
@@ -358,11 +358,13 @@ async def _run(self: Any, orig: Callable[..., Any], method: str, str_or_url: Any
     discovery = _runtime.get_discovery()
     target, op, idempotent, hash_ = _judge(self, method, str_or_url, kwargs)
     env = _http.build_request(target, op, idempotent, hash_)
-    # Buffer the body ONLY when a cache ttl OR a poll table is actually
-    # configured for the target (mirrors Node's fetch gate and the sibling
-    # HTTP packs): with neither, there is nothing to store or judge, so a
-    # streaming/SSE GET passes through unbuffered at Level 0.
-    cacheable = hash_ is not None and _http.buffer_body_configured(target)
+    # Buffer the body ONLY when a cache ttl is configured AND there is a hash
+    # to key it by (mirrors Node's fetch gate and the sibling HTTP packs), OR
+    # a poll table is configured (poll judges the body regardless of
+    # args_hash — an llm:* GET derives none, issue #76): with neither, there
+    # is nothing to store or judge, so a streaming/SSE GET passes through
+    # unbuffered at Level 0.
+    cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
     exec_async = getattr(backend, "execute_async", None)
 

@@ -65,7 +65,7 @@ export const llmPack = Object.freeze({
         idempotencyRule:
           "LLM generate/stream calls are treated as retryable (idempotent) so 429/5xx/timeout retry per the pack",
         argsHashRule:
-          "sha256 over the (key-sorted) call params for generate (dev-cache key); null for streams (a live stream is not cache-replayable)",
+          "null for a GET state query (issue #76); sha256 over the (key-sorted) call params for generate (dev-cache key); null for streams (a live stream is not cache-replayable)",
       },
     ];
   },

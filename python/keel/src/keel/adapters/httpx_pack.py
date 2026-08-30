@@ -121,7 +121,7 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "sha256(method + url) for idempotent GET; sha256 over "
+                "None for GET (state queries — issue #76); sha256 over "
                 "(method, url, canonicalized JSON body) for LLM POST "
                 "(dev-cache replay); None otherwise"
             ),
@@ -401,15 +401,17 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
         target, op, idempotent, hash_, injected = _judge(current)
         env = _http.build_request(target, op, idempotent, hash_)
         _inject_policy_timeout(current, target)
-        # Buffer the body ONLY when a cache ttl or a poll table is actually
-        # configured for the target (mirrors Node's fetch gate), OR a budget
-        # is configured (usage accounting needs the response body — see
+        # Buffer the body ONLY when a cache ttl is actually configured for the
+        # target AND there is a hash to key it by (mirrors Node's fetch gate),
+        # OR a poll table is configured (poll judges the body regardless of
+        # args_hash — an llm:* GET derives none, issue #76), OR a budget is
+        # configured (usage accounting needs the response body — see
         # `_llm_policy`).
         is_llm, cap_cents = _llm_generate_gate(target, current.method)
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        cacheable = hash_ is not None and _http.buffer_body_configured(target)
+        cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 
@@ -510,7 +512,7 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
-        cacheable = hash_ is not None and _http.buffer_body_configured(target)
+        cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}
 

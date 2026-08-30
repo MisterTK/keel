@@ -314,8 +314,16 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
         assert hash_ is not None
         self.assertEqual(len(hash_), 64)
 
-    def test_llm_get_hashes_method_and_url(self) -> None:
+    def test_llm_get_derives_no_hash(self) -> None:
+        # A GET on an llm:* target is a state query (operation status, file
+        # metadata) — never a prompt. Caching one silently breaks
+        # submit-then-poll loops (issue #76), so it derives no cache key.
         url = "https://api.openai.com/v1/models"
+        _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
+        self.assertIsNone(hash_)
+
+    def test_non_llm_get_still_hashes(self) -> None:
+        url = "https://api.example.com/v1/things"
         _t, _op, _idem, hash_, _injected = httpx_pack._judge(httpx.Request("GET", url))
         self.assertEqual(hash_, _http.args_hash("GET", url))
 

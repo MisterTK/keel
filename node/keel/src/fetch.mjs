@@ -189,9 +189,11 @@ export function installFetch(
       const op = `${method} ${hostname}${hopParsed.pathname}`;
       const hash = deriveArgsHash(target, method, hopParsed.href, hopBody);
       const request = { v: 1, target, op, idempotent, args_hash: hash };
+      // A cache ttl needs a hash to key it by; a poll table judges the body
+      // regardless of args_hash — an llm:* GET derives none (issue #76), but
+      // its poll-configured target must still get its body buffered.
       const cacheable =
-        hash != null &&
-        ((isTable(cacheCfg) && cacheCfg.ttl !== undefined) || isTable(pollCfg));
+        (hash != null && isTable(cacheCfg) && cacheCfg.ttl !== undefined) || isTable(pollCfg);
 
       heldOk = null;
       heldTransient = null;

@@ -13,7 +13,9 @@ same target/idempotency/args_hash/error-class decisions for the same call):
     per RFC 9110) are retryable; POST/PATCH are NOT retryable (Level 0 hard
     rule) unless an idempotency header is present.
   * args_hash   — a stable SHA-256 over method+url, cache-key material, derived
-    ONLY for idempotent GETs; ``None`` otherwise (disables caching for the call).
+    ONLY for idempotent GETs — EXCEPT on ``llm:*`` targets, which derive
+    ``None`` (state queries, issue #76); ``None`` otherwise (disables caching
+    for the call).
   * error class — a response status ≥500 or ==429 becomes a typed ``http`` error
     (with Retry-After parsed to ms); every other status (2xx/3xx and non-429
     4xx) passes through UNCHANGED as a success — Keel never turns a real HTTP
@@ -317,7 +319,8 @@ def derive_args_hash(
     """Cache-key material for one intercepted call, or ``None`` to disable
     caching for it.
 
-      * idempotent GET      → ``sha256(method + url [+ buffered body])`` (as before).
+      * idempotent GET      → ``sha256(method + url [+ buffered body])`` — EXCEPT
+        on ``llm:*`` targets, which derive ``None`` (state queries, issue #76).
       * LLM POST (``llm:*``) → the dev-cache exception: ``sha256`` over
         ``(method, url, canonicalized JSON body)``. This enables dev-loop REPLAY
         of an identical prompt; it does NOT make the call retryable — idempotency
@@ -327,6 +330,11 @@ def derive_args_hash(
       * everything else     → ``None``.
     """
     if method == "GET":
+        if target.startswith("llm:"):
+            # A GET on an llm:* target is a state query (operation status,
+            # file metadata, model listing), never a prompt — caching one
+            # replays stale state into submit-then-poll loops (issue #76).
+            return None
         return args_hash(method, url, body)
     if method == "POST" and target.startswith("llm:"):
         canon = _canonical_json(body)

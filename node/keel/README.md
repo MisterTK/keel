@@ -67,8 +67,11 @@ Judgments (kept in parity with the Python adapters):
   crashed predecessor's key when inside an open Tier 2 flow), making the call
   retryable without the caller supplying one. A non-idempotent transient
   failure is *observed, not retried* → **KEEL-E014**.
-- **args_hash** (cache/journal key material) is derived **only for idempotent
-  GET requests** (sha256 over method+URL); it is `null` for everything else.
+- **args_hash** (cache/journal key material) is derived only for idempotent
+  GET requests on non-`llm:` targets (sha256 over method+URL) and for `llm:`
+  POSTs (canonicalized JSON body — the dev-cache replay key); `null` for
+  everything else, including every GET on an `llm:` target (state queries,
+  issue #76).
 - **Transient vs. success** — only `429` and `≥500` are treated as retryable
   typed errors (`Retry-After` is parsed to ms and overrides the backoff:
   `wait = max(schedule, retry_after)`). **Every other status** (2xx/3xx and

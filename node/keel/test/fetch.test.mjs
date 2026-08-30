@@ -334,6 +334,37 @@ test("LLM POST dev-cache replays an identical prompt through the fetch seam (0 e
   assert.deepEqual(await r2.json(), { reply: "hi", served: 1 });
 });
 
+test("LLM GET derives no args_hash and never replays from the dev cache (issue #76)", async () => {
+  let hits = 0;
+  const captured = [];
+  const globalObj = {
+    fetch: async () => {
+      hits++;
+      return new Response(JSON.stringify({ status: hits < 2 ? "running" : "done" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure({ target: { "llm:openai": { cache: { ttl: "24h" }, retry: { attempts: 1 } } } });
+  const realExecute = backend.execute.bind(backend);
+  backend.execute = (request, effect) => {
+    captured.push(request);
+    return realExecute(request, effect);
+  };
+  installFetch(backend, null, { globalObj });
+  const url = "https://api.openai.com/v1/operations/op-1";
+
+  const r1 = await globalObj.fetch(url);
+  const r2 = await globalObj.fetch(url);
+  assert.equal(hits, 2, "the stub fetch was invoked twice — no replay");
+  assert.equal(r1.keelOutcome.from_cache, false);
+  assert.equal(r2.keelOutcome.from_cache, false);
+  assert.equal(captured[0].args_hash, null);
+  assert.equal(captured[1].args_hash, null);
+});
+
 // --- rebuildResponse must not re-declare the original wire encoding (#66) ---
 
 test("gzip response replays without a stale content-encoding header", async () => {
