@@ -84,7 +84,10 @@ enforcing wall-clock timeouts).
 2. **Cache.** When the resolved policy has `cache` with a `ttl` and the
    request carries `args_hash`: a fresh entry returns `from_cache: true`
    with `attempts: 0` and no effect invocation; a successful live call
-   stores its payload for `ttl`.
+   stores its payload for `ttl`. A cache table with `mode = "off"` never
+   caches — no lookup, no store — even when the same table carries a
+   `ttl` (the per-target escape hatch from a defaults-level cache, CCR-7);
+   pinned by scenario 39 (`39-cache-mode-off.json`).
 3. **Rate.** Token bucket, bit-identical across the real core and every stub
    (parity rule): burst capacity equals the rate's `limit`, refilling
    continuously at `limit` scaled units per elapsed millisecond (1 token =
