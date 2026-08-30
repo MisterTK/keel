@@ -118,7 +118,8 @@ the five phases in order; the static scan is evidence, not the verdict.
    unattributed URL) down to mechanical facts awaiting a decision. Codes are
    a closed set: `url-no-transport`, `orchestration-blind-spot`,
    `subprocess-blind-spot`, `dependency-averse-excluded`,
-   `local-host-excluded`, `preexisting-resilience`, `code-hash-stale`.
+   `local-host-excluded`, `preexisting-resilience`, `sdk-client-timeout`,
+   `code-hash-stale`.
    Then read `boundaries` — it names what this report could not parse (source
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
