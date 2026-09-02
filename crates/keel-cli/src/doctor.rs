@@ -920,19 +920,27 @@ const CONFIG_ABOVE_CWD_MAX_WALK_LEVELS: usize = 8;
 /// its own). Fails open: any filesystem error (an unreadable/unwalkable
 /// ancestor, a `project` with no parent) yields `None` rather than a wrong
 /// finding.
+///
+/// Canonicalize BEFORE walking, not after: `main.rs` hands every subcommand
+/// `project = Path::new(".")`, and `Path::new(".").parent()` is `Some("")`
+/// while `Path::new("").parent()` is `None` — so a relative-path walk dies one
+/// step in, without ever leaving the project directory, and this finding could
+/// never fire in production. Resolving to an absolute path first makes the walk
+/// real, and hands the message the absolute paths it wants for free.
 fn config_above_cwd_finding(project: &Path) -> Option<Finding> {
     if project.join("keel.toml").is_file() {
         return None;
     }
-    let mut dir = project.parent()?;
+    let here = std::fs::canonicalize(project).ok()?;
+    let mut dir = here.parent()?;
     for _ in 0..CONFIG_ABOVE_CWD_MAX_WALK_LEVELS {
         if dir.join("keel.toml").is_file() {
-            let parent = std::fs::canonicalize(dir).ok()?;
-            let here = std::fs::canonicalize(project).ok()?;
+            let parent = dir;
             return Some(Finding {
                 action: format!(
-                    "Run from {}, or set KEEL_CWD={} so activation and this report load it; \
-                     keel doctor reads its own working directory only.",
+                    "Run keel doctor from {} to report against that policy; for runtime \
+                     activation, set KEEL_CWD={}. keel doctor reads its own working directory \
+                     only.",
                     parent.display(),
                     parent.display()
                 ),
@@ -2932,11 +2940,27 @@ mod tests {
             "detail names the project: {}",
             finding.detail
         );
-        assert!(
-            finding.action.contains("KEEL_CWD"),
-            "action names the fix: {}",
-            finding.action
+        assert_eq!(
+            finding.action,
+            format!(
+                "Run keel doctor from {p} to report against that policy; for runtime \
+                 activation, set KEEL_CWD={p}. keel doctor reads its own working directory \
+                 only.",
+                p = canonical_parent.display()
+            ),
+            "the action must not claim KEEL_CWD changes what doctor itself reads"
         );
+    }
+
+    /// `main.rs` hands every subcommand `Path::new(".")`. These two std facts
+    /// are exactly why the walk must canonicalize FIRST — pinned here so a
+    /// future "simplification" back to `project.parent()` fails loudly instead
+    /// of silently switching the finding off in production (the
+    /// `keel doctor --json` child-process pin lives in `tests/cli.rs`).
+    #[test]
+    fn a_relative_dot_project_path_has_no_walkable_parent_chain() {
+        assert_eq!(Path::new(".").parent(), Some(Path::new("")));
+        assert_eq!(Path::new("").parent(), None);
     }
 
     /// The project has its own `keel.toml` — even though a parent also has

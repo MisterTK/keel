@@ -601,6 +601,77 @@ fn doctor_fix_json_matches_golden_and_applies() {
     );
 }
 
+// ---- config-above-cwd through the REAL binary (issue #85) ----
+
+/// The built `keel` binary (the `CARGO_BIN_EXE_keel` convention `tests/exec.rs`
+/// and `tests/flows_force.rs` already use).
+fn keel_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_keel")
+}
+
+/// `keel doctor --json` as a real child process rooted at `cwd` — the only
+/// faithful way to exercise the `project = Path::new(".")` that `main.rs`
+/// passes every subcommand. Child-process cwd, never `std::env::set_current_dir`
+/// (issue #72: process-global mutation is unsound against a parallel test
+/// binary).
+fn doctor_json_from(cwd: &Path) -> serde_json::Value {
+    let out = Command::new(keel_bin())
+        .current_dir(cwd)
+        .arg("doctor")
+        .arg("--json")
+        .output()
+        .expect("spawn keel doctor --json");
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "keel doctor --json emitted unparseable output ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+fn has_topic(report: &serde_json::Value, topic: &str) -> bool {
+    report["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .any(|f| f["topic"] == topic)
+}
+
+/// Regression pin for the production path of `config_above_cwd_finding`: run
+/// from `root/sub/` (a `keel.toml` above, none here) the finding must fire, and
+/// run from `root/` itself it must not. The in-crate unit tests pass an
+/// ABSOLUTE project path and so never noticed that the relative `.` `main.rs`
+/// actually passes made the parent walk terminate immediately — this test is
+/// the only one that sees what an adopter sees.
+///
+/// Asserts on the finding's presence by topic, not on a byte-golden report:
+/// every path in it is tempdir-specific.
+#[test]
+fn doctor_reports_config_above_cwd_when_run_from_a_subdirectory() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("keel.toml"),
+        "[target.\"api.example.com\"]\n",
+    )
+    .unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    let from_sub = doctor_json_from(&sub);
+    assert!(
+        has_topic(&from_sub, "config-above-cwd"),
+        "running from a subdirectory of a keel.toml-bearing root must warn: {}",
+        json_string(&from_sub)
+    );
+
+    let from_root = doctor_json_from(dir.path());
+    assert!(
+        !has_topic(&from_root, "config-above-cwd"),
+        "running from the root that OWNS the keel.toml must not warn: {}",
+        json_string(&from_root)
+    );
+}
+
 /// The evidence readers honor `keel.toml`'s `journal` key: a journal at a
 /// custom `file:` location (relative to the project) is found by `flows`,
 /// `trace`, and `status` even though `.keel/journal.db` does not exist.
