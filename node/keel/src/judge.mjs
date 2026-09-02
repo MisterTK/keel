@@ -201,8 +201,20 @@ export function deriveArgsHash(target, method, url, body) {
     // query string is excluded, only the PATH is checked); OpenAI/Anthropic
     // flag it in the body (top-level `"stream": true`, exactly the boolean —
     // a string `"true"` or a nested `stream` key does not count). Mirrors the
-    // Python twin's `_http.derive_args_hash` exactly.
-    if (new URL(url).pathname.endsWith(":streamGenerateContent")) return null;
+    // Python twin's `_http.derive_args_hash` exactly — including on a URL
+    // neither can make sense of: Python's `urlsplit` never raises, while
+    // `new URL` throws on anything non-absolute, so an unparseable URL is
+    // caught and treated the way every other unrecognized shape is (not a
+    // streaming call → fall through to the normal hash path). Never let a
+    // malformed URL turn a cache-key derivation into a thrown error at the
+    // seam.
+    let pathname = null;
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      pathname = null;
+    }
+    if (pathname !== null && pathname.endsWith(":streamGenerateContent")) return null;
     let parsed;
     try {
       parsed = JSON.parse(canon);

@@ -172,6 +172,21 @@ test("deriveArgsHash: a non-streaming llm POST still derives a hash (dev-cache r
   );
 });
 
+test("deriveArgsHash: an unparseable URL falls through to the normal hash path, never throws", () => {
+  // Python's `urlsplit` never raises; `new URL` throws on a non-absolute URL.
+  // The twins must agree, and a cache-key derivation must never become an
+  // exception at the seam: an unrecognizable URL simply isn't a streaming
+  // shape.
+  assert.match(
+    deriveArgsHash("llm:openai", "POST", "not a url", JSON.stringify({ model: "gpt-4o" })),
+    /^[0-9a-f]{64}$/,
+  );
+  assert.match(
+    deriveArgsHash("llm:openai", "POST", "/v1/chat/completions", JSON.stringify({ model: "x" })),
+    /^[0-9a-f]{64}$/,
+  );
+});
+
 // --- streamingResponse: the response-side twin of the args_hash streaming
 // exception above (#84) — every fetch response envelope choke point consumes
 // this predicate. -----------------------------------------------------------
