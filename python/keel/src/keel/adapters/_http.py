@@ -39,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 from .. import _runtime
 from .._errors import KeelError
@@ -171,6 +172,18 @@ def buffer_body_configured(target: str) -> bool:
     """The body-buffering gate at the seam: cache ttl OR poll table. Mirrors
     Node's fetch gate."""
     return cache_configured(target) or poll_configured(target)
+
+
+def streaming_response(content_type: str | None) -> bool:
+    """True iff a response's Content-Type marks a live event stream
+    (`text/event-stream`, any casing, parameters tolerated) — such a body
+    must NEVER be buffered at the seam (issue #84): reading it consumes
+    (httpx) or blocks on (undici clone) the stream the caller is about to
+    iterate, and an SSE session may never terminate at all. Twin of
+    judge.mjs `streamingResponse`; keep the predicates identical."""
+    if not content_type:
+        return False
+    return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
 
 
 def is_idempotent(
@@ -326,7 +339,10 @@ def derive_args_hash(
         of an identical prompt; it does NOT make the call retryable — idempotency
         is a separate judgment, still ``False`` for a bare POST (a cache *lookup*
         needs no idempotency; a *retry* does). A streaming/unbuffered body yields
-        ``None`` (a live stream is not cache-replayable).
+        ``None`` (a live stream is not cache-replayable), and so does a
+        STREAMING generate call (SSE — issue #84): its response is never
+        buffered (see ``streaming_response``), so a cache hit would rebuild an
+        empty body.
       * everything else     → ``None``.
     """
     if method == "GET":
@@ -338,7 +354,25 @@ def derive_args_hash(
         return args_hash(method, url, body)
     if method == "POST" and target.startswith("llm:"):
         canon = _canonical_json(body)
-        return args_hash(method, url, canon) if canon is not None else None
+        if canon is None:
+            return None
+        # A STREAMING generate call is not cache-replayable (issue #84): a
+        # cached envelope would carry no body (the stream is never buffered,
+        # see `streaming_response`) and a hit would rebuild an empty
+        # response. Two shapes cover the real providers: Gemini/Vertex name
+        # the method in the URL path (`:streamGenerateContent`, with or
+        # without `?alt=sse`); OpenAI/Anthropic flag it in the body
+        # (`"stream": true`). Mirrors judge.mjs's deriveArgsHash exactly.
+        path = urlsplit(url).path
+        if path.endswith(":streamGenerateContent"):
+            return None
+        try:
+            parsed = json.loads(canon)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("stream") is True:
+            return None
+        return args_hash(method, url, canon)
     return None
 
 
@@ -529,6 +563,7 @@ __all__ = [
     "cache_configured",
     "poll_configured",
     "buffer_body_configured",
+    "streaming_response",
     "is_idempotent",
     "new_idempotency_key",
     "step_key",
