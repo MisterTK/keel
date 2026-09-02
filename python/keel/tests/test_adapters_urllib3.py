@@ -24,7 +24,7 @@ from keel._discovery import Discovery
 from keel._errors import KeelError
 from keel.adapters import requests_pack, urllib3_pack
 
-from .faultserver import FaultServer, fail, ok, reset, slow, status, throttled
+from .faultserver import FaultServer, fail, ok, reset, slow, sse, status, throttled
 
 _NON_RETRYABLE_CONN = {
     "target": {"127.0.0.1": {"retry": {"attempts": 3, "on": ["timeout"], "schedule": "fixed(1ms)"}}}
@@ -206,6 +206,46 @@ class CacheReplayTest(Urllib3Base):
             self.assertEqual(second.data, b'{"a":1}')
             self.assertNotIn("Content-Encoding", second.headers)
             self.assertEqual(second.headers["Content-Type"], "application/json")
+        self.assertEqual(srv.served, 1)
+
+
+class StreamingResponseTest(Urllib3Base):
+    """Issue #84: a `text/event-stream` body never lands in the envelope, even
+    with the buffer gate ON (cache ttl configured) — nothing usable to cache or
+    poll-judge, and on a `preload_content=False` response reading `.data` here
+    would drain the caller's own stream."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+    _EVENTS = [b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"]
+
+    def test_sse_body_is_not_carried_in_the_envelope(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            r = self.pool.urlopen("GET", srv.url("/sse"))
+            self.assertEqual(r.headers["Content-Type"], "text/event-stream")
+            self.assertNotIn("body_b64", r.keel_outcome["payload"])
+            # Byte-transparency is untouched: urllib3's own preload still
+            # delivers the whole stream to the caller.
+            self.assertEqual(r.data, b"".join(self._EVENTS))
+        self.assertEqual(srv.served, 1)
+
+    def test_unbuffered_sse_stream_is_left_alone(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            r = self.pool.urlopen("GET", srv.url("/sse"), preload_content=False)
+            try:
+                self.assertNotIn("body_b64", r.keel_outcome["payload"])
+                self.assertEqual(list(r.read_chunked()), self._EVENTS)
+            finally:
+                r.release_conn()
+        self.assertEqual(srv.served, 1)
+
+    def test_non_streaming_body_is_still_carried(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([ok(b'{"a":1}', {"Content-Type": "application/json"})]) as srv:
+            r = self.pool.urlopen("GET", srv.url("/j"))
+            self.assertIn("body_b64", r.keel_outcome["payload"])
+            self.assertEqual(r.data, b'{"a":1}')
         self.assertEqual(srv.served, 1)
 
 

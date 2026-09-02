@@ -33,7 +33,7 @@ from keel._errors import KeelError
 from keel._discovery import Discovery
 from keel.adapters import urllib_pack
 
-from .faultserver import FaultServer, fail, ok, reset, slow, status, throttled
+from .faultserver import FaultServer, fail, ok, reset, slow, sse, status, throttled
 
 _NON_RETRYABLE_CONN = {
     "target": {"127.0.0.1": {"retry": {"attempts": 3, "on": ["timeout"], "schedule": "fixed(1ms)"}}}
@@ -335,6 +335,51 @@ class CacheReplayTest(UrllibBase):
                 self.assertEqual(second_body, first_body)
                 self.assertEqual(second.headers.get("Content-Encoding"), "gzip")
                 self.assertEqual(second.headers.get("Content-Type"), "application/json")
+        self.assertEqual(srv.served, 1)
+
+
+class StreamingResponseTest(UrllibBase):
+    """Issue #84: with the buffer gate ON (a cache ttl on the target), a
+    `text/event-stream` body is never read at the seam — on BOTH body-read
+    paths this pack has (the success branch and the non-transient
+    ``HTTPError`` branch). Reading one consumes the stream the caller is about
+    to iterate, and a live SSE session may never end."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+    _EVENTS = [b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"]
+
+    def test_sse_body_is_not_read_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            with urllib.request.urlopen(srv.url("/sse")) as resp:
+                self.assertEqual(resp.headers.get("Content-Type"), "text/event-stream")
+                self.assertNotIn("body_b64", resp.keel_outcome["payload"])
+                # The live, unconsumed stream reached the caller: reading it
+                # here (not at the seam) still yields every event.
+                self.assertEqual(resp.readline(), b"data: one\n")
+                self.assertEqual(resp.read(), b"\ndata: two\n\ndata: three\n\n")
+        self.assertEqual(srv.served, 1)
+
+    def test_sse_httperror_body_is_not_read_at_the_seam(self) -> None:
+        # The second body-read path: a non-transient >=400 is a core-level
+        # SUCCESS whose body is normally buffered and re-wrapped. A streaming
+        # one is left alone — the ORIGINAL HTTPError is raised, still readable.
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([status(404, b"data: nope\n\n", {"Content-Type": "text/event-stream"})]) as srv:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(srv.url("/sse-404"))
+            err = ctx.exception
+            self.assertNotIn("body_b64", err.keel_outcome["payload"])
+            self.assertEqual(err.read(), b"data: nope\n\n")
+            err.close()
+        self.assertEqual(srv.served, 1)
+
+    def test_non_streaming_body_is_still_buffered_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([ok(b'{"a":1}', {"Content-Type": "application/json"})]) as srv:
+            with urllib.request.urlopen(srv.url("/j")) as resp:
+                self.assertIn("body_b64", resp.keel_outcome["payload"])
+                self.assertEqual(resp.read(), b'{"a":1}')
         self.assertEqual(srv.served, 1)
 
 

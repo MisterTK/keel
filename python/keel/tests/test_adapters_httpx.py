@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import gzip
 import sqlite3
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,7 +26,7 @@ from keel._discovery import Discovery
 from keel._errors import KeelError
 from keel.adapters import httpx_pack
 
-from .faultserver import FaultServer, fail, ok, reset, slow, status, throttled
+from .faultserver import FaultServer, fail, ok, reset, slow, sse, status, throttled
 
 _NON_RETRYABLE_CONN = {
     "target": {"127.0.0.1": {"retry": {"attempts": 3, "on": ["timeout"], "schedule": "fixed(1ms)"}}}
@@ -324,6 +326,132 @@ class CacheReplayTest(HttpxBase):
             self.assertEqual(second.json(), {"a": 1})
             self.assertEqual(second.headers["x-trace"], "t1")
         self.assertEqual(srv.served, 1)
+
+
+class StreamingResponseTest(HttpxBase):
+    """Issue #84: a `text/event-stream` response is NEVER read at the seam, no
+    matter what the request-time buffer gate said. Buffering one consumes the
+    stream the caller is about to iterate — and a live SSE session may never
+    end, so the read can block forever (Google ADK `streaming_mode=SSE` yielded
+    zero events)."""
+
+    #: A cache ttl turns the request-time buffer gate ON for these GETs — the
+    #: exact configuration under which the bug fires.
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+    _POLL = {
+        "target": {
+            "127.0.0.1": {
+                "poll": {
+                    "interval": "10ms",
+                    "deadline": "1s",
+                    "until": {"field": "status", "terminal": ["done"]},
+                }
+            }
+        }
+    }
+    _EVENTS = [b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"]
+
+    def test_sync_sse_body_is_not_read_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            with httpx.Client() as c:
+                with c.stream("GET", srv.url("/sse")) as r:
+                    self.assertEqual(r.headers["content-type"], "text/event-stream")
+                    # The load-bearing assertion: the pack left the stream alone.
+                    self.assertFalse(r.is_stream_consumed)
+                    self.assertEqual(r.keel_outcome["result"], "ok")
+                    data = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+        self.assertEqual(data, ["data: one", "data: two", "data: three"])
+        self.assertEqual(srv.served, 1)
+
+    def test_async_sse_body_is_not_read_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            async def go() -> list[str]:
+                async with httpx.AsyncClient() as c:
+                    async with c.stream("GET", srv.url("/sse")) as r:
+                        self.assertEqual(r.headers["content-type"], "text/event-stream")
+                        self.assertFalse(r.is_stream_consumed)
+                        self.assertEqual(r.keel_outcome["result"], "ok")
+                        return [ln async for ln in r.aiter_lines() if ln.startswith("data:")]
+
+            data = asyncio.run(go())
+        self.assertEqual(data, ["data: one", "data: two", "data: three"])
+        self.assertEqual(srv.served, 1)
+
+    def test_poll_configured_sse_passes_through_in_one_attempt(self) -> None:
+        # A poll table also turns the buffer gate on. The bodyless envelope a
+        # streaming response now produces makes the core's poll judgment fail
+        # open (conformance "Poll": no body_b64 → fail_open → terminal), so
+        # there is exactly ONE dispatch — no poll loop around a live stream.
+        self.backend.configure({**level0_defaults(), **self._POLL})
+        with FaultServer([sse(self._EVENTS)]) as srv:
+            with httpx.Client() as c:
+                with c.stream("GET", srv.url("/op")) as r:
+                    self.assertFalse(r.is_stream_consumed)
+                    data = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+                    self.assertEqual(r.keel_outcome["attempts"], 1)
+        self.assertEqual(data, ["data: one", "data: two", "data: three"])
+        self.assertEqual(srv.served, 1)
+
+    def test_non_streaming_response_is_still_buffered_and_cached(self) -> None:
+        # Regression guard for the negative: a plain JSON GET on a cache-
+        # configured target still gets read at the seam (body_b64 in the
+        # envelope) and still replays from cache.
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        with FaultServer([ok(b'{"a":1}', {"Content-Type": "application/json"})]) as srv:
+            with httpx.Client() as c:
+                with c.stream("GET", srv.url("/j")) as r:
+                    self.assertTrue(r.is_stream_consumed)  # buffered by the pack
+                    self.assertEqual(r.read(), b'{"a":1}')
+                second = c.get(srv.url("/j"))
+        self.assertTrue(second.keel_outcome["from_cache"])
+        self.assertEqual(second.json(), {"a": 1})
+        self.assertEqual(srv.served, 1)  # the replay never hit the network
+
+
+class SseLivenessTest(HttpxBase):
+    """The local stand-in for the adopter's `test_agent_stream` repro (issue
+    #84): a REAL server, a REAL httpx client, the REAL patched transport, and a
+    dev-cache ttl on the target — events must reach the caller INCREMENTALLY.
+    The server holds the second and third events back until the client reports
+    having seen the first, so a seam that buffers the whole body deadlocks
+    until the gate times out and the first-event latency blows past the bound
+    (that is exactly how this test fails on the pre-fix code)."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+    _GATE_TIMEOUT = 5.0
+    _LIVENESS_BOUND_S = 2.0
+
+    def test_sse_events_arrive_incrementally_through_the_real_stack(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+        gate = threading.Event()
+        events = [b"data: one\n\n", b"data: two\n\n", b"data: three\n\n"]
+        script = [sse(events, gate=gate, gate_after=1, gate_timeout=self._GATE_TIMEOUT)]
+        try:
+            with FaultServer(script) as srv:
+                started = time.perf_counter()
+                first_at: float | None = None
+                seen: list[str] = []
+                with httpx.Client(timeout=30.0) as c:
+                    with c.stream("GET", srv.url("/v1/stream")) as r:
+                        self.assertEqual(r.status_code, 200)
+                        for line in r.iter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            if first_at is None:
+                                first_at = time.perf_counter() - started
+                                gate.set()  # release events two and three
+                            seen.append(line)
+        finally:
+            gate.set()  # never leave the server thread parked on a failed run
+        self.assertEqual(seen, ["data: one", "data: two", "data: three"])
+        self.assertIsNotNone(first_at)
+        self.assertLess(
+            first_at,  # type: ignore[arg-type]
+            self._LIVENESS_BOUND_S,
+            "first SSE event was not delivered live — the body was buffered at the seam",
+        )
 
 
 class DiscoveryTest(HttpxBase):

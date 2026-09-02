@@ -62,8 +62,12 @@ class _FakeResponse:
         self.headers = _FakeHeaders(headers)
         self._body = body
         self.released = False
+        #: How many times the body was read — the pack must never read a
+        #: `text/event-stream` body at the seam (issue #84).
+        self.reads = 0
 
     async def read(self) -> bytes:
+        self.reads += 1
         return self._body
 
     def release(self) -> None:
@@ -365,6 +369,41 @@ class CacheReplayTest(AiohttpTestBase):
             self.assertEqual(await second.json(), {"a": 1})
             self.assertIsNone(second.headers.get("Content-Encoding"))
             self.assertEqual(second.headers.get("Content-Type"), "application/json")
+
+        self.run_async(go())
+
+
+class StreamingResponseTest(AiohttpTestBase):
+    """Issue #84: a `text/event-stream` response is never read at the seam,
+    even with the buffer gate on (cache ttl configured) — reading it drains
+    the `resp.content` stream the caller is about to iterate, and a live SSE
+    session may never end."""
+
+    _CACHE = {"target": {"127.0.0.1": {"cache": {"ttl": "10s"}}}}
+
+    def test_sse_body_is_not_read_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+
+        async def go() -> None:
+            live = _FakeResponse(200, b"data: one\n\n", headers={"Content-Type": "text/event-stream"})
+            session = _ScriptedSession([live])
+            resp = await session.get("http://127.0.0.1/sse")
+            self.assertIs(resp, live)  # the live response, untouched
+            self.assertEqual(live.reads, 0)
+            self.assertNotIn("body_b64", resp.keel_outcome["payload"])
+            self.assertEqual(await resp.read(), b"data: one\n\n")  # the caller's own read
+
+        self.run_async(go())
+
+    def test_non_streaming_body_is_still_read_at_the_seam(self) -> None:
+        self.backend.configure({**level0_defaults(), **self._CACHE})
+
+        async def go() -> None:
+            live = _FakeResponse(200, b'{"a":1}', headers={"Content-Type": "application/json"})
+            session = _ScriptedSession([live])
+            resp = await session.get("http://127.0.0.1/j")
+            self.assertEqual(live.reads, 1)
+            self.assertIn("body_b64", resp.keel_outcome["payload"])
 
         self.run_async(go())
 
