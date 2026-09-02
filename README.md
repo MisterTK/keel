@@ -299,10 +299,16 @@ uvicorn, a test runner), Keel can activate as a plain dependency:
 - **Python** — the `keelrun` wheel ships a site-packages `.pth` shim gated on
   one env var. Set `KEEL_ENABLE=1` (e.g. in your project `.env`) and every
   Python process in that environment boots with the same policy engine
-  `keel run` uses — `keel.toml` from the working directory, or from
-  `KEEL_CWD=<dir>` when your config lives in the deployable app directory.
+  `keel run` uses — `keel.toml` from the working directory.
 - **Node** — add `NODE_OPTIONS="--import keelrun/register"` alongside
   `KEEL_ENABLE=1`.
+
+Both front ends read `keel.toml` from the working directory, and both honor
+`KEEL_CWD=<dir>` to relocate that config root when your policy lives in the
+deployable app directory rather than where the launcher happens to start the
+process (`keel run` exports it to the children it spawns for exactly this
+reason). When no `keel.toml` is found and one exists in a parent directory,
+the startup banner says so and names the `KEEL_CWD` value that would load it.
 
 Activation is fail-open by design: a broken install or invalid `keel.toml`
 prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
