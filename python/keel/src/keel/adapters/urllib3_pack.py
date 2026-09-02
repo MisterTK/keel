@@ -106,9 +106,10 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "None for GET (state queries — issue #76); sha256 over "
-                "(method, url, canonicalized JSON body) for LLM POST "
-                "(dev-cache replay); None otherwise"
+                "None for GET (state queries — issue #76) and for streaming "
+                "generate calls (:streamGenerateContent path or \"stream\": true "
+                "body — issue #84); sha256 over (method, url, canonicalized JSON "
+                "body) for non-streaming LLM POST (dev-cache replay); None otherwise"
             ),
         )
         for host_name, provider in _http.known_llm_hosts()
@@ -209,8 +210,15 @@ def _classify(err: BaseException) -> str:
 
 
 def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
+    """A JSON envelope of a live ``HTTPResponse``. The request-time
+    ``cacheable`` intent is overridden at RESPONSE time for a
+    ``text/event-stream`` body (issue #84) — a stream is never carried in an
+    envelope (nothing usable to cache or poll-judge, and on a
+    ``preload_content=False`` response ``.data`` would drain the caller's
+    stream). The core's poll judgment fails open on the bodyless envelope.
+    The single choke point for every body read in this pack, deliberately."""
     body = None
-    if cacheable:
+    if cacheable and not _streaming(resp):
         try:
             body = resp.data  # already buffered (preload_content=True checked by the caller)
         except Exception:
@@ -220,6 +228,14 @@ def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
     except Exception:
         headers = []
     return _http.response_envelope(resp.status, headers, body)
+
+
+def _streaming(resp: Any) -> bool:
+    """True iff the LIVE response is an event stream — never buffer it."""
+    try:
+        return _http.streaming_response(resp.headers.get("content-type"))
+    except Exception:
+        return False
 
 
 def _rebuild(payload: Any) -> Any:
@@ -273,7 +289,9 @@ def _run(pool: Any, do_call: Callable[[], Any], method: str, url: str, headers: 
     # table (which judges the body regardless of args_hash — an llm:* GET
     # derives none, issue #76) is configured AND the caller did not ask for a
     # streamed (unbuffered) response — never force-read a stream the caller
-    # explicitly opted out of buffering.
+    # explicitly opted out of buffering. Request-time intent only:
+    # `_ok_payload` overrides it at response time for a `text/event-stream`
+    # body, never carried in an envelope whatever the policy says (issue #84).
     cacheable = preload_content and (
         (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
     )

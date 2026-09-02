@@ -42,6 +42,7 @@ import {
   parseRetryAfter,
   classifyThrow,
   isTransientStatus,
+  streamingResponse,
   responseEnvelope,
   rebuildResponse,
   stepKey,
@@ -233,7 +234,16 @@ export function installFetch(
           cancelBody(heldTransient); // a good response supersedes any held transient
           heldTransient = null;
           heldOk = resp;
-          return { status: "ok", payload: await responseEnvelope(resp, { withBody: cacheable || trackUsage }) };
+          // Request-time signals alone (cacheable/trackUsage) are not enough:
+          // a `text/event-stream` response must NEVER be buffered, no matter
+          // what the request-time gate said (issue #84). Buffering one reads
+          // the very stream the caller is about to iterate — and on Node this
+          // is worse than a wasted read: `clone().arrayBuffer()` AWAITS the
+          // clone's stream end rather than merely draining it, so a live SSE
+          // session that never closes would hang this effect (and the whole
+          // call) forever instead of ever delivering the real response.
+          const withBody = (cacheable || trackUsage) && !streamingResponse(resp.headers.get("content-type"));
+          return { status: "ok", payload: await responseEnvelope(resp, { withBody }) };
         } catch (err) {
           heldErr = err;
           return { status: "error", class: classifyThrow(err), message: err?.message ?? String(err) };

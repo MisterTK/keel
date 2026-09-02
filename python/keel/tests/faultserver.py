@@ -6,6 +6,11 @@ exact fault sequence — e.g. ``[fail(503), ok(b"hi")]`` returns 503 then 200.
 Supported faults cover the brief's cases: 5xx / 429-with-Retry-After statuses,
 an abrupt connection reset, and a slow response (for client-side timeout).
 Sleeps are kept tiny and are only used to trip a small client timeout.
+
+``sse()`` adds a real chunked ``text/event-stream`` response (issue #84) —
+per-event chunks with flushes, optionally gated on the client's progress — so
+a pack's "never buffer a stream at the seam" contract can be tested against a
+live socket rather than a fake.
 """
 
 from __future__ import annotations
@@ -54,6 +59,32 @@ def slow(seconds: float, then: dict[str, Any] | None = None) -> dict[str, Any]:
     d = dict(then or ok())
     d["sleep"] = seconds
     return d
+
+
+def sse(
+    events: list[bytes],
+    *,
+    gate: threading.Event | None = None,
+    gate_after: int = 1,
+    gate_timeout: float = 5.0,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """A REAL chunked ``text/event-stream`` response (issue #84): each event is
+    written as its own HTTP chunk and flushed, so a client that iterates the
+    stream sees them one at a time. ``gate`` makes that observable: the server
+    pauses after ``gate_after`` events until the client sets the event (or
+    ``gate_timeout`` elapses), so a client that only sees data after the pause
+    was buffering the whole body somewhere."""
+    return {
+        "status": 200,
+        "headers": headers or {},
+        "sse": {
+            "events": list(events),
+            "gate": gate,
+            "gate_after": gate_after,
+            "gate_timeout": gate_timeout,
+        },
+    }
 
 
 class FaultServer:
@@ -113,6 +144,10 @@ class FaultServer:
                 sleep_s = directive.get("sleep")
                 if sleep_s:
                     time.sleep(sleep_s)
+                sse_cfg = directive.get("sse")
+                if sse_cfg is not None:
+                    self._serve_sse(directive, sse_cfg)
+                    return
                 body: bytes = directive.get("body", b"")
                 try:
                     self.send_response(directive.get("status", 200))
@@ -124,6 +159,27 @@ class FaultServer:
                         self.wfile.write(body)
                 except OSError:
                     self.close_connection = True  # client already gone (timeout)
+
+            def _serve_sse(self, directive: dict[str, Any], cfg: dict[str, Any]) -> None:
+                """Write a chunked SSE body, flushing each event separately."""
+                try:
+                    self.send_response(directive.get("status", 200))
+                    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+                    headers.update(directive.get("headers", {}))
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    gate = cfg.get("gate")
+                    for i, event in enumerate(cfg["events"], start=1):
+                        self.wfile.write(b"%x\r\n" % len(event) + event + b"\r\n")
+                        self.wfile.flush()
+                        if gate is not None and i == cfg.get("gate_after", 1):
+                            gate.wait(cfg.get("gate_timeout", 5.0))
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except OSError:
+                    self.close_connection = True  # client already gone
 
             do_GET = _serve
             do_POST = _serve

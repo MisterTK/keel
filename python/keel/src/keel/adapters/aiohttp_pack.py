@@ -99,9 +99,10 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "None for GET (state queries — issue #76); sha256 over "
-                "(method, url, canonicalized JSON body) for LLM POST "
-                "(dev-cache replay); None otherwise"
+                "None for GET (state queries — issue #76) and for streaming "
+                "generate calls (:streamGenerateContent path or \"stream\": true "
+                "body — issue #84); sha256 over (method, url, canonicalized JSON "
+                "body) for non-streaming LLM POST (dev-cache replay); None otherwise"
             ),
         )
         for host_name, provider in _http.known_llm_hosts()
@@ -232,8 +233,15 @@ def _classify(err: BaseException) -> str:
 
 
 async def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
+    """A JSON envelope of a live ``ClientResponse``. The request-time
+    ``cacheable`` intent is overridden at RESPONSE time for a
+    ``text/event-stream`` body (issue #84): ``read()`` drains the very stream
+    the caller is about to iterate over ``resp.content``, and an SSE session
+    may never end, so the read can block forever. The envelope then carries no
+    ``body_b64`` — the core's poll judgment fails open on that. The single
+    choke point for every body read in this pack, deliberately."""
     body = None
-    if cacheable:
+    if cacheable and not _streaming(resp):
         try:
             body = await resp.read()  # aiohttp caches the buffered body internally
         except Exception:
@@ -243,6 +251,14 @@ async def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
     except Exception:
         headers = []
     return _http.response_envelope(resp.status, headers, body)
+
+
+def _streaming(resp: Any) -> bool:
+    """True iff the LIVE response is an event stream — never buffer it."""
+    try:
+        return _http.streaming_response(resp.headers.get("Content-Type"))
+    except Exception:
+        return False
 
 
 class _CIHeaders:
@@ -363,7 +379,9 @@ async def _run(self: Any, orig: Callable[..., Any], method: str, str_or_url: Any
     # a poll table is configured (poll judges the body regardless of
     # args_hash — an llm:* GET derives none, issue #76): with neither, there
     # is nothing to store or judge, so a streaming/SSE GET passes through
-    # unbuffered at Level 0.
+    # unbuffered at Level 0. With either, this is only the request-time
+    # INTENT — `_ok_payload` overrides it at response time for a
+    # `text/event-stream` body, never buffered whatever the policy says (#84).
     cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
     live: dict[str, Any] = {"ok": None, "transient": None, "exc": None}
     exec_async = getattr(backend, "execute_async", None)

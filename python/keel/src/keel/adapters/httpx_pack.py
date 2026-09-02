@@ -121,9 +121,10 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "None for GET (state queries — issue #76); sha256 over "
-                "(method, url, canonicalized JSON body) for LLM POST "
-                "(dev-cache replay); None otherwise"
+                "None for GET (state queries — issue #76) and for streaming "
+                "generate calls (:streamGenerateContent path or \"stream\": true "
+                "body — issue #84); sha256 over (method, url, canonicalized JSON "
+                "body) for non-streaming LLM POST (dev-cache replay); None otherwise"
             ),
         )
         for host_name, provider in _http.known_llm_hosts()
@@ -254,9 +255,18 @@ def _classify(err: BaseException) -> str:
 def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
     """A JSON envelope of `resp` for the core payload (sync). The body is
     buffered only for cacheable calls (so a non-cached streaming body is never
-    forced); the live response is returned unchanged on the success path."""
+    forced); the live response is returned unchanged on the success path.
+
+    The request-time `cacheable` intent is overridden at RESPONSE time by the
+    streaming check (issue #84): reading a `text/event-stream` body here
+    consumes the very stream the caller is about to iterate — and an SSE
+    session may never end, so the read can block forever. The envelope then
+    carries no `body_b64`, which the core's poll judgment treats as fail-open
+    (one attempt, no poll loop). This is THE choke point for every body read
+    in this pack (both runners, every fallback hop), deliberately, so no new
+    call site can reintroduce the bug."""
     body = None
-    if cacheable:
+    if cacheable and not _streaming(resp):
         try:
             body = resp.read()  # buffers the transport stream into resp.content
         except Exception:
@@ -265,14 +275,23 @@ def _ok_payload(resp: Any, cacheable: bool) -> dict[str, Any]:
 
 
 async def _ok_payload_async(resp: Any, cacheable: bool) -> dict[str, Any]:
-    """Async twin of `_ok_payload` — buffers the body via `aread` on the loop."""
+    """Async twin of `_ok_payload` — buffers the body via `aread` on the loop,
+    and skips the read identically for a streaming response (issue #84)."""
     body = None
-    if cacheable:
+    if cacheable and not _streaming(resp):
         try:
             body = await resp.aread()
         except Exception:
             body = None
     return _http.response_envelope(resp.status_code, _headers(resp), body)
+
+
+def _streaming(resp: Any) -> bool:
+    """True iff the LIVE response is an event stream — never buffer it."""
+    try:
+        return _http.streaming_response(resp.headers.get("content-type"))
+    except Exception:
+        return False
 
 
 def _headers(resp: Any) -> list[tuple[str, str]]:
@@ -406,7 +425,9 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
         # OR a poll table is configured (poll judges the body regardless of
         # args_hash — an llm:* GET derives none, issue #76), OR a budget is
         # configured (usage accounting needs the response body — see
-        # `_llm_policy`).
+        # `_llm_policy`). This is only the request-time INTENT: `_ok_payload`
+        # overrides it at response time for a `text/event-stream` body, which
+        # is never buffered whatever the policy says (issue #84).
         is_llm, cap_cents = _llm_generate_gate(target, current.method)
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
@@ -512,6 +533,9 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
         if hop == 0 and cap_cents is not None and _llm_policy.spent_cents(target) >= cap_cents:
             raise _budget_blocked_error(target, cap_cents, discovery)
         track_usage = cap_cents is not None
+        # Request-time buffering intent only — `_ok_payload_async` overrides it
+        # at response time for a `text/event-stream` body (issue #84). Same
+        # gate as `_run_sync`; see its comment for the three terms.
         cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
         buffer_body = cacheable or track_usage
         live = {"ok": None, "transient": None, "exc": None}

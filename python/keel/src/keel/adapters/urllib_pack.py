@@ -122,9 +122,10 @@ def targets() -> list[TargetDecl]:
             kind="llm",
             idempotency_rule=f"host {host_name} maps to llm:{provider}; idempotency as for host targets",
             args_hash_rule=(
-                "None for GET (state queries — issue #76); sha256 over "
-                "(method, url, canonicalized JSON body) for LLM POST "
-                "(dev-cache replay); None otherwise"
+                "None for GET (state queries — issue #76) and for streaming "
+                "generate calls (:streamGenerateContent path or \"stream\": true "
+                "body — issue #84); sha256 over (method, url, canonicalized JSON "
+                "body) for non-streaming LLM POST (dev-cache replay); None otherwise"
             ),
         )
         for host_name, provider in _http.known_llm_hosts()
@@ -281,6 +282,16 @@ def _close(obj: Any) -> None:
         pass
 
 
+def _streaming(resp: Any) -> bool:
+    """True iff the LIVE response (an ``addinfourl`` or an ``HTTPError``, both
+    of which expose ``.headers``) is an event stream — never buffer it
+    (issue #84)."""
+    try:
+        return _http.streaming_response(resp.headers.get("Content-Type"))
+    except Exception:
+        return False
+
+
 # --- seam --------------------------------------------------------------------
 
 
@@ -304,7 +315,12 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
     # Buffer the body ONLY when a cache ttl is configured AND there is a hash
     # to key it by (mirrors Node's fetch gate and the sibling HTTP packs), OR
     # a poll table is configured (poll judges the body regardless of
-    # args_hash — an llm:* GET derives none, issue #76).
+    # args_hash — an llm:* GET derives none, issue #76). Request-time INTENT
+    # only: BOTH body reads below (the success branch and the non-transient
+    # HTTPError branch) re-check the live response's Content-Type and skip the
+    # read for a `text/event-stream` body, which is never buffered whatever
+    # the policy says (issue #84) — reading it consumes the stream the caller
+    # is about to iterate, and an SSE session may never end.
     cacheable = (hash_ is not None and _http.cache_configured(target)) or _http.poll_configured(target)
     live: dict[str, Any] = {"ok": None, "exc": None}
 
@@ -331,7 +347,7 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
             live["exc"] = None
             body = None
             err_live: Any = err
-            if cacheable:
+            if cacheable and not _streaming(err):
                 try:
                     body = err.read()
                 except Exception:
@@ -352,7 +368,7 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
         if prior_exc is not None:
             _close(prior_exc)
         live["exc"] = None
-        if cacheable:
+        if cacheable and not _streaming(resp):
             body = resp.read()
             replacement = addinfourl(
                 io.BytesIO(body), resp.headers, resp.geturl(), getattr(resp, "status", 200)

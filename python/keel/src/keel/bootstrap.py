@@ -130,7 +130,7 @@ def install_keel(
     _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
 
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets], adapters, mcp)
+    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd)
 
     state = {
         "enabled": True,
@@ -214,12 +214,44 @@ def _register_exit_flush() -> None:
     atexit.register(_flush)
 
 
+def _policy_above_cwd(cwd: str | Path, max_levels: int = 8) -> Path | None:
+    """#85: a server launched with its cwd in a subdirectory (e.g. uvicorn
+    with `cwd=agents/`) makes `load_policy(cwd)` find no `keel.toml` and fall
+    back to Level 0 defaults — silently, since that fallback is normal and
+    intentional for a genuinely unconfigured project. This walk exists only
+    to tell the two cases apart for the banner: is there a `keel.toml` one of
+    the NEXT (at most `max_levels`) parent directories up from `cwd` never
+    looked at?
+
+    Fail-open by construction: any `OSError` while walking (permissions,
+    a vanished directory, …) returns None rather than raising — this is
+    purely cosmetic (the banner), never load-bearing for policy resolution,
+    which already ran and already decided "defaults" before this is called.
+    Mirrors the Node front end's walk (`node/keel/src/bootstrap.mjs`) and the
+    agents-cli/doctor bounded-parent-walk convention (8 levels, stop at the
+    filesystem root).
+    """
+    try:
+        current = Path(cwd)
+        for _ in range(max_levels):
+            parent = current.parent
+            if parent == current:  # reached the filesystem root
+                return None
+            if (parent / "keel.toml").exists():
+                return parent
+            current = parent
+    except OSError:
+        return None
+    return None
+
+
 def _banner(
     env: Mapping[str, str],
     source: str,
     target_keys: list[str],
     adapters: list[Detection],
     mcp: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
@@ -237,4 +269,17 @@ def _banner(
     if mcp and mcp.get("active"):
         pieces.append("mcp: transports")
     wrapped = " + ".join(pieces) if pieces else "nothing yet"
-    sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")
+    # #85: on the defaults path only (a real policy loaded means this cwd is
+    # already the right one — zero cost there), check whether a keel.toml
+    # exists somewhere above cwd that load_policy never looked at. If so, the
+    # usual "keel init to customize" nudge reads as if nothing is wrong, when
+    # actually the adopter's policy silently never loaded — name both paths
+    # and the fix instead.
+    found = _policy_above_cwd(cwd) if source == "defaults" and cwd is not None else None
+    if found is not None:
+        sys.stderr.write(
+            f"keel ▸ wrapped {wrapped} with {desc} — found keel.toml at {found} but "
+            f"running from {Path(cwd)}; set KEEL_CWD={found} to load it\n"
+        )
+    else:
+        sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")

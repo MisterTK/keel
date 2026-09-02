@@ -12,6 +12,8 @@
  */
 
 import { register } from "node:module";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   loadPolicy,
   extractFunctionTargets,
@@ -155,7 +157,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   }
 
   installExitFlush(discovery, { backend: effectiveBackend });
-  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection);
+  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd);
   return {
     enabled: true,
     backend: effectiveBackend,
@@ -239,7 +241,39 @@ export function installExitFlush(discovery, { proc = process, backend = null } =
   return flush;
 }
 
-function banner(env, source, fnCount, packs, eve, aiSdk) {
+/**
+ * #85: a process launched with cwd in a subdirectory (e.g. uvicorn-style
+ * `cwd=agents/`, or here a Node server started from a nested working dir)
+ * makes `loadPolicy(cwd)` find no `keel.toml` and fall back to Level 0
+ * defaults — silently, since that fallback is normal for a genuinely
+ * unconfigured project. This walk exists only to tell the two cases apart
+ * for the banner: is there a `keel.toml` in one of the NEXT (at most
+ * `maxLevels`) parent directories up from `cwd` that was never looked at?
+ *
+ * Fail-open by construction: any filesystem error while walking (a
+ * permission problem, a vanished directory, …) returns null rather than
+ * throwing — this is purely cosmetic (the banner), never load-bearing for
+ * policy resolution, which already ran and already decided "defaults"
+ * before this is called. Mirrors the Python front end's walk
+ * (`python/keel/src/keel/bootstrap.py`) and the doctor bounded-parent-walk
+ * convention (8 levels, stop at the filesystem root).
+ */
+function policyAboveCwd(cwd, maxLevels = 8) {
+  try {
+    let current = cwd;
+    for (let i = 0; i < maxLevels; i++) {
+      const parent = dirname(current);
+      if (parent === current) return null; // reached the filesystem root
+      if (existsSync(join(parent, "keel.toml"))) return parent;
+      current = parent;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
@@ -247,9 +281,23 @@ function banner(env, source, fnCount, packs, eve, aiSdk) {
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
   const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
-  process.stderr.write(
-    `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`
-  );
+  // #85: on the defaults path only (a real policy loaded means this cwd is
+  // already the right one — zero cost there), check whether a keel.toml
+  // exists somewhere above cwd that loadPolicy never looked at. If so, the
+  // usual "keel init to customize" nudge reads as if nothing is wrong, when
+  // actually the adopter's policy silently never loaded — name both paths
+  // and the fix instead.
+  const found = source === "defaults" && cwd ? policyAboveCwd(cwd) : null;
+  if (found) {
+    process.stderr.write(
+      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — found keel.toml at ${found} ` +
+        `but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
+    );
+  } else {
+    process.stderr.write(
+      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`
+    );
+  }
 }
 
 // Cross-language parity with the Python front end's `.strip().lower() in

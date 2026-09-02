@@ -372,6 +372,52 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
         self.assertTrue(o2["from_cache"])
         self.assertEqual(n["calls"], 0, "non-idempotent request still served from cache")
 
+    def test_llm_post_stream_generate_content_derives_no_hash(self) -> None:
+        # Gemini/Vertex SSE: the URL path itself names the streaming method.
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
+            b'{"contents": [{"parts": [{"text": "hi"}]}]}',
+        ))
+        # Without the query string too — the path suffix alone decides.
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST",
+            "https://example.com/v1/models/m:streamGenerateContent",
+            b'{"contents": []}',
+        ))
+
+    def test_llm_post_stream_true_body_derives_no_hash(self) -> None:
+        # OpenAI/Anthropic convention: top-level "stream": true in the JSON body.
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:openai", "POST", "https://api.openai.com/v1/chat/completions",
+            b'{"model": "gpt-4o", "stream": true, "messages": []}',
+        ))
+
+    def test_llm_post_non_stream_still_derives_hash(self) -> None:
+        # The dev-cache replay path for a NON-streaming prompt is unchanged.
+        self.assertIsNotNone(_http.derive_args_hash(
+            "llm:openai", "POST", "https://api.openai.com/v1/chat/completions",
+            b'{"model": "gpt-4o", "stream": false, "messages": []}',
+        ))
+        self.assertIsNotNone(_http.derive_args_hash(
+            "llm:google-genai", "POST",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+            b'{"contents": []}',
+        ))
+
+
+class StreamingResponseTest(unittest.TestCase):
+    """The response-side twin of the args_hash streaming exception above: a
+    ``text/event-stream`` Content-Type must never be buffered at the seam
+    (issue #84) — Task 2 consumes this predicate from every HTTP pack."""
+
+    def test_streaming_response_predicate(self) -> None:
+        self.assertTrue(_http.streaming_response("text/event-stream"))
+        self.assertTrue(_http.streaming_response("Text/Event-Stream; charset=utf-8"))
+        self.assertFalse(_http.streaming_response("application/json"))
+        self.assertFalse(_http.streaming_response(None))
+        self.assertFalse(_http.streaming_response(""))
+
 
 if __name__ == "__main__":
     unittest.main()

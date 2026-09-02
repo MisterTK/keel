@@ -467,6 +467,7 @@ pub fn run(project: &Path) -> Rendered {
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
     let agents_cli_finding = agents_cli_placement_finding(project);
+    let config_above_cwd_finding = config_above_cwd_finding(project);
     let boundaries = boundaries(project);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
     let report = build_report(
@@ -475,6 +476,7 @@ pub fn run(project: &Path) -> Rendered {
         policy,
         journal,
         agents_cli_finding,
+        config_above_cwd_finding,
         boundaries,
         &stale_flows,
     );
@@ -903,6 +905,61 @@ fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
     })
 }
 
+/// Bound on how many parents [`config_above_cwd_finding`] walks above
+/// `project` — mirrors `agents_cli::find_agents_cli_layout`'s bounded-walk
+/// shape (same bound, 8), so neither walk can loop forever on a pathological
+/// filesystem.
+const CONFIG_ABOVE_CWD_MAX_WALK_LEVELS: usize = 8;
+
+/// Issue #85: a `keel.toml` sitting in a directory *above* `project` is
+/// invisible to this report and to runtime activation — both resolve config
+/// from their own working directory only, never by searching upward. Emitted
+/// only when `project` itself has no `keel.toml` (checked here directly, not
+/// just by the caller's `!policy.present` gate, so this function is correct
+/// standalone too — a parent's `keel.toml` is irrelevant once the project has
+/// its own). Fails open: any filesystem error (an unreadable/unwalkable
+/// ancestor, a `project` with no parent) yields `None` rather than a wrong
+/// finding.
+///
+/// Canonicalize BEFORE walking, not after: `main.rs` hands every subcommand
+/// `project = Path::new(".")`, and `Path::new(".").parent()` is `Some("")`
+/// while `Path::new("").parent()` is `None` — so a relative-path walk dies one
+/// step in, without ever leaving the project directory, and this finding could
+/// never fire in production. Resolving to an absolute path first makes the walk
+/// real, and hands the message the absolute paths it wants for free.
+fn config_above_cwd_finding(project: &Path) -> Option<Finding> {
+    if project.join("keel.toml").is_file() {
+        return None;
+    }
+    let here = std::fs::canonicalize(project).ok()?;
+    let mut dir = here.parent()?;
+    for _ in 0..CONFIG_ABOVE_CWD_MAX_WALK_LEVELS {
+        if dir.join("keel.toml").is_file() {
+            let parent = dir;
+            return Some(Finding {
+                action: format!(
+                    "Run keel doctor from {} to report against that policy; for runtime \
+                     activation, set KEEL_CWD={}. keel doctor reads its own working directory \
+                     only.",
+                    parent.display(),
+                    parent.display()
+                ),
+                detail: format!(
+                    "keel.toml found at {} but this report ran from {} — the policy file is \
+                     NOT loaded from there.",
+                    parent.display(),
+                    here.display()
+                ),
+                fix: None,
+                level: "warn",
+                topic: "config-above-cwd",
+            });
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
 /// `target` relative to `base` when it is actually nested under `base`, else
 /// the absolute path unchanged (a manifest found above `project`, or on a
 /// different mount — pathological, but must not panic or produce nonsense
@@ -955,22 +1012,27 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the seven evidence inputs. Pure, so the golden test
+/// Assemble the report from the eight evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3` — the filesystem-dependent
 /// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
-/// check for a root `keel.toml`; `boundaries`, since it stats the project root
-/// for governance files; `stale_flows`, since it needs to read
-/// `.keel/journal.db` and stat scripts on disk) are computed by the caller
-/// and passed in already resolved, the same pattern `policy`/`journal`
-/// already use.
-#[allow(clippy::too_many_lines)] // straight-line report assembly, one section per
+/// check for a root `keel.toml`; `config_above_cwd_finding`, since it walks
+/// parent directories for a `keel.toml` — issue #85; `boundaries`, since it
+/// stats the project root for governance files; `stale_flows`, since it
+/// needs to read `.keel/journal.db` and stat scripts on disk) are computed
+/// by the caller and passed in already resolved, the same pattern
+/// `policy`/`journal` already use.
+#[allow(clippy::too_many_lines)]
+// straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
+#[allow(clippy::too_many_arguments)] // eight already-resolved evidence inputs (see doc
+// comment above); issue #85 added the eighth, config_above_cwd_finding.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
     policy: PolicyValidation,
     journal: JournalReport,
     agents_cli_finding: Option<Finding>,
+    config_above_cwd_finding: Option<Finding>,
     boundaries: Boundaries,
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
@@ -1115,6 +1177,13 @@ fn build_report(
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
+    // Issue #85: only meaningful when this project has no keel.toml of its
+    // own — `config_above_cwd_finding` already checks this independently,
+    // but gating here too keeps the rule visible at the one call site that
+    // decides what goes into the report.
+    if !policy.present {
+        findings.extend(config_above_cwd_finding);
+    }
 
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
@@ -1590,6 +1659,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -1679,6 +1749,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -1756,6 +1827,7 @@ mod tests {
             &BTreeSet::new(),
             policy,
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -1838,6 +1910,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -1913,6 +1986,7 @@ mod tests {
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2014,6 +2088,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2062,6 +2137,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2088,6 +2164,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2108,6 +2185,7 @@ mod tests {
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2195,6 +2273,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2271,6 +2350,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2339,6 +2419,7 @@ mod tests {
             &wrapped,
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2440,6 +2521,7 @@ mod tests {
             policy,
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2505,6 +2587,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2554,6 +2637,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2588,6 +2672,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2617,6 +2702,7 @@ mod tests {
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -2635,6 +2721,7 @@ mod tests {
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2666,6 +2753,7 @@ mod tests {
             &wrapped,
             policy,
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2707,6 +2795,7 @@ mod tests {
             &wrapped,
             policy,
             journal,
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -2818,6 +2907,84 @@ mod tests {
                 .iter()
                 .any(|f| f["topic"] == "agents-cli-config-placement" && f["level"] == "warn")
         );
+    }
+
+    // ---- config above cwd (issue #85) ----
+
+    /// A parent directory carries a `keel.toml` this project subdirectory
+    /// does not — the finding must name both paths and point at `KEEL_CWD`.
+    #[test]
+    fn config_above_cwd_finding_fires_when_a_parent_has_keel_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+        let project = dir.path().join("sub").join("nested");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let finding =
+            config_above_cwd_finding(&project).expect("parent keel.toml should be flagged");
+        assert_eq!(finding.level, "warn");
+        assert_eq!(finding.topic, "config-above-cwd");
+        let canonical_parent = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        assert!(
+            finding
+                .detail
+                .contains(&canonical_parent.display().to_string()),
+            "detail names the parent: {}",
+            finding.detail
+        );
+        assert!(
+            finding
+                .detail
+                .contains(&canonical_project.display().to_string()),
+            "detail names the project: {}",
+            finding.detail
+        );
+        assert_eq!(
+            finding.action,
+            format!(
+                "Run keel doctor from {p} to report against that policy; for runtime \
+                 activation, set KEEL_CWD={p}. keel doctor reads its own working directory \
+                 only.",
+                p = canonical_parent.display()
+            ),
+            "the action must not claim KEEL_CWD changes what doctor itself reads"
+        );
+    }
+
+    /// `main.rs` hands every subcommand `Path::new(".")`. These two std facts
+    /// are exactly why the walk must canonicalize FIRST — pinned here so a
+    /// future "simplification" back to `project.parent()` fails loudly instead
+    /// of silently switching the finding off in production (the
+    /// `keel doctor --json` child-process pin lives in `tests/cli.rs`).
+    #[test]
+    fn a_relative_dot_project_path_has_no_walkable_parent_chain() {
+        assert_eq!(Path::new(".").parent(), Some(Path::new("")));
+        assert_eq!(Path::new("").parent(), None);
+    }
+
+    /// The project has its own `keel.toml` — even though a parent also has
+    /// one, there is nothing to flag: this project's own config is what
+    /// actually loads.
+    #[test]
+    fn config_above_cwd_finding_is_none_when_project_has_its_own_keel_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keel.toml"), "[target.\"x\"]\n").unwrap();
+        let project = dir.path().join("sub");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("keel.toml"), "[target.\"y\"]\n").unwrap();
+
+        assert!(config_above_cwd_finding(&project).is_none());
+    }
+
+    /// No `keel.toml` anywhere within the walk bound: nothing to flag.
+    #[test]
+    fn config_above_cwd_finding_is_none_when_no_keel_toml_is_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("sub");
+        std::fs::create_dir(&project).unwrap();
+
+        assert!(config_above_cwd_finding(&project).is_none());
     }
 
     /// End-to-end over a real project dir: doctor resolves and reports the
@@ -3146,6 +3313,7 @@ def caller():
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -3191,6 +3359,7 @@ def caller():
             default_policy(),
             default_journal(),
             None,
+            None,
             boundaries(dir.path()),
             &[],
         );
@@ -3228,6 +3397,7 @@ def caller():
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -3267,6 +3437,7 @@ def caller():
             default_policy(),
             default_journal(),
             None,
+            None,
             empty_boundaries(),
             &[],
         );
@@ -3287,6 +3458,7 @@ def caller():
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
@@ -3312,6 +3484,7 @@ def caller():
             &BTreeSet::new(),
             default_policy(),
             default_journal(),
+            None,
             None,
             empty_boundaries(),
             &[],
