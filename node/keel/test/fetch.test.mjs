@@ -720,6 +720,76 @@ test("LLM fallback: does NOT chase a budget-exceeded block (dx-spec: not on budg
   assert.equal(hits, 0, "the budget block happens before any hop is dispatched");
 });
 
+// --- text/event-stream responses are never buffered at the seam (#84) ------
+//
+// The HTTP packs (and this fetch wrapper) decide whether to buffer a response
+// body from REQUEST-time signals alone (a cache ttl + an args hash, or a poll
+// table). A `text/event-stream` response must never be buffered regardless of
+// those signals — reading it would consume the very stream the caller is
+// about to iterate, and on Node `resp.clone().arrayBuffer()` AWAITS the
+// stream's end rather than merely draining it, so a live SSE session that
+// never closes would hang the wrapped effect forever.
+
+/** A minimal chunked text/event-stream response. */
+function sseHandler(events) {
+  return (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const e of events) res.write(e);
+    res.end();
+  };
+}
+
+test("SSE response with a cache ttl configured is not consumed/locked by the wrapper (issue #84)", async () => {
+  const events = ["data: one\n\n", "data: two\n\n", "data: three\n\n"];
+  const server = await startServer(sseHandler(events));
+  await withKeel2(server, { target: { "127.0.0.1": { cache: { ttl: "10s" } } } }, async () => {
+    const resp = await fetch(server.url());
+    assert.equal(resp.headers.get("content-type"), "text/event-stream");
+    assert.equal(resp.bodyUsed, false, "the wrapper must not have consumed the caller's stream");
+    assert.equal(resp.keelOutcome.payload.body_b64, undefined, "the envelope carries no buffered body");
+    assert.equal(await resp.text(), events.join(""), "the caller can still read the live body in full");
+    assert.equal(server.hits(), 1);
+  });
+});
+
+test("poll-configured target + SSE: exactly one attempt, live pass-through (fail-open on a bodyless envelope)", async () => {
+  const events = ["data: one\n\n", "data: two\n\n"];
+  const server = await startServer(sseHandler(events));
+  const policy = {
+    target: {
+      "127.0.0.1": {
+        poll: { interval: "10ms", deadline: "1s", until: { field: "status", terminal: ["done"] } },
+      },
+    },
+  };
+  await withKeel2(server, policy, async () => {
+    const resp = await fetch(server.url());
+    assert.equal(resp.bodyUsed, false, "an SSE response is never buffered even when poll is configured");
+    assert.equal(resp.keelOutcome.attempts, 1, "no poll loop around a live stream");
+    assert.equal(resp.keelOutcome.payload.body_b64, undefined);
+    assert.equal(await resp.text(), events.join(""));
+    assert.equal(server.hits(), 1);
+  });
+});
+
+test("non-streaming response on a cache-configured target is still buffered and replays (regression, #84)", async () => {
+  const server = await startServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ a: 1 }));
+  });
+  await withKeel2(server, { target: { "127.0.0.1": { cache: { ttl: "10s" } } } }, async () => {
+    const first = await fetch(server.url());
+    assert.ok(first.keelOutcome.payload.body_b64, "a non-streaming response IS buffered into the envelope");
+    assert.deepEqual(await first.json(), { a: 1 });
+
+    const second = await fetch(server.url());
+    assert.equal(second.keelOutcome.from_cache, true, "identical GET replays from the dev cache");
+    assert.equal(second.keelOutcome.attempts, 0, "a cache hit runs zero attempts");
+    assert.deepEqual(await second.json(), { a: 1 });
+    assert.equal(server.hits(), 1, "the replay never hit the network");
+  });
+});
+
 test("LLM fallback: an unrecognized request shape stops the chain and delivers the original failure", async () => {
   resetLlmBudgets();
   let hits = 0;

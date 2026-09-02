@@ -179,7 +179,10 @@ function canonicalBody(body) {
  *     (method, url, canonicalized JSON body). This enables dev-loop REPLAY of an
  *     identical prompt; it does NOT make the POST retryable — idempotency is a
  *     separate judgment, still false for a bare POST (a cache LOOKUP needs no
- *     idempotency; a RETRY does). A streaming/unbuffered body yields null.
+ *     idempotency; a RETRY does). A streaming/unbuffered body yields null, and
+ *     so does a STREAMING generate call (SSE — issue #84): its response is
+ *     never buffered (see `streamingResponse`), so a cache hit would rebuild
+ *     an empty body.
  *   - everything else  → null.
  */
 export function deriveArgsHash(target, method, url, body) {
@@ -189,9 +192,45 @@ export function deriveArgsHash(target, method, url, body) {
   if (method === "GET") return target.startsWith("llm:") ? null : argsHash(method, url, body);
   if (method === "POST" && target.startsWith("llm:")) {
     const canon = canonicalBody(body);
-    return canon === null ? null : argsHash(method, url, canon);
+    if (canon === null) return null;
+    // A STREAMING generate call is not cache-replayable (issue #84): a cached
+    // envelope would carry no body (the stream is never buffered, see
+    // `streamingResponse`) and a hit would rebuild an empty response. Two
+    // shapes cover the real providers: Gemini/Vertex name the method in the
+    // URL path (`:streamGenerateContent`, with or without `?alt=sse` — the
+    // query string is excluded, only the PATH is checked); OpenAI/Anthropic
+    // flag it in the body (top-level `"stream": true`, exactly the boolean —
+    // a string `"true"` or a nested `stream` key does not count). Mirrors the
+    // Python twin's `_http.derive_args_hash` exactly.
+    if (new URL(url).pathname.endsWith(":streamGenerateContent")) return null;
+    let parsed;
+    try {
+      parsed = JSON.parse(canon);
+    } catch {
+      parsed = null;
+    }
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && parsed.stream === true) {
+      return null;
+    }
+    return argsHash(method, url, canon);
   }
   return null;
+}
+
+/**
+ * True iff a response's Content-Type marks a live event stream
+ * (`text/event-stream`, any casing, parameters tolerated) — such a body must
+ * NEVER be buffered at the seam (issue #84). This matters even more on Node
+ * than it looks: `resp.clone().arrayBuffer()` doesn't consume the CALLER's
+ * stream, but it AWAITS the clone's stream end before resolving — an SSE
+ * session that stays open (as most do) would hang the wrapped effect
+ * forever, never delivering the live response the caller is iterating.
+ * Twin of the Python adapters' `_http.streaming_response`; the predicate must
+ * stay byte-identical.
+ */
+export function streamingResponse(contentType) {
+  if (!contentType) return false;
+  return contentType.split(";", 1)[0].trim().toLowerCase() === "text/event-stream";
 }
 
 /** Parse a Retry-After header value to milliseconds, or undefined. */
