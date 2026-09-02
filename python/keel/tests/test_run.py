@@ -254,7 +254,15 @@ class BannerTest(unittest.TestCase):
     """The happy-path banner is a single line in the dx-spec format, and never
     reports the awkward 'wrapped 0 call sites' at Level 0 (adapters only)."""
 
-    def _banner(self, source: str, target_keys: list[str], adapters: list) -> str:
+    def _banner(
+        self,
+        source: str,
+        target_keys: list[str],
+        adapters: list,
+        *,
+        env: dict | None = None,
+        cwd: str | Path | None = None,
+    ) -> str:
         import contextlib
         import io
 
@@ -262,7 +270,7 @@ class BannerTest(unittest.TestCase):
 
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
-            _banner({}, source, target_keys, adapters)
+            _banner(env if env is not None else {}, source, target_keys, adapters, None, cwd)
         return buf.getvalue()
 
     def test_level0_banner_lists_adapters_not_zero_call_sites(self) -> None:
@@ -276,6 +284,56 @@ class BannerTest(unittest.TestCase):
     def test_banner_with_function_targets_counts_call_sites(self) -> None:
         out = self._banner("keel.toml", ["py:m.enrich"], [])
         self.assertIn("keel ▸ wrapped 1 call site (py:m.enrich) with policy keel.toml", out)
+
+    def test_defaults_banner_without_parent_keel_toml_is_byte_unchanged(self) -> None:
+        # #85: pin today's exact line when no parent keel.toml exists, even
+        # though a cwd is now threaded through — nothing should change here.
+        with TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            out = self._banner("defaults", [], [], cwd=sub)
+        self.assertEqual(
+            out, "keel ▸ wrapped nothing yet with production defaults — `keel init` to customize\n"
+        )
+
+    def test_defaults_banner_names_parent_keel_toml_and_keel_cwd_fix(self) -> None:
+        # #85: a server launched with cwd in a subdirectory of the real
+        # project root must not read "production defaults" as normal — the
+        # banner must name both paths and the KEEL_CWD fix.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keel.toml").write_text("")
+            sub = root / "agents" / "worker"
+            sub.mkdir(parents=True)
+            out = self._banner("defaults", [], [], cwd=sub)
+        self.assertEqual(out.count("\n"), 1, "banner must stay a single line")
+        self.assertIn(f"found keel.toml at {root}", out)
+        self.assertIn(f"running from {sub}", out)
+        self.assertIn(f"set KEEL_CWD={root} to load it", out)
+        self.assertNotIn("`keel init` to customize", out)
+
+    def test_defaults_banner_parent_keel_toml_beyond_eight_levels_is_not_found(self) -> None:
+        # The walk is bounded (8 parent levels) — a keel.toml further up than
+        # that must not surface (matches the Node/doctor walk convention).
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keel.toml").write_text("")
+            deep = root
+            for i in range(9):
+                deep = deep / f"lvl{i}"
+            deep.mkdir(parents=True)
+            out = self._banner("defaults", [], [], cwd=deep)
+        self.assertIn("`keel init` to customize", out)
+        self.assertNotIn("found keel.toml", out)
+
+    def test_defaults_banner_parent_keel_toml_quiet_stays_silent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keel.toml").write_text("")
+            sub = root / "sub"
+            sub.mkdir()
+            out = self._banner("defaults", [], [], env={"KEEL_QUIET": "1"}, cwd=sub)
+        self.assertEqual(out, "")
 
 
 if __name__ == "__main__":
