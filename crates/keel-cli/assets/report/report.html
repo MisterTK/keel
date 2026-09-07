@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'">
+<title>keel report</title>
+<style>
+{{CSS}}
+</style>
+</head>
+<body>
+<header class="hdr">
+  <h1>keel <span class="tri">&#9656;</span> report</h1>
+  <p id="banner" class="banner"></p>
+</header>
+<main>
+  <section id="headline" class="strip" aria-label="headline"></section>
+  <section>
+    <h2>By target</h2>
+    <table id="targets">
+      <thead><tr><th>target</th><th>calls</th><th>unprotected</th><th>retries</th><th>not retried</th><th>throttled</th><th>breaker opens</th><th>cache hit rate</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Last 7 days</h2>
+    <svg id="trend" viewBox="0 0 700 120" role="img" aria-label="calls per day"></svg>
+  </section>
+  <section id="flows-section">
+    <h2>Flows</h2>
+    <dl id="flows" class="strip"></dl>
+  </section>
+  <section>
+    <h2>Recent activity</h2>
+    <pre id="events"></pre>
+  </section>
+</main>
+<script id="keel-data" type="application/json">{{DATA}}</script>
+<script>
+{{JS}}
+</script>
+</body>
+</html>

@@ -168,3 +168,55 @@ fn parse_interval_accepts_seconds_and_millis() {
     assert!(report::parse_interval("0s").is_err());
     assert!(report::parse_interval("soon").is_err());
 }
+
+#[test]
+fn static_html_matches_golden() {
+    let (_d, project) = full_project();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    check_golden("report.html", &keel_cli::report_html::render(&data));
+}
+
+#[test]
+fn static_html_is_self_contained() {
+    let (_d, project) = full_project();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let html = keel_cli::report_html::render(&data);
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("id=\"keel-data\""));
+    assert!(!html.contains("http://"), "no external references");
+    assert!(!html.contains("https://"), "no external references");
+    assert!(!html.contains("src=\"") || html.contains("src=\"data:"), "no external script/img sources");
+    // A `</script>` inside the blob would end the data element early.
+    let blob_start = html.find("id=\"keel-data\"").unwrap();
+    let blob_end = html[blob_start..].find("</script>").unwrap() + blob_start;
+    assert!(!html[blob_start..blob_end].contains("</"), "blob escapes </");
+}
+
+#[test]
+fn run_static_writes_the_page_atomically() {
+    let (_d, project) = full_project();
+    let r = report::run_static(&project, &opts(), T0, false);
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "{}", r.human);
+    let out = project.join(".keel").join("report.html");
+    let html = std::fs::read_to_string(&out).unwrap();
+    assert!(html.contains("id=\"keel-data\""));
+    assert!(r.human.contains("wrote"));
+    // No temp file left beside the target.
+    let leftovers: Vec<_> = std::fs::read_dir(project.join(".keel"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+#[test]
+fn out_flag_and_missing_parent_dir() {
+    let (_d, project) = full_project();
+    let custom = project.join("reports").join("nested").join("r.html");
+    let o = ReportOptions { out: Some(custom.clone()), ..opts() };
+    let r = report::run_static(&project, &o, T0, false);
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "{}", r.human);
+    assert!(custom.exists());
+    assert_eq!(r.json["written"], custom.display().to_string());
+}
