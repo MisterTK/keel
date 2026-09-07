@@ -1,6 +1,6 @@
 {
   "name": "keelrun-core-native",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -29,9 +29,9 @@
     ]
   },
   "optionalDependencies": {
-    "keelrun-core-native-darwin-x64": "0.5.3",
-    "keelrun-core-native-darwin-arm64": "0.5.3",
-    "keelrun-core-native-linux-x64-gnu": "0.5.3",
-    "keelrun-core-native-linux-arm64-gnu": "0.5.3"
+    "keelrun-core-native-darwin-x64": "0.5.4",
+    "keelrun-core-native-darwin-arm64": "0.5.4",
+    "keelrun-core-native-linux-x64-gnu": "0.5.4",
+    "keelrun-core-native-linux-arm64-gnu": "0.5.4"
   }
 }
