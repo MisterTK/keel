@@ -63,10 +63,14 @@ daemon. No port. No new abstractions in your code.
   are journaled: `kill -9` it mid-run, and rerunning it replays completed
   steps from the journal instead of re-executing their side effects —
   proven by real subprocess crash-and-resume tests, not a mocked clock.
-- **Observable when you need it, invisible when you don't.** OpenTelemetry
-  spans and metrics for every call and attempt are one build feature and one
-  env var away — off by default, so the shipped library carries no
-  OpenTelemetry dependency until you ask for it.
+- **Observable when you need it, invisible when you don't.** Every run ends
+  with one line saying what Keel did — `keel ▸ 47 calls · absorbed 3 rate
+  limits · 2 retries succeeded · 4 calls unprotected` — and `keel report
+  --open` turns the same evidence into a self-contained HTML page (add
+  `--serve` for a live view). OpenTelemetry spans and metrics for every call
+  and attempt are one build feature and one env var away — off by default, so
+  the shipped library carries no OpenTelemetry dependency until you ask for
+  it. Set `console = false` under `[telemetry]` to silence the summary.
 - **Built for LLM and agent workloads.** First-class `llm:`/`tool:`/`mcp:`
   targets, per-run spend caps, model fallback chains, and a dev-mode cache
   that replays identical prompts for free — because agent code is the
@@ -119,6 +123,7 @@ cargo install keelrun-cli            # CLI binary
 
 ```bash
 uvx --from keelrun-cli keel run your_app.py
+uvx --from keelrun-cli keel report --open      # what did Keel do for this project?
 ```
 
 **Building from source** (contributors — needs Rust; `rustup` picks up the
