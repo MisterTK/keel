@@ -284,7 +284,7 @@ pub(crate) fn no_evidence() -> Rendered {
 }
 
 /// A usage error (exit 2, stderr).
-pub(crate) fn usage(message: &str) -> Rendered {
+pub fn usage(message: &str) -> Rendered {
     #[derive(Serialize)]
     struct Err<'a> {
         error: &'a str,

@@ -374,15 +374,11 @@ fn dispatch_report(
 ) -> i32 {
     let interval = match report::parse_interval(interval) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("keel \u{25b8} {e}");
-            return keel_cli::EXIT_USAGE;
-        }
+        Err(e) => return emit(&report::usage(&e), json),
     };
     let opts = report::ReportOptions { out, open, watch, interval, serve: false, port: 0 };
     if json && watch {
-        eprintln!("keel \u{25b8} --json cannot be combined with --watch");
-        keel_cli::EXIT_USAGE
+        emit(&report::usage("--json cannot be combined with --watch or --serve"), json)
     } else if watch {
         let stop = report::interrupt_flag();
         let mut stderr = std::io::stderr().lock();
