@@ -44,6 +44,7 @@ pub mod render;
 pub mod replay;
 pub mod report;
 pub mod report_html;
+pub mod report_serve;
 pub mod resume;
 pub mod run;
 pub mod scan;

@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use keel_cli::render::emit;
 use keel_cli::{
     doctor, effective, exec, explain, flows, flows_add, flows_suggest, force, fsck, init, mcp,
-    record, replay, report, resume, run, sim, status, tail,
+    record, replay, report, report_serve, resume, run, sim, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -132,11 +132,18 @@ enum Command {
         open: bool,
         /// Foreground: rewrite the file every --interval; the page reloads
         /// itself. No networking. Ctrl-C to stop.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "serve")]
         watch: bool,
         /// Rewrite interval for --watch, e.g. `2s` or `500ms`.
         #[arg(long, default_value = "2s", value_name = "DURATION")]
         interval: String,
+        /// Foreground: serve the live report on 127.0.0.1 (the page polls
+        /// every second). Ctrl-C to stop.
+        #[arg(long)]
+        serve: bool,
+        /// Port for --serve (0 = ephemeral; the chosen port is printed).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// Capture effects during a run, then turn the capture into a replayable
     /// offline test fixture (`docs/recording-format.md`).
@@ -334,7 +341,7 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
-        Command::Report { out, open, watch, interval } => dispatch_report(&project, out, open, watch, &interval, json),
+        Command::Report { out, open, watch, interval, serve, port } => dispatch_report(&project, out, open, watch, &interval, serve, port, json),
         Command::Record { action } => dispatch_record(&project, action, json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
@@ -362,27 +369,36 @@ fn main() {
     exit(code);
 }
 
-/// `keel report [--out PATH] [--open] [--watch] [--interval DURATION]`
-/// (extracted from `main` — clippy's `too_many_lines`).
+/// `keel report [--out PATH] [--open] [--watch] [--interval DURATION]
+/// [--serve] [--port PORT]` (extracted from `main` — clippy's `too_many_lines`).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)] // four independent CLI flags, not a state machine
 fn dispatch_report(
     project: &std::path::Path,
     out: Option<PathBuf>,
     open: bool,
     watch: bool,
     interval: &str,
+    serve: bool,
+    port: u16,
     json: bool,
 ) -> i32 {
     let interval = match report::parse_interval(interval) {
         Ok(d) => d,
         Err(e) => return emit(&report::usage(&e), json),
     };
-    let opts = report::ReportOptions { out, open, watch, interval, serve: false, port: 0 };
-    if json && watch {
+    let opts = report::ReportOptions { out, open, watch, interval, serve, port };
+    if json && (watch || serve) {
         emit(&report::usage("--json cannot be combined with --watch or --serve"), json)
-    } else if watch {
+    } else if watch || serve {
         let stop = report::interrupt_flag();
         let mut stderr = std::io::stderr().lock();
-        match report::run_watch(project, &opts, || SystemClock.now_ms(), &stop, &mut stderr) {
+        let result = if serve {
+            report_serve::run_serve(project, &opts, || SystemClock.now_ms(), &stop, &mut stderr)
+        } else {
+            report::run_watch(project, &opts, || SystemClock.now_ms(), &stop, &mut stderr)
+        };
+        match result {
             Ok(()) => keel_cli::EXIT_OK,
             Err(r) => emit(&r, json),
         }

@@ -314,3 +314,74 @@ mod watch_tests {
         assert_eq!(err.human, keel_cli::status::NO_EVIDENCE);
     }
 }
+
+mod serve_tests {
+    use super::{T0, full_project};
+    use keel_cli::report_serve::{self, handle_request};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn routes() {
+        let (_d, project) = full_project();
+        let page = handle_request(&project, T0, "GET / HTTP/1.1");
+        assert_eq!(page.status, 200);
+        assert!(page.content_type.starts_with("text/html"));
+        assert!(page.body.contains("id=\"keel-data\""));
+        assert!(page.body.contains("\"mode\":\"serve\""));
+
+        let state = handle_request(&project, T0, "GET /api/state HTTP/1.1");
+        assert_eq!(state.status, 200);
+        assert_eq!(state.content_type, "application/json");
+        let blob: serde_json::Value = serde_json::from_str(&state.body).unwrap();
+        assert_eq!(blob["mode"], "serve");
+        assert!(!blob["events"].as_array().unwrap().is_empty());
+        let cursor = blob["events_seq"].as_u64().unwrap();
+
+        let newer = handle_request(&project, T0, &format!("GET /api/state?since={cursor} HTTP/1.1"));
+        let blob2: serde_json::Value = serde_json::from_str(&newer.body).unwrap();
+        assert!(blob2["events"].as_array().unwrap().is_empty());
+        assert_eq!(blob2["events_seq"].as_u64().unwrap(), cursor);
+
+        assert_eq!(handle_request(&project, T0, "GET /nope HTTP/1.1").status, 404);
+        assert_eq!(handle_request(&project, T0, "POST / HTTP/1.1").status, 405);
+        assert_eq!(handle_request(&project, T0, "").status, 400);
+    }
+
+    #[test]
+    fn no_evidence_is_503_on_the_api_and_a_nudge_at_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(handle_request(dir.path(), T0, "GET /api/state HTTP/1.1").status, 503);
+        let stop = AtomicBool::new(true);
+        let mut out = Vec::new();
+        let opts = keel_cli::report::ReportOptions { serve: true, ..super::opts() };
+        let err = report_serve::run_serve(dir.path(), &opts, || T0, &stop, &mut out).unwrap_err();
+        assert_eq!(err.exit, keel_cli::EXIT_OK);
+    }
+
+    #[test]
+    fn real_socket_round_trip_and_clean_stop() {
+        let (_d, project) = full_project();
+        let listener = report_serve::bind(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let server = std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
+
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(resp.contains("Content-Type: application/json\r\n"));
+        assert!(resp.contains("Connection: close\r\n"));
+        let body = resp.split("\r\n\r\n").nth(1).unwrap();
+        let blob: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(blob["v"], 1);
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+    }
+}
