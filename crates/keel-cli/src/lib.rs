@@ -16,7 +16,9 @@
 //! one-command durability designation), [`resume`] (`keel flows resume` —
 //! actually re-invoke a resumable flow's recorded entrypoint through
 //! `keel run`), and [`force`] (`keel flows force` — arm the durable one-shot
-//! KEEL-E033 override, the out-of-process equivalent of `keel exec --force`).
+//! KEEL-E033 override, the out-of-process equivalent of `keel exec --force`),
+//! and [`report`] (the evidence as one self-contained HTML page: static,
+//! `--watch`, `--serve`).
 //!
 //! Every command obeys the DX invariants: a `--json` twin with byte-deterministic
 //! output (sorted keys, no wall-clock timestamps), and stable exit codes —
@@ -40,6 +42,8 @@ pub mod mcp;
 pub mod record;
 pub mod render;
 pub mod replay;
+pub mod report;
+pub mod report_html;
 pub mod resume;
 pub mod run;
 pub mod scan;

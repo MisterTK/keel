@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use keel_cli::render::emit;
 use keel_cli::{
     doctor, effective, exec, explain, flows, flows_add, flows_suggest, force, fsck, init, mcp,
-    record, replay, resume, run, sim, status, tail,
+    record, replay, report, resume, run, sim, status, tail,
 };
 use keel_journal::{Clock, SystemClock};
 
@@ -120,6 +120,17 @@ enum Command {
     /// get_status, get_doctor_report, propose_policy, get_trace, list_flows,
     /// explain_error — each byte-identical to the matching `--json` command.
     Mcp,
+    /// Render the evidence (`keel status` + the newest run's events + flows)
+    /// into one self-contained HTML report at `.keel/report.html`. `--json`
+    /// prints the report's data blob instead (byte-deterministic).
+    Report {
+        /// Where to write the HTML (default `.keel/report.html`).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Open the report in the default browser once it exists.
+        #[arg(long)]
+        open: bool,
+    },
     /// Capture effects during a run, then turn the capture into a replayable
     /// offline test fixture (`docs/recording-format.md`).
     Record {
@@ -316,6 +327,7 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
+        Command::Report { out, open } => dispatch_report(&project, out, open, json),
         Command::Record { action } => dispatch_record(&project, action, json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
@@ -341,6 +353,20 @@ fn main() {
         Command::Explain { code } => emit(&explain::run(&code), json),
     };
     exit(code);
+}
+
+/// `keel report [--out PATH] [--open]` (extracted from `main` — clippy's
+/// `too_many_lines`).
+fn dispatch_report(project: &std::path::Path, out: Option<PathBuf>, open: bool, json: bool) -> i32 {
+    let opts = report::ReportOptions {
+        out,
+        open,
+        watch: false,
+        interval: report::DEFAULT_INTERVAL,
+        serve: false,
+        port: 0,
+    };
+    emit(&report::run_static(project, &opts, SystemClock.now_ms(), json), json)
 }
 
 /// `keel flows [--dead] [<action>]` (extracted from `main` — clippy's

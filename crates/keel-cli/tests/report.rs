@@ -1,0 +1,170 @@
+//! `keel report` — blob assembly, static export, and the serving modes
+//! (design spec 2026-09-04, Part B/C). Goldens are regenerated with
+//! `KEEL_UPDATE_GOLDEN=1 cargo test -p keelrun-cli --test report`.
+
+use std::path::{Path, PathBuf};
+
+use keel_cli::render::{json_string, to_json};
+use keel_cli::report::{self, Mode, ReportOptions};
+use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
+
+/// The fixed clock every golden is rendered against (same instant as cli.rs).
+const T0: i64 = 1_783_728_000_000;
+
+const JOURNAL_SCHEMA: &str = include_str!("../../../contracts/journal.sql");
+const COMPLETED_FLOW: &str = include_str!("../../../conformance/fixtures/journal/completed-flow.sql");
+const INTERRUPTED_FLOW: &str = include_str!("../../../conformance/fixtures/journal/interrupted-flow.sql");
+const DEAD_FLOW: &str = include_str!("../../../conformance/fixtures/journal/dead-flow.sql");
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+fn golden_dir() -> PathBuf {
+    manifest_dir().join("tests").join("golden")
+}
+fn check_golden(name: &str, actual: &str) {
+    let path = golden_dir().join(name);
+    if std::env::var_os("KEEL_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(actual, expected, "golden mismatch for {name}; re-run with KEEL_UPDATE_GOLDEN=1 to update");
+}
+
+fn build_journal(project: &Path) {
+    let keel = project.join(".keel");
+    std::fs::create_dir_all(&keel).unwrap();
+    let conn = rusqlite::Connection::open(keel.join("journal.db")).unwrap();
+    conn.execute_batch(JOURNAL_SCHEMA).unwrap();
+    conn.execute_batch(COMPLETED_FLOW).unwrap();
+    conn.execute_batch(INTERRUPTED_FLOW).unwrap();
+    conn.execute_batch(DEAD_FLOW).unwrap();
+}
+
+fn build_discovery(project: &Path) {
+    let keel = project.join(".keel");
+    std::fs::create_dir_all(&keel).unwrap();
+    let store = DiscoveryStore::open(keel.join("discovery.db"), ManualClock::new(T0)).unwrap();
+    store
+        .merge_report(&[
+            TargetStats {
+                target: "api.example.com".to_owned(),
+                calls: 100, attempts: 102, retries: 12, successes: 88, failures: 2, cache_hits: 10,
+                throttled: 3, breaker_opens: 1, total_latency_ms: 12_000, max_latency_ms: 300,
+                first_seen_ms: T0, last_seen_ms: T0 + 120_000,
+                last_error_class: Some(keel_journal::ErrorClass::Http), last_error_status: Some(503),
+                not_retried: 1, unwrapped_calls: 0,
+            },
+            TargetStats {
+                target: "llm:openai".to_owned(),
+                calls: 40, attempts: 20, retries: 0, successes: 20, failures: 0, cache_hits: 20,
+                throttled: 0, breaker_opens: 0, total_latency_ms: 8_000, max_latency_ms: 400,
+                first_seen_ms: T0, last_seen_ms: T0 + 60_000,
+                last_error_class: None, last_error_status: None,
+                not_retried: 0, unwrapped_calls: 5,
+            },
+        ])
+        .unwrap();
+}
+
+fn copy_events(project: &Path, runs: &[&str]) {
+    let src = manifest_dir().join("tests").join("fixtures").join("events");
+    let events = project.join(".keel").join("events");
+    std::fs::create_dir_all(&events).unwrap();
+    for run in runs {
+        let name = format!("{run}.ndjson");
+        std::fs::copy(src.join(&name), events.join(&name)).unwrap();
+    }
+}
+
+/// discovery + journal + one event run: the full evidence set.
+fn full_project() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_journal(dir.path());
+    build_discovery(dir.path());
+    copy_events(dir.path(), &["0000000f00d-0001"]);
+    let p = dir.path().to_path_buf();
+    (dir, p)
+}
+
+fn opts() -> ReportOptions {
+    ReportOptions { out: None, open: false, watch: false, interval: report::DEFAULT_INTERVAL, serve: false, port: 0 }
+}
+
+#[test]
+fn report_json_matches_golden() {
+    let (_d, project) = full_project();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().expect("evidence present");
+    check_golden("report.json", &json_string(&to_json(&data)));
+}
+
+#[test]
+fn blob_status_is_byte_identical_to_status_json() {
+    let (_d, project) = full_project();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    assert_eq!(to_json(&data)["status"], keel_cli::status::run(&project, T0).json);
+}
+
+#[test]
+fn blob_carries_the_newest_run_and_a_cursor() {
+    let (_d, project) = full_project();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    assert_eq!(data.run.as_ref().unwrap().id, "0000000f00d-0001");
+    assert!(!data.events.is_empty());
+    assert!(data.events.len() <= report::EVENT_LIMIT);
+    assert!(data.events_seq > 0);
+    // since == cursor → no events, same cursor.
+    let again = report::assemble(&project, T0, Mode::Serve, 0, Some(data.events_seq)).unwrap().unwrap();
+    assert!(again.events.is_empty());
+    assert_eq!(again.events_seq, data.events_seq);
+}
+
+#[test]
+fn discovery_only_project_still_reports() {
+    let dir = tempfile::TempDir::new().unwrap();
+    build_discovery(dir.path());
+    let data = report::assemble(dir.path(), T0, Mode::Static, 2000, None).unwrap().unwrap();
+    assert!(data.run.is_none());
+    assert!(data.events.is_empty());
+    assert_eq!(data.events_seq, 0);
+    assert_eq!(data.status.calls, 140);
+}
+
+#[test]
+fn no_evidence_is_a_nudge_exit_0_and_writes_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let r = report::run_static(dir.path(), &opts(), T0, false);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert_eq!(r.human, keel_cli::status::NO_EVIDENCE);
+    assert!(!dir.path().join(".keel").join("report.html").exists());
+}
+
+#[test]
+fn json_mode_prints_the_blob_and_writes_nothing() {
+    let (_d, project) = full_project();
+    let r = report::run_static(&project, &opts(), T0, true);
+    assert_eq!(r.exit, keel_cli::EXIT_OK);
+    assert_eq!(r.json["v"], 1);
+    assert_eq!(r.json["mode"], "static");
+    assert!(!project.join(".keel").join("report.html").exists());
+}
+
+#[test]
+fn json_conflicts_with_watch_and_serve() {
+    let (_d, project) = full_project();
+    let watch = ReportOptions { watch: true, ..opts() };
+    assert_eq!(report::run_static(&project, &watch, T0, true).exit, keel_cli::EXIT_USAGE);
+    let serve = ReportOptions { serve: true, ..opts() };
+    assert_eq!(report::run_static(&project, &serve, T0, true).exit, keel_cli::EXIT_USAGE);
+}
+
+#[test]
+fn parse_interval_accepts_seconds_and_millis() {
+    use std::time::Duration;
+    assert_eq!(report::parse_interval("2s").unwrap(), Duration::from_secs(2));
+    assert_eq!(report::parse_interval("500ms").unwrap(), Duration::from_millis(500));
+    assert_eq!(report::parse_interval("3").unwrap(), Duration::from_secs(3));
+    assert!(report::parse_interval("0s").is_err());
+    assert!(report::parse_interval("soon").is_err());
+}
