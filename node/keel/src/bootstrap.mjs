@@ -23,6 +23,7 @@ import {
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
+import { createSummary, formatSummary, keelOnPath } from "./summary.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
 import { resolveDevCache } from "./packs/llm.mjs";
@@ -100,7 +101,13 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   // just configured — discovery's "wrapped" classification (dx-spec §2's
   // coverage gap) must agree with what actually applied.
   const knownTargets = new Set(Object.keys(policy.target ?? {}));
-  const discovery = createDiscovery(cwd, { knownTargets });
+  // `[telemetry].console` (schema default true) gates the exit-time summary.
+  // policy.mjs applies no schema defaults, so an absent table is `undefined`
+  // here — only an explicit `false` turns it off. KEEL_QUIET silences it
+  // exactly as it silences the banner.
+  const consoleEnabled = policy.telemetry?.console !== false && !isTruthy(env.KEEL_QUIET);
+  const summary = consoleEnabled ? createSummary() : null;
+  const discovery = createDiscovery(cwd, { knownTargets, summary });
   setRuntime({ enabled: true, backend: effectiveBackend, discovery });
 
   // Outbound host/URL-pattern targets (docs/targeting.md) are resolved by the
@@ -156,7 +163,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
     });
   }
 
-  installExitFlush(discovery, { backend: effectiveBackend });
+  installExitFlush(discovery, { backend: effectiveBackend, summary });
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd);
   return {
     enabled: true,
@@ -200,7 +207,7 @@ export function applyJournalEnvOverride(policy, env) {
  * terminates with code 128+signum) or step aside (when the app has its own
  * handler that owns termination). We never swallow the signal.
  */
-export function installExitFlush(discovery, { proc = process, backend = null } = {}) {
+export function installExitFlush(discovery, { proc = process, backend = null, summary = null } = {}) {
   let flushed = false;
   const flush = () => {
     if (flushed) return;
@@ -219,6 +226,17 @@ export function installExitFlush(discovery, { proc = process, backend = null } =
       backend?.flushEvents?.();
     } catch {
       /* best-effort — event flush never throws into the user's program */
+    }
+    // The console summary (design spec Part A): its own counters only,
+    // synchronous, never throws. After persistence so a formatter bug can
+    // never cost a discovery write.
+    try {
+      if (summary) {
+        const text = formatSummary(summary.counts(), keelOnPath());
+        if (text) proc.stderr.write(text);
+      }
+    } catch {
+      /* observability never fails the process */
     }
   };
   proc.once("exit", flush); // normal exit / process.exit()

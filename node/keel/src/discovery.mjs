@@ -57,7 +57,7 @@ export const MS_PER_DAY = 86_400_000;
 
 export function createDiscovery(
   cwd = process.cwd(),
-  { now = Date.now, knownTargets = new Set() } = {}
+  { now = Date.now, knownTargets = new Set(), summary = null } = {}
 ) {
   const dbPath = join(cwd, ".keel", "discovery.db");
   const aggregates = new Map(); // target -> Aggregate
@@ -71,6 +71,13 @@ export function createDiscovery(
      */
     observe(target, outcome, latencyMs = 0) {
       if (!target || outcome == null) return;
+      // The exit-time console summary (src/summary.mjs) is fed here because
+      // this is the one place that knows whether the target was wrapped.
+      try {
+        summary?.observe(outcome, knownTargets.has(target));
+      } catch {
+        /* the summary never breaks a call */
+      }
       let a = aggregates.get(target);
       if (!a) aggregates.set(target, (a = newAggregate()));
 

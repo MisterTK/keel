@@ -66,3 +66,57 @@ test("keelOnPath scans PATH for a keel executable", () => {
   chmodSync(exe, 0o755);
   assert.equal(keelOnPath({ PATH: `${tmpdir()}${delimiter}${dir}` }), true);
 });
+
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const hookUrl = new URL("../hook.mjs", import.meta.url).href;
+const fetchOnce = fileURLToPath(new URL("../fixtures/fetch-once.mjs", import.meta.url));
+// Either bridge form is correct (depends on whether `keel` is installed here).
+const SUMMARY_RE = /keel ▸ 1 call( · 1 call unprotected)?\n {7}(uvx --from keelrun-cli )?keel report --open for the full picture\n/;
+
+function runFixture(policy, env = {}) {
+  const cwd = mkdtempSync(join(tmpdir(), "keel-summary-"));
+  if (policy !== null) writeFileSync(join(cwd, "keel.toml"), policy);
+  const cleanEnv = { ...process.env };
+  for (const k of ["KEEL_DISABLE", "KEEL_QUIET", "KEEL_BACKEND", "KEEL_CWD"]) delete cleanEnv[k];
+  return spawnSync(process.execPath, ["--import", hookUrl, fetchOnce], {
+    cwd,
+    env: { ...cleanEnv, ...env },
+    encoding: "utf8",
+  });
+}
+
+test("summary prints on stderr after one wrapped call; stdout untouched", () => {
+  const r = runFixture('[target."127.0.0.1"]\n');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "status 200\n");
+  assert.match(r.stderr, /keel ▸ wrapped global fetch/);
+  assert.match(r.stderr, /keel ▸ 1 call\n {7}(uvx --from keelrun-cli )?keel report --open for the full picture\n/);
+  assert.ok(r.stderr.indexOf("wrapped") < r.stderr.indexOf("report --open"), "banner before summary");
+});
+
+test("a call on a target with no policy entry is reported unprotected", () => {
+  const r = runFixture(null);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /keel ▸ 1 call · 1 call unprotected\n/);
+});
+
+test("telemetry.console = false silences the summary but not the banner", () => {
+  const r = runFixture('[target."127.0.0.1"]\n[telemetry]\nconsole = false\n');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /keel ▸ wrapped/);
+  assert.doesNotMatch(r.stderr, /report --open/);
+});
+
+test("KEEL_QUIET silences the summary", () => {
+  const r = runFixture('[target."127.0.0.1"]\n', { KEEL_QUIET: "1" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /keel ▸/);
+});
+
+test("KEEL_DISABLE prints nothing at all", () => {
+  const r = runFixture('[target."127.0.0.1"]\n', { KEEL_DISABLE: "1" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /keel ▸/);
+});
