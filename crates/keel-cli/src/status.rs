@@ -28,107 +28,109 @@ const WINDOW_DAYS: i64 = 7;
 
 /// Per-target line in the status report.
 #[derive(Debug, Serialize)]
-struct TargetLine {
-    breaker_opens: i64,
-    cache_hits: i64,
-    calls: i64,
-    failures: i64,
-    not_retried: i64,
-    retries: i64,
-    successes: i64,
-    target: String,
-    throttled: i64,
-    unwrapped_calls: i64,
+pub struct TargetLine {
+    pub breaker_opens: i64,
+    pub cache_hits: i64,
+    pub calls: i64,
+    pub failures: i64,
+    pub not_retried: i64,
+    pub retries: i64,
+    pub successes: i64,
+    pub target: String,
+    pub throttled: i64,
+    pub unwrapped_calls: i64,
 }
 
 /// The flows-table summary.
 #[derive(Debug, Default, Serialize)]
-struct FlowSummary {
-    completed: i64,
-    dead: i64,
-    failed: i64,
-    resumable: i64,
-    running: i64,
-    total: i64,
+pub struct FlowSummary {
+    pub completed: i64,
+    pub dead: i64,
+    pub failed: i64,
+    pub resumable: i64,
+    pub running: i64,
+    pub total: i64,
 }
 
 /// Trailing-window aggregates over the last [`WINDOW_DAYS`] stored daily
 /// buckets, ending on the day `now_ms` falls in (dx-spec §6, "retries saved
 /// this week"). Zero on a legacy (v1) discovery file, which has no buckets.
 #[derive(Debug, Default, Serialize)]
-struct WeekSummary {
-    breaker_opens: i64,
-    cache_hits: i64,
-    calls: i64,
-    failures: i64,
-    not_retried: i64,
-    retries: i64,
-    successes: i64,
-    throttled: i64,
-    unwrapped_calls: i64,
+pub struct WeekSummary {
+    pub breaker_opens: i64,
+    pub cache_hits: i64,
+    pub calls: i64,
+    pub failures: i64,
+    pub not_retried: i64,
+    pub retries: i64,
+    pub successes: i64,
+    pub throttled: i64,
+    pub unwrapped_calls: i64,
 }
 
 /// The whole status report — one struct, so the human screen and the `--json`
 /// twin cannot drift (every human fact has a JSON counterpart).
 #[derive(Debug, Serialize)]
-struct StatusReport {
-    breaker_opens: i64,
-    cache_hit_rate: f64,
-    cache_hits: i64,
-    calls: i64,
-    discovery_present: bool,
-    failures: i64,
-    flows: FlowSummary,
-    journal_present: bool,
-    not_retried: i64,
-    retries: i64,
-    success_rate: f64,
-    successes: i64,
-    targets: Vec<TargetLine>,
-    targets_wrapped: usize,
-    throttled: i64,
-    unwrapped_calls: i64,
-    week: WeekSummary,
-    wrapped_coverage: f64,
+pub struct StatusReport {
+    pub breaker_opens: i64,
+    pub cache_hit_rate: f64,
+    pub cache_hits: i64,
+    pub calls: i64,
+    pub discovery_present: bool,
+    pub failures: i64,
+    pub flows: FlowSummary,
+    pub journal_present: bool,
+    pub not_retried: i64,
+    pub retries: i64,
+    pub success_rate: f64,
+    pub successes: i64,
+    pub targets: Vec<TargetLine>,
+    pub targets_wrapped: usize,
+    pub throttled: i64,
+    pub unwrapped_calls: i64,
+    pub week: WeekSummary,
+    pub wrapped_coverage: f64,
 }
 
 /// Build the status report for `project`, windowing "this week" against
 /// `now_ms` (the caller's clock — `SystemClock` in production, a fixed value
-/// under test).
-pub fn run(project: &Path, now_ms: i64) -> Rendered {
-    let discovery = match evidence::read_discovery(project) {
-        Ok(d) => d,
-        Err(e) => return soft_error(&e),
-    };
-    let daily = match evidence::read_discovery_daily(project) {
-        Ok(d) => d,
-        Err(e) => return soft_error(&e),
-    };
+/// under test). The one constructor both `keel status` and `keel report`
+/// use, so their `status` JSON can never drift.
+pub fn report(project: &Path, now_ms: i64) -> Result<StatusReport, String> {
+    let discovery = evidence::read_discovery(project)?;
+    let daily = evidence::read_discovery_daily(project)?;
     let discovery_present = evidence::discovery_db(project).exists();
     // Honor the policy's `journal` key (file: locations), like the engine does.
     let journal_path = evidence::resolved_journal(project).path;
     let journal_present = journal_path.exists();
 
     let flows = if journal_present {
-        match read_flows(&journal_path) {
-            Ok(f) => f,
-            Err(e) => return soft_error(&e),
-        }
+        read_flows(&journal_path)?
     } else {
         FlowSummary::default()
     };
 
-    let report = aggregate(
+    Ok(aggregate(
         discovery,
         &daily,
         flows,
         discovery_present,
         journal_present,
         now_ms,
-    );
-    let human = human(&report);
-    Rendered::ok(human, to_json(&report))
+    ))
 }
+
+/// Render `keel status` for `project` (see [`report`]).
+pub fn run(project: &Path, now_ms: i64) -> Rendered {
+    match report(project, now_ms) {
+        Ok(r) => Rendered::ok(human(&r), to_json(&r)),
+        Err(e) => soft_error(&e),
+    }
+}
+
+/// The friendly nudge printed when there is no evidence yet — shared with
+/// `keel report`, which must say exactly the same thing.
+pub const NO_EVIDENCE: &str = "keel \u{25b8} no evidence yet.\n  Run `keel run <script>` to start recording coverage and flows.";
 
 /// Fold per-target stats, the daily buckets, and the flow summary into the
 /// report.
@@ -258,7 +260,7 @@ fn read_flows(path: &Path) -> Result<FlowSummary, String> {
 /// show a fact the JSON twin omits.
 fn human(r: &StatusReport) -> String {
     if !r.discovery_present && !r.journal_present {
-        return "keel \u{25b8} no evidence yet.\n  Run `keel run <script>` to start recording coverage and flows.".to_owned();
+        return NO_EVIDENCE.to_owned();
     }
     let mut lines: Vec<String> = vec![
         "keel \u{25b8} status\n".to_owned(),
@@ -353,6 +355,16 @@ mod tests {
         assert!(r.human.contains("no evidence yet"));
         assert_eq!(r.json["discovery_present"], false);
         assert_eq!(r.json["journal_present"], false);
+    }
+
+    #[test]
+    fn report_and_run_agree_byte_for_byte() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No evidence at all: both paths must still agree on the JSON twin.
+        let via_run = run(dir.path(), 1_783_728_000_000).json;
+        let via_report = to_json(&report(dir.path(), 1_783_728_000_000).unwrap());
+        assert_eq!(via_run, via_report);
+        assert!(!via_report["discovery_present"].as_bool().unwrap());
     }
 
     #[test]
