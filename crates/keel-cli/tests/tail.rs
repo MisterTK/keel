@@ -185,3 +185,44 @@ async fn tail_renders_the_real_engines_feed_byte_exactly() {
          00:00.100  t-000001  api.slow.internal        error    KEEL-E010 after 2 attempts\n"
     );
 }
+
+mod read_events_tests {
+    use super::project_with_fixture_runs;
+    use keel_cli::tail::read_events;
+
+    const RUN: &str = "0000000f00d-0001";
+
+    #[test]
+    fn newest_run_full_read() {
+        let (_d, project) = project_with_fixture_runs(&[RUN]);
+        let slice = read_events(&project, None, None, 1000).unwrap().expect("a run exists");
+        assert_eq!(slice.run.id, RUN);
+        assert!(!slice.events.is_empty());
+        assert_eq!(slice.events[0]["event"], "run_start");
+        let max_seq = slice.events.iter().map(|e| e["seq"].as_u64().unwrap()).max().unwrap();
+        assert_eq!(slice.last_seq, max_seq);
+    }
+
+    #[test]
+    fn since_filters_and_limit_keeps_the_tail() {
+        let (_d, project) = project_with_fixture_runs(&[RUN]);
+        let all = read_events(&project, None, None, 1000).unwrap().unwrap();
+        let last = all.events.last().unwrap()["seq"].as_u64().unwrap();
+        // since == last_seq → nothing new, cursor unchanged.
+        let none = read_events(&project, None, Some(last), 1000).unwrap().unwrap();
+        assert!(none.events.is_empty());
+        assert_eq!(none.last_seq, all.last_seq);
+        // limit 1 → exactly the newest line.
+        let one = read_events(&project, None, None, 1).unwrap().unwrap();
+        assert_eq!(one.events.len(), 1);
+        assert_eq!(one.events[0]["seq"].as_u64().unwrap(), last);
+    }
+
+    #[test]
+    fn no_runs_is_none_and_unknown_pin_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(read_events(dir.path(), None, None, 10).unwrap().is_none());
+        let (_d, project) = project_with_fixture_runs(&[RUN]);
+        assert!(read_events(&project, Some("nope"), None, 10).is_err());
+    }
+}

@@ -62,6 +62,82 @@ pub struct TailOptions {
     pub run: Option<String>,
 }
 
+/// The run a one-shot read came from (`keel report`'s `run` blob field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunInfo {
+    /// The run id — the event file's stem.
+    pub id: String,
+    /// Wall-clock start from the `run_start` header; absent under the
+    /// deterministic test/bench sink, which writes no `wall_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+}
+
+/// A one-shot slice of one run's feed: the parsed lines after `since`
+/// (newest last, at most `limit` of them) plus the file's highest `seq`.
+#[derive(Debug, Clone)]
+pub struct EventsSlice {
+    pub run: RunInfo,
+    pub events: Vec<Value>,
+    /// Highest `seq` in the file — the cursor a poller resumes from — even
+    /// when `since`/`limit` left `events` empty.
+    pub last_seq: u64,
+}
+
+/// Read one run's feed once (no following): the pinned `run`, else the
+/// newest. `Ok(None)` when nothing is recorded yet. Lines that are not JSON
+/// objects are skipped, as the live view does — the feed is best-effort
+/// observability, never a hard failure.
+pub fn read_events(
+    project: &Path,
+    run: Option<&str>,
+    since: Option<u64>,
+    limit: usize,
+) -> Result<Option<EventsSlice>, Rendered> {
+    let dir = project.join(".keel").join("events");
+    let Some(path) = select_run(&dir, run)? else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| unreadable(&path, &e))?;
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut started_at_ms = None;
+    let mut last_seq = 0;
+    let mut events = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !value.is_object() {
+            continue;
+        }
+        let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        last_seq = last_seq.max(seq);
+        if value.get("event").and_then(Value::as_str) == Some("run_start") {
+            started_at_ms = value.get("wall_ms").and_then(Value::as_u64);
+        }
+        if since.is_some_and(|s| seq <= s) {
+            continue;
+        }
+        events.push(value);
+    }
+    if events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
+    Ok(Some(EventsSlice {
+        run: RunInfo { id, started_at_ms },
+        events,
+        last_seq,
+    }))
+}
+
 /// Drives the follow loop's waiting, injected so tests never sleep for real:
 /// each call separates two polls and its return value decides continuation.
 pub trait Ticker {
