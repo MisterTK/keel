@@ -130,6 +130,13 @@ enum Command {
         /// Open the report in the default browser once it exists.
         #[arg(long)]
         open: bool,
+        /// Foreground: rewrite the file every --interval; the page reloads
+        /// itself. No networking. Ctrl-C to stop.
+        #[arg(long)]
+        watch: bool,
+        /// Rewrite interval for --watch, e.g. `2s` or `500ms`.
+        #[arg(long, default_value = "2s", value_name = "DURATION")]
+        interval: String,
     },
     /// Capture effects during a run, then turn the capture into a replayable
     /// offline test fixture (`docs/recording-format.md`).
@@ -327,7 +334,7 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
-        Command::Report { out, open } => dispatch_report(&project, out, open, json),
+        Command::Report { out, open, watch, interval } => dispatch_report(&project, out, open, watch, &interval, json),
         Command::Record { action } => dispatch_record(&project, action, json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
@@ -355,18 +362,37 @@ fn main() {
     exit(code);
 }
 
-/// `keel report [--out PATH] [--open]` (extracted from `main` — clippy's
-/// `too_many_lines`).
-fn dispatch_report(project: &std::path::Path, out: Option<PathBuf>, open: bool, json: bool) -> i32 {
-    let opts = report::ReportOptions {
-        out,
-        open,
-        watch: false,
-        interval: report::DEFAULT_INTERVAL,
-        serve: false,
-        port: 0,
+/// `keel report [--out PATH] [--open] [--watch] [--interval DURATION]`
+/// (extracted from `main` — clippy's `too_many_lines`).
+fn dispatch_report(
+    project: &std::path::Path,
+    out: Option<PathBuf>,
+    open: bool,
+    watch: bool,
+    interval: &str,
+    json: bool,
+) -> i32 {
+    let interval = match report::parse_interval(interval) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("keel \u{25b8} {e}");
+            return keel_cli::EXIT_USAGE;
+        }
     };
-    emit(&report::run_static(project, &opts, SystemClock.now_ms(), json), json)
+    let opts = report::ReportOptions { out, open, watch, interval, serve: false, port: 0 };
+    if json && watch {
+        eprintln!("keel \u{25b8} --json cannot be combined with --watch");
+        keel_cli::EXIT_USAGE
+    } else if watch {
+        let stop = report::interrupt_flag();
+        let mut stderr = std::io::stderr().lock();
+        match report::run_watch(project, &opts, || SystemClock.now_ms(), &stop, &mut stderr) {
+            Ok(()) => keel_cli::EXIT_OK,
+            Err(r) => emit(&r, json),
+        }
+    } else {
+        emit(&report::run_static(project, &opts, SystemClock.now_ms(), json), json)
+    }
 }
 
 /// `keel flows [--dead] [<action>]` (extracted from `main` — clippy's

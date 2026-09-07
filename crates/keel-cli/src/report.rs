@@ -9,9 +9,11 @@
 //! page polls). Every mode is a pure function of the evidence files plus the
 //! injected `now_ms` (dx-spec §5).
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use keel_journal::{DailyStats, MS_PER_DAY};
@@ -163,6 +165,69 @@ pub fn run_static(project: &Path, opts: &ReportOptions, now_ms: i64, json: bool)
         human.push_str("\n  (could not launch a browser; open the file yourself)");
     }
     Rendered::ok(human, to_json(&Written { written: out.display().to_string() }))
+}
+
+/// A flag SIGINT/SIGTERM flips, for the foreground loops to poll. Installing
+/// the handler can only fail if one is already installed (never, in a
+/// single-command process); on failure Ctrl-C simply keeps its default
+/// disposition, which still ends the process.
+pub fn interrupt_flag() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let hook = Arc::clone(&flag);
+    let _ = ctrlc::set_handler(move || hook.store(true, Ordering::SeqCst));
+    flag
+}
+
+/// Sleep `total` in 50ms steps, returning early with `false` once `stop`
+/// is set (so Ctrl-C is honored within 50ms, not a whole interval).
+fn sleep_until(stop: &AtomicBool, total: Duration) -> bool {
+    let chunk = Duration::from_millis(50);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < total {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let remaining = total.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+        std::thread::sleep(chunk.min(remaining));
+        elapsed += chunk;
+    }
+    !stop.load(Ordering::SeqCst)
+}
+
+/// `--watch`: rewrite the page every `opts.interval` until `stop` is set.
+/// The page reloads itself on the same interval (plus jitter), so a refresh
+/// — manual or automatic — always finds a complete, fresh file. `now` is
+/// called per rewrite so every file carries its own `generated_at_ms`.
+pub fn run_watch(
+    project: &Path,
+    opts: &ReportOptions,
+    now: impl Fn() -> i64,
+    stop: &AtomicBool,
+    out: &mut dyn Write,
+) -> Result<(), Rendered> {
+    let out_path = out_path(project, opts);
+    let interval_ms = u64::try_from(opts.interval.as_millis()).unwrap_or(2000);
+    let mut announced = false;
+    loop {
+        let Some(data) = assemble(project, now(), Mode::Watch, interval_ms, None)? else {
+            return Err(no_evidence());
+        };
+        write_atomic(&out_path, &report_html::render(&data)).map_err(|e| write_error(&out_path, &e))?;
+        if !announced {
+            let _ = writeln!(
+                out,
+                "keel \u{25b8} watching \u{2014} rewriting {} every {interval_ms}ms (Ctrl-C to stop)",
+                out_path.display()
+            );
+            if opts.open && !open_in_browser(&out_path.display().to_string()) {
+                let _ = writeln!(out, "  (could not launch a browser; open the file yourself)");
+            }
+            announced = true;
+        }
+        if !sleep_until(stop, opts.interval) {
+            return Ok(());
+        }
+    }
 }
 
 /// Where this invocation writes its HTML.

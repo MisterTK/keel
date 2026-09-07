@@ -57,6 +57,11 @@ oxc_syntax = "=0.139.0"
 # the TOML *document*, so user formatting/comments outside touched regions
 # survive byte-for-byte. Already in-tree as toml's own backend.
 toml_edit = "0.22"
+# `keel report --watch/--serve` are foreground loops that must exit 0 on
+# Ctrl-C (design spec 2026-09-04). The workspace has no signal handling;
+# `ctrlc` (MIT OR Apache-2.0, inside deny.toml's allowlist) sets a flag the
+# loops poll, without widening this crate's narrowly-scoped `unsafe`.
+ctrlc = "3"
 
 # `keel exec`'s dead-holder detection (WS6): `libc::kill(pid, 0)` probes a
 # recorded holder's PID on unix; other platforms treat it as alive (the lease

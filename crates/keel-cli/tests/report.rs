@@ -257,3 +257,60 @@ fn out_flag_and_missing_parent_dir() {
     assert!(custom.exists());
     assert_eq!(r.json["written"], custom.display().to_string());
 }
+
+mod watch_tests {
+    use super::{T0, full_project, opts};
+    use keel_cli::report::{self, ReportOptions};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn a_preset_stop_flag_writes_exactly_once_and_returns() {
+        let (_d, project) = full_project();
+        let stop = AtomicBool::new(true);
+        let mut out = Vec::new();
+        let o = ReportOptions { watch: true, interval: Duration::from_millis(20), ..opts() };
+        report::run_watch(&project, &o, || T0, &stop, &mut out).unwrap();
+        let html = std::fs::read_to_string(project.join(".keel").join("report.html")).unwrap();
+        assert!(html.contains("\"mode\":\"watch\""));
+        assert!(html.contains("\"watch_interval_ms\":20"));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("watching"), "{text}");
+        let leftovers: Vec<_> = std::fs::read_dir(project.join(".keel"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn rewrites_until_stopped() {
+        let (_d, project) = full_project();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stopper.store(true, Ordering::SeqCst);
+        });
+        let calls = std::sync::atomic::AtomicI64::new(0);
+        let now = || T0 + calls.fetch_add(1, Ordering::SeqCst); // each rewrite stamps a new generated_at_ms
+        let mut out = Vec::new();
+        let o = ReportOptions { watch: true, interval: Duration::from_millis(20), ..opts() };
+        report::run_watch(&project, &o, now, &stop, &mut out).unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 2, "rewrote more than once before stop");
+        let html = std::fs::read_to_string(project.join(".keel").join("report.html")).unwrap();
+        assert!(html.contains("\"mode\":\"watch\""));
+    }
+
+    #[test]
+    fn no_evidence_returns_the_nudge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stop = AtomicBool::new(true);
+        let mut out = Vec::new();
+        let o = ReportOptions { watch: true, ..opts() };
+        let err = report::run_watch(dir.path(), &o, || T0, &stop, &mut out).unwrap_err();
+        assert_eq!(err.exit, keel_cli::EXIT_OK);
+        assert_eq!(err.human, keel_cli::status::NO_EVIDENCE);
+    }
+}
