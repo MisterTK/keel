@@ -91,11 +91,13 @@
     }
     var flows = s.flows && s.flows.total > 0 ? s.flows : null;
     var events = (state.events || []).map(eventLine).filter(function (l) { return l !== null; });
-    return { headline: headline, rows: rows, days: days, flows: flows, events: events, banner: bannerText(state), runId: state.run ? state.run.id : null };
+    return { headline: headline, rows: rows, days: days, flows: flows, events: events, banner: bannerText(state) };
   }
 
   // ---- DOM patching (idempotent) ----
-  var rowNodes = {};
+  // Keyed by target name; a null prototype so a target literally named
+  // `constructor` or `__proto__` cannot collide with Object.prototype.
+  var rowNodes = Object.create(null);
   function setText(el, text) { if (el.textContent !== String(text)) el.textContent = text; }
 
   function renderHeadline(vm) {
@@ -201,8 +203,10 @@
     var events = cursor.events.concat(state.events || []).slice(-EVENT_CAP);
     // An `events_seq` of 0 is a real cursor (the run's only event so far is
     // `run_start`) and must be honored — `||` would treat it as falsy and
-    // keep re-requesting the whole run.
-    var since = typeof state.events_seq === "number" ? state.events_seq : cursor.since;
+    // keep re-requesting the whole run. But with no run at all (evidence
+    // exists, nothing has started yet) there is nothing to be a cursor into:
+    // keep `since` null so the first run is fetched in full, `seq` 0 included.
+    var since = state.run && typeof state.events_seq === "number" ? state.events_seq : cursor.since;
     return { cursor: { since: since, runId: cursor.runId, events: events }, render: true, refetchNow: false };
   }
 

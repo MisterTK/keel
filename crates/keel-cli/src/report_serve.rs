@@ -80,6 +80,7 @@ fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        421 => "Misdirected Request",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
@@ -106,7 +107,16 @@ fn handle_connection(mut stream: TcpStream, project: &Path, now_ms: i64) {
     }
     let text = String::from_utf8_lossy(&head);
     let request_line = text.lines().next().unwrap_or("");
-    let resp = handle_request(project, now_ms, request_line);
+    // The listener is loopback-only, but a browser on this machine can be
+    // steered to it by DNS rebinding (`attacker.example` resolving to
+    // 127.0.0.1 on a later lookup) and then read the blob same-origin. The
+    // `Host` header is the one thing such a page cannot forge, so only
+    // loopback spellings are served; anything else is misdirected.
+    let resp = if host_is_loopback(&text) {
+        handle_request(project, now_ms, request_line)
+    } else {
+        Response { status: 421, content_type: "text/plain; charset=utf-8", body: "keel report --serve answers only 127.0.0.1 / localhost\n".to_owned() }
+    };
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         resp.status,
@@ -117,6 +127,28 @@ fn handle_connection(mut stream: TcpStream, project: &Path, now_ms: i64) {
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(resp.body.as_bytes());
     let _ = stream.flush();
+}
+
+/// `true` when the request head carries a `Host` header naming this machine:
+/// `127.0.0.1`, `localhost`, or `[::1]`, each with an optional `:port`.
+/// A missing `Host` is refused too — every browser sends one.
+fn host_is_loopback(head: &str) -> bool {
+    let Some(value) = head
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| l.split_once(':').filter(|(name, _)| name.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v.trim()))
+    else {
+        return false;
+    };
+    let lower = value.to_ascii_lowercase();
+    let host = if let Some(rest) = lower.strip_prefix("[::1]") {
+        // Bracketed IPv6 keeps its brackets; only an optional port follows.
+        if rest.is_empty() || rest.starts_with(':') { "[::1]" } else { return false }
+    } else {
+        lower.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// Bind loopback only (`port` 0 = ephemeral); the listener is non-blocking

@@ -73,7 +73,6 @@ import { fileURLToPath } from "node:url";
 const hookUrl = new URL("../hook.mjs", import.meta.url).href;
 const fetchOnce = fileURLToPath(new URL("../fixtures/fetch-once.mjs", import.meta.url));
 // Either bridge form is correct (depends on whether `keel` is installed here).
-const SUMMARY_RE = /keel ▸ 1 call( · 1 call unprotected)?\n {7}(uvx --from keelrun-cli )?keel report --open for the full picture\n/;
 
 function runFixture(policy, env = {}) {
   const cwd = mkdtempSync(join(tmpdir(), "keel-summary-"));

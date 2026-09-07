@@ -132,3 +132,21 @@ test("mergePoll: an events_seq of 0 is a real cursor, not a falsy no-op", () => 
   assert.equal(result.cursor.since, 0);
   assert.notEqual(result.cursor.since, null);
 });
+
+test("mergePoll: a run:null response (evidence, no run yet) does not adopt a cursor; the first run then arrives in full", () => {
+  const cursor = { since: null, runId: null, events: [] };
+  const empty = { run: null, events: [], events_seq: 0 };
+  const first = mergePoll(cursor, empty);
+  assert.equal(first.cursor.since, null);
+  assert.equal(first.cursor.runId, null);
+  assert.equal(first.render, true);
+  const runA = {
+    run: { id: "A" },
+    events: [{ seq: 0, event: "run_start" }, { seq: 1, event: "call_start" }, { seq: 2, event: "call_end" }],
+    events_seq: 2,
+  };
+  const adopted = mergePoll(first.cursor, runA);
+  assert.equal(adopted.cursor.runId, "A");
+  assert.equal(adopted.cursor.since, 2);
+  assert.deepEqual(adopted.cursor.events.map((e) => e.seq), [0, 1, 2]);
+});

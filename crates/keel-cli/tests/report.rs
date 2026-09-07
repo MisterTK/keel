@@ -293,11 +293,26 @@ mod watch_tests {
             std::thread::sleep(Duration::from_millis(150));
             stopper.store(true, Ordering::SeqCst);
         });
-        let calls = std::sync::atomic::AtomicI64::new(0);
-        let now = || T0 + calls.fetch_add(1, Ordering::SeqCst); // each rewrite stamps a new generated_at_ms
+        let calls = std::sync::atomic::AtomicI64::new(0); // each rewrite stamps a new generated_at_ms
         let mut out = Vec::new();
         let o = ReportOptions { watch: true, interval: Duration::from_millis(20), ..opts() };
-        report::run_watch(&project, &o, now, &stop, &mut out).unwrap();
+        // Run the loop on its own thread and bound the wait, so a regression
+        // in stop handling fails the test instead of hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let project2 = project.clone();
+        let stop_ref = std::sync::Arc::clone(&stop);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let calls = &calls;
+                let now = || T0 + calls.fetch_add(1, Ordering::SeqCst);
+                let r = report::run_watch(&project2, &o, now, &stop_ref, &mut out);
+                let _ = done_tx.send(r);
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("run_watch did not return within 5s of the stop flag")
+                .unwrap();
+        });
         assert!(calls.load(Ordering::SeqCst) >= 2, "rewrote more than once before stop");
         let html = std::fs::read_to_string(project.join(".keel").join("report.html")).unwrap();
         assert!(html.contains("\"mode\":\"watch\""));
@@ -322,6 +337,7 @@ mod serve_tests {
     use std::net::TcpStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn routes() {
@@ -382,6 +398,48 @@ mod serve_tests {
         assert_eq!(blob["v"], 1);
 
         stop.store(true, Ordering::SeqCst);
-        server.join().unwrap().unwrap();
+        join_within(server, Duration::from_secs(5)).unwrap();
+    }
+
+    /// Join a server thread, failing (not hanging) if it ignores the stop flag.
+    fn join_within<T: Send + 'static>(handle: std::thread::JoinHandle<T>, limit: Duration) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        rx.recv_timeout(limit)
+            .expect("server thread did not stop within the limit")
+            .expect("server thread panicked")
+    }
+
+    fn raw_request(port: u16, request: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    #[test]
+    fn foreign_host_header_is_refused_with_421() {
+        let (_d, project) = full_project();
+        let listener = report_serve::bind(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let server = std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
+
+        // A DNS-rebinding page in the local browser arrives with its own host name.
+        let evil = raw_request(port, "GET /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        assert!(evil.starts_with("HTTP/1.1 421 "), "{evil}");
+        assert!(!evil.contains("\"events\""), "blob must not leak: {evil}");
+        // Loopback spellings, with and without a port, still work.
+        let ok_ip = raw_request(port, &format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+        assert!(ok_ip.starts_with("HTTP/1.1 200 OK\r\n"), "{ok_ip}");
+        let ok_local = raw_request(port, "GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(ok_local.starts_with("HTTP/1.1 200 OK\r\n"), "{ok_local}");
+
+        stop.store(true, Ordering::SeqCst);
+        join_within(server, Duration::from_secs(5)).unwrap();
     }
 }

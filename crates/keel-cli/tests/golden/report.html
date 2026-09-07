@@ -6,9 +6,9 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'">
 <title>keel report</title>
 <style>
-:root { --bg: #fff; --fg: #1b1f23; --dim: #6a737d; --line: #e1e4e8; --flag: #b31d28; --flagbg: #ffeef0; --ok: #22863a; --warn: #b08800; --bar: #0366d6; }
+:root { --bg: #fff; --fg: #1b1f23; --dim: #6a737d; --line: #e1e4e8; --flag: #b31d28; --flagbg: #ffeef0; --warn: #b08800; --bar: #0366d6; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0d1117; --fg: #c9d1d9; --dim: #8b949e; --line: #30363d; --flag: #ff7b72; --flagbg: #3a1d20; --ok: #3fb950; --warn: #d29922; --bar: #58a6ff; }
+  :root { --bg: #0d1117; --fg: #c9d1d9; --dim: #8b949e; --line: #30363d; --flag: #ff7b72; --flagbg: #3a1d20; --warn: #d29922; --bar: #58a6ff; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -165,11 +165,13 @@ pre#events { margin: 0; padding: 10px 12px; border: 1px solid var(--line); borde
     }
     var flows = s.flows && s.flows.total > 0 ? s.flows : null;
     var events = (state.events || []).map(eventLine).filter(function (l) { return l !== null; });
-    return { headline: headline, rows: rows, days: days, flows: flows, events: events, banner: bannerText(state), runId: state.run ? state.run.id : null };
+    return { headline: headline, rows: rows, days: days, flows: flows, events: events, banner: bannerText(state) };
   }
 
   // ---- DOM patching (idempotent) ----
-  var rowNodes = {};
+  // Keyed by target name; a null prototype so a target literally named
+  // `constructor` or `__proto__` cannot collide with Object.prototype.
+  var rowNodes = Object.create(null);
   function setText(el, text) { if (el.textContent !== String(text)) el.textContent = text; }
 
   function renderHeadline(vm) {
@@ -275,8 +277,10 @@ pre#events { margin: 0; padding: 10px 12px; border: 1px solid var(--line); borde
     var events = cursor.events.concat(state.events || []).slice(-EVENT_CAP);
     // An `events_seq` of 0 is a real cursor (the run's only event so far is
     // `run_start`) and must be honored — `||` would treat it as falsy and
-    // keep re-requesting the whole run.
-    var since = typeof state.events_seq === "number" ? state.events_seq : cursor.since;
+    // keep re-requesting the whole run. But with no run at all (evidence
+    // exists, nothing has started yet) there is nothing to be a cursor into:
+    // keep `since` null so the first run is fetched in full, `seq` 0 included.
+    var since = state.run && typeof state.events_seq === "number" ? state.events_seq : cursor.since;
     return { cursor: { since: since, runId: cursor.runId, events: events }, render: true, refetchNow: false };
   }
 
