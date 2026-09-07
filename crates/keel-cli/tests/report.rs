@@ -192,6 +192,43 @@ fn static_html_is_self_contained() {
     assert!(!html[blob_start..blob_end].contains("</"), "blob escapes </");
 }
 
+/// `</` escaping alone is not enough: `<!--<script` drives the HTML5
+/// tokenizer into the "script data double escaped" state, which swallows the
+/// template's own real `</script>` closing tag (and everything after it,
+/// including the page's script) as inert text. Only escaping every `<` (not
+/// just `</`) prevents this. See task-9-review.md Finding 1.
+#[test]
+fn hostile_event_data_cannot_corrupt_the_page_via_the_double_escape_state() {
+    let (_d, project) = full_project();
+    let mut data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let hostile = "<!--<script>alert(1)</script>";
+    data.events.push(serde_json::json!({
+        "v": 1,
+        "seq": 9999,
+        "ms": 999_999,
+        "event": "call_start",
+        "call": "t-hostile",
+        "target": "evil.example.com",
+        "op": hostile,
+    }));
+    let html = keel_cli::report_html::render(&data);
+
+    let tag_start = html.find("id=\"keel-data\"").unwrap();
+    let open_end = html[tag_start..].find('>').unwrap() + tag_start + 1;
+    let close_start = html[open_end..].find("</script>").unwrap() + open_end;
+    let blob = &html[open_end..close_start];
+
+    assert!(!blob.contains('<'), "escaped blob must contain no bare '<'; page can otherwise render blank");
+    let parsed: serde_json::Value = serde_json::from_str(blob).expect("blob round-trips as JSON");
+    let hostile_event = parsed["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|e| e["call"] == "t-hostile")
+        .expect("hostile event present");
+    assert_eq!(hostile_event["op"], hostile);
+}
+
 #[test]
 fn run_static_writes_the_page_atomically() {
     let (_d, project) = full_project();

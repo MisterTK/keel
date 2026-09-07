@@ -255,7 +255,11 @@ pre#events { margin: 0; padding: 10px 12px; border: 1px solid var(--line); borde
 
   function boot() {
     var blob = JSON.parse(document.getElementById("keel-data").textContent);
-    if (location.protocol === "file:") {
+    // Static and watch exports render the embedded blob directly, whether
+    // opened via `file://` or served over `http(s)://` (e.g. attached to a
+    // ticket). Only `serve` mode polls — that's the only mode with a live
+    // `./api/state` endpoint behind it.
+    if (blob.mode !== "serve") {
       render(blob);
       if (blob.mode === "watch") setTimeout(function () { location.reload(); }, (blob.watch_interval_ms || 2000) + 250);
       return;
