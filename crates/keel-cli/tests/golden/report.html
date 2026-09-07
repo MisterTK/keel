@@ -253,6 +253,33 @@ pre#events { margin: 0; padding: 10px 12px; border: 1px solid var(--line); borde
     if (on) setText(b, "Live — stalled (server not responding)");
   }
 
+  // Pure: fold one `/api/state` response into the poll cursor. `cursor` is
+  // `{ since, runId, events }`; `since === null` means "no cursor yet" and
+  // asks the server for the whole run (seq 0 included — `since` is
+  // exclusive server-side, so an initial `?since=0` would drop `run_start`).
+  //
+  // A run change is detected by `state.run.id !== cursor.runId`. The first
+  // poll ever (`cursor.runId === null`) was itself cursor-less, so its
+  // response is already the complete run — adopt it and render. A run
+  // change *mid-session* means this response was fetched under the old
+  // run's stale cursor and is therefore partial (or empty): drop it without
+  // rendering, reset the cursor, and ask the caller to re-poll immediately
+  // (`refetchNow`) rather than waiting out a full `POLL_MS` showing nothing.
+  function mergePoll(cursor, state) {
+    if (state.run && state.run.id !== cursor.runId) {
+      if (cursor.runId === null) {
+        return { cursor: { since: state.events_seq, runId: state.run.id, events: state.events || [] }, render: true, refetchNow: false };
+      }
+      return { cursor: { since: null, runId: state.run.id, events: [] }, render: false, refetchNow: true };
+    }
+    var events = cursor.events.concat(state.events || []).slice(-EVENT_CAP);
+    // An `events_seq` of 0 is a real cursor (the run's only event so far is
+    // `run_start`) and must be honored — `||` would treat it as falsy and
+    // keep re-requesting the whole run.
+    var since = typeof state.events_seq === "number" ? state.events_seq : cursor.since;
+    return { cursor: { since: since, runId: cursor.runId, events: events }, render: true, refetchNow: false };
+  }
+
   function boot() {
     var blob = JSON.parse(document.getElementById("keel-data").textContent);
     // Static and watch exports render the embedded blob directly, whether
@@ -264,26 +291,27 @@ pre#events { margin: 0; padding: 10px 12px; border: 1px solid var(--line); borde
       if (blob.mode === "watch") setTimeout(function () { location.reload(); }, (blob.watch_interval_ms || 2000) + 250);
       return;
     }
-    var since = 0, runId = null, events = [], failures = 0;
+    var cursor = { since: null, runId: null, events: [] }, failures = 0;
     function tick() {
-      fetch("./api/state?since=" + since, { cache: "no-store" })
+      var url = "./api/state" + (cursor.since === null ? "" : "?since=" + cursor.since);
+      var delay = POLL_MS;
+      fetch(url, { cache: "no-store" })
         .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
         .then(function (state) {
-          if (state.run && state.run.id !== runId) { runId = state.run.id; events = []; }
-          events = events.concat(state.events || []).slice(-EVENT_CAP);
-          since = state.events_seq || since;
+          var result = mergePoll(cursor, state);
+          cursor = result.cursor;
+          if (result.render) { state.events = cursor.events; render(state); }
+          if (result.refetchNow) delay = 0;
           failures = 0;
-          state.events = events;
-          render(state);
           setStalled(false);
         })
         .catch(function () { failures += 1; if (failures >= 2) setStalled(true); })
-        .then(function () { setTimeout(tick, POLL_MS); });
+        .then(function () { setTimeout(tick, delay); });
     }
     tick();
   }
 
-  globalThis.KeelReport = { viewModel: viewModel, render: render, eventLine: eventLine };
+  globalThis.KeelReport = { viewModel: viewModel, render: render, eventLine: eventLine, mergePoll: mergePoll };
   if (typeof document !== "undefined" && document.getElementById("keel-data")) boot();
 })();
 

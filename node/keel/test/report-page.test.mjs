@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 await import(new URL("../../../crates/keel-cli/assets/report/report.js", import.meta.url));
-const { viewModel, eventLine } = globalThis.KeelReport;
+const { viewModel, eventLine, mergePoll } = globalThis.KeelReport;
 
 const T0 = 1_783_728_000_000; // day 20645
 const state = {
@@ -82,4 +82,53 @@ test("banner names the mode", () => {
   assert.match(viewModel(state).banner, /^Snapshot at /);
   assert.equal(viewModel({ ...state, mode: "serve" }).banner, "Live");
   assert.equal(viewModel({ ...state, mode: "watch" }).banner, "Live via --watch (reload every 2s)");
+});
+
+test("mergePoll: first poll adopts the run and keeps seq 0 (run_start)", () => {
+  const cursor = { since: null, runId: null, events: [] };
+  const resp = {
+    run: { id: "0000000f00d-0001" },
+    events: [
+      { v: 1, seq: 0, ms: 0, event: "run_start", run: "0000000f00d-0001" },
+      { v: 1, seq: 1, ms: 12, event: "call_start" },
+      { v: 1, seq: 2, ms: 40, event: "mystery" },
+    ],
+    events_seq: 2,
+  };
+  const result = mergePoll(cursor, resp);
+  assert.equal(result.render, true);
+  assert.equal(result.refetchNow, false);
+  assert.equal(result.cursor.runId, "0000000f00d-0001");
+  assert.equal(result.cursor.since, 2);
+  assert.equal(result.cursor.events.length, 3);
+  assert.equal(result.cursor.events[0].seq, 0);
+});
+
+test("mergePoll: a run change mid-session resets the cursor and asks for an immediate re-poll", () => {
+  const cursor = { since: 25, runId: "A", events: [{ seq: 24 }, { seq: 25 }] };
+  const resp = { run: { id: "B" }, events: [{ seq: 0 }, { seq: 1 }], events_seq: 1 };
+  const result = mergePoll(cursor, resp);
+  assert.equal(result.render, false);
+  assert.equal(result.refetchNow, true);
+  assert.equal(result.cursor.runId, "B");
+  assert.equal(result.cursor.since, null);
+  assert.equal(result.cursor.events.length, 0);
+});
+
+test("mergePoll: same run appends new events and advances the cursor", () => {
+  const cursor = { since: 2, runId: "0000000f00d-0001", events: [{ seq: 0 }, { seq: 1 }, { seq: 2 }] };
+  const resp = { run: { id: "0000000f00d-0001" }, events: [{ seq: 3 }, { seq: 4 }], events_seq: 4 };
+  const result = mergePoll(cursor, resp);
+  assert.equal(result.render, true);
+  assert.equal(result.refetchNow, false);
+  assert.equal(result.cursor.events.length, 5);
+  assert.equal(result.cursor.since, 4);
+});
+
+test("mergePoll: an events_seq of 0 is a real cursor, not a falsy no-op", () => {
+  const cursor = { since: null, runId: null, events: [] };
+  const resp = { run: { id: "R" }, events: [{ seq: 0 }], events_seq: 0 };
+  const result = mergePoll(cursor, resp);
+  assert.equal(result.cursor.since, 0);
+  assert.notEqual(result.cursor.since, null);
 });
