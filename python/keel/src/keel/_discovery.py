@@ -76,7 +76,10 @@ import sqlite3
 import threading
 from pathlib import Path
 from time import time as _wall_clock  # captured at import: immune to in-flow
-from typing import Any  # time virtualization (keel's own clock is never journaled)
+from typing import TYPE_CHECKING, Any  # time virtualization (keel's own clock is never journaled)
+
+if TYPE_CHECKING:
+    from ._summary import Summary
 
 #: Current discovery schema version, stamped in `PRAGMA user_version`.
 #: Mirrors `keel_journal::discovery::DISCOVERY_SCHEMA_VERSION`.
@@ -192,9 +195,13 @@ class Discovery:
         self,
         cwd: str | Path | None = None,
         known_targets: frozenset[str] | None = None,
+        summary: "Summary | None" = None,
     ) -> None:
         self.db_path = Path(cwd or Path.cwd()) / ".keel" / "discovery.db"
         self._known_targets = known_targets or frozenset()
+        # The exit-time console summary (`_summary.Summary`), fed from
+        # `record()` because this is the one place that knows `wrapped`.
+        self._summary = summary
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._last_prune_day: int | None = None
@@ -222,6 +229,11 @@ class Discovery:
         aggregates (lifetime row plus the clock-day bucket). Best-effort:
         never raises."""
         wrapped = target in self._known_targets
+        if self._summary is not None:
+            try:
+                self._summary.observe(outcome, wrapped)
+            except Exception:  # noqa: BLE001 — the summary never breaks a call
+                pass
         row = _row_from_outcome(target, outcome, latency_ms, wrapped)
         now_ms = row[12]  # last_seen_ms, per _row_from_outcome's column order
         day = now_ms // MS_PER_DAY

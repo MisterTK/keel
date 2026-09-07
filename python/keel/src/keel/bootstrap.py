@@ -36,6 +36,7 @@ from ._runtime import (
     set_flow_entrypoints,
     set_runtime,
 )
+from ._summary import Summary, format_summary, keel_on_path
 from .adapters import Detection, install_adapters, uninstall_adapters
 from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
 
@@ -47,10 +48,20 @@ def is_disabled(env: Mapping[str, str] | None = None) -> bool:
     return env.get("KEEL_DISABLE", "").strip().lower() in _TRUTHY
 
 
+def _console_enabled(policy: Mapping[str, Any], env: Mapping[str, str]) -> bool:
+    if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
+        return False
+    telemetry = policy.get("telemetry")
+    if not isinstance(telemetry, dict):
+        return True  # schema default: console = true
+    return bool(telemetry.get("console", True))
+
+
 class _State:
     installed: bool = False
     finder: KeelFinder | None = None
     discovery: Discovery | None = None
+    summary: Summary | None = None
     exit_registered: bool = False
     mcp_uninstall: Any = None
     state: dict[str, Any] | None = None
@@ -98,8 +109,14 @@ def install_keel(
     # just configured — discovery's "wrapped" classification (dx-spec §2's
     # coverage gap) must agree with what actually applied.
     known_targets = frozenset(policy.get("target") or {})
-    discovery = Discovery(cwd, known_targets)
+    # `[telemetry].console` (schema default true) gates the exit-time summary;
+    # the raw dict is what we hold, so re-derive the default here (as
+    # `_policy.extract_cmd_flows` does for `on_busy`). KEEL_QUIET silences it
+    # exactly as it silences the banner.
+    summary = Summary() if _console_enabled(policy, env) else None
+    discovery = Discovery(cwd, known_targets, summary=summary)
     _STATE.discovery = discovery
+    _STATE.summary = summary
     set_runtime(backend, discovery)
 
     targets = extract_function_targets(policy)
@@ -185,6 +202,7 @@ def uninstall_keel() -> None:
     if _STATE.discovery is not None:
         _STATE.discovery.close()
         _STATE.discovery = None
+    _STATE.summary = None
     clear_runtime()
     _STATE.installed = False
     _STATE.state = None
@@ -196,6 +214,15 @@ def _register_exit_flush() -> None:
     _STATE.exit_registered = True
 
     def _flush() -> None:
+        # The console summary goes first (design spec Part A: "prints before
+        # the store closes"). It reads only its own counters and never raises.
+        if _STATE.summary is not None:
+            try:
+                text = format_summary(_STATE.summary.counts(), keel_on_path())
+                if text:
+                    sys.stderr.write(text)
+            except Exception:  # noqa: BLE001 — observability never fails the process
+                pass
         if _STATE.discovery is not None:
             _STATE.discovery.close()
         # The native engine's live NDJSON event feed (`.keel/events/`,
