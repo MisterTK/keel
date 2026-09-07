@@ -823,19 +823,11 @@ impl Engine {
         // `telemetry.otlp_endpoint` IS honored: native front ends built with the
         // `otel` feature read it back via `telemetry_otlp_endpoint` (below) and
         // pass it to `otel::init_otlp` (env still wins — see `otel::export_enabled`
-        // / `otel::resolve_endpoint`). `telemetry.console` (the local
-        // pretty-console-summary switch, architecture spec §4.5) is validated and
-        // carried but has no consumer yet; warn on an explicit non-default value
-        // rather than silently ignoring the user's intent.
-        if let Some(telemetry) = &policy.telemetry
-            && !telemetry.console
-        {
-            warn!(
-                "policy `telemetry.console = false` is validated but not yet wired: v0.1 always \
-                 uses the default local summary. `telemetry.otlp_endpoint` IS honored by front \
-                 ends built with the `otel` feature."
-            );
-        }
+        // / `otel::resolve_endpoint`). `telemetry.console` (the exit-time console
+        // summary, architecture spec §4.5) is consumed by the front ends
+        // themselves — `python/keel/src/keel/bootstrap.py` and
+        // `node/keel/src/bootstrap.mjs` read it off the effective policy they
+        // hand to `configure` — so the core only validates and carries it.
         warn_inert_breaker_knobs(&policy);
         *self.policy.write().expect("policy lock poisoned") = policy;
         *self.raw_policy.write().expect("raw policy lock poisoned") = policy_json.clone();

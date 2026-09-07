@@ -851,9 +851,9 @@ impl TryFrom<String> for JournalLocation {
 /// which feed it to `keel-core`'s `otel::init_otlp` when built with the `otel`
 /// feature — the standard `OTEL_*` environment variables take precedence over
 /// this table (see `keel-core`'s otel module for the exact precedence rules).
-/// `console` (the local pretty-console-summary switch) is validated and
-/// carried but has no consumer yet; `Engine::configure` warns on an explicit
-/// `false` so the user is not silently surprised.
+/// `console` (schema default `true`) gates the exit-time console summary the
+/// Python and Node front ends print from their shutdown hooks; the core
+/// validates and carries it but never prints.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryPolicy {
@@ -889,8 +889,8 @@ pub struct Policy {
     /// configure time (see [`JournalLocation`]).
     pub journal: Option<JournalLocation>,
     /// Telemetry config (schema-validated); `otlp_endpoint` is honored by
-    /// native front ends (env still wins), `console` is not yet wired — see
-    /// [`TelemetryPolicy`].
+    /// native front ends (env still wins), `console` by the front ends' exit
+    /// summary — see [`TelemetryPolicy`].
     pub telemetry: Option<TelemetryPolicy>,
 }
 
