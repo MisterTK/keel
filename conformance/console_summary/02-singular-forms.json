@@ -1,0 +1,6 @@
+{
+  "name": "singular-forms",
+  "counts": { "calls": 1, "throttled": 1, "retries_succeeded": 1, "breaker_trips": 1, "cache_hits": 1, "not_retried": 1, "unprotected": 1 },
+  "keel_on_path": true,
+  "expected": "keel ▸ 1 call · absorbed 1 rate limit · 1 retry succeeded · 1 breaker trip · 1 served from cache · 1 failure not retried · 1 call unprotected\n       keel report --open for the full picture\n"
+}

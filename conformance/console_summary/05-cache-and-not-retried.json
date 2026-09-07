@@ -1,0 +1,6 @@
+{
+  "name": "cache-and-not-retried",
+  "counts": { "calls": 20, "throttled": 0, "retries_succeeded": 0, "breaker_trips": 0, "cache_hits": 8, "not_retried": 2, "unprotected": 0 },
+  "keel_on_path": true,
+  "expected": "keel ▸ 20 calls · 8 served from cache · 2 failures not retried\n       keel report --open for the full picture\n"
+}

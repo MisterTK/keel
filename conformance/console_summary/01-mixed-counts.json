@@ -1,0 +1,6 @@
+{
+  "name": "mixed-counts",
+  "counts": { "calls": 47, "throttled": 3, "retries_succeeded": 2, "breaker_trips": 1, "cache_hits": 0, "not_retried": 0, "unprotected": 4 },
+  "keel_on_path": true,
+  "expected": "keel ▸ 47 calls · absorbed 3 rate limits · 2 retries succeeded · 1 breaker trip · 4 calls unprotected\n       keel report --open for the full picture\n"
+}
