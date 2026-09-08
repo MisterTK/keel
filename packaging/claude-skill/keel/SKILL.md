@@ -1,6 +1,6 @@
 ---
 name: keel
-description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project; when evaluating, reviewing, or auditing whether and how Keel should cover a project, including a repo with no `keel.toml` yet; or when working in a repo that already uses Keel (a `keel.toml`, or an AGENTS.md "Keel" section, is present). Covers assessing fit, installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server, and reading `keel status`/`keel trace`. Invoke this before calling the `keel` MCP tools (`get_doctor_report`, `get_status`, `propose_policy`, `get_trace`, `list_flows`, `explain_error`) — they are diagnostic primitives this skill orchestrates. Do not use for building a workflow engine or queue system from scratch, for unsupported languages (only Python/Node/Rust), or for one-off retry logic in a codebase that has declined to adopt Keel.
+description: Use when adding production-grade resilience (retry/backoff/timeout/circuit-breaker/rate-limit/cache/poll-until-terminal) or opt-in durable, crash-resumable execution to a Python, Node/TypeScript, or Rust project; when evaluating, reviewing, or auditing whether and how Keel should cover a project, including a repo with no `keel.toml` yet; or when working in a repo that already uses Keel (a `keel.toml`, or an AGENTS.md "Keel" section, is present). Covers assessing fit, installing Keel, running `keel init`/`keel doctor`, wiring the `keel mcp` server, and reading a run's console summary, `keel report`, and `keel status`/`keel trace`. Invoke before calling the `keel` MCP tools (`get_doctor_report`, `get_status`, `propose_policy`, `get_trace`, `list_flows`, `explain_error`) - diagnostic primitives this skill orchestrates. Do not use for building a workflow engine or queue system from scratch, for unsupported languages (only Python/Node/Rust), or for one-off retry logic in a codebase that has declined to adopt Keel.
 ---
 
 # Keel
@@ -88,6 +88,30 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
   without needing a web search.
 - Uninstalling Keel (removing the package) restores the original behavior
   exactly — there is nothing else to revert.
+
+## Reading what Keel did
+
+Three levels of evidence, cheapest first — reach for `keel doctor`/`keel
+status --json` for structured diagnosis (see the protocol below), but for a
+human-facing "what happened" check these first:
+
+- **Console summary — always on, no CLI needed.** Every run under Keel
+  (`keel run`, `python -m keel run`, the Node loader, `#[keel::wrap]`) prints
+  one summary line at exit, e.g. `keel ▸ 47 calls · absorbed 3 rate limits ·
+  2 retries succeeded · 4 calls unprotected`, plus a hint line pointing at
+  `keel report --open` (or, if the CLI isn't installed, the `uvx`
+  equivalent). A no-op run stays silent. `console = false` under
+  `[telemetry]`, or `KEEL_QUIET=1`, turns it off.
+- **`keel report`** — a self-contained HTML page at `.keel/report.html`:
+  per-target tables, a calls/failures trend, the newest run's event stream,
+  and flow status. `--open` launches it; `--json` prints the same evidence
+  as byte-deterministic JSON. Works with no persistent CLI install via `uvx
+  --from keelrun-cli keel report --open`.
+- **Live view** — `keel report --watch` rewrites the file on an interval (no
+  networking); `keel report --serve` runs a loopback-only server the page
+  polls (rejects a mismatched `Host` header). Use `--watch` when driving a
+  long test run locally and want the file to stay current; use `--serve`
+  when someone else needs to watch the same page open.
 
 ## Evaluating Keel against a codebase (the protocol)
 

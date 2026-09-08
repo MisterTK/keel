@@ -64,13 +64,14 @@ daemon. No port. No new abstractions in your code.
   steps from the journal instead of re-executing their side effects —
   proven by real subprocess crash-and-resume tests, not a mocked clock.
 - **Observable when you need it, invisible when you don't.** Every run ends
-  with one line saying what Keel did — `keel ▸ 47 calls · absorbed 3 rate
-  limits · 2 retries succeeded · 4 calls unprotected` — and `keel report
-  --open` turns the same evidence into a self-contained HTML page (add
-  `--serve` for a live view). OpenTelemetry spans and metrics for every call
-  and attempt are one build feature and one env var away — off by default, so
-  the shipped library carries no OpenTelemetry dependency until you ask for
-  it. Set `console = false` under `[telemetry]` to silence the summary.
+  with a console summary — `keel ▸ 47 calls · absorbed 3 rate limits · 2
+  retries succeeded · 4 calls unprotected` — needing no CLI at all, and
+  `keel report` turns the same evidence into a self-contained HTML page you
+  can watch live with `--watch` or `--serve`. See
+  [Observability](#observability) below. OpenTelemetry spans and metrics for
+  every call and attempt are one build feature and one env var away — off by
+  default, so the shipped library carries no OpenTelemetry dependency until
+  you ask for it.
 - **Built for LLM and agent workloads.** First-class `llm:`/`tool:`/`mcp:`
   targets, per-run spend caps, model fallback chains, and a dev-mode cache
   that replays identical prompts for free — because agent code is the
@@ -164,6 +165,44 @@ policy:
    your observed mean") beats template guesses; with no observed runs the
    static scan alone still works, just with more conservative proposals.
 3. `keel init --diff` — preview what any new evidence would change, any time.
+
+## Observability
+
+"What did Keel actually do?" has three answers, from zero setup to a live
+dashboard — pick whichever fits the moment:
+
+1. **Console summary — automatic, library-only.** Every process that runs
+   under Keel (`keel run`, `python -m keel run`, the Node loader, `#[keel::wrap]`)
+   prints one summary at exit, no CLI required:
+
+   ```
+   keel ▸ 47 calls · absorbed 3 rate limits · 2 retries succeeded · 4 calls unprotected
+          keel report --open for the full picture
+   ```
+
+   A no-op run (nothing intercepted) stays silent. If the `keel` CLI isn't
+   installed, that second line prints `uvx --from keelrun-cli keel report
+   --open` instead — the summary itself never needs the CLI. Turn it off
+   with `console = false` under `[telemetry]` in `keel.toml`, or `KEEL_QUIET=1`.
+
+2. **Static HTML report — one command, no persistent install needed.**
+   `keel report --open` (or, with no CLI installed at all, `uvx --from
+   keelrun-cli keel report --open`) renders `.keel/report.html`: a single
+   self-contained page — inlined CSS/JS, a strict CSP, zero external
+   requests — with per-target call/retry/breaker/cache tables, a
+   calls-vs-failures trend, the newest run's raw event stream, and durable
+   flow status. It's just a file: screenshot it, attach it to a PR, email it.
+   `keel report --json` prints the identical evidence as byte-deterministic
+   JSON, for CI artifacts or feeding another tool.
+
+3. **Live HTML report — two ways, both local-only, both CLI.**
+   - `keel report --watch` rewrites `.keel/report.html` on an interval
+     (default 2s) and the open page reloads itself — no networking, nothing
+     to bind or firewall.
+   - `keel report --serve` runs a loopback-only server (`127.0.0.1`, an
+     ephemeral port by default) that the page polls once a second; a
+     mismatched `Host` header is rejected (DNS-rebinding protection). Either
+     way, Ctrl-C stops it cleanly.
 
 ## See it work
 
