@@ -342,6 +342,36 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertIn(b"Keel NOT activated", proc.stderr)
         self.assertNotIn(b"hello", proc.stdout, "the target must not run")
 
+    def test_json_log_format_emits_one_object_per_line(self) -> None:
+        import json as _json
+        (self.root / "keel.toml").write_text("")
+        proc = _run(
+            "import keel._auto; import sample_targets; sample_targets.enrich_a(1)",
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        lines = [l for l in proc.stderr.decode().splitlines() if l.strip()]
+        objs = [_json.loads(l) for l in lines]
+        kinds = [o["keel"] for o in objs]
+        self.assertEqual(kinds, ["activation", "summary"], proc.stderr)
+        self.assertEqual(objs[0]["policy_source"], "keel.toml")
+        self.assertEqual(objs[0]["policy_path"], str(self.root / "keel.toml"))
+        self.assertEqual(objs[0]["root_source"], "KEEL_CWD")
+        self.assertEqual(objs[1]["keel_cwd"], str(self.root))
+
+    def test_json_log_format_refusal_is_an_error_object(self) -> None:
+        import json as _json
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]["keel"], "error")
+        self.assertEqual(objs[0]["code"], "policy-missing-at-keel-cwd")
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,16 @@ function esc(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Keel's own JSON lines, in order — the fixture app writes its own prose to
+ *  stderr too, and that has to stay untouched (Keel owns only its own lines). */
+function keelJsonLines(stderr) {
+  return stderr
+    .split("\n")
+    .filter((l) => l.startsWith("{"))
+    .map((l) => JSON.parse(l))
+    .filter((o) => o.keel !== undefined);
+}
+
 test("defaults banner names a parent keel.toml and the KEEL_CWD fix", () => {
   const root = mkdtempSync(join(tmpdir(), "keel-banner-parent-"));
   try {
@@ -190,6 +200,48 @@ test("the defaults banner names the directory it searched", () => {
       proc.stderr,
       new RegExp(`^keel ▸ wrapped .* with production defaults — no keel\\.toml in ${esc(realRoot)}; \`keel init\` to customize\n`, "m")
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// F10: in a container the only surface that survives is stderr, so
+// `KEEL_LOG_FORMAT=json` turns the activation line and the exit summary into
+// queryable fields. Unlike the text form the summary prints at zero calls —
+// the fixture app makes none, and that zero line is itself the evidence.
+test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-json-logs-"));
+  try {
+    writeFileSync(join(root, "keel.toml"), "");
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_LOG_FORMAT: "json" });
+    assert.equal(proc.status, 7, proc.stderr);
+    const objs = keelJsonLines(proc.stderr);
+    assert.ok(!proc.stderr.includes("keel ▸"), `json mode must emit no prose: ${proc.stderr}`);
+    assert.deepEqual(objs.map((o) => o.keel), ["activation", "summary"], proc.stderr);
+    assert.equal(objs[0].policy_source, "keel.toml");
+    assert.equal(objs[0].policy_path, join(realRoot, "keel.toml"));
+    assert.equal(objs[0].root, realRoot);
+    assert.equal(objs[0].root_source, "cwd");
+    assert.equal(objs[1].calls, 0);
+    assert.equal(objs[1].policy_source, "keel.toml");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("KEEL_LOG_FORMAT=json turns the refusal into one error object", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-json-refusal-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: realRoot, KEEL_LOG_FORMAT: "json" });
+    assert.equal(proc.status, 7, proc.stderr);
+    const objs = keelJsonLines(proc.stderr);
+    assert.ok(!proc.stderr.includes("keel ▸"), `json mode must emit no prose: ${proc.stderr}`);
+    assert.equal(objs.length, 1, proc.stderr);
+    assert.equal(objs[0].keel, "error");
+    assert.equal(objs[0].code, "policy-missing-at-keel-cwd");
+    assert.equal(objs[0].keel_cwd, realRoot);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

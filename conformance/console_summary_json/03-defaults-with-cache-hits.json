@@ -1,0 +1,19 @@
+{
+  "name": "defaults-with-cache-hits",
+  "counts": {
+    "calls": 91,
+    "throttled": 0,
+    "retries_succeeded": 0,
+    "breaker_trips": 0,
+    "cache_hits": 90,
+    "not_retried": 0,
+    "unprotected": 0
+  },
+  "meta": {
+    "keel_cwd": "/code",
+    "policy_path": null,
+    "policy_source": "defaults",
+    "version": "0.5.5"
+  },
+  "expected": "{\"breaker_trips\":0,\"cache_hits\":90,\"calls\":91,\"keel\":\"summary\",\"keel_cwd\":\"/code\",\"not_retried\":0,\"policy_path\":null,\"policy_source\":\"defaults\",\"retries_succeeded\":0,\"throttled\":0,\"unprotected\":0,\"version\":\"0.5.5\"}\n"
+}

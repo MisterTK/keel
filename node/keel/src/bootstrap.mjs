@@ -11,7 +11,7 @@
  * a silent fall-back to defaults.
  */
 
-import { register } from "node:module";
+import { createRequire, register } from "node:module";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -23,7 +23,8 @@ import {
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
-import { createSummary, formatSummary, keelOnPath } from "./summary.mjs";
+import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
+import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
 import { resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
@@ -59,6 +60,9 @@ const FRAMEWORK_PACKS = [
 let installed = false;
 let refused = null; // the refusal result, once printed — never print it twice
 
+/** This package's own version, for the JSON log lines' `version` field. */
+const VERSION = createRequire(import.meta.url)("../package.json").version;
+
 export function policyOptional(env = process.env) {
   return String(env?.KEEL_POLICY ?? "").trim().toLowerCase() === "optional";
 }
@@ -78,11 +82,27 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
 
   const { policy: raw, source } = loadPolicy(cwd); // throws KEEL-E001 on bad syntax
   if (source === "defaults" && cwdSource === "KEEL_CWD" && !policyOptional(env)) {
-    process.stderr.write(missingPolicyError(cwd));
+    const text = missingPolicyError(cwd);
+    emit(env, text, {
+      keel: "error",
+      code: "policy-missing-at-keel-cwd",
+      keel_cwd: String(cwd),
+      message: text.slice("keel ▸ error: ".length).replace(/\n$/, ""),
+      version: VERSION,
+    });
     refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd };
     return { ...refused };
   }
   installed = true;
+  // Policy provenance, captured once: the two fields ("did my policy ship?",
+  // "how many calls were served from cache?") that would have named the
+  // 2026-09-15 outage in one log query (F10). Read again at exit by the flush.
+  const meta = {
+    keel_cwd: env.KEEL_CWD || null,
+    policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),
+    policy_source: source,
+    version: VERSION,
+  };
   // Backend first: whether it's persistent (native + attached journal) decides
   // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
   const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
@@ -182,7 +202,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
     });
   }
 
-  installExitFlush(discovery, { backend: effectiveBackend, summary });
+  installExitFlush(discovery, { backend: effectiveBackend, summary, meta, env });
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource);
   return {
     enabled: true,
@@ -226,7 +246,10 @@ export function applyJournalEnvOverride(policy, env) {
  * terminates with code 128+signum) or step aside (when the app has its own
  * handler that owns termination). We never swallow the signal.
  */
-export function installExitFlush(discovery, { proc = process, backend = null, summary = null } = {}) {
+export function installExitFlush(
+  discovery,
+  { proc = process, backend = null, summary = null, meta = null, env = process.env } = {}
+) {
   let flushed = false;
   const flush = () => {
     if (flushed) return;
@@ -251,8 +274,15 @@ export function installExitFlush(discovery, { proc = process, backend = null, su
     // never cost a discovery write.
     try {
       if (summary) {
-        const text = formatSummary(summary.counts(), keelOnPath());
-        if (text) proc.stderr.write(text);
+        if (jsonLogs(env)) {
+          // Unconditional, unlike the text form: a zero line proves Keel was
+          // live and intercepted nothing, which is exactly what the outage
+          // post-mortem had no way to establish.
+          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}));
+        } else {
+          const text = formatSummary(summary.counts(), keelOnPath());
+          if (text) proc.stderr.write(text);
+        }
       }
     } catch {
       /* observability never fails the process */
@@ -323,29 +353,40 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd")
     if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
   }
   const head = `keel ▸ wrapped ${seams.join(" + ")} with ${desc}`;
-  if (source !== "defaults") {
-    process.stderr.write(`${head}\n`);
-    return;
+  // `note` is the text after the em-dash — the one place the tail variants
+  // differ. Held as a value (rather than written inline per variant) so the
+  // JSON form can carry it as a field; the text assembled below is
+  // byte-identical to what each variant used to write directly.
+  let note = null;
+  if (source === "defaults") {
+    // On the defaults path only (a real policy loaded means this cwd is
+    // already the right one — zero cost there), check whether a keel.toml
+    // exists somewhere above cwd that loadPolicy never looked at (#85). If
+    // so, the usual "keel init to customize" nudge reads as if nothing is
+    // wrong, when actually the adopter's policy silently never loaded — name
+    // both paths and the fix instead.
+    const found = policyAboveCwd(cwd);
+    if (found) {
+      note = `found keel.toml at ${found} but running from ${cwd}; set KEEL_CWD=${found} to load it`;
+    } else if (cwdSource === "KEEL_CWD") {
+      // Only reachable under KEEL_POLICY=optional (installKeel refuses otherwise).
+      note = `KEEL_CWD=${cwd} is set but ${join(cwd, "keel.toml")} does not exist (KEEL_POLICY=optional)`;
+    } else {
+      note = `no keel.toml in ${cwd}; \`keel init\` to customize`;
+    }
   }
-  // #85: on the defaults path only (a real policy loaded means this cwd is
-  // already the right one — zero cost there), check whether a keel.toml
-  // exists somewhere above cwd that loadPolicy never looked at. If so, the
-  // usual "keel init to customize" nudge reads as if nothing is wrong, when
-  // actually the adopter's policy silently never loaded — name both paths
-  // and the fix instead.
-  const found = policyAboveCwd(cwd);
-  if (found) {
-    process.stderr.write(
-      `${head} — found keel.toml at ${found} but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
-    );
-  } else if (cwdSource === "KEEL_CWD") {
-    // Only reachable under KEEL_POLICY=optional (installKeel refuses otherwise).
-    process.stderr.write(
-      `${head} — KEEL_CWD=${cwd} is set but ${join(cwd, "keel.toml")} does not exist (KEEL_POLICY=optional)\n`
-    );
-  } else {
-    process.stderr.write(`${head} — no keel.toml in ${cwd}; \`keel init\` to customize\n`);
-  }
+  const text = note === null ? `${head}\n` : `${head} — ${note}\n`;
+  const obj = {
+    keel: "activation",
+    policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),
+    policy_source: source,
+    root: String(cwd),
+    root_source: cwdSource,
+    version: VERSION,
+    wrapped: seams.join(" + "),
+  };
+  if (note !== null) obj.note = note;
+  emit(env, text, obj);
 }
 
 // Cross-language parity with the Python front end's `.strip().lower() in

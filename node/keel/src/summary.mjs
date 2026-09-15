@@ -13,6 +13,7 @@
 
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import { dumpsLine } from "./log.mjs";
 
 export const PREFIX = "keel ▸ ";
 /** Continuation lines align under the text after the prefix (7 columns). */
@@ -62,6 +63,19 @@ export function formatSummary(counts, keelOnPath) {
   if (counts.unprotected) segments.push(`${n(counts.unprotected, "call", "calls")} unprotected`);
   const command = keelOnPath ? "keel report --open" : "uvx --from keelrun-cli keel report --open";
   return `${PREFIX}${segments.join(" · ")}\n${INDENT}${command} for the full picture\n`;
+}
+
+/**
+ * The `KEEL_LOG_FORMAT=json` twin of `formatSummary`: one line, sorted keys,
+ * no spaces. Unlike the text form it prints even at zero calls — in a
+ * container "Keel activated and intercepted nothing" is itself the evidence
+ * the outage post-mortem needed. Pinned by conformance/console_summary_json/,
+ * which the Python front end reads too (identical bytes, both languages).
+ */
+export function formatSummaryJson(counts, meta) {
+  const obj = {};
+  for (const k of KEYS) obj[k] = Number(counts?.[k] ?? 0);
+  return dumpsLine({ ...obj, keel: "summary", ...meta });
 }
 
 /** Whether the `keel` CLI binary is on PATH — decides which bridge line prints. */
