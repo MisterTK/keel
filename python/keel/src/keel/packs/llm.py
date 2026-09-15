@@ -40,9 +40,36 @@ from ..adapters._pack import Detection, Seam, TargetDecl
 DEV_CACHE_TTL = "24h"
 
 
+#: Environment variables that identify a serverless/container platform (Cloud
+#: Run services and jobs, Lambda, Azure Functions and App Service). Their
+#: presence means "production" for the dev cache when KEEL_ENV is unset —
+#: replaying an LLM response from a cache in a deployed container is never
+#: the dev loop the cache exists for (field report 2026-09-15, F0/F6).
+SERVERLESS_MARKERS = (
+    "K_SERVICE",
+    "K_REVISION",
+    "CLOUD_RUN_JOB",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "FUNCTIONS_WORKER_RUNTIME",
+    "WEBSITE_SITE_NAME",
+)
+
+
+def serverless_marker(env: Mapping[str, str] | None = None) -> str | None:
+    """The first present, non-blank serverless marker variable, or None."""
+    env = env if env is not None else os.environ
+    for name in SERVERLESS_MARKERS:
+        if str(env.get(name, "")).strip():
+            return name
+    return None
+
+
 def _is_prod(env: Mapping[str, str] | None) -> bool:
     env = env if env is not None else os.environ
-    return str(env.get("KEEL_ENV", "")).strip().lower() == "prod"
+    keel_env = str(env.get("KEEL_ENV", "")).strip().lower()
+    if keel_env:
+        return keel_env == "prod"  # explicit always wins, either way
+    return serverless_marker(env) is not None
 
 
 class _LlmPack:

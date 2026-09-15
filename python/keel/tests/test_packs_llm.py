@@ -134,6 +134,35 @@ class ResolveDevCacheTest(unittest.TestCase):
         self.assertEqual(raw["target"]["llm:openai"]["cache"], {"mode": "dev"})
 
 
+class ServerlessDevCacheTest(unittest.TestCase):
+    _POLICY = {"defaults": {"llm": {"cache": {"mode": "dev"}}}}
+
+    def test_cloud_run_marker_disables_the_dev_cache(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {"K_SERVICE": "render"})
+        self.assertNotIn("cache", out["defaults"]["llm"])
+
+    def test_every_marker_is_recognized(self) -> None:
+        from keel.packs.llm import SERVERLESS_MARKERS, serverless_marker
+
+        self.assertEqual(
+            SERVERLESS_MARKERS,
+            ("K_SERVICE", "K_REVISION", "CLOUD_RUN_JOB", "AWS_LAMBDA_FUNCTION_NAME",
+             "FUNCTIONS_WORKER_RUNTIME", "WEBSITE_SITE_NAME"),
+        )
+        for name in SERVERLESS_MARKERS:
+            self.assertEqual(serverless_marker({name: "x"}), name)
+        self.assertIsNone(serverless_marker({"K_SERVICE": "   "}), "blank values do not count")
+        self.assertIsNone(serverless_marker({}))
+
+    def test_explicit_keel_env_dev_wins_over_a_marker(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {"K_SERVICE": "render", "KEEL_ENV": "dev"})
+        self.assertEqual(out["defaults"]["llm"]["cache"]["ttl"], DEV_CACHE_TTL)
+
+    def test_no_marker_and_no_keel_env_keeps_the_dev_cache(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {})
+        self.assertEqual(out["defaults"]["llm"]["cache"]["ttl"], DEV_CACHE_TTL)
+
+
 class DevCacheReplayCountersTest(unittest.TestCase):
     """The report-counter parity contract with the Node twin, driven through the
     stub core directly (as Node drives its AsyncEngine)."""

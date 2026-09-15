@@ -11,7 +11,7 @@ import {
   outboundDefaults,
   llmDefaults,
 } from "../src/defaults.mjs";
-import { llmPack, resolveDevCache, DEV_CACHE_TTL } from "../src/packs/llm.mjs";
+import { llmPack, resolveDevCache, DEV_CACHE_TTL, SERVERLESS_MARKERS, serverlessMarker } from "../src/packs/llm.mjs";
 
 const ok = (payload) => async () => ({ status: "ok", payload });
 const req = (target, args_hash) => ({ v: 1, target, op: target, idempotent: true, args_hash });
@@ -107,6 +107,28 @@ test("resolveDevCache treats KEEL_ENV with surrounding whitespace/case as prod (
   assert.deepEqual(resolveDevCache(raw(), { KEEL_ENV: " dev " }).target["llm:openai"].cache, {
     ttl: DEV_CACHE_TTL,
   });
+});
+
+const DEV_POLICY = { defaults: { llm: { cache: { mode: "dev" } } } };
+
+test("a Cloud Run marker disables the dev cache when KEEL_ENV is unset", () => {
+  const out = resolveDevCache(DEV_POLICY, { K_SERVICE: "render" });
+  assert.equal(out.defaults.llm.cache, undefined);
+});
+
+test("every serverless marker is recognized, blank values are not", () => {
+  assert.deepEqual(SERVERLESS_MARKERS, [
+    "K_SERVICE", "K_REVISION", "CLOUD_RUN_JOB", "AWS_LAMBDA_FUNCTION_NAME",
+    "FUNCTIONS_WORKER_RUNTIME", "WEBSITE_SITE_NAME",
+  ]);
+  for (const name of SERVERLESS_MARKERS) assert.equal(serverlessMarker({ [name]: "x" }), name);
+  assert.equal(serverlessMarker({ K_SERVICE: "   " }), null);
+  assert.equal(serverlessMarker({}), null);
+});
+
+test("an explicit KEEL_ENV=dev wins over a marker", () => {
+  const out = resolveDevCache(DEV_POLICY, { K_SERVICE: "render", KEEL_ENV: "dev" });
+  assert.equal(out.defaults.llm.cache.ttl, DEV_CACHE_TTL);
 });
 
 test("dev-cache replay parity: identical calls → cache hit off-prod (counters)", async () => {

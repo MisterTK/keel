@@ -394,6 +394,16 @@ class BannerTest(unittest.TestCase):
             out = self._banner("defaults", [], [], env={"KEEL_QUIET": "1"}, cwd=sub)
         self.assertEqual(out, "")
 
+    def test_banner_notes_when_a_serverless_marker_turned_the_dev_cache_off(self) -> None:
+        with TemporaryDirectory() as tmp:
+            out = self._banner("defaults", [], [], env={"K_SERVICE": "render"}, cwd=Path(tmp))
+        self.assertIn("with production defaults (dev cache off: K_SERVICE detected) — no keel.toml in", out)
+
+    def test_banner_has_no_dev_cache_note_when_keel_env_is_explicit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            out = self._banner("defaults", [], [], env={"K_SERVICE": "x", "KEEL_ENV": "prod"}, cwd=Path(tmp))
+        self.assertNotIn("dev cache off", out)
+
 
 if __name__ == "__main__":
     unittest.main()

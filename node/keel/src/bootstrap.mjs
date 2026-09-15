@@ -26,7 +26,7 @@ import { createDiscovery } from "./discovery.mjs";
 import { createSummary, formatSummary, keelOnPath } from "./summary.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
-import { resolveDevCache } from "./packs/llm.mjs";
+import { resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
 import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
 import { installPgPack } from "./packs/pg.mjs";
@@ -299,6 +299,11 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
   const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
+  let desc = policyDesc;
+  if (!String(env.KEEL_ENV ?? "").trim()) {
+    const marker = serverlessMarker(env);
+    if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
+  }
   // #85: on the defaults path only (a real policy loaded means this cwd is
   // already the right one — zero cost there), check whether a keel.toml
   // exists somewhere above cwd that loadPolicy never looked at. If so, the
@@ -308,12 +313,12 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
   const found = source === "defaults" && cwd ? policyAboveCwd(cwd) : null;
   if (found) {
     process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — found keel.toml at ${found} ` +
+      `keel ▸ wrapped ${seams.join(" + ")} with ${desc} — found keel.toml at ${found} ` +
         `but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
     );
   } else {
     process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`
+      `keel ▸ wrapped ${seams.join(" + ")} with ${desc} — \`keel init\` to customize\n`
     );
   }
 }

@@ -38,7 +38,7 @@ from ._runtime import (
 )
 from ._summary import Summary, format_summary, keel_on_path
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
+from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache, serverless_marker
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -323,6 +323,10 @@ def _banner(
         desc = f"policy {root / 'keel.toml'}"
     else:
         desc = "policy keel.toml"
+    if not env.get("KEEL_ENV", "").strip():
+        marker = serverless_marker(env)
+        if marker is not None:
+            desc = f"{desc} (dev cache off: {marker} detected)"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".

@@ -32,11 +32,35 @@ function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+/** Environment variables that identify a serverless/container platform
+ *  (Cloud Run services and jobs, Lambda, Azure Functions and App Service).
+ *  Their presence means "production" for the dev cache when KEEL_ENV is
+ *  unset — replaying an LLM response from a cache in a deployed container is
+ *  never the dev loop the cache exists for (field report 2026-09-15, F0/F6). */
+export const SERVERLESS_MARKERS = [
+  "K_SERVICE",
+  "K_REVISION",
+  "CLOUD_RUN_JOB",
+  "AWS_LAMBDA_FUNCTION_NAME",
+  "FUNCTIONS_WORKER_RUNTIME",
+  "WEBSITE_SITE_NAME",
+];
+
+/** The first present, non-blank serverless marker variable, or null. */
+export function serverlessMarker(env = process.env) {
+  for (const name of SERVERLESS_MARKERS) {
+    if (String(env?.[name] ?? "").trim()) return name;
+  }
+  return null;
+}
+
 function isProd(env) {
   // Trim + lowercase before comparing — cross-language parity with the Python
-  // twin's `.strip().lower()`, so `KEEL_ENV=" prod "` disables the dev cache
-  // identically in both front ends.
-  return String(env?.KEEL_ENV ?? "").trim().toLowerCase() === "prod";
+  // twin's `.strip().lower()`. An explicit KEEL_ENV always wins; otherwise a
+  // serverless marker means production (see SERVERLESS_MARKERS).
+  const keelEnv = String(env?.KEEL_ENV ?? "").trim().toLowerCase();
+  if (keelEnv) return keelEnv === "prod";
+  return serverlessMarker(env) !== null;
 }
 
 /** The `llm:` adapter pack — the four uniform operations (adapter-pack.md). */
