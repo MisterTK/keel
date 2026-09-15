@@ -18,6 +18,10 @@ const hookUrl = new URL("../hook.mjs", import.meta.url).href;
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite");
 
+function esc(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 test("loader wraps a ts: function target and drives it through retry", () => {
   const dir = mkdtempSync(join(tmpdir(), "keel-loader-"));
   try {
@@ -46,7 +50,7 @@ test("loader wraps a ts: function target and drives it through retry", () => {
     // banner reflects the wrapped function target, on stderr only.
     assert.match(run.stderr, /1 function target/);
     const realDir = realpathSync(dir);
-    assert.match(run.stderr, new RegExp(`policy ${join(realDir, "keel.toml").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(run.stderr, new RegExp(`policy ${esc(join(realDir, "keel.toml"))}`));
 
     const dbPath = join(dir, ".keel", "discovery.db");
     assert.ok(existsSync(dbPath), "discovery.db should be written on exit");
