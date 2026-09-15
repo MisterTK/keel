@@ -154,7 +154,13 @@ class ChildActivationEnvTest(unittest.TestCase):
     unless disabled or already set by the user."""
 
     def test_children_inherit_keel_enable_and_cwd(self) -> None:
+        # WS1: KEEL_CWD is only ever exported to children when a policy file
+        # actually lives at the activation root (otherwise an exported
+        # KEEL_CWD would make a child that self-activates via the .pth
+        # wrongly refuse — the exact bug this program fixes) — so this needs
+        # a real keel.toml to observe the inherited KEEL_CWD at all.
         with TemporaryDirectory() as d:
+            (Path(d) / "keel.toml").write_text("", encoding="utf-8")
             out = subprocess.run(
                 [sys.executable, "-m", "keel", "run", SPAWN_PROBE],
                 capture_output=True,
@@ -262,6 +268,7 @@ class BannerTest(unittest.TestCase):
         *,
         env: dict | None = None,
         cwd: str | Path | None = None,
+        cwd_source: str = "cwd",
     ) -> str:
         import contextlib
         import io
@@ -270,7 +277,7 @@ class BannerTest(unittest.TestCase):
 
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
-            _banner(env if env is not None else {}, source, target_keys, adapters, None, cwd)
+            _banner(env if env is not None else {}, source, target_keys, adapters, None, cwd, cwd_source)
         return buf.getvalue()
 
     def test_level0_banner_lists_adapters_not_zero_call_sites(self) -> None:
@@ -285,6 +292,36 @@ class BannerTest(unittest.TestCase):
         out = self._banner("keel.toml", ["py:m.enrich"], [])
         self.assertIn("keel ▸ wrapped 1 call site (py:m.enrich) with policy keel.toml", out)
 
+    def test_defaults_banner_names_the_root_it_searched(self) -> None:
+        # WS1: the defaults line must say WHERE it looked — "production
+        # defaults" alone read as success in the field (F0).
+        with TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            out = self._banner("defaults", [], [], cwd=sub)
+        self.assertEqual(
+            out,
+            f"keel ▸ wrapped nothing yet with production defaults — no keel.toml in {sub}; "
+            "`keel init` to customize\n",
+        )
+
+    def test_policy_banner_names_the_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            out = self._banner("keel.toml", ["py:m.enrich"], [], cwd=Path(tmp))
+        self.assertIn(f"with policy {Path(tmp) / 'keel.toml'}", out)
+
+    def test_optional_defaults_under_keel_cwd_warn_in_the_banner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = self._banner(
+                "defaults", [], [], env={"KEEL_POLICY": "optional"}, cwd=root, cwd_source="KEEL_CWD"
+            )
+        self.assertEqual(
+            out,
+            f"keel ▸ wrapped nothing yet with production defaults — KEEL_CWD={root} is set but "
+            f"{root / 'keel.toml'} does not exist (KEEL_POLICY=optional)\n",
+        )
+
     def test_defaults_banner_without_parent_keel_toml_is_byte_unchanged(self) -> None:
         # #85: pin today's exact line when no parent keel.toml exists, even
         # though a cwd is now threaded through — nothing should change here.
@@ -293,7 +330,9 @@ class BannerTest(unittest.TestCase):
             sub.mkdir()
             out = self._banner("defaults", [], [], cwd=sub)
         self.assertEqual(
-            out, "keel ▸ wrapped nothing yet with production defaults — `keel init` to customize\n"
+            out,
+            f"keel ▸ wrapped nothing yet with production defaults — no keel.toml in {sub}; "
+            "`keel init` to customize\n",
         )
 
     def test_defaults_banner_names_parent_keel_toml_and_keel_cwd_fix(self) -> None:

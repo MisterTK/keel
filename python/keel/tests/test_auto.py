@@ -276,5 +276,72 @@ class DoubleActivationEndToEndTest(unittest.TestCase):
         self.assertNotIn(b"stdout-line-1", proc.stdout, "the fixture must never run on a broken config")
 
 
+_PROBE_INSTALLED = "import keel._auto; from keel import bootstrap; print('INSTALLED', bootstrap._STATE.installed)"
+
+
+class StrictKeelCwdTest(unittest.TestCase):
+    """WS1: KEEL_CWD asserts where policy lives. Pointing it at a directory
+    with no keel.toml refuses activation (keel-free, one error line) unless
+    KEEL_POLICY=optional."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _keel_lines(self, proc: subprocess.CompletedProcess[bytes]) -> list[str]:
+        return [l for l in proc.stderr.decode().splitlines() if l.startswith("keel ▸")]
+
+    def test_missing_policy_at_keel_cwd_refuses_to_activate(self) -> None:
+        proc = _run(_PROBE_INSTALLED, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"INSTALLED False", proc.stdout)
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertEqual(
+            lines[0],
+            f"keel ▸ error: KEEL_CWD={self.root} is set but {self.root / 'keel.toml'} does not exist — "
+            "Keel NOT activated; the app continues without keel "
+            "(set KEEL_POLICY=optional to run on production defaults instead)",
+        )
+
+    def test_refusal_prints_once_even_when_install_is_called_twice(self) -> None:
+        code = "import keel._auto; from keel.bootstrap import install_keel; import os; " \
+               "install_keel(cwd=os.environ['KEEL_CWD'], env=os.environ, cwd_source='KEEL_CWD'); print('OK')"
+        proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertIn(b"OK", proc.stdout)
+        self.assertEqual(len(self._keel_lines(proc)), 1, proc.stderr)
+
+    def test_keel_policy_optional_restores_defaults_with_a_warning(self) -> None:
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_POLICY="optional"),
+            cwd=str(self.root),
+        )
+        self.assertIn(b"INSTALLED True", proc.stdout)
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertIn("with production defaults — KEEL_CWD=", lines[0])
+        self.assertIn("(KEEL_POLICY=optional)", lines[0])
+
+    def test_keel_cwd_with_a_policy_file_activates_normally(self) -> None:
+        (self.root / "keel.toml").write_text("")
+        proc = _run(_PROBE_INSTALLED, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertIn(b"INSTALLED True", proc.stdout)
+        self.assertIn(f"with policy {self.root / 'keel.toml'}", proc.stderr.decode())
+
+    def test_python_m_keel_run_exits_2_under_a_stale_keel_cwd(self) -> None:
+        proc = _run(
+            "import sys; sys.argv=['keel','run',%r]; from keel._run import main_module; main_module()" % HELLO,
+            env=child_env(KEEL_CWD=str(self.root)),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(b"Keel NOT activated", proc.stderr)
+        self.assertNotIn(b"hello", proc.stdout, "the target must not run")
+
+
 if __name__ == "__main__":
     unittest.main()

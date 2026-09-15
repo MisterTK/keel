@@ -48,6 +48,22 @@ def is_disabled(env: Mapping[str, str] | None = None) -> bool:
     return env.get("KEEL_DISABLE", "").strip().lower() in _TRUTHY
 
 
+def policy_optional(env: Mapping[str, str] | None = None) -> bool:
+    """`KEEL_POLICY=optional` restores the pre-0.5.5 fallback: an explicit
+    KEEL_CWD with no keel.toml runs on production defaults (with a warning)
+    instead of refusing to activate. The only recognized value."""
+    env = env if env is not None else os.environ
+    return env.get("KEEL_POLICY", "").strip().lower() == "optional"
+
+
+def missing_policy_error(root: Path) -> str:
+    return (
+        f"keel ▸ error: KEEL_CWD={root} is set but {root / 'keel.toml'} does not exist — "
+        "Keel NOT activated; the app continues without keel "
+        "(set KEEL_POLICY=optional to run on production defaults instead)\n"
+    )
+
+
 def _console_enabled(policy: Mapping[str, Any], env: Mapping[str, str]) -> bool:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return False
@@ -65,18 +81,30 @@ class _State:
     exit_registered: bool = False
     mcp_uninstall: Any = None
     state: dict[str, Any] | None = None
+    refused: dict[str, Any] | None = None
 
 
 _STATE = _State()
 
 
 def install_keel(
-    *, cwd: str | Path | None = None, env: Mapping[str, str] | None = None
+    *,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd_source: str = "cwd",
 ) -> dict[str, Any]:
-    """Install Keel's Tier 1 machinery. Idempotent within a process."""
+    """Install Keel's Tier 1 machinery. Idempotent within a process.
+
+    `cwd_source` is "KEEL_CWD" when `cwd` came from that env var: pointing
+    KEEL_CWD at a directory with no keel.toml is a misconfiguration (the
+    policy did not ship — issue #85's second occurrence), so Keel refuses to
+    activate rather than silently running production defaults.
+    """
     env = env if env is not None else os.environ
     if is_disabled(env):
         return {"enabled": False, "reason": "KEEL_DISABLE"}
+    if _STATE.refused is not None:
+        return dict(_STATE.refused)  # already said so once this process
     if _STATE.installed:
         # Return the SAME full state the first install produced (backend,
         # discovery, flow_entrypoints, …) rather than a bare marker — callers
@@ -91,6 +119,10 @@ def install_keel(
 
     cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
+    if source == "defaults" and cwd_source == "KEEL_CWD" and not policy_optional(env):
+        sys.stderr.write(missing_policy_error(cwd))
+        _STATE.refused = {"enabled": False, "reason": "policy-missing-at-keel-cwd", "root": str(cwd)}
+        return dict(_STATE.refused)
     # Backend first: whether it's persistent (native + attached journal) decides
     # whether the LLM dev cache resolves to `scope=persistent` (cross-run replay).
     backend = load_backend(env.get("KEEL_BACKEND"), cwd=cwd, env=env)
@@ -147,7 +179,7 @@ def install_keel(
     _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
 
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd)
+    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd, cwd_source)
 
     state = {
         "enabled": True,
@@ -206,6 +238,7 @@ def uninstall_keel() -> None:
     clear_runtime()
     _STATE.installed = False
     _STATE.state = None
+    _STATE.refused = None
 
 
 def _register_exit_flush() -> None:
@@ -279,10 +312,17 @@ def _banner(
     adapters: list[Detection],
     mcp: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
+    cwd_source: str = "cwd",
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
-    desc = "production defaults" if source == "defaults" else "policy keel.toml"
+    root = Path(cwd) if cwd is not None else None
+    if source == "defaults":
+        desc = "production defaults"
+    elif root is not None:
+        desc = f"policy {root / 'keel.toml'}"
+    else:
+        desc = "policy keel.toml"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".
@@ -296,17 +336,24 @@ def _banner(
     if mcp and mcp.get("active"):
         pieces.append("mcp: transports")
     wrapped = " + ".join(pieces) if pieces else "nothing yet"
-    # #85: on the defaults path only (a real policy loaded means this cwd is
-    # already the right one — zero cost there), check whether a keel.toml
-    # exists somewhere above cwd that load_policy never looked at. If so, the
-    # usual "keel init to customize" nudge reads as if nothing is wrong, when
-    # actually the adopter's policy silently never loaded — name both paths
-    # and the fix instead.
-    found = _policy_above_cwd(cwd) if source == "defaults" and cwd is not None else None
+    head = f"keel ▸ wrapped {wrapped} with {desc}"
+    if source != "defaults":
+        sys.stderr.write(f"{head}\n")
+        return
+    # #85: a keel.toml above cwd that load_policy never looked at — byte-identical line.
+    found = _policy_above_cwd(root) if root is not None else None
     if found is not None:
         sys.stderr.write(
-            f"keel ▸ wrapped {wrapped} with {desc} — found keel.toml at {found} but "
-            f"running from {Path(cwd)}; set KEEL_CWD={found} to load it\n"
+            f"{head} — found keel.toml at {found} but running from {root}; "
+            f"set KEEL_CWD={found} to load it\n"
         )
+    elif cwd_source == "KEEL_CWD" and root is not None:
+        # Only reachable under KEEL_POLICY=optional (install_keel refuses otherwise).
+        sys.stderr.write(
+            f"{head} — KEEL_CWD={root} is set but {root / 'keel.toml'} does not exist "
+            "(KEEL_POLICY=optional)\n"
+        )
+    elif root is not None:
+        sys.stderr.write(f"{head} — no keel.toml in {root}; `keel init` to customize\n")
     else:
-        sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")
+        sys.stderr.write(f"{head} — `keel init` to customize\n")
