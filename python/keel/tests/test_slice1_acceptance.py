@@ -29,6 +29,7 @@ from tempfile import TemporaryDirectory
 from . import FIXTURES, child_env
 
 APP = str(FIXTURES / "lro_poll_app.py")
+GENERATE_APP = str(FIXTURES / "generate_cache_app.py")
 
 
 class _FakeVertex(BaseHTTPRequestHandler):
@@ -65,11 +66,11 @@ class Slice1AcceptanceTest(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeVertex)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        port = self.server.server_address[1]
-        self.base = (
-            f"http://127.0.0.1:{port}"
-            "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1"
-        )
+        # Only the authority travels to the child: the fixtures address a real
+        # Vertex URL so the core's own host map resolves `llm:google-genai`,
+        # and their transport redirects the socket here (see
+        # `fixtures/vertex_loopback.py`).
+        self.local_authority = f"127.0.0.1:{self.server.server_address[1]}"
         self._tmp = TemporaryDirectory()
         self.empty_root = Path(self._tmp.name)  # no keel.toml here — the image without COPY
 
@@ -89,7 +90,7 @@ class Slice1AcceptanceTest(unittest.TestCase):
                 **{
                     "KEEL_ENABLE": "1",
                     "KEEL_CWD": str(self.empty_root),
-                    "LRO_BASE": self.base,
+                    "LRO_LOCAL": self.local_authority,
                     "KEEL_LOG_FORMAT": "json",  # overridable by a caller (b2)
                     **env,
                 }
@@ -163,25 +164,21 @@ class Slice1AcceptanceTest(unittest.TestCase):
 
     def test_d_a_generate_call_still_replays_from_the_dev_cache(self) -> None:
         # Control: the dev cache itself still works for prompt-shaped POSTs, so
-        # (c) passes because of the LRO exemption, not because caching is dead.
-        code = (
-            "import keel._auto, httpx, os\n"
-            "from keel import _runtime\n"
-            "b=_runtime.get_backend(); o=b.resolve_target\n"
-            "b.resolve_target=lambda m,h,*,scheme=None,port=None,path=None:"
-            " 'llm:google-genai' if h=='127.0.0.1' else"
-            " o(m,h,scheme=scheme,port=port,path=path)\n"
-            "base=os.environ['LRO_BASE']\n"
-            "with httpx.Client() as c:\n"
-            "    for _ in range(2): c.post(base+':generateContent', json={'contents': []})\n"
-        )
+        # (c) passes because of the LRO exemption, not because caching is dead —
+        # and not because the host map failed to recognize the endpoint, which
+        # would leave every call on a non-`llm:` target and make (c) vacuous.
         proc = subprocess.run(
-            [sys.executable, "-c", code],
+            [
+                sys.executable,
+                "-c",
+                "import keel._auto; import runpy; runpy.run_path(%r, run_name='__main__')"
+                % GENERATE_APP,
+            ],
             env=child_env(
                 KEEL_ENABLE="1",
                 KEEL_CWD=str(self.empty_root),
                 KEEL_POLICY="optional",
-                LRO_BASE=self.base,
+                LRO_LOCAL=self.local_authority,
                 KEEL_LOG_FORMAT="json",
             ),
             cwd=str(self.empty_root),
