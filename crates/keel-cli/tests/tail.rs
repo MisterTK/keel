@@ -195,11 +195,18 @@ mod read_events_tests {
     #[test]
     fn newest_run_full_read() {
         let (_d, project) = project_with_fixture_runs(&[RUN]);
-        let slice = read_events(&project, None, None, 1000).unwrap().expect("a run exists");
+        let slice = read_events(&project, None, None, 1000)
+            .unwrap()
+            .expect("a run exists");
         assert_eq!(slice.run.id, RUN);
         assert!(!slice.events.is_empty());
         assert_eq!(slice.events[0]["event"], "run_start");
-        let max_seq = slice.events.iter().map(|e| e["seq"].as_u64().unwrap()).max().unwrap();
+        let max_seq = slice
+            .events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .max()
+            .unwrap();
         assert_eq!(slice.last_seq, max_seq);
     }
 
@@ -209,7 +216,9 @@ mod read_events_tests {
         let all = read_events(&project, None, None, 1000).unwrap().unwrap();
         let last = all.events.last().unwrap()["seq"].as_u64().unwrap();
         // since == last_seq → nothing new, cursor unchanged.
-        let none = read_events(&project, None, Some(last), 1000).unwrap().unwrap();
+        let none = read_events(&project, None, Some(last), 1000)
+            .unwrap()
+            .unwrap();
         assert!(none.events.is_empty());
         assert_eq!(none.last_seq, all.last_seq);
         // limit 1 → exactly the newest line.

@@ -32,10 +32,18 @@ pub struct Response {
 
 impl Response {
     fn json(status: u16, body: String) -> Self {
-        Self { status, content_type: "application/json", body }
+        Self {
+            status,
+            content_type: "application/json",
+            body,
+        }
     }
     fn text(status: u16, body: &str) -> Self {
-        Self { status, content_type: "text/plain; charset=utf-8", body: body.to_owned() }
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: body.to_owned(),
+        }
     }
 }
 
@@ -115,7 +123,11 @@ fn handle_connection(mut stream: TcpStream, project: &Path, now_ms: i64) {
     let resp = if host_is_loopback(&text) {
         handle_request(project, now_ms, request_line)
     } else {
-        Response { status: 421, content_type: "text/plain; charset=utf-8", body: "keel report --serve answers only 127.0.0.1 / localhost\n".to_owned() }
+        Response {
+            status: 421,
+            content_type: "text/plain; charset=utf-8",
+            body: "keel report --serve answers only 127.0.0.1 / localhost\n".to_owned(),
+        }
     };
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -137,14 +149,22 @@ fn host_is_loopback(head: &str) -> bool {
         .lines()
         .skip(1)
         .take_while(|l| !l.is_empty())
-        .find_map(|l| l.split_once(':').filter(|(name, _)| name.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v.trim()))
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.trim())
+        })
     else {
         return false;
     };
     let lower = value.to_ascii_lowercase();
     let host = if let Some(rest) = lower.strip_prefix("[::1]") {
         // Bracketed IPv6 keeps its brackets; only an optional port follows.
-        if rest.is_empty() || rest.starts_with(':') { "[::1]" } else { return false }
+        if rest.is_empty() || rest.starts_with(':') {
+            "[::1]"
+        } else {
+            return false;
+        }
     } else {
         lower.split(':').next().unwrap_or("")
     };
@@ -208,7 +228,10 @@ pub fn run_serve(
     let listener = bind(opts.port).map_err(|e| bind_error(opts.port, &e))?;
     let port = listener.local_addr().map_or(opts.port, |a| a.port());
     let url = format!("http://127.0.0.1:{port}/");
-    let _ = writeln!(out, "keel \u{25b8} serving the live report at {url} (Ctrl-C to stop)");
+    let _ = writeln!(
+        out,
+        "keel \u{25b8} serving the live report at {url} (Ctrl-C to stop)"
+    );
     if opts.open && !report::open_in_browser(&url) {
         let _ = writeln!(out, "  (could not launch a browser; open the URL yourself)");
     }
@@ -224,7 +247,10 @@ fn bind_error(port: u16, error: &io::Error) -> Rendered {
     let message = format!("could not bind 127.0.0.1:{port}: {error}");
     Rendered {
         human: format!("keel \u{25b8} {message}"),
-        json: to_json(&Err { error: message, port }),
+        json: to_json(&Err {
+            error: message,
+            port,
+        }),
         exit: EXIT_FAILURE,
         to_stderr: true,
     }
