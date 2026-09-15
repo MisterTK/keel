@@ -821,6 +821,86 @@ fn run_refuses_a_stale_keel_cwd_before_launching() {
     );
 }
 
+/// The kill switch must still work under a stale `KEEL_CWD` — that operator
+/// (policy never shipped, app misbehaving) is exactly who reaches for
+/// `--disable`. README: "`KEEL_DISABLE=1` always wins". Command mode keeps this
+/// independent of whether a `keelrun` wheel happens to be importable here.
+#[test]
+fn run_disable_flag_still_launches_under_a_stale_keel_cwd() {
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .env("KEEL_CWD", stale.path())
+        .args(["run", "--disable", "--", "sh", "-c", "echo RAN"])
+        .output()
+        .expect("spawn keel run --disable");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "the program must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The other arm: no CLI flag at all, just an ambient `KEEL_DISABLE=1`. Both
+/// front ends check `is_disabled` before the refusal, so the child would run
+/// keel-free; `keel run` must not refuse on its behalf.
+#[test]
+fn run_ambient_keel_disable_still_launches_under_a_stale_keel_cwd() {
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .env("KEEL_CWD", stale.path())
+        .env("KEEL_DISABLE", "1")
+        .args(["run", "--", "sh", "-c", "echo RAN"])
+        .output()
+        .expect("spawn keel run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "the program must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A refused `keel record run` must leave nothing behind — the preflight runs
+/// before the recordings directory is created, not after.
+#[test]
+fn record_run_refused_by_a_stale_keel_cwd_creates_no_recordings_dir() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('RAN')\n").unwrap();
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .current_dir(dir.path())
+        .env("KEEL_CWD", stale.path())
+        .args(["record", "run", "app.py"])
+        .output()
+        .expect("spawn keel record run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Keel NOT activated"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.path().join(".keel").join("recordings").exists(),
+        "a refused record must not create .keel/recordings/"
+    );
+}
+
 /// The evidence readers honor `keel.toml`'s `journal` key: a journal at a
 /// custom `file:` location (relative to the project) is found by `flows`,
 /// `trace`, and `status` even though `.keel/journal.db` does not exist.

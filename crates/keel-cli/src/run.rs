@@ -582,10 +582,21 @@ pub(crate) fn activation_env_in(
 /// An ambient `KEEL_CWD` naming a directory with no `keel.toml` would make the
 /// child refuse to activate (WS1); an explicit `keel run` can fail properly
 /// instead, before anything launches. `KEEL_POLICY=optional` opts out.
+///
+/// `disabled` opts out too, and is not a nicety: with Keel switched off there
+/// is no activation left to refuse. Both front ends check `is_disabled` BEFORE
+/// the refusal, so the child would run fine and keel-free — failing here would
+/// break the documented kill switch ("`KEEL_DISABLE=1` always wins") for
+/// exactly the operator whose policy did not ship, i.e. the population this
+/// preflight exists for.
 pub(crate) fn keel_cwd_preflight_in(
     keel_cwd: Option<&str>,
     policy_optional: bool,
+    disabled: bool,
 ) -> Option<Rendered> {
+    if disabled {
+        return None;
+    }
     let root = keel_cwd?.trim();
     if root.is_empty() || policy_optional || Path::new(root).join("keel.toml").is_file() {
         return None;
@@ -598,11 +609,24 @@ pub(crate) fn keel_cwd_preflight_in(
     )
 }
 
-pub(crate) fn keel_cwd_preflight() -> Option<Rendered> {
+/// `KEEL_DISABLE`'s truthy set, byte-identical to the two front ends'
+/// (`bootstrap.py::is_disabled`, `bootstrap.mjs::isDisabled`): `1`/`true`/`yes`,
+/// trimmed, case-insensitive. Any other value (including `0`) is not disabled.
+fn keel_disable_is_truthy(value: &str) -> bool {
+    let v = value.trim();
+    v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+}
+
+/// `--disable` (`plan.disable`) is only half the kill switch — an operator can
+/// also export `KEEL_DISABLE=1` and never touch the CLI flag. Both must skip
+/// the preflight.
+pub(crate) fn keel_cwd_preflight(disable: bool) -> Option<Rendered> {
     let keel_cwd = std::env::var("KEEL_CWD").ok();
     let optional =
         std::env::var("KEEL_POLICY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("optional"));
-    keel_cwd_preflight_in(keel_cwd.as_deref(), optional)
+    let disabled =
+        disable || std::env::var("KEEL_DISABLE").is_ok_and(|v| keel_disable_is_truthy(&v));
+    keel_cwd_preflight_in(keel_cwd.as_deref(), optional, disabled)
 }
 
 /// The stderr banner `keel run` prints once a plan resolves to command mode
@@ -632,7 +656,7 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
             (Some(r), code)
         }
         Ok(plan) => {
-            if let Some(r) = keel_cwd_preflight() {
+            if let Some(r) = keel_cwd_preflight(plan.disable) {
                 let code = r.exit;
                 return (Some(r), code);
             }
@@ -1085,18 +1109,40 @@ mod tests {
     fn keel_cwd_preflight_rejects_a_root_without_keel_toml() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().to_string_lossy().into_owned();
-        let r = keel_cwd_preflight_in(Some(&root), false).expect("must refuse");
+        let r = keel_cwd_preflight_in(Some(&root), false, false).expect("must refuse");
         assert_eq!(r.exit, EXIT_USAGE);
         assert!(r.to_stderr);
         assert_eq!(r.json["error"], "policy-missing-at-keel-cwd");
         assert!(r.human.contains(&format!("KEEL_CWD={root}")), "{}", r.human);
         // Present file, optional, unset, blank: all pass.
         fs::write(dir.path().join("keel.toml"), "").unwrap();
-        assert!(keel_cwd_preflight_in(Some(&root), false).is_none());
+        assert!(keel_cwd_preflight_in(Some(&root), false, false).is_none());
         fs::remove_file(dir.path().join("keel.toml")).unwrap();
-        assert!(keel_cwd_preflight_in(Some(&root), true).is_none());
-        assert!(keel_cwd_preflight_in(None, false).is_none());
-        assert!(keel_cwd_preflight_in(Some("  "), false).is_none());
+        assert!(keel_cwd_preflight_in(Some(&root), true, false).is_none());
+        assert!(keel_cwd_preflight_in(None, false, false).is_none());
+        assert!(keel_cwd_preflight_in(Some("  "), false, false).is_none());
+    }
+
+    /// The kill switch outranks the refusal: with Keel switched off there is no
+    /// activation to refuse, and both front ends check `is_disabled` before the
+    /// refusal anyway. Integration twins (real binary, child env only):
+    /// `tests/cli.rs::run_{disable_flag,ambient_keel_disable}_*`.
+    #[test]
+    fn keel_cwd_preflight_is_skipped_when_keel_is_disabled() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        assert!(keel_cwd_preflight_in(Some(&root), false, false).is_some());
+        assert!(keel_cwd_preflight_in(Some(&root), false, true).is_none());
+    }
+
+    #[test]
+    fn keel_disable_truthiness_matches_the_front_ends() {
+        for v in ["1", "true", "YES", " True ", "\tyes\n"] {
+            assert!(keel_disable_is_truthy(v), "{v:?} must disable");
+        }
+        for v in ["", "0", "no", "false", "off", "2"] {
+            assert!(!keel_disable_is_truthy(v), "{v:?} must NOT disable");
+        }
     }
 
     #[test]

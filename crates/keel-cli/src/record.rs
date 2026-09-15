@@ -78,6 +78,15 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
         let code = r.exit;
         return (Some(r), code);
     }
+    // Before BOTH the python preflight and `create_dir_all` below — same order
+    // `keel run` uses, and a refused record must leave no `.keel/recordings/`
+    // behind. The preflight needs no plan state; `record run` has no
+    // `--disable` flag, so only an ambient `KEEL_DISABLE` switches it off here
+    // (which `keel_cwd_preflight` reads itself).
+    if let Some(r) = run::keel_cwd_preflight(false) {
+        let code = r.exit;
+        return (Some(r), code);
+    }
     if let Some(r) = run::python_preflight(target, &plan) {
         let code = r.exit;
         return (Some(r), code);
@@ -94,10 +103,6 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
     }
     let path = dir.join(format!("{}.{RECORDING_EXT}", new_id()));
     let path_str = path.to_string_lossy().into_owned();
-    if let Some(r) = run::keel_cwd_preflight() {
-        let code = r.exit;
-        return (Some(r), code);
-    }
     match run::exec_with(&plan, |cmd| {
         cmd.env("KEEL_RECORD", &path_str);
         cmd.envs(run::activation_env(&plan));
