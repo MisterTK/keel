@@ -360,10 +360,15 @@ def _banner(
         desc = f"policy {root / 'keel.toml'}"
     else:
         desc = "policy keel.toml"
+    # The marker that demoted the dev cache, held as a value so the JSON form
+    # can carry it as a field: "was the dev cache on in that container?" is one
+    # of the questions the 2026-09-15 post-mortem had to answer by inference,
+    # and a log pipeline can only index what the object names (F10).
+    dev_cache_off: str | None = None
     if not env.get("KEEL_ENV", "").strip():
-        marker = serverless_marker(env)
-        if marker is not None:
-            desc = f"{desc} (dev cache off: {marker} detected)"
+        dev_cache_off = serverless_marker(env)
+        if dev_cache_off is not None:
+            desc = f"{desc} (dev cache off: {dev_cache_off} detected)"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".
@@ -405,6 +410,7 @@ def _banner(
             note = "`keel init` to customize"
     text = f"{head}\n" if note is None else f"{head} — {note}\n"
     obj: dict[str, Any] = {
+        "dev_cache_off": dev_cache_off,
         "keel": "activation",
         "policy_path": str(root / "keel.toml") if source != "defaults" and root is not None else None,
         "policy_source": source,

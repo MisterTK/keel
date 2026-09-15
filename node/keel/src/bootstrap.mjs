@@ -365,9 +365,14 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd")
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
   let desc = source === "defaults" ? "production defaults" : `policy ${join(cwd, "keel.toml")}`;
+  // The marker that demoted the dev cache, held as a value so the JSON form
+  // can carry it as a field: "was the dev cache on in that container?" is one
+  // of the questions the 2026-09-15 post-mortem had to answer by inference,
+  // and a log pipeline can only index what the object names (F10).
+  let devCacheOff = null;
   if (!String(env.KEEL_ENV ?? "").trim()) {
-    const marker = serverlessMarker(env);
-    if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
+    devCacheOff = serverlessMarker(env);
+    if (devCacheOff !== null) desc = `${desc} (dev cache off: ${devCacheOff} detected)`;
   }
   const head = `keel ▸ wrapped ${seams.join(" + ")} with ${desc}`;
   // `note` is the text after the em-dash — the one place the tail variants
@@ -394,6 +399,7 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd")
   }
   const text = note === null ? `${head}\n` : `${head} — ${note}\n`;
   const obj = {
+    dev_cache_off: devCacheOff,
     keel: "activation",
     policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),
     policy_source: source,

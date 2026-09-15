@@ -232,8 +232,20 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
     assert.equal(objs[0].root, realRoot);
     assert.equal(objs[0].root_source, "cwd");
     assert.ok(!("note" in objs[0]), `a loaded policy has no em-dash tail — no note key: ${objs[0].note}`);
+    assert.equal(objs[0].dev_cache_off, null, "no serverless marker here — the dev cache stayed on");
     assert.equal(objs[1].calls, 0);
     assert.equal(objs[1].policy_source, "keel.toml");
+
+    // The banner's `(dev cache off: K_SERVICE detected)` suffix, as a named
+    // field: a log pipeline can only index what the object names. Twin of
+    // python/keel/tests/test_slice1_acceptance.py's (b)/(b2).
+    const served = run(root, { KEEL_LOG_FORMAT: "json", K_SERVICE: "render" });
+    assert.equal(keelJsonLines(served.stderr)[0].dev_cache_off, "K_SERVICE", served.stderr);
+    const prose = run(root, { K_SERVICE: "render" });
+    assert.ok(
+      prose.stderr.includes("(dev cache off: K_SERVICE detected)"),
+      `the text twin must say the same thing: ${prose.stderr}`,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
