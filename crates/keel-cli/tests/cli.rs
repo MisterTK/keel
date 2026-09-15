@@ -672,6 +672,59 @@ fn doctor_reports_config_above_cwd_when_run_from_a_subdirectory() {
     );
 }
 
+/// WS3: a root Dockerfile whose COPY/ADD directives never reach keel.toml —
+/// the exact shape of the 2026-09-15 field outage. Doctor must say so, and
+/// `policy.path` must be machine-checkable.
+#[test]
+fn doctor_json_matches_golden_for_dockerfile_without_keel_toml() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in ["app.py", "keel.toml", "Dockerfile"] {
+        std::fs::copy(
+            fixtures().join("py_dockerfile_no_copy").join(f),
+            dir.path().join(f),
+        )
+        .unwrap();
+    }
+    let r = doctor::run(dir.path());
+    assert_eq!(
+        r.exit,
+        keel_cli::EXIT_OK,
+        "a packaging warning does not flip ok"
+    );
+    assert_eq!(r.json["policy"]["path"], "keel.toml");
+    assert!(
+        has_topic(&r.json, "keel-toml-not-in-image"),
+        "{}",
+        json_string(&r.json)
+    );
+    check_golden("doctor_dockerfile_no_copy.json", &json_string(&r.json));
+}
+
+/// #87: the agents-cli manifest walk must find a manifest ABOVE a relative
+/// project path (`main.rs` passes "."), same defect class as #85's C1.
+#[test]
+fn doctor_finds_the_agents_cli_manifest_from_a_nested_subdirectory() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("agents-cli-manifest.yaml"),
+        "agent_directory: app\n",
+    )
+    .unwrap();
+    let nested = root.join("app").join("pkg");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("keel.toml"), "").unwrap();
+    let report = doctor_json_from(&nested);
+    assert!(
+        has_topic(&report, "agents-cli-config-placement"),
+        "walk must reach the manifest two levels up: {report}"
+    );
+}
+
 /// WS1 production pin: `keel run` under an ambient KEEL_CWD that names a
 /// directory with no keel.toml must fail before launching anything. Child env
 /// only — never `std::env::set_var` (issue #72).

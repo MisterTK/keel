@@ -241,6 +241,11 @@ struct Coverage {
 struct PolicyCheck {
     field: Option<String>,
     message: Option<String>,
+    /// The policy file this report read, project-relative (`"keel.toml"`), or
+    /// `None` when there is none. Machine-checkable: a consumer comparing two
+    /// environments can see *which* file — if any — each one actually loaded,
+    /// rather than inferring it from `present`.
+    path: Option<String>,
     present: bool,
     valid: bool,
 }
@@ -384,6 +389,10 @@ struct Boundaries {
     /// fail-closed contracts and "never touch this file" rules live in that
     /// prose, so a call site that looks wrappable may be deliberately locked.
     governance_files: Vec<&'static str>,
+    /// File classes read coarsely by directive, not parsed into an AST — so a
+    /// verdict drawn from them is a lead about the packaging boundary, never a
+    /// build. Today: the root build files' `COPY`/`ADD` lines (WS3).
+    parsed_files: &'static [&'static str],
     /// The languages the static scan parses into an AST.
     parsed_languages: &'static [&'static str],
     /// One line naming the protocol that turns this evidence into a verdict,
@@ -469,6 +478,7 @@ pub fn run(project: &Path) -> Rendered {
     let agents_cli_finding = agents_cli_placement_finding(project);
     let config_above_cwd_finding = config_above_cwd_finding(project);
     let boundaries = boundaries(project);
+    let build_files = crate::dockerfile::analyze(project);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
     let report = build_report(
         &scan,
@@ -478,6 +488,7 @@ pub fn run(project: &Path) -> Rendered {
         agents_cli_finding,
         config_above_cwd_finding,
         boundaries,
+        &build_files,
         &stale_flows,
     );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
@@ -986,6 +997,7 @@ fn boundaries(project: &Path) -> Boundaries {
     }
     Boundaries {
         governance_files,
+        parsed_files: &["dockerfile (COPY/ADD directives only)"],
         parsed_languages: &["python", "js-ts"],
         protocol: "Static + adapter-interception evidence, not a verdict. Drive an \
                    evaluate/adopt/review task through the keel skill's five phases: Scope every \
@@ -1012,20 +1024,21 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the eight evidence inputs. Pure, so the golden test
+/// Assemble the report from the nine evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3` — the filesystem-dependent
 /// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
 /// check for a root `keel.toml`; `config_above_cwd_finding`, since it walks
 /// parent directories for a `keel.toml` — issue #85; `boundaries`, since it
-/// stats the project root for governance files; `stale_flows`, since it
+/// stats the project root for governance files; `build_files`, since it reads
+/// the root `Dockerfile`s and `.dockerignore`; `stale_flows`, since it
 /// needs to read `.keel/journal.db` and stat scripts on disk) are computed
 /// by the caller and passed in already resolved, the same pattern
 /// `policy`/`journal` already use.
 #[allow(clippy::too_many_lines)]
 // straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
-#[allow(clippy::too_many_arguments)] // eight already-resolved evidence inputs (see doc
-// comment above); issue #85 added the eighth, config_above_cwd_finding.
+#[allow(clippy::too_many_arguments)] // nine already-resolved evidence inputs (see doc
+// comment above); issue #85 added config_above_cwd_finding, WS3 added build_files.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1034,6 +1047,7 @@ fn build_report(
     agents_cli_finding: Option<Finding>,
     config_above_cwd_finding: Option<Finding>,
     boundaries: Boundaries,
+    build_files: &[crate::dockerfile::BuildFile],
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation {
@@ -1177,6 +1191,11 @@ fn build_report(
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
+    // WS3: only meaningful when there IS a policy file to ship — with no
+    // keel.toml in the checkout there is nothing for the image to be missing.
+    if policy.present {
+        findings.extend(packaging_findings(build_files));
+    }
     // Issue #85: only meaningful when this project has no keel.toml of its
     // own — `config_above_cwd_finding` already checks this independently,
     // but gating here too keeps the rule visible at the one call site that
@@ -1201,6 +1220,62 @@ fn build_report(
         policy,
         topology,
     }
+}
+
+/// WS3: the policy file exists in the checkout — does the image get it?
+fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Finding> {
+    use crate::dockerfile::Reach;
+    let mut out = Vec::new();
+    for bf in build_files {
+        match bf.reach {
+            Reach::NotReached => out.push(Finding {
+                action:
+                    "Add `COPY keel.toml ./` (before the layer that runs the app). At runtime the \
+                         policy is read from KEEL_CWD or the working directory; without the file \
+                         Keel refuses to activate under KEEL_CWD and runs production defaults \
+                         otherwise."
+                        .to_owned(),
+                detail: format!(
+                    "`{}` has no COPY/ADD directive that reaches keel.toml — the policy in this \
+                     checkout will not be in the image.",
+                    bf.file
+                ),
+                fix: None,
+                level: "warn",
+                topic: "keel-toml-not-in-image",
+            }),
+            Reach::Reached if !bf.reached_in_final_stage => out.push(Finding {
+                action:
+                    "Copy keel.toml into the final stage too (`COPY keel.toml ./` after the last \
+                         FROM), or `COPY --from=<stage>` it across."
+                        .to_owned(),
+                detail: format!(
+                    "`{}` copies keel.toml only in a non-final build stage — the runtime image \
+                     will not have it.",
+                    bf.file
+                ),
+                fix: None,
+                level: "warn",
+                topic: "keel-toml-not-in-image",
+            }),
+            Reach::Indeterminate => out.push(Finding {
+                action: "Confirm the expanded source includes keel.toml, or add an explicit \
+                         `COPY keel.toml ./`."
+                    .to_owned(),
+                detail: format!(
+                    "`{}`: could not tell whether keel.toml reaches the image — `{}` depends on a \
+                     build variable.",
+                    bf.file,
+                    bf.directive.as_deref().unwrap_or_default()
+                ),
+                fix: None,
+                level: "info",
+                topic: "keel-toml-image-indeterminate",
+            }),
+            Reach::Reached => {}
+        }
+    }
+    out
 }
 
 /// Sort every host the static scan saw into exactly one of the three honesty
@@ -1361,6 +1436,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -1413,6 +1489,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 check: PolicyCheck {
                     field: None,
                     message: None,
+                    path: Some("keel.toml".to_owned()),
                     present: true,
                     valid: true,
                 },
@@ -1434,6 +1511,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
         check: PolicyCheck {
             field,
             message: Some(message.to_owned()),
+            path: Some("keel.toml".to_owned()),
             present: true,
             valid: false,
         },
@@ -1646,6 +1724,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -1661,6 +1740,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -1752,6 +1832,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -1830,6 +1911,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -1913,6 +1995,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             r.topology
@@ -1989,6 +2072,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         let retry = r
@@ -2091,6 +2175,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -2140,6 +2225,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let hit: Vec<_> = r
             .follow_ups
@@ -2167,6 +2253,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
     }
@@ -2188,6 +2275,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
@@ -2276,6 +2364,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
 
         assert!(
@@ -2353,6 +2442,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -2422,6 +2512,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(
@@ -2508,6 +2599,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -2523,6 +2615,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -2590,6 +2683,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let mcp = r
             .adapters
@@ -2613,6 +2707,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -2639,6 +2734,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         let row = r
@@ -2675,6 +2771,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let finding = r
             .findings
@@ -2705,6 +2802,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.findings
@@ -2725,6 +2823,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.findings
@@ -2741,6 +2840,7 @@ mod tests {
             check: PolicyCheck {
                 field: Some("target.x.retry.attempts".to_owned()),
                 message: Some("invalid value: integer `0`".to_owned()),
+                path: Some("keel.toml".to_owned()),
                 present: true,
                 valid: false,
             },
@@ -2756,6 +2856,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(!r.ok);
@@ -2777,6 +2878,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: Some("keel.toml".to_owned()),
                 present: true,
                 valid: true,
             },
@@ -2798,6 +2900,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(!r.ok, "an unbootable configuration must not be ok");
@@ -3316,6 +3419,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
         assert!(r.boundaries.unparsed.contains(&"ci-workflow"));
@@ -3362,6 +3466,7 @@ def caller():
             None,
             boundaries(dir.path()),
             &[],
+            &[],
         );
         let text = human(&r);
         assert!(text.contains("\nboundaries\n"), "{text}");
@@ -3400,6 +3505,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         let f = r
@@ -3440,6 +3546,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let f = r
             .findings
@@ -3461,6 +3568,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(
@@ -3487,6 +3595,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         let up = r

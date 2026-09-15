@@ -141,6 +141,9 @@
   ],
   "boundaries": {
     "governance_files": [],
+    "parsed_files": [
+      "dockerfile (COPY/ADD directives only)"
+    ],
     "parsed_languages": [
       "python",
       "js-ts"
@@ -185,6 +188,7 @@
   "policy": {
     "field": null,
     "message": null,
+    "path": "keel.toml",
     "present": true,
     "valid": true
   },

@@ -223,6 +223,12 @@ pub fn run(project: &Path, opts: InitOptions) -> Rendered {
         );
     }
     let gitignore_updated = update_gitignore(project).unwrap_or(false);
+    // WS3: the policy is a file, and files get left out of container images —
+    // say so at the moment the file is written, while the Dockerfile is still
+    // in the author's head. Write path only, same rule as the note above.
+    if let Some(note) = crate::dockerfile::init_note(project) {
+        eprintln!("{note}");
+    }
 
     let mut warnings = String::new();
     if !scan.python_available && has_python_files(project) {
