@@ -63,14 +63,24 @@ daemon. No port. No new abstractions in your code.
   are journaled: `kill -9` it mid-run, and rerunning it replays completed
   steps from the journal instead of re-executing their side effects —
   proven by real subprocess crash-and-resume tests, not a mocked clock.
-- **Observable when you need it, invisible when you don't.** Every run ends
-  with one line saying what Keel did — `keel ▸ 47 calls · absorbed 3 rate
-  limits · 2 retries succeeded · 4 calls unprotected` — and `keel report
-  --open` turns the same evidence into a self-contained HTML page (add
-  `--serve` for a live view). OpenTelemetry spans and metrics for every call
-  and attempt are one build feature and one env var away — off by default, so
-  the shipped library carries no OpenTelemetry dependency until you ask for
-  it. Set `console = false` under `[telemetry]` to silence the summary.
+- **Observable when you need it, invisible when you don't.** Every run
+  prints one summary to **stderr** at exit saying what Keel did — `keel ▸ 47
+  calls · absorbed 3 rate limits · 2 retries succeeded · 4 calls
+  unprotected` — and `keel report --open` turns the same evidence into a
+  self-contained HTML page (add `--serve` for a live view). In a container
+  this is the surface that survives; set `KEEL_LOG_FORMAT=json` to emit it
+  (and the startup line) as one JSON object per line for Cloud Logging /
+  CloudWatch. OpenTelemetry spans and metrics for every call and attempt are
+  a source build with the `otel` feature plus one env var away — off by
+  default, so the shipped library carries no OpenTelemetry dependency until
+  you ask for it. Set `console = false` under `[telemetry]` to silence the
+  summary.
+- **What that observability is not.** OpenTelemetry export (spans and
+  metrics, not logs) requires a source build with the `otel` feature — the
+  published wheels and npm addon do not include it — and lands in a
+  tracing/metrics backend, never in your log search. Everything under
+  `.keel/` is a local file: on a scale-to-zero platform it is gone by the
+  time you investigate.
 - **Built for LLM and agent workloads.** First-class `llm:`/`tool:`/`mcp:`
   targets, per-run spend caps, model fallback chains, and a dev-mode cache
   that replays identical prompts for free — because agent code is the
@@ -206,17 +216,21 @@ Two tiers, one policy file:
   replays completed steps from the journal instead of re-firing their side
   effects, then resumes live from wherever it left off.
 
-### Keel's timeout is not the only timeout
+### Three clocks: `timeout`, `poll.deadline`, and the SDK's own
 
-`timeout` bounds how long **Keel** waits. It does not reconfigure deadlines
-inside the SDK making the call: most clients (google-genai, openai, plain
-httpx) enforce their own client-level deadline, and the shorter one wins. If
-the SDK gives up first, Keel just sees a retryable `timeout`-class error —
-and may then retry a call that can never finish inside the SDK's own limit.
-For long-running calls, set the SDK/call-site timeout to at least the Keel
-value; for submit-then-poll APIs, prefer the `poll` policy above. `keel
-doctor` flags LRO-sized timeouts (>600s) with an `sdk-client-timeout`
-follow-up as a reminder.
+- **`timeout`** bounds **one attempt of one call**.
+- **`poll.deadline`** bounds the **whole submit-then-poll loop** — the
+  end-to-end budget an operator actually wants for a job or a render.
+- **The SDK's client timeout** (google-genai, openai, plain httpx, often
+  ~600s) is not reconfigured by Keel and fires first if it is shorter; Keel
+  then just sees a retryable timeout. Set the SDK/call-site timeout to at
+  least the Keel value for long calls.
+
+`keel doctor` flags LRO-sized timeouts (>600s) with an `sdk-client-timeout`
+follow-up. **`poll` applies to GET/HEAD polls only** in 0.5.x: Vertex
+`:fetchPredictOperation` and other POST-shaped polls cannot use it yet — set
+`cache = { mode = "off" }` on that target and keep your app-level deadline
+(poll v2 tracks POST-shaped polls and boolean terminals).
 
 ### `keel exec` — durable external commands (CCR-4)
 
@@ -315,6 +329,16 @@ process (`keel run` exports it to the children it spawns for exactly this
 reason). When no `keel.toml` is found and one exists in a parent directory,
 the startup banner says so and names the `KEEL_CWD` value that would load it.
 
+`KEEL_CWD` is an assertion. If it names a directory with no `keel.toml`, Keel
+prints `keel ▸ error: KEEL_CWD=… is set but …/keel.toml does not exist — Keel
+NOT activated` and the app runs keel-free (`keel run` exits 2 instead).
+`KEEL_POLICY=optional` restores the old behavior of running production
+defaults with a warning. Without `KEEL_CWD`, a missing `keel.toml` still
+means Level 0 defaults, and the banner names the directory it searched. In
+Cloud Run / Lambda / Azure Functions (detected from `K_SERVICE`,
+`AWS_LAMBDA_FUNCTION_NAME`, …) the default LLM dev cache is off unless
+`KEEL_ENV=dev` says otherwise.
+
 Activation is fail-open by design: a broken install or invalid `keel.toml`
 prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
 always wins. The preflight resilience advisory stays a `keel run`-only,
@@ -360,6 +384,24 @@ that doesn't launch from the project directory) needs an explicit `cwd`:
 
 No `keel` on PATH (only installed via `uvx`)? Swap in
 `"command": "uvx", "args": ["--from", "keelrun-cli", "keel", "mcp"]`.
+
+### Deploying with Keel
+
+Keel is a file plus an env var, so reaching production has four invariants:
+
+1. **`keel.toml` is in the artifact.** `COPY keel.toml ./` — `keel doctor`
+   warns `keel-toml-not-in-image` when a root Dockerfile's `COPY`/`ADD`
+   directives never reach it, and `keel init` prints the line to add.
+2. **`KEEL_ENABLE=1` reaches the process doing the I/O.** Python children
+   inherit it; Node children also need `NODE_OPTIONS`.
+3. **`KEEL_CWD` names the policy's directory** from that process's point
+   of view (see above).
+4. **`.keel/` outlives the instance** if you use durable flows — a volume
+   or a Postgres journal.
+
+Verify from the logs: exactly one `keel ▸ wrapped … with policy /code/keel.toml`
+line per process. `keel init --agents` writes the same four invariants into
+`AGENTS.md` so the agent that edits your Dockerfile has them in context.
 
 ### Keel for Google ADK + agents-cli
 
