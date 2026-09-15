@@ -1477,6 +1477,59 @@ mod tests {
         );
     }
 
+    /// The contract on [`diff`]: an EXCLUDED host the user already declared in
+    /// their own keel.toml is left alone — neither added (it is excluded) nor
+    /// removed (they declared it deliberately; `removed` filters against the
+    /// unfiltered generated set, not against the exclusions). WS5 made this
+    /// newly reachable for `example.com`, far and away the most common
+    /// reserved name in real code, so it gets a test of its own rather than
+    /// riding on an incidental fixture.
+    #[test]
+    fn a_declared_but_excluded_host_is_neither_added_nor_removed() {
+        let dir = TempDir::new().unwrap();
+        // `api.example.com` is RFC 2606 (excluded as a fixture); `api.vendor.com`
+        // is an ordinary host the scan should still propose.
+        fs::write(
+            dir.path().join("app.mjs"),
+            "const a = await fetch(\"https://api.example.com/v1/x\");\n\
+             const b = await fetch(\"https://api.vendor.com/v2/y\");\n",
+        )
+        .unwrap();
+        let old = "[target.\"api.example.com\"]\ntimeout = \"9s\"   # user tuning\n";
+        fs::write(dir.path().join("keel.toml"), old).unwrap();
+
+        let r = run(
+            dir.path(),
+            InitOptions {
+                diff: true,
+                stamp: false,
+                agents: false,
+            },
+        );
+
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert_eq!(
+            r.json["unchanged"].as_array().unwrap(),
+            &vec![serde_json::json!("api.example.com")],
+            "a declared, excluded, still-sighted host stays unchanged"
+        );
+        assert!(
+            r.json["removed"].as_array().unwrap().is_empty(),
+            "never removed just because it is excluded: {}",
+            r.json["removed"]
+        );
+        assert_eq!(
+            r.json["added"].as_array().unwrap(),
+            &vec![serde_json::json!("api.vendor.com")],
+            "the excluded host is not proposed; the real one still is"
+        );
+        // The user's own block survives the patch byte-for-byte.
+        let patch = r.json["patch"].as_str().unwrap();
+        let applied = crate::diff::apply_unified(old, patch).unwrap();
+        assert!(applied.contains("timeout = \"9s\"   # user tuning"));
+        assert!(applied.contains("[target.\"api.vendor.com\"]"));
+    }
+
     /// #65: a `--diff` run against a project with no `.keel/discovery.db` (the
     /// common first-run state) nudges toward `keel run` in both the human
     /// text and the structured `notes` — the exact sentence external

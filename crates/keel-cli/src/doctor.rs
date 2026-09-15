@@ -358,9 +358,10 @@ pub(crate) struct ExternalProcess {
 /// regardless of policy), or "shouldn't reach it" (a local/loopback host, an
 /// RFC 2606/5737 reserved name, a host sighted only in test files, or one
 /// sighted only inside a file the scan judged dependency-averse — all
-/// excluded from proposed policy on purpose). `external_processes` is the adjacent, host-independent honesty
-/// signal: traffic inside an externally-launched process Keel cannot see at
-/// all, no matter which bucket its host would otherwise land in.
+/// excluded from proposed policy on purpose). `external_processes` is the
+/// adjacent, host-independent honesty signal: traffic inside an
+/// externally-launched process Keel cannot see at all, no matter which bucket
+/// its host would otherwise land in.
 ///
 /// `pub(crate)`: `init.rs` reuses [`classify_topology`] to skip proposing
 /// policy for excluded hosts and print why.
@@ -3891,6 +3892,45 @@ def caller():
         );
         assert!(r.topology.wrappable.contains(&"example.com".to_owned()));
         assert!(r.topology.excluded.is_empty());
+
+        // The other half of the name: a host sighted ONLY in test files, which
+        // `classify_topology` would otherwise exclude as `test-only`. Runtime
+        // evidence has to beat that check too — it sits below the
+        // `wrapped_targets` shortcut, and this pins that ordering.
+        let mut test_only = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        test_only.targets.insert(
+            "api.vendor.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "tests/test_client.py".into(),
+                    line: 3,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        test_only
+            .host_transports
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
+        let observed: BTreeSet<String> = ["api.vendor.com".to_owned()].into_iter().collect();
+        let r2 = build_report(
+            &test_only,
+            &observed,
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
+        assert!(r2.topology.excluded.is_empty(), "{:?}", r2.topology);
     }
 
     #[test]
