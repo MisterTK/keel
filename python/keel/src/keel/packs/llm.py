@@ -64,12 +64,27 @@ def serverless_marker(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
-def _is_prod(env: Mapping[str, str] | None) -> bool:
+def dev_cache_off_reason(env: Mapping[str, str] | None = None) -> str | None:
+    """WHY the LLM dev cache is off in this process, as a machine-readable
+    token — ``"KEEL_ENV"`` when an explicit ``KEEL_ENV=prod`` demoted it,
+    the serverless marker's variable name when a container did, or ``None``
+    when the cache is genuinely ON.
+
+    This is the single source of truth for `_is_prod` (below) AND for the
+    activation line's ``dev_cache_off`` field, so the field can never claim
+    something the cache resolution does not do: a field literally named
+    `dev_cache_off` reporting null is a positive claim that the cache is on,
+    and `KEEL_ENV=prod` is a reachable production configuration where that
+    would be a lie. Twin of Node's `devCacheOffReason`; keep identical."""
     env = env if env is not None else os.environ
     keel_env = str(env.get("KEEL_ENV", "")).strip().lower()
     if keel_env:
-        return keel_env == "prod"  # explicit always wins, either way
-    return serverless_marker(env) is not None
+        return "KEEL_ENV" if keel_env == "prod" else None  # explicit always wins, either way
+    return serverless_marker(env)
+
+
+def _is_prod(env: Mapping[str, str] | None) -> bool:
+    return dev_cache_off_reason(env) is not None
 
 
 class _LlmPack:

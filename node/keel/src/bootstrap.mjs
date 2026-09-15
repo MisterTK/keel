@@ -27,7 +27,7 @@ import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./s
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
-import { resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
+import { devCacheOffReason, resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
 import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
 import { installPgPack } from "./packs/pg.mjs";
@@ -365,14 +365,18 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd")
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
   let desc = source === "defaults" ? "production defaults" : `policy ${join(cwd, "keel.toml")}`;
-  // The marker that demoted the dev cache, held as a value so the JSON form
-  // can carry it as a field: "was the dev cache on in that container?" is one
-  // of the questions the 2026-09-15 post-mortem had to answer by inference,
-  // and a log pipeline can only index what the object names (F10).
-  let devCacheOff = null;
+  // WHY the dev cache is off, read from the SAME resolution the cache itself
+  // uses (`devCacheOffReason`), so the JSON form can carry it as a field:
+  // "was the dev cache on in that container, and if not why" is one of the
+  // questions the 2026-09-15 post-mortem had to answer by inference, and a
+  // log pipeline can only index what the object names (F10). Note this is
+  // WIDER than the banner's parenthetical, which stays marker-only prose
+  // (byte-unchanged): an explicit `KEEL_ENV=prod` also turns the cache off,
+  // and a field named `dev_cache_off` reporting null there would be a lie.
+  const devCacheOff = devCacheOffReason(env);
   if (!String(env.KEEL_ENV ?? "").trim()) {
-    devCacheOff = serverlessMarker(env);
-    if (devCacheOff !== null) desc = `${desc} (dev cache off: ${devCacheOff} detected)`;
+    const marker = serverlessMarker(env);
+    if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
   }
   const head = `keel ▸ wrapped ${seams.join(" + ")} with ${desc}`;
   // `note` is the text after the em-dash — the one place the tail variants

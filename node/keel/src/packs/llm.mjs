@@ -54,13 +54,30 @@ export function serverlessMarker(env = process.env) {
   return null;
 }
 
-function isProd(env) {
+/**
+ * WHY the LLM dev cache is off in this process, as a machine-readable token —
+ * `"KEEL_ENV"` when an explicit `KEEL_ENV=prod` demoted it, the serverless
+ * marker's variable name when a container did, or `null` when the cache is
+ * genuinely ON.
+ *
+ * Single source of truth for `isProd` (below) AND for the activation line's
+ * `dev_cache_off` field, so the field can never claim something the cache
+ * resolution does not do: a field literally named `dev_cache_off` reporting
+ * null is a positive claim that the cache is on, and `KEEL_ENV=prod` is a
+ * reachable production configuration where that would be a lie. Twin of
+ * Python's `dev_cache_off_reason`; keep identical.
+ */
+export function devCacheOffReason(env = process.env) {
   // Trim + lowercase before comparing — cross-language parity with the Python
   // twin's `.strip().lower()`. An explicit KEEL_ENV always wins; otherwise a
   // serverless marker means production (see SERVERLESS_MARKERS).
   const keelEnv = String(env?.KEEL_ENV ?? "").trim().toLowerCase();
-  if (keelEnv) return keelEnv === "prod";
-  return serverlessMarker(env) !== null;
+  if (keelEnv) return keelEnv === "prod" ? "KEEL_ENV" : null;
+  return serverlessMarker(env);
+}
+
+function isProd(env) {
+  return devCacheOffReason(env) !== null;
 }
 
 /** The `llm:` adapter pack — the four uniform operations (adapter-pack.md). */

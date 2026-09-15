@@ -132,6 +132,18 @@ class Slice1AcceptanceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(b"(dev cache off: K_SERVICE detected)", proc.stderr)
 
+    def test_b3_an_explicit_keel_env_prod_is_named_as_the_reason_too(self) -> None:
+        # The other way a deployment turns the dev cache off (and the one the
+        # docs recommend when no marker is present). The banner's parenthetical
+        # is marker-only prose, so the JSON field is the ONLY place this shows
+        # up — reporting null here would be a lie about a production process.
+        proc = self._run(KEEL_POLICY="optional", KEEL_ENV="prod")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"POLLS=3 DONE=True", proc.stdout)
+        objs = self._objs(proc)
+        self.assertEqual(objs[0]["dev_cache_off"], "KEEL_ENV")
+        self.assertEqual(objs[-1]["cache_hits"], 0)
+
     def test_c_optional_alone_the_field_configuration_no_longer_replays_polls(self) -> None:
         # No serverless marker, dev cache ON by default: only the LRO-shape
         # exemption (#83) stands between this run and the 15-minute hang.
@@ -139,6 +151,11 @@ class Slice1AcceptanceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(b"POLLS=3 DONE=True", proc.stdout)
         objs = self._objs(proc)
+        # Self-evidencing: the dev cache was genuinely ON in THIS process (no
+        # marker, no KEEL_ENV), so the zero below is the LRO exemption holding
+        # — not a cache that happened to be off. (d) is the second, independent
+        # witness that the cache still replays when the shape allows it.
+        self.assertIsNone(objs[0]["dev_cache_off"], "the dev cache must be ON for (c) to mean anything")
         self.assertEqual(objs[-1]["keel"], "summary")
         self.assertEqual(objs[-1]["cache_hits"], 0, "a cache hit here is the field outage")
         self.assertEqual(objs[-1]["calls"], 4)  # 1 submit + 3 polls, all intercepted
@@ -171,5 +188,6 @@ class Slice1AcceptanceTest(unittest.TestCase):
             capture_output=True,
             timeout=60,
         )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         objs = self._objs(proc)
         self.assertEqual(objs[-1]["cache_hits"], 1, proc.stderr)

@@ -40,7 +40,13 @@ from ._runtime import (
 )
 from ._summary import Summary, format_summary, format_summary_json, keel_on_path
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache, serverless_marker
+from .packs import (
+    dev_cache_off_reason,
+    install_mcp_pack,
+    present_provider_defaults,
+    resolve_dev_cache,
+    serverless_marker,
+)
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -360,15 +366,19 @@ def _banner(
         desc = f"policy {root / 'keel.toml'}"
     else:
         desc = "policy keel.toml"
-    # The marker that demoted the dev cache, held as a value so the JSON form
-    # can carry it as a field: "was the dev cache on in that container?" is one
-    # of the questions the 2026-09-15 post-mortem had to answer by inference,
-    # and a log pipeline can only index what the object names (F10).
-    dev_cache_off: str | None = None
+    # WHY the dev cache is off, read from the SAME resolution the cache itself
+    # uses (`dev_cache_off_reason`), so the JSON form can carry it as a field:
+    # "was the dev cache on in that container, and if not why" is one of the
+    # questions the 2026-09-15 post-mortem had to answer by inference, and a
+    # log pipeline can only index what the object names (F10). Note this is
+    # WIDER than the banner's parenthetical, which stays marker-only prose
+    # (byte-unchanged): an explicit `KEEL_ENV=prod` also turns the cache off,
+    # and a field named `dev_cache_off` reporting null there would be a lie.
+    dev_cache_off = dev_cache_off_reason(env)
     if not env.get("KEEL_ENV", "").strip():
-        dev_cache_off = serverless_marker(env)
-        if dev_cache_off is not None:
-            desc = f"{desc} (dev cache off: {dev_cache_off} detected)"
+        marker = serverless_marker(env)
+        if marker is not None:
+            desc = f"{desc} (dev cache off: {marker} detected)"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".

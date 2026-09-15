@@ -60,7 +60,14 @@ from . import (
     pydantic_ai_pack,
 )
 from .langgraph_pack import KeelSaver
-from .llm import DEV_CACHE_TTL, SERVERLESS_MARKERS, llm_pack, resolve_dev_cache, serverless_marker
+from .llm import (
+    DEV_CACHE_TTL,
+    SERVERLESS_MARKERS,
+    dev_cache_off_reason,
+    llm_pack,
+    resolve_dev_cache,
+    serverless_marker,
+)
 from .mcp_pack import install_mcp_pack
 from .tool import is_valid_tool_name, tool_pack, wrap_tool
 
@@ -95,6 +102,7 @@ __all__ = [
     "adk_pack",
     "llm_pack",
     "resolve_dev_cache",
+    "dev_cache_off_reason",
     "serverless_marker",
     "openai_pack",
     "anthropic_pack",

@@ -246,6 +246,20 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
       prose.stderr.includes("(dev cache off: K_SERVICE detected)"),
       `the text twin must say the same thing: ${prose.stderr}`,
     );
+
+    // The field reads from the RESOLVED state, so it names the explicit
+    // override too — wider than the banner's marker-only parenthetical, which
+    // stays byte-unchanged (a `dev_cache_off: null` in a KEEL_ENV=prod process
+    // would be a positive claim that the dev cache is on, and it is not).
+    const explicit = run(root, { KEEL_LOG_FORMAT: "json", KEEL_ENV: "prod" });
+    assert.equal(keelJsonLines(explicit.stderr)[0].dev_cache_off, "KEEL_ENV", explicit.stderr);
+    const explicitProse = run(root, { KEEL_ENV: "prod" });
+    assert.ok(
+      !explicitProse.stderr.includes("dev cache off"),
+      `the text form stays marker-only prose: ${explicitProse.stderr}`,
+    );
+    const devWins = run(root, { KEEL_LOG_FORMAT: "json", KEEL_ENV: "dev", K_SERVICE: "render" });
+    assert.equal(keelJsonLines(devWins.stderr)[0].dev_cache_off, null, devWins.stderr);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

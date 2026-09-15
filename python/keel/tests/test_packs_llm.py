@@ -162,6 +162,29 @@ class ServerlessDevCacheTest(unittest.TestCase):
         out = resolve_dev_cache(self._POLICY, {})
         self.assertEqual(out["defaults"]["llm"]["cache"]["ttl"], DEV_CACHE_TTL)
 
+    def test_dev_cache_off_reason_names_every_way_the_cache_goes_off(self) -> None:
+        """The activation line's `dev_cache_off` field reads from this, so it
+        must agree with `resolve_dev_cache` in EVERY configuration — a null
+        there is a positive claim that the dev cache is on."""
+        from keel.packs.llm import dev_cache_off_reason
+
+        cases = [
+            ({}, None),
+            ({"K_SERVICE": "render"}, "K_SERVICE"),
+            ({"WEBSITE_SITE_NAME": "app"}, "WEBSITE_SITE_NAME"),
+            ({"KEEL_ENV": "prod"}, "KEEL_ENV"),  # the explicit override: NOT null
+            ({"KEEL_ENV": "  PROD  "}, "KEEL_ENV"),
+            ({"KEEL_ENV": "dev"}, None),
+            ({"KEEL_ENV": "dev", "K_SERVICE": "render"}, None),  # explicit wins
+            ({"KEEL_ENV": "prod", "K_SERVICE": "render"}, "KEEL_ENV"),
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env):
+                self.assertEqual(dev_cache_off_reason(env), expected)
+                # …and it never disagrees with what the cache resolution does.
+                has_cache = "cache" in resolve_dev_cache(self._POLICY, env)["defaults"]["llm"]
+                self.assertEqual(has_cache, expected is None)
+
 
 class DevCacheReplayCountersTest(unittest.TestCase):
     """The report-counter parity contract with the Node twin, driven through the
