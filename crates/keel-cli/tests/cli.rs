@@ -704,10 +704,9 @@ fn doctor_json_matches_golden_for_dockerfile_without_keel_toml() {
     check_golden("doctor_dockerfile_no_copy.json", &json_string(&r.json));
 }
 
-/// #87: the agents-cli manifest walk must find a manifest ABOVE a relative
-/// project path (`main.rs` passes "."), same defect class as #85's C1.
-#[test]
-fn doctor_finds_the_agents_cli_manifest_from_a_nested_subdirectory() {
+/// An agents-cli project root with `agent_directory: app`, `app/` present, and
+/// a `keel.toml` written at `<root>/<toml_at>`. Returns the root TempDir.
+fn agents_cli_tree(toml_at: &str) -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
     std::fs::write(
@@ -715,13 +714,80 @@ fn doctor_finds_the_agents_cli_manifest_from_a_nested_subdirectory() {
         "agent_directory: app\n",
     )
     .unwrap();
-    let nested = root.join("app").join("pkg");
-    std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(nested.join("keel.toml"), "").unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    let toml = root.join(toml_at);
+    std::fs::create_dir_all(toml.parent().unwrap()).unwrap();
+    std::fs::write(toml, "").unwrap();
+    dir
+}
+
+/// The first finding with `topic`, or `None`.
+fn finding_by_topic<'a>(
+    report: &'a serde_json::Value,
+    topic: &str,
+) -> Option<&'a serde_json::Value> {
+    report["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .find(|f| f["topic"] == topic)
+}
+
+/// #87: the agents-cli manifest walk must find a manifest ABOVE a relative
+/// project path (`main.rs` passes "."), same defect class as #85's C1.
+///
+/// Run from `<root>/svc/sub` — two levels below the manifest, and OUTSIDE the
+/// `app/` directory the generated Dockerfile ships — with a `keel.toml` right
+/// there. The walk has to climb two levels for the finding to exist at all, so
+/// its presence is the #87 regression proof. Its *text* is asserted too: at
+/// level > 0 the layout carries canonical absolute paths, and the finding is
+/// documented (`doctor.rs::agents_cli_placement_finding`) to stay reproducible
+/// across checkouts — so nothing machine-specific may leak into `--json`.
+#[test]
+fn doctor_finds_the_agents_cli_manifest_from_a_nested_subdirectory() {
+    let dir = agents_cli_tree("svc/sub/keel.toml");
+    let nested = dir.path().join("svc").join("sub");
+    let report = doctor_json_from(&nested);
+    let finding = finding_by_topic(&report, "agents-cli-config-placement")
+        .unwrap_or_else(|| panic!("walk must reach the manifest two levels up: {report}"));
+
+    let action = finding["action"].as_str().unwrap();
+    let detail = finding["detail"].as_str().unwrap();
+    assert_eq!(
+        action,
+        "Move keel.toml to app/keel.toml (or add a `COPY keel.toml` line to the Dockerfile).",
+        "the agent dir must be named relative to the agents-cli project root"
+    );
+    assert!(
+        detail.ends_with(
+            "uv.lock*, and app into the image, so the keel.toml at the project root never \
+             ships to the container."
+        ),
+        "{detail}"
+    );
+    // The real regression guard: no machine-specific path anywhere in the text.
+    let abs_root = std::fs::canonicalize(dir.path()).unwrap();
+    let abs_root = abs_root.to_str().unwrap();
+    assert!(
+        !action.contains(abs_root) && !detail.contains(abs_root),
+        "absolute path leaked into --json: {action} / {detail}"
+    );
+}
+
+/// The other half of the same newly-live walk: a `keel.toml` that is ALREADY
+/// inside the agent directory ships fine, so there is no placement problem to
+/// report — even though the manifest is two levels up and the walk therefore
+/// succeeds. Before the containment fix this emitted a factually wrong warning
+/// ("the keel.toml at the project root never ships") about a file that does
+/// ship, which is exactly the crying-wolf class WS5 exists to remove.
+#[test]
+fn doctor_does_not_flag_a_keel_toml_already_inside_the_agent_directory() {
+    let dir = agents_cli_tree("app/pkg/keel.toml");
+    let nested = dir.path().join("app").join("pkg");
     let report = doctor_json_from(&nested);
     assert!(
-        has_topic(&report, "agents-cli-config-placement"),
-        "walk must reach the manifest two levels up: {report}"
+        !has_topic(&report, "agents-cli-config-placement"),
+        "a keel.toml inside the shipped agent directory is correctly placed: {report}"
     );
 }
 

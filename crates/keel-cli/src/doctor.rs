@@ -881,26 +881,44 @@ fn build_follow_ups(
     ups
 }
 
-/// A root `keel.toml` in a Google `agents-cli` project (an
-/// `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches the
-/// container: the generated Dockerfile only `COPY`s `pyproject.toml`,
+/// A `keel.toml` outside the agent directory of a Google `agents-cli` project
+/// (an `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches
+/// the container: the generated Dockerfile only `COPY`s `pyproject.toml`,
 /// `README.md`, `uv.lock*`, and the agent directory itself. Emitted only when
-/// a manifest is found, `<project>/keel.toml` actually exists, and the agent
-/// directory is not `project` itself — when `agent_directory` names the
-/// project root, the root `keel.toml` already sits inside the one directory
-/// the Dockerfile ships, so there is no placement problem to report.
+/// a manifest is found, `<project>/keel.toml` actually exists, and that file is
+/// NOT inside the agent directory — a policy already under `agent_dir` ships
+/// fine, which covers both the `agent_directory`-names-the-project-root case
+/// and (since issue #87 made the upward walk actually work) a `keel.toml` in a
+/// subdirectory of the agent directory.
+///
+/// Containment is decided on CANONICALIZED paths, the house pattern from
+/// `init::agents_cli_toml_path`: `project` is the relative `"."` `main.rs`
+/// passes, while a manifest found above it yields an absolute `agent_dir`, so
+/// a syntactic comparison of the two would be meaningless. Fails open — if
+/// either side cannot be canonicalized (a TOCTOU removal), say nothing rather
+/// than guess.
 fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
     let layout = agents_cli::find_agents_cli_layout(project)?;
-    if layout.agent_dir == project || !evidence::keel_toml(project).exists() {
+    let keel_toml = evidence::keel_toml(project);
+    if !keel_toml.exists() {
         return None;
     }
-    // Display paths relative to `project` (the common case: `agent_directory`
-    // names a subdirectory of the project it's declared in) rather than the
-    // absolute filesystem path — keeps the finding's text, and therefore
-    // `--json`, reproducible across checkouts instead of embedding wherever
-    // this particular clone happens to sit on disk.
-    let agent_dir = relative_display(project, &layout.agent_dir);
-    let moved_to = relative_display(project, &layout.agent_dir.join("keel.toml"));
+    let canonical_toml = std::fs::canonicalize(&keel_toml).ok()?;
+    let canonical_agent_dir = std::fs::canonicalize(&layout.agent_dir).ok()?;
+    if canonical_toml.starts_with(&canonical_agent_dir) {
+        return None;
+    }
+    // Display paths relative to the MANIFEST directory — the agents-cli
+    // project root, which is the anchor `agent_directory` is itself declared
+    // against and the only one that is stable at every walk level. Relative to
+    // `project` would be identical at level 0 (manifest_dir IS project there)
+    // but degrade to an absolute machine path once the walk climbs, since
+    // `agent_dir` is then never under `project` — and the whole point of this
+    // is to keep the finding's text, and therefore `--json`, reproducible
+    // across checkouts instead of embedding wherever this particular clone
+    // happens to sit on disk.
+    let agent_dir = relative_display(&layout.manifest_dir, &layout.agent_dir);
+    let moved_to = relative_display(&layout.manifest_dir, &layout.agent_dir.join("keel.toml"));
     Some(Finding {
         action: format!(
             "Move keel.toml to {moved_to} (or add a `COPY keel.toml` line to the Dockerfile)."

@@ -73,12 +73,19 @@ pub fn analyze(project: &Path) -> Vec<BuildFile> {
 }
 
 /// Join backslash continuations, drop comments and blank lines.
+///
+/// A comment line is dropped wherever it appears — including in the MIDDLE of
+/// a continuation, which is what Docker does (comment lines are removed before
+/// continuations are joined, and a trailing `\` on a comment line does not
+/// continue anything). Concatenating one instead would fold its tokens into the
+/// surrounding `COPY`, so a commented-out `# keel.toml \` between two real
+/// source lines would read as a source and silently suppress the warning.
 fn logical_lines(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for raw in text.lines() {
         let line = raw.trim_end();
-        if cur.is_empty() && line.trim_start().starts_with('#') {
+        if line.trim_start().starts_with('#') {
             continue;
         }
         if let Some(stripped) = line.strip_suffix('\\') {
@@ -338,6 +345,19 @@ mod tests {
         assert_eq!(
             reach("FROM x\n# COPY keel.toml ./\nCOPY pyproject.toml ./\n"),
             Reach::NotReached
+        );
+        // A comment line INSIDE a continuation is dropped by Docker, so the
+        // `keel.toml` token on it is not a source — concatenating it would be
+        // a false negative on the warning this module exists to raise.
+        assert_eq!(
+            reach("FROM x\nCOPY pyproject.toml \\\n# keel.toml \\\n     ./\n"),
+            Reach::NotReached
+        );
+        // ...but a real source on a continued line AFTER a dropped comment
+        // still counts — dropping the comment must not drop the rest.
+        assert_eq!(
+            reach("FROM x\nCOPY pyproject.toml \\\n# a note\n     keel.toml ./\n"),
+            Reach::Reached
         );
     }
 
