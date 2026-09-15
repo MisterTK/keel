@@ -94,6 +94,10 @@ pub fn run(project: &Path, target: &str, args: &[String]) -> (Option<Rendered>, 
     }
     let path = dir.join(format!("{}.{RECORDING_EXT}", new_id()));
     let path_str = path.to_string_lossy().into_owned();
+    if let Some(r) = run::keel_cwd_preflight() {
+        let code = r.exit;
+        return (Some(r), code);
+    }
     match run::exec_with(&plan, |cmd| {
         cmd.env("KEEL_RECORD", &path_str);
         cmd.envs(run::activation_env(&plan));

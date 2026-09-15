@@ -78,6 +78,9 @@ pub enum RunError {
     /// killer) is shadowing it. Without this pre-flight the user gets a raw
     /// "No module named keel.__main__" two steps after `pip install keel`.
     MissingPythonKeelrun { target: String },
+    /// The caller's environment sets `KEEL_CWD` to a directory with no
+    /// `keel.toml` — the child would refuse to activate (WS1), so fail here.
+    PolicyMissingAtKeelCwd { keel_cwd: String },
 }
 
 impl RunError {
@@ -133,6 +136,17 @@ impl RunError {
                  Python environment."
                     .to_owned(),
                 "missing-keelrun-py",
+            ),
+            Self::PolicyMissingAtKeelCwd { keel_cwd } => (
+                format!("Cannot run with KEEL_CWD={keel_cwd}: {keel_cwd}/keel.toml does not exist — Keel NOT activated."),
+                "KEEL_CWD asserts where keel.toml lives; when the file is not there the policy \
+                 did not ship (a missing COPY in the image, a wrong path) and Keel refuses to run \
+                 on production defaults silently."
+                    .to_owned(),
+                "Point KEEL_CWD at the directory that holds keel.toml (or unset it to use the \
+                 working directory), or set KEEL_POLICY=optional to run on production defaults."
+                    .to_owned(),
+                "policy-missing-at-keel-cwd",
             ),
         };
         let human = format!("keel \u{25b8} {what}\n  why:  {why}\n  next: {next}");
@@ -536,19 +550,59 @@ pub(crate) fn python_preflight(target: &str, plan: &RunPlan) -> Option<Rendered>
 /// (including a falsy one) always wins; `--disable` exports nothing (the
 /// child env already carries KEEL_DISABLE=1, which beats KEEL_ENABLE anyway).
 pub(crate) fn activation_env(plan: &RunPlan) -> Vec<(String, String)> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    activation_env_in(plan, &cwd, &|k| std::env::var_os(k).is_some())
+}
+
+/// The testable core of [`activation_env`]: `cwd` is the directory whose
+/// `keel.toml` would be advertised, `ambient(name)` says whether the caller's
+/// environment already sets `name`. `KEEL_CWD` is exported ONLY when
+/// `<cwd>/keel.toml` exists — since 0.5.5 a child refuses to activate under a
+/// `KEEL_CWD` with no policy (WS1), so advertising an empty root would break
+/// every unconfigured project's `keel run`. An unconfigured child falls back
+/// to its own cwd and Level 0 defaults exactly as before.
+pub(crate) fn activation_env_in(
+    plan: &RunPlan,
+    cwd: &Path,
+    ambient: &dyn Fn(&str) -> bool,
+) -> Vec<(String, String)> {
     if plan.disable {
         return Vec::new();
     }
     let mut env = Vec::new();
-    if std::env::var_os("KEEL_ENABLE").is_none() {
+    if !ambient("KEEL_ENABLE") {
         env.push(("KEEL_ENABLE".to_owned(), "1".to_owned()));
     }
-    if std::env::var_os("KEEL_CWD").is_none()
-        && let Ok(cwd) = std::env::current_dir()
-    {
+    if !ambient("KEEL_CWD") && cwd.join("keel.toml").is_file() {
         env.push(("KEEL_CWD".to_owned(), cwd.to_string_lossy().into_owned()));
     }
     env
+}
+
+/// An ambient `KEEL_CWD` naming a directory with no `keel.toml` would make the
+/// child refuse to activate (WS1); an explicit `keel run` can fail properly
+/// instead, before anything launches. `KEEL_POLICY=optional` opts out.
+pub(crate) fn keel_cwd_preflight_in(
+    keel_cwd: Option<&str>,
+    policy_optional: bool,
+) -> Option<Rendered> {
+    let root = keel_cwd?.trim();
+    if root.is_empty() || policy_optional || Path::new(root).join("keel.toml").is_file() {
+        return None;
+    }
+    Some(
+        RunError::PolicyMissingAtKeelCwd {
+            keel_cwd: root.to_owned(),
+        }
+        .render(),
+    )
+}
+
+pub(crate) fn keel_cwd_preflight() -> Option<Rendered> {
+    let keel_cwd = std::env::var("KEEL_CWD").ok();
+    let optional =
+        std::env::var("KEEL_POLICY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("optional"));
+    keel_cwd_preflight_in(keel_cwd.as_deref(), optional)
 }
 
 /// The stderr banner `keel run` prints once a plan resolves to command mode
@@ -578,6 +632,10 @@ pub fn run(target: &str, args: &[String], disable: bool) -> (Option<Rendered>, i
             (Some(r), code)
         }
         Ok(plan) => {
+            if let Some(r) = keel_cwd_preflight() {
+                let code = r.exit;
+                return (Some(r), code);
+            }
             if plan.command_mode {
                 if let Some(banner) = command_mode_banner(target, &plan) {
                     eprintln!("{banner}");
@@ -961,88 +1019,84 @@ mod tests {
         ));
     }
 
-    /// RAII guard: removes `KEEL_ENABLE`/`KEEL_CWD` from the process
-    /// environment on construction, restores whatever was there before on
-    /// drop — including when the test body panics in between (an
-    /// `unwrap`/`assert_eq!` failure must never leak mutated env state to
-    /// every later test in this binary, since cargo runs tests in threads
-    /// within one process and unwinding still runs `Drop`). Holds a
-    /// process-wide lock for its whole lifetime so no concurrent test can
-    /// observe the vars mid-mutation.
-    struct EnvVarGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved_enable: Option<String>,
-        saved_cwd: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn unset_activation_vars() -> Self {
-            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let lock = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let saved_enable = std::env::var("KEEL_ENABLE").ok();
-            let saved_cwd = std::env::var("KEEL_CWD").ok();
-            // SAFETY: serialized by ENV_LOCK, held for this guard's whole
-            // lifetime; no other test in this binary touches these two vars.
-            unsafe {
-                std::env::remove_var("KEEL_ENABLE");
-                std::env::remove_var("KEEL_CWD");
-            }
-            Self {
-                _lock: lock,
-                saved_enable,
-                saved_cwd,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: still serialized by `_lock`, released only after this
-            // runs (fields drop in declaration order after `drop()` returns).
-            unsafe {
-                match self.saved_enable.take() {
-                    Some(v) => std::env::set_var("KEEL_ENABLE", v),
-                    None => std::env::remove_var("KEEL_ENABLE"),
-                }
-                match self.saved_cwd.take() {
-                    Some(v) => std::env::set_var("KEEL_CWD", v),
-                    None => std::env::remove_var("KEEL_CWD"),
-                }
-            }
+    fn plan_sh(script: &str) -> RunPlan {
+        RunPlan {
+            program: "sh".to_owned(),
+            argv: vec!["-c".to_owned(), script.to_owned()],
+            disable: false,
+            command_mode: false,
         }
     }
 
     #[test]
-    fn activation_env_is_layered_onto_children_unless_disabled() {
-        // `activation_env` reads KEEL_ENABLE/KEEL_CWD from the real process
-        // environment (set-if-absent semantics) — the guard clears ambient
-        // values for the duration and restores them (panic-safe) on drop.
-        let _guard = EnvVarGuard::unset_activation_vars();
-
-        let plan = RunPlan {
-            program: "sh".to_owned(),
-            argv: vec![
-                "-c".to_owned(),
-                r#"[ "$KEEL_ENABLE" = "1" ] && [ -n "$KEEL_CWD" ] && exit 0 || exit 9"#.to_owned(),
-            ],
-            disable: false,
-            command_mode: false,
-        };
-        let mut cmd_env = activation_env(&plan);
-        cmd_env.sort();
+    fn activation_env_exports_keel_cwd_only_when_a_policy_exists_there() {
+        // WS1: KEEL_CWD is an assertion that policy lives there, so never
+        // export one that would make the child refuse to activate.
+        let dir = TempDir::new().unwrap();
+        let plan = plan_sh("exit 0");
+        let none = |_: &str| false;
+        let without = activation_env_in(&plan, dir.path(), &none);
         assert_eq!(
-            cmd_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["KEEL_CWD", "KEEL_ENABLE"]
+            without.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["KEEL_ENABLE"],
+            "no keel.toml → no KEEL_CWD export"
         );
+        fs::write(dir.path().join("keel.toml"), "").unwrap();
+        let mut with = activation_env_in(&plan, dir.path(), &none);
+        with.sort();
+        assert_eq!(
+            with,
+            vec![
+                (
+                    "KEEL_CWD".to_owned(),
+                    dir.path().to_string_lossy().into_owned()
+                ),
+                ("KEEL_ENABLE".to_owned(), "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_env_is_set_if_absent() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keel.toml"), "").unwrap();
+        let plan = plan_sh("exit 0");
+        let all = |_: &str| true; // the caller already set both
+        assert!(activation_env_in(&plan, dir.path(), &all).is_empty());
+    }
+
+    #[test]
+    fn activation_env_reaches_the_child() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keel.toml"), "").unwrap();
+        let plan = plan_sh(r#"[ "$KEEL_ENABLE" = "1" ] && [ -n "$KEEL_CWD" ] && exit 0 || exit 9"#);
+        let none = |_: &str| false;
+        let env = activation_env_in(&plan, dir.path(), &none);
         assert_eq!(
             exec_with(&plan, |cmd| {
-                cmd.envs(activation_env(&plan));
+                cmd.envs(env.clone());
             })
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn keel_cwd_preflight_rejects_a_root_without_keel_toml() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let r = keel_cwd_preflight_in(Some(&root), false).expect("must refuse");
+        assert_eq!(r.exit, EXIT_USAGE);
+        assert!(r.to_stderr);
+        assert_eq!(r.json["error"], "policy-missing-at-keel-cwd");
+        assert!(r.human.contains(&format!("KEEL_CWD={root}")), "{}", r.human);
+        // Present file, optional, unset, blank: all pass.
+        fs::write(dir.path().join("keel.toml"), "").unwrap();
+        assert!(keel_cwd_preflight_in(Some(&root), false).is_none());
+        fs::remove_file(dir.path().join("keel.toml")).unwrap();
+        assert!(keel_cwd_preflight_in(Some(&root), true).is_none());
+        assert!(keel_cwd_preflight_in(None, false).is_none());
+        assert!(keel_cwd_preflight_in(Some("  "), false).is_none());
     }
 
     #[test]

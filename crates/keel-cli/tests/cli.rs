@@ -672,6 +672,34 @@ fn doctor_reports_config_above_cwd_when_run_from_a_subdirectory() {
     );
 }
 
+/// WS1 production pin: `keel run` under an ambient KEEL_CWD that names a
+/// directory with no keel.toml must fail before launching anything. Child env
+/// only — never `std::env::set_var` (issue #72).
+#[test]
+fn run_refuses_a_stale_keel_cwd_before_launching() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('RAN')\n").unwrap();
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .current_dir(dir.path())
+        .env("KEEL_CWD", stale.path())
+        .args(["run", "app.py"])
+        .output()
+        .expect("spawn keel run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Keel NOT activated"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "target must not run"
+    );
+}
+
 /// The evidence readers honor `keel.toml`'s `journal` key: a journal at a
 /// custom `file:` location (relative to the project) is found by `flows`,
 /// `trace`, and `status` even though `.keel/journal.db` does not exist.
