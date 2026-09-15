@@ -264,6 +264,9 @@ enum RecordCommand {
     },
 }
 
+#[allow(clippy::too_many_lines)] // one arm per subcommand, straight-line dispatch;
+// rustfmt's expansion of the arms pushes this past the 100-line limit, and
+// splitting the match would scatter the CLI surface across helpers for no gain.
 fn main() {
     let cli = Cli::parse();
     let json = cli.json;
@@ -341,7 +344,14 @@ fn main() {
             let stdout = std::io::stdout();
             mcp::Server::new(project, || SystemClock.now_ms()).serve(stdin.lock(), stdout.lock())
         }
-        Command::Report { out, open, watch, interval, serve, port } => dispatch_report(&project, out, open, watch, &interval, serve, port, json),
+        Command::Report {
+            out,
+            open,
+            watch,
+            interval,
+            serve,
+            port,
+        } => dispatch_report(&project, out, open, watch, &interval, serve, port, json),
         Command::Record { action } => dispatch_record(&project, action, json),
         Command::Replay { flow, step } => emit(&replay::replay(&project, &flow, step), json),
         Command::Sim { plan } => emit(&sim::run(&project, &plan), json),
@@ -387,9 +397,19 @@ fn dispatch_report(
         Ok(d) => d,
         Err(e) => return emit(&report::usage(&e), json),
     };
-    let opts = report::ReportOptions { out, open, watch, interval, serve, port };
+    let opts = report::ReportOptions {
+        out,
+        open,
+        watch,
+        interval,
+        serve,
+        port,
+    };
     if json && (watch || serve) {
-        emit(&report::usage("--json cannot be combined with --watch or --serve"), json)
+        emit(
+            &report::usage("--json cannot be combined with --watch or --serve"),
+            json,
+        )
     } else if watch || serve {
         let stop = report::interrupt_flag();
         let mut stderr = std::io::stderr().lock();
@@ -403,7 +423,10 @@ fn dispatch_report(
             Err(r) => emit(&r, json),
         }
     } else {
-        emit(&report::run_static(project, &opts, SystemClock.now_ms(), json), json)
+        emit(
+            &report::run_static(project, &opts, SystemClock.now_ms(), json),
+            json,
+        )
     }
 }
 

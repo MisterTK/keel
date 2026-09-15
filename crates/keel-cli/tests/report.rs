@@ -12,8 +12,10 @@ use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
 const T0: i64 = 1_783_728_000_000;
 
 const JOURNAL_SCHEMA: &str = include_str!("../../../contracts/journal.sql");
-const COMPLETED_FLOW: &str = include_str!("../../../conformance/fixtures/journal/completed-flow.sql");
-const INTERRUPTED_FLOW: &str = include_str!("../../../conformance/fixtures/journal/interrupted-flow.sql");
+const COMPLETED_FLOW: &str =
+    include_str!("../../../conformance/fixtures/journal/completed-flow.sql");
+const INTERRUPTED_FLOW: &str =
+    include_str!("../../../conformance/fixtures/journal/interrupted-flow.sql");
 const DEAD_FLOW: &str = include_str!("../../../conformance/fixtures/journal/dead-flow.sql");
 
 fn manifest_dir() -> PathBuf {
@@ -29,7 +31,10 @@ fn check_golden(name: &str, actual: &str) {
         return;
     }
     let expected = std::fs::read_to_string(&path).unwrap_or_default();
-    assert_eq!(actual, expected, "golden mismatch for {name}; re-run with KEEL_UPDATE_GOLDEN=1 to update");
+    assert_eq!(
+        actual, expected,
+        "golden mismatch for {name}; re-run with KEEL_UPDATE_GOLDEN=1 to update"
+    );
 }
 
 fn build_journal(project: &Path) {
@@ -50,19 +55,41 @@ fn build_discovery(project: &Path) {
         .merge_report(&[
             TargetStats {
                 target: "api.example.com".to_owned(),
-                calls: 100, attempts: 102, retries: 12, successes: 88, failures: 2, cache_hits: 10,
-                throttled: 3, breaker_opens: 1, total_latency_ms: 12_000, max_latency_ms: 300,
-                first_seen_ms: T0, last_seen_ms: T0 + 120_000,
-                last_error_class: Some(keel_journal::ErrorClass::Http), last_error_status: Some(503),
-                not_retried: 1, unwrapped_calls: 0,
+                calls: 100,
+                attempts: 102,
+                retries: 12,
+                successes: 88,
+                failures: 2,
+                cache_hits: 10,
+                throttled: 3,
+                breaker_opens: 1,
+                total_latency_ms: 12_000,
+                max_latency_ms: 300,
+                first_seen_ms: T0,
+                last_seen_ms: T0 + 120_000,
+                last_error_class: Some(keel_journal::ErrorClass::Http),
+                last_error_status: Some(503),
+                not_retried: 1,
+                unwrapped_calls: 0,
             },
             TargetStats {
                 target: "llm:openai".to_owned(),
-                calls: 40, attempts: 20, retries: 0, successes: 20, failures: 0, cache_hits: 20,
-                throttled: 0, breaker_opens: 0, total_latency_ms: 8_000, max_latency_ms: 400,
-                first_seen_ms: T0, last_seen_ms: T0 + 60_000,
-                last_error_class: None, last_error_status: None,
-                not_retried: 0, unwrapped_calls: 5,
+                calls: 40,
+                attempts: 20,
+                retries: 0,
+                successes: 20,
+                failures: 0,
+                cache_hits: 20,
+                throttled: 0,
+                breaker_opens: 0,
+                total_latency_ms: 8_000,
+                max_latency_ms: 400,
+                first_seen_ms: T0,
+                last_seen_ms: T0 + 60_000,
+                last_error_class: None,
+                last_error_status: None,
+                not_retried: 0,
+                unwrapped_calls: 5,
             },
         ])
         .unwrap();
@@ -89,33 +116,51 @@ fn full_project() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn opts() -> ReportOptions {
-    ReportOptions { out: None, open: false, watch: false, interval: report::DEFAULT_INTERVAL, serve: false, port: 0 }
+    ReportOptions {
+        out: None,
+        open: false,
+        watch: false,
+        interval: report::DEFAULT_INTERVAL,
+        serve: false,
+        port: 0,
+    }
 }
 
 #[test]
 fn report_json_matches_golden() {
     let (_d, project) = full_project();
-    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().expect("evidence present");
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .expect("evidence present");
     check_golden("report.json", &json_string(&to_json(&data)));
 }
 
 #[test]
 fn blob_status_is_byte_identical_to_status_json() {
     let (_d, project) = full_project();
-    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
-    assert_eq!(to_json(&data)["status"], keel_cli::status::run(&project, T0).json);
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        to_json(&data)["status"],
+        keel_cli::status::run(&project, T0).json
+    );
 }
 
 #[test]
 fn blob_carries_the_newest_run_and_a_cursor() {
     let (_d, project) = full_project();
-    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
     assert_eq!(data.run.as_ref().unwrap().id, "0000000f00d-0001");
     assert!(!data.events.is_empty());
     assert!(data.events.len() <= report::EVENT_LIMIT);
     assert!(data.events_seq > 0);
     // since == cursor → no events, same cursor.
-    let again = report::assemble(&project, T0, Mode::Serve, 0, Some(data.events_seq)).unwrap().unwrap();
+    let again = report::assemble(&project, T0, Mode::Serve, 0, Some(data.events_seq))
+        .unwrap()
+        .unwrap();
     assert!(again.events.is_empty());
     assert_eq!(again.events_seq, data.events_seq);
 }
@@ -124,7 +169,9 @@ fn blob_carries_the_newest_run_and_a_cursor() {
 fn discovery_only_project_still_reports() {
     let dir = tempfile::TempDir::new().unwrap();
     build_discovery(dir.path());
-    let data = report::assemble(dir.path(), T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let data = report::assemble(dir.path(), T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
     assert!(data.run.is_none());
     assert!(data.events.is_empty());
     assert_eq!(data.events_seq, 0);
@@ -153,17 +200,35 @@ fn json_mode_prints_the_blob_and_writes_nothing() {
 #[test]
 fn json_conflicts_with_watch_and_serve() {
     let (_d, project) = full_project();
-    let watch = ReportOptions { watch: true, ..opts() };
-    assert_eq!(report::run_static(&project, &watch, T0, true).exit, keel_cli::EXIT_USAGE);
-    let serve = ReportOptions { serve: true, ..opts() };
-    assert_eq!(report::run_static(&project, &serve, T0, true).exit, keel_cli::EXIT_USAGE);
+    let watch = ReportOptions {
+        watch: true,
+        ..opts()
+    };
+    assert_eq!(
+        report::run_static(&project, &watch, T0, true).exit,
+        keel_cli::EXIT_USAGE
+    );
+    let serve = ReportOptions {
+        serve: true,
+        ..opts()
+    };
+    assert_eq!(
+        report::run_static(&project, &serve, T0, true).exit,
+        keel_cli::EXIT_USAGE
+    );
 }
 
 #[test]
 fn parse_interval_accepts_seconds_and_millis() {
     use std::time::Duration;
-    assert_eq!(report::parse_interval("2s").unwrap(), Duration::from_secs(2));
-    assert_eq!(report::parse_interval("500ms").unwrap(), Duration::from_millis(500));
+    assert_eq!(
+        report::parse_interval("2s").unwrap(),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        report::parse_interval("500ms").unwrap(),
+        Duration::from_millis(500)
+    );
     assert_eq!(report::parse_interval("3").unwrap(), Duration::from_secs(3));
     assert!(report::parse_interval("0s").is_err());
     assert!(report::parse_interval("soon").is_err());
@@ -172,24 +237,34 @@ fn parse_interval_accepts_seconds_and_millis() {
 #[test]
 fn static_html_matches_golden() {
     let (_d, project) = full_project();
-    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
     check_golden("report.html", &keel_cli::report_html::render(&data));
 }
 
 #[test]
 fn static_html_is_self_contained() {
     let (_d, project) = full_project();
-    let data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
     let html = keel_cli::report_html::render(&data);
     assert!(html.contains("Content-Security-Policy"));
     assert!(html.contains("id=\"keel-data\""));
     assert!(!html.contains("http://"), "no external references");
     assert!(!html.contains("https://"), "no external references");
-    assert!(!html.contains("src=\"") || html.contains("src=\"data:"), "no external script/img sources");
+    assert!(
+        !html.contains("src=\"") || html.contains("src=\"data:"),
+        "no external script/img sources"
+    );
     // A `</script>` inside the blob would end the data element early.
     let blob_start = html.find("id=\"keel-data\"").unwrap();
     let blob_end = html[blob_start..].find("</script>").unwrap() + blob_start;
-    assert!(!html[blob_start..blob_end].contains("</"), "blob escapes </");
+    assert!(
+        !html[blob_start..blob_end].contains("</"),
+        "blob escapes </"
+    );
 }
 
 /// `</` escaping alone is not enough: `<!--<script` drives the HTML5
@@ -200,7 +275,9 @@ fn static_html_is_self_contained() {
 #[test]
 fn hostile_event_data_cannot_corrupt_the_page_via_the_double_escape_state() {
     let (_d, project) = full_project();
-    let mut data = report::assemble(&project, T0, Mode::Static, 2000, None).unwrap().unwrap();
+    let mut data = report::assemble(&project, T0, Mode::Static, 2000, None)
+        .unwrap()
+        .unwrap();
     let hostile = "<!--<script>alert(1)</script>";
     data.events.push(serde_json::json!({
         "v": 1,
@@ -218,7 +295,10 @@ fn hostile_event_data_cannot_corrupt_the_page_via_the_double_escape_state() {
     let close_start = html[open_end..].find("</script>").unwrap() + open_end;
     let blob = &html[open_end..close_start];
 
-    assert!(!blob.contains('<'), "escaped blob must contain no bare '<'; page can otherwise render blank");
+    assert!(
+        !blob.contains('<'),
+        "escaped blob must contain no bare '<'; page can otherwise render blank"
+    );
     let parsed: serde_json::Value = serde_json::from_str(blob).expect("blob round-trips as JSON");
     let hostile_event = parsed["events"]
         .as_array()
@@ -251,7 +331,10 @@ fn run_static_writes_the_page_atomically() {
 fn out_flag_and_missing_parent_dir() {
     let (_d, project) = full_project();
     let custom = project.join("reports").join("nested").join("r.html");
-    let o = ReportOptions { out: Some(custom.clone()), ..opts() };
+    let o = ReportOptions {
+        out: Some(custom.clone()),
+        ..opts()
+    };
     let r = report::run_static(&project, &o, T0, false);
     assert_eq!(r.exit, keel_cli::EXIT_OK, "{}", r.human);
     assert!(custom.exists());
@@ -269,7 +352,11 @@ mod watch_tests {
         let (_d, project) = full_project();
         let stop = AtomicBool::new(true);
         let mut out = Vec::new();
-        let o = ReportOptions { watch: true, interval: Duration::from_millis(20), ..opts() };
+        let o = ReportOptions {
+            watch: true,
+            interval: Duration::from_millis(20),
+            ..opts()
+        };
         report::run_watch(&project, &o, || T0, &stop, &mut out).unwrap();
         let html = std::fs::read_to_string(project.join(".keel").join("report.html")).unwrap();
         assert!(html.contains("\"mode\":\"watch\""));
@@ -295,7 +382,11 @@ mod watch_tests {
         });
         let calls = std::sync::atomic::AtomicI64::new(0); // each rewrite stamps a new generated_at_ms
         let mut out = Vec::new();
-        let o = ReportOptions { watch: true, interval: Duration::from_millis(20), ..opts() };
+        let o = ReportOptions {
+            watch: true,
+            interval: Duration::from_millis(20),
+            ..opts()
+        };
         // Run the loop on its own thread and bound the wait, so a regression
         // in stop handling fails the test instead of hanging the suite.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -313,7 +404,10 @@ mod watch_tests {
                 .expect("run_watch did not return within 5s of the stop flag")
                 .unwrap();
         });
-        assert!(calls.load(Ordering::SeqCst) >= 2, "rewrote more than once before stop");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "rewrote more than once before stop"
+        );
         let html = std::fs::read_to_string(project.join(".keel").join("report.html")).unwrap();
         assert!(html.contains("\"mode\":\"watch\""));
     }
@@ -323,7 +417,10 @@ mod watch_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let stop = AtomicBool::new(true);
         let mut out = Vec::new();
-        let o = ReportOptions { watch: true, ..opts() };
+        let o = ReportOptions {
+            watch: true,
+            ..opts()
+        };
         let err = report::run_watch(dir.path(), &o, || T0, &stop, &mut out).unwrap_err();
         assert_eq!(err.exit, keel_cli::EXIT_OK);
         assert_eq!(err.human, keel_cli::status::NO_EVIDENCE);
@@ -356,12 +453,19 @@ mod serve_tests {
         assert!(!blob["events"].as_array().unwrap().is_empty());
         let cursor = blob["events_seq"].as_u64().unwrap();
 
-        let newer = handle_request(&project, T0, &format!("GET /api/state?since={cursor} HTTP/1.1"));
+        let newer = handle_request(
+            &project,
+            T0,
+            &format!("GET /api/state?since={cursor} HTTP/1.1"),
+        );
         let blob2: serde_json::Value = serde_json::from_str(&newer.body).unwrap();
         assert!(blob2["events"].as_array().unwrap().is_empty());
         assert_eq!(blob2["events_seq"].as_u64().unwrap(), cursor);
 
-        assert_eq!(handle_request(&project, T0, "GET /nope HTTP/1.1").status, 404);
+        assert_eq!(
+            handle_request(&project, T0, "GET /nope HTTP/1.1").status,
+            404
+        );
         assert_eq!(handle_request(&project, T0, "POST / HTTP/1.1").status, 405);
         assert_eq!(handle_request(&project, T0, "").status, 400);
     }
@@ -369,10 +473,16 @@ mod serve_tests {
     #[test]
     fn no_evidence_is_503_on_the_api_and_a_nudge_at_startup() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert_eq!(handle_request(dir.path(), T0, "GET /api/state HTTP/1.1").status, 503);
+        assert_eq!(
+            handle_request(dir.path(), T0, "GET /api/state HTTP/1.1").status,
+            503
+        );
         let stop = AtomicBool::new(true);
         let mut out = Vec::new();
-        let opts = keel_cli::report::ReportOptions { serve: true, ..super::opts() };
+        let opts = keel_cli::report::ReportOptions {
+            serve: true,
+            ..super::opts()
+        };
         let err = report_serve::run_serve(dir.path(), &opts, || T0, &stop, &mut out).unwrap_err();
         assert_eq!(err.exit, keel_cli::EXIT_OK);
     }
@@ -384,10 +494,12 @@ mod serve_tests {
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
-        let server = std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
+        let server =
+            std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
 
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(b"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        s.write_all(b"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
@@ -427,14 +539,21 @@ mod serve_tests {
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);
-        let server = std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
+        let server =
+            std::thread::spawn(move || report_serve::serve_on(listener, project, || T0, &stop2));
 
         // A DNS-rebinding page in the local browser arrives with its own host name.
-        let evil = raw_request(port, "GET /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        let evil = raw_request(
+            port,
+            "GET /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+        );
         assert!(evil.starts_with("HTTP/1.1 421 "), "{evil}");
         assert!(!evil.contains("\"events\""), "blob must not leak: {evil}");
         // Loopback spellings, with and without a port, still work.
-        let ok_ip = raw_request(port, &format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+        let ok_ip = raw_request(
+            port,
+            &format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
         assert!(ok_ip.starts_with("HTTP/1.1 200 OK\r\n"), "{ok_ip}");
         let ok_local = raw_request(port, "GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(ok_local.starts_with("HTTP/1.1 200 OK\r\n"), "{ok_local}");

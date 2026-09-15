@@ -132,7 +132,9 @@ pub fn parse_interval(text: &str) -> Result<Duration, String> {
         .parse()
         .map_err(|_| format!("invalid interval {text:?}: use e.g. `2s` or `500ms`"))?;
     if n == 0 {
-        return Err(format!("invalid interval {text:?}: must be greater than zero"));
+        return Err(format!(
+            "invalid interval {text:?}: must be greater than zero"
+        ));
     }
     Ok(Duration::from_millis(n * unit_ms))
 }
@@ -164,7 +166,12 @@ pub fn run_static(project: &Path, opts: &ReportOptions, now_ms: i64, json: bool)
     if opts.open && !open_in_browser(&out.display().to_string()) {
         human.push_str("\n  (could not launch a browser; open the file yourself)");
     }
-    Rendered::ok(human, to_json(&Written { written: out.display().to_string() }))
+    Rendered::ok(
+        human,
+        to_json(&Written {
+            written: out.display().to_string(),
+        }),
+    )
 }
 
 /// A flag SIGINT/SIGTERM flips, for the foreground loops to poll. Installing
@@ -212,7 +219,8 @@ pub fn run_watch(
         let Some(data) = assemble(project, now(), Mode::Watch, interval_ms, None)? else {
             return Err(no_evidence());
         };
-        write_atomic(&out_path, &report_html::render(&data)).map_err(|e| write_error(&out_path, &e))?;
+        write_atomic(&out_path, &report_html::render(&data))
+            .map_err(|e| write_error(&out_path, &e))?;
         if !announced {
             let _ = writeln!(
                 out,
@@ -220,7 +228,10 @@ pub fn run_watch(
                 out_path.display()
             );
             if opts.open && !open_in_browser(&out_path.display().to_string()) {
-                let _ = writeln!(out, "  (could not launch a browser; open the file yourself)");
+                let _ = writeln!(
+                    out,
+                    "  (could not launch a browser; open the file yourself)"
+                );
             }
             announced = true;
         }
@@ -232,7 +243,9 @@ pub fn run_watch(
 
 /// Where this invocation writes its HTML.
 pub fn out_path(project: &Path, opts: &ReportOptions) -> PathBuf {
-    opts.out.clone().unwrap_or_else(|| project.join(DEFAULT_OUT))
+    opts.out
+        .clone()
+        .unwrap_or_else(|| project.join(DEFAULT_OUT))
 }
 
 /// Write `contents` to `path` without a reader ever seeing a partial file:
@@ -244,7 +257,10 @@ pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("report.html");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("report.html");
     let tmp = path.with_file_name(format!("{name}.tmp-{}", std::process::id()));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
@@ -280,7 +296,13 @@ pub(crate) fn no_evidence() -> Rendered {
         evidence: bool,
         next: &'a str,
     }
-    Rendered::ok(NO_EVIDENCE, to_json(&Nudge { evidence: false, next: "keel run <script>" }))
+    Rendered::ok(
+        NO_EVIDENCE,
+        to_json(&Nudge {
+            evidence: false,
+            next: "keel run <script>",
+        }),
+    )
 }
 
 /// A usage error (exit 2, stderr).
@@ -322,7 +344,10 @@ pub(crate) fn write_error(path: &Path, error: &io::Error) -> Rendered {
     let message = format!("could not write {}: {error}", path.display());
     Rendered {
         human: format!("keel \u{25b8} {message}"),
-        json: to_json(&Err { error: message, path: path.display().to_string() }),
+        json: to_json(&Err {
+            error: message,
+            path: path.display().to_string(),
+        }),
         exit: EXIT_FAILURE,
         to_stderr: true,
     }
