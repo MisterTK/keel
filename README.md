@@ -337,7 +337,9 @@ defaults with a warning. Without `KEEL_CWD`, a missing `keel.toml` still
 means Level 0 defaults, and the banner names the directory it searched. In
 Cloud Run / Lambda / Azure Functions (detected from `K_SERVICE`,
 `AWS_LAMBDA_FUNCTION_NAME`, …) the default LLM dev cache is off unless
-`KEEL_ENV=dev` says otherwise.
+`KEEL_ENV=dev` says otherwise. This refusal *is* the fail-open behavior
+described next — the `.pth`/preload can't halt the host process either way; it
+just says so with an error line instead of a warning.
 
 Activation is fail-open by design: a broken install or invalid `keel.toml`
 prints one `keel ▸` warning line and your app runs unwrapped. `KEEL_DISABLE=1`
@@ -395,7 +397,8 @@ Keel is a file plus an env var, so reaching production has four invariants:
 2. **`KEEL_ENABLE=1` reaches the process doing the I/O.** Python children
    inherit it; Node children also need `NODE_OPTIONS`.
 3. **`KEEL_CWD` names the policy's directory** from that process's point
-   of view (see above).
+   of view — point it at a directory with no `keel.toml` and Keel refuses to
+   activate rather than run defaults (see above).
 4. **`.keel/` outlives the instance** if you use durable flows — a volume
    or a Postgres journal.
 
