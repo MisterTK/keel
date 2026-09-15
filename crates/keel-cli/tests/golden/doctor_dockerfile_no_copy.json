@@ -1,7 +1,7 @@
 {
   "adapters": [
     {
-      "detected": false,
+      "detected": true,
       "lib": "httpx",
       "status": "pinned",
       "target": "host"
@@ -97,7 +97,7 @@
       "target": "mcp:<server>"
     },
     {
-      "detected": true,
+      "detected": false,
       "lib": "fetch",
       "status": "pinned",
       "target": "host"
@@ -159,11 +159,17 @@
   "coverage": {
     "invisible": [],
     "visible_unwrapped": [
-      "api.example.com"
+      "us-central1-aiplatform.googleapis.com"
     ],
     "wrapped": []
   },
   "findings": [
+    {
+      "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
+      "detail": "`us-central1-aiplatform.googleapis.com` is visible in your code but has no observed runtime evidence.",
+      "level": "warn",
+      "topic": "visible-unwrapped"
+    },
     {
       "action": "If a dependency makes calls Keel never reports, file an adapter request.",
       "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
@@ -171,18 +177,18 @@
       "topic": "invisible"
     },
     {
-      "action": "Nothing to do — a reserved/documentation name is a fixture by definition.",
-      "detail": "`api.example.com` — RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real.",
-      "level": "info",
-      "topic": "reserved-name-excluded"
+      "action": "Add `COPY keel.toml ./` (before the layer that runs the app). At runtime the policy is read from KEEL_CWD or the working directory; without the file Keel refuses to activate under KEEL_CWD and runs production defaults otherwise.",
+      "detail": "`Dockerfile` has no COPY/ADD directive that reaches keel.toml — the policy in this checkout will not be in the image.",
+      "level": "warn",
+      "topic": "keel-toml-not-in-image"
     }
   ],
   "follow_ups": [
     {
-      "code": "reserved-name-excluded",
-      "detail": "`api.example.com` was excluded from proposed policy — RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real. Confirm the exclusion is intended.",
-      "rank": 4,
-      "subject": "api.example.com"
+      "code": "sdk-client-timeout",
+      "detail": "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline.",
+      "rank": 5,
+      "subject": "target.\"llm:google-genai\""
     }
   ],
   "journal": {
@@ -200,15 +206,11 @@
     "valid": true
   },
   "topology": {
-    "excluded": [
-      {
-        "host": "api.example.com",
-        "kind": "reserved-name",
-        "reason": "RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real"
-      }
-    ],
+    "excluded": [],
     "external_processes": [],
     "unreachable": [],
-    "wrappable": []
+    "wrappable": [
+      "us-central1-aiplatform.googleapis.com"
+    ]
   }
 }

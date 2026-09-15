@@ -40,9 +40,61 @@ from ..adapters._pack import Detection, Seam, TargetDecl
 DEV_CACHE_TTL = "24h"
 
 
-def _is_prod(env: Mapping[str, str] | None) -> bool:
+#: Environment variables that identify a serverless/container platform (Cloud
+#: Run services and jobs, Lambda, Azure Functions and App Service). Their
+#: presence means "production" for the dev cache when KEEL_ENV is unset —
+#: replaying an LLM response from a cache in a deployed container is never
+#: the dev loop the cache exists for (field report 2026-09-15, F0/F6).
+SERVERLESS_MARKERS = (
+    "K_SERVICE",
+    "K_REVISION",
+    "CLOUD_RUN_JOB",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "FUNCTIONS_WORKER_RUNTIME",
+    "WEBSITE_SITE_NAME",
+)
+
+
+def serverless_marker(env: Mapping[str, str] | None = None) -> str | None:
+    """The first present, non-blank serverless marker variable, or None."""
     env = env if env is not None else os.environ
-    return str(env.get("KEEL_ENV", "")).strip().lower() == "prod"
+    for name in SERVERLESS_MARKERS:
+        if str(env.get(name, "")).strip():
+            return name
+    return None
+
+
+def dev_cache_off_reason(env: Mapping[str, str] | None = None) -> str | None:
+    """WHY the LLM dev cache is off in this process, as a machine-readable
+    token — ``"KEEL_ENV"`` when an explicit ``KEEL_ENV=prod`` demoted it,
+    the serverless marker's variable name when a container did, or ``None``
+    when the cache is genuinely ON.
+
+    This is the single source of truth for `_is_prod` (below) AND for the
+    activation line's ``dev_cache_off`` field, so the field can never claim
+    something the cache resolution does not do: a field literally named
+    `dev_cache_off` reporting null is a positive claim that the cache is on,
+    and `KEEL_ENV=prod` is a reachable production configuration where that
+    would be a lie. Twin of Node's `devCacheOffReason`; keep identical.
+
+    Only the two declarations Keel actually understands short-circuit the
+    marker: ``prod`` (off) and ``dev`` (on — someone saying "this IS my dev
+    loop" may have one inside a container). Every other value, blank
+    included, falls through to the serverless marker: ``KEEL_ENV=staging``
+    on Cloud Run must not silently re-arm the dev cache, which is the
+    2026-09-15 outage class itself (spec §2: a detected serverless
+    environment counts as ``KEEL_ENV=prod`` for dev-cache resolution)."""
+    env = env if env is not None else os.environ
+    keel_env = str(env.get("KEEL_ENV", "")).strip().lower()
+    if keel_env == "prod":
+        return "KEEL_ENV"
+    if keel_env == "dev":
+        return None  # an explicit dev declaration beats a marker
+    return serverless_marker(env)
+
+
+def _is_prod(env: Mapping[str, str] | None) -> bool:
+    return dev_cache_off_reason(env) is not None
 
 
 class _LlmPack:
@@ -74,7 +126,7 @@ class _LlmPack:
                     "is orthogonal to retry — it enables replay, not retry."
                 ),
                 args_hash_rule=(
-                    "None for GET (state queries — issue #76) and for streaming "
+                    "None for GET (state queries — issue #76) and for LRO submit/poll POST shapes (:predictLongRunning, :fetch*Operation — issue #83) and for streaming "
                     "generate calls (:streamGenerateContent path or \"stream\": true "
                     "body — issue #84); sha256 over (method, url, canonicalized JSON "
                     "body) for non-streaming LLM POST (dev-cache replay key); None "

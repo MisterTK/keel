@@ -141,11 +141,14 @@
   ],
   "boundaries": {
     "governance_files": [],
+    "parsed_files": [
+      "dockerfile (COPY/ADD directives only)"
+    ],
     "parsed_languages": [
       "python",
       "js-ts"
     ],
-    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's five phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose. Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
+    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's six phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, activation reaching the I/O process, durable evidence). Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
     "unparsed": [
       "shell",
       "makefile",
@@ -185,6 +188,7 @@
   "policy": {
     "field": null,
     "message": null,
+    "path": null,
     "present": false,
     "valid": true
   },

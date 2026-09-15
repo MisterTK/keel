@@ -7,9 +7,11 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
-import { createSummary, formatSummary, keelOnPath } from "../src/summary.mjs";
+import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "../src/summary.mjs";
+import { jsonLogs } from "../src/log.mjs";
 
 const corpusDir = new URL("../../../conformance/console_summary/", import.meta.url);
+const jsonCorpusDir = new URL("../../../conformance/console_summary_json/", import.meta.url);
 
 function outcome(overrides = {}) {
   return {
@@ -56,6 +58,24 @@ test("every corpus case formats byte-identically", () => {
     const c = JSON.parse(readFileSync(new URL(file, corpusDir), "utf8"));
     assert.equal(formatSummary(c.counts, c.keel_on_path), c.expected, c.name);
   }
+});
+
+// `KEEL_LOG_FORMAT=json` (F10): a second shared corpus, read by the Python
+// front end too — identical counts + meta must produce identical BYTES
+// (sorted keys, no spaces), or a log pipeline sees two different schemas.
+test("every json corpus case formats byte-identically", () => {
+  const files = readdirSync(jsonCorpusDir).filter((f) => f.endsWith(".json")).sort();
+  assert.ok(files.length >= 3, "json corpus present");
+  for (const file of files) {
+    const c = JSON.parse(readFileSync(new URL(file, jsonCorpusDir), "utf8"));
+    assert.equal(formatSummaryJson(c.counts, c.meta), c.expected, c.name);
+  }
+});
+
+test("only the exact value json switches the log format", () => {
+  for (const v of ["json", "JSON", "  json  ", "Json"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), true, v);
+  for (const v of ["", "1", "true", "ndjson", "text", "jsonl"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), false, v);
+  assert.equal(jsonLogs({}), false);
 });
 
 test("keelOnPath scans PATH for a keel executable", () => {

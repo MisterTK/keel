@@ -143,11 +143,14 @@
     "governance_files": [
       "CLAUDE.md"
     ],
+    "parsed_files": [
+      "dockerfile (COPY/ADD directives only)"
+    ],
     "parsed_languages": [
       "python",
       "js-ts"
     ],
-    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's five phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose. Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
+    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's six phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, activation reaching the I/O process, durable evidence). Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
     "unparsed": [
       "shell",
       "makefile",
@@ -158,14 +161,14 @@
   "coverage": {
     "invisible": [],
     "visible_unwrapped": [
-      "api.example.com"
+      "api.vendor.com"
     ],
     "wrapped": []
   },
   "findings": [
     {
       "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
-      "detail": "`api.example.com` is visible in your code but has no observed runtime evidence.",
+      "detail": "`api.vendor.com` is visible in your code but has no observed runtime evidence.",
       "level": "warn",
       "topic": "visible-unwrapped"
     },
@@ -193,6 +196,7 @@
   "policy": {
     "field": null,
     "message": null,
+    "path": "keel.toml",
     "present": true,
     "valid": true
   },
@@ -201,7 +205,7 @@
     "external_processes": [],
     "unreachable": [],
     "wrappable": [
-      "api.example.com"
+      "api.vendor.com"
     ]
   }
 }

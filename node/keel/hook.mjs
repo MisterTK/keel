@@ -29,7 +29,11 @@ import { matchFlow, runAsFlow } from "./src/flow.mjs";
 // the real cwd (so `keel run`'s own child, where the two are equal, is
 // unaffected). Only CONFIG resolution moves: `matchFlow` below still resolves
 // `process.argv[1]` against the real cwd, exactly as Node itself does.
-const state = await installKeel({ cwd: process.env.KEEL_CWD || process.cwd() });
+const keelCwd = process.env.KEEL_CWD || "";
+const state = await installKeel({
+  cwd: keelCwd || process.cwd(),
+  cwdSource: keelCwd ? "KEEL_CWD" : "cwd",
+});
 if (state.enabled && process.argv[1]) {
   const entry = matchFlow(process.argv[1], process.cwd(), state.flowEntrypoints ?? []);
   if (entry) {

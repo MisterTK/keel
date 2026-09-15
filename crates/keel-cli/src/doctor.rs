@@ -241,6 +241,11 @@ struct Coverage {
 struct PolicyCheck {
     field: Option<String>,
     message: Option<String>,
+    /// The policy file this report read, project-relative (`"keel.toml"`), or
+    /// `None` when there is none. Machine-checkable: a consumer comparing two
+    /// environments can see *which* file — if any — each one actually loaded,
+    /// rather than inferring it from `present`.
+    path: Option<String>,
     present: bool,
     valid: bool,
 }
@@ -261,8 +266,9 @@ struct Finding {
 /// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
 /// agent/human reading the report to work top-down. `code` is a CLOSED set —
 /// url-no-transport | orchestration-blind-spot | subprocess-blind-spot |
-/// dependency-averse-excluded | local-host-excluded | preexisting-resilience |
-/// sdk-client-timeout | code-hash-stale — ranked lowest-Keel-confidence first
+/// dependency-averse-excluded | local-host-excluded | reserved-name-excluded |
+/// test-only-excluded | preexisting-resilience | sdk-client-timeout |
+/// code-hash-stale — ranked lowest-Keel-confidence first
 /// (rank 1 = Keel knows least, investigate first). Text is entirely
 /// keel-authored; only hostnames, file paths, and lib names are interpolated.
 #[derive(Debug, Serialize)]
@@ -337,6 +343,10 @@ pub(crate) struct ExternalProcess {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) covered_by: Option<String>,
     pub(crate) file: String,
+    /// Whether the sighting's file is test code ([`scan::is_test_path`]) — a
+    /// test-only launch is counted separately from the production blind spots
+    /// rather than warned about (WS5).
+    pub(crate) in_tests: bool,
     pub(crate) launcher: String,
     pub(crate) line: u32,
 }
@@ -345,11 +355,13 @@ pub(crate) struct ExternalProcess {
 /// scan saw, sorted into exactly one of "wrap it" (a tracked transport is in
 /// reach, or the target is wrapped-at-runtime/`llm:*` by construction),
 /// "can't reach it" (no adapted transport in reach — Keel is blind here
-/// regardless of policy), or "shouldn't reach it" (sighted only inside a
-/// file the scan judged dependency-averse — excluded from proposed policy on
-/// purpose). `external_processes` is the adjacent, host-independent honesty
-/// signal: traffic inside an externally-launched process Keel cannot see at
-/// all, no matter which bucket its host would otherwise land in.
+/// regardless of policy), or "shouldn't reach it" (a local/loopback host, an
+/// RFC 2606/5737 reserved name, a host sighted only in test files, or one
+/// sighted only inside a file the scan judged dependency-averse — all
+/// excluded from proposed policy on purpose). `external_processes` is the
+/// adjacent, host-independent honesty signal: traffic inside an
+/// externally-launched process Keel cannot see at all, no matter which bucket
+/// its host would otherwise land in.
 ///
 /// `pub(crate)`: `init.rs` reuses [`classify_topology`] to skip proposing
 /// policy for excluded hosts and print why.
@@ -384,6 +396,10 @@ struct Boundaries {
     /// fail-closed contracts and "never touch this file" rules live in that
     /// prose, so a call site that looks wrappable may be deliberately locked.
     governance_files: Vec<&'static str>,
+    /// File classes read coarsely by directive, not parsed into an AST — so a
+    /// verdict drawn from them is a lead about the packaging boundary, never a
+    /// build. Today: the root build files' `COPY`/`ADD` lines (WS3).
+    parsed_files: &'static [&'static str],
     /// The languages the static scan parses into an AST.
     parsed_languages: &'static [&'static str],
     /// One line naming the protocol that turns this evidence into a verdict,
@@ -469,6 +485,7 @@ pub fn run(project: &Path) -> Rendered {
     let agents_cli_finding = agents_cli_placement_finding(project);
     let config_above_cwd_finding = config_above_cwd_finding(project);
     let boundaries = boundaries(project);
+    let build_files = crate::dockerfile::analyze(project);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
     let report = build_report(
         &scan,
@@ -478,6 +495,7 @@ pub fn run(project: &Path) -> Rendered {
         agents_cli_finding,
         config_above_cwd_finding,
         boundaries,
+        &build_files,
         &stale_flows,
     );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
@@ -533,6 +551,8 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
 /// never gets the dependency-averse-specific `# keel: include` advice, which
 /// does not apply to it. None of these are configuration errors — they
 /// never affect `ok`.
+#[allow(clippy::too_many_lines)] // one straight-line section per finding topic;
+// WS5 added the test-only subprocess section, not new branching depth.
 fn topology_findings(topology: &Topology) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in &topology.unreachable {
@@ -547,10 +567,14 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             topic: "url-no-transport",
         });
     }
-    let (covered, uncovered): (Vec<_>, Vec<_>) = topology
+    let (covered, unmatched): (Vec<_>, Vec<_>) = topology
         .external_processes
         .iter()
         .partition(|p| p.covered_by.is_some());
+    // WS5: a launch that only ever happens from test code is not a production
+    // blind spot. It is still reported — dropping evidence silently would be
+    // its own honesty violation — but as `info`, out of the `warn` list.
+    let (in_tests, uncovered): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|p| p.in_tests);
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
@@ -567,6 +591,23 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             ),
             fix: None,
             level: "warn",
+            topic: "subprocess-blind-spot",
+        });
+    }
+    if !in_tests.is_empty() {
+        let cmds: Vec<String> = in_tests
+            .iter()
+            .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
+            .collect();
+        findings.push(Finding {
+            action: "No action needed for test-only launches.".to_owned(),
+            detail: format!(
+                "{} externally-launched process(es) in test files only: {}.",
+                in_tests.len(),
+                cmds.join(", ")
+            ),
+            fix: None,
+            level: "info",
             topic: "subprocess-blind-spot",
         });
     }
@@ -611,6 +652,13 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                                   run under keel to gather runtime evidence, or add it to \
                                   keel.toml explicitly."
             }
+            "reserved-name" => {
+                "Nothing to do — a reserved/documentation name is a fixture by definition."
+            }
+            "test-only" => {
+                "Nothing to do unless production code also reaches this host; if it does, \
+                 run under keel so runtime evidence promotes it."
+            }
             _ => {
                 "Confirm the exclusion is intended; add `# keel: include` to the file to \
                   override."
@@ -632,11 +680,14 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
 /// (#64) — shared between [`topology_findings`] and [`build_follow_ups`] so
 /// the two surfaces never disagree about an excluded host's category slug.
 /// `"dependency-averse"` is the pre-#64 default: any kind other than the
-/// loopback one added here falls back to it, with a debug-build assertion
-/// (not a release panic) catching genuine `classify_topology` drift.
+/// loopback one (#64) and the two WS5 fixture kinds added here falls back to
+/// it, with a debug-build assertion (not a release panic) catching genuine
+/// `classify_topology` drift.
 fn excluded_kind_topic(kind: &str) -> &'static str {
     match kind {
         "local/loopback" => "local-host-excluded",
+        "reserved-name" => "reserved-name-excluded",
+        "test-only" => "test-only-excluded",
         other => {
             debug_assert!(
                 other == "dependency-averse",
@@ -675,8 +726,10 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                      policy (interval / deadline / until) replaces the whole loop",
                     s.function, s.file, s.line, targets, when
                 ),
-                "Wrap the target, then replace the loop with a `poll` policy — the poll \
-                 primitive (CCR-3) is the designated replacement for submit-then-poll loops."
+                "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
+                 bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
+                 GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
+                 loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
                     .to_owned(),
             ),
             "silent-swallow" => (
@@ -727,10 +780,11 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
 /// (orchestration-blind-spot) is a coarse substring match on a file Keel
 /// cannot parse at all — strictly less verifiable than rank 3
 /// (subprocess-blind-spot), which comes from an AST sighting of a real call
-/// — so it sorts above it. Rank 4 covers BOTH `topology.excluded` kinds
-/// (dependency-averse-excluded and, since #64, local-host-excluded) — same
-/// confidence tier, "Keel saw why this was excluded and just wants it
-/// confirmed", ties broken by `code` then `subject`. Rank 5 also covers
+/// — so it sorts above it. Rank 4 covers EVERY `topology.excluded` kind
+/// (dependency-averse-excluded; since #64, local-host-excluded; since WS5,
+/// reserved-name-excluded and test-only-excluded) — same confidence tier,
+/// "Keel saw why this was excluded and just wants it confirmed", ties broken
+/// by `code` then `subject`. Rank 5 also covers
 /// `sdk-client-timeout` (since #80): a mechanically-verified fact from the
 /// declared policy itself (Keel is fully confident an LRO-sized timeout is
 /// set), same tier as `preexisting-resilience`'s "Keel is confident about
@@ -742,7 +796,10 @@ fn follow_up_rank(code: &str) -> u32 {
         "url-no-transport" => 1,
         "orchestration-blind-spot" => 2,
         "subprocess-blind-spot" => 3,
-        "dependency-averse-excluded" | "local-host-excluded" => 4,
+        "dependency-averse-excluded"
+        | "local-host-excluded"
+        | "reserved-name-excluded"
+        | "test-only-excluded" => 4,
         "preexisting-resilience" | "sdk-client-timeout" => 5,
         _ => 6, // code-hash-stale (WS6)
     }
@@ -789,16 +846,24 @@ fn build_follow_ups(
     // is covered when Keel is active, so it drops out of this "investigate
     // top-down" list entirely — it needs no chasing, only the lower-priority
     // `info` finding `topology_findings` still emits for it.
-    let uncovered: Vec<&ExternalProcess> = topology
+    // WS5: a launch seen only in test files is not a production blind spot
+    // either — it stays out of the detail list and is surfaced only as a count
+    // on the subject, so the reader knows the evidence was seen, not dropped.
+    let (in_tests, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = topology
         .external_processes
         .iter()
         .filter(|p| p.covered_by.is_none())
-        .collect();
+        .partition(|p| p.in_tests);
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
             .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
             .collect();
+        let suffix = if in_tests.is_empty() {
+            String::new()
+        } else {
+            format!(" (+{} in test files)", in_tests.len())
+        };
         ups.push(FollowUp {
             code: "subprocess-blind-spot",
             detail: format!(
@@ -807,7 +872,10 @@ fn build_follow_ups(
                 cmds.join(", ")
             ),
             rank: follow_up_rank("subprocess-blind-spot"),
-            subject: format!("{} externally-launched process(es)", uncovered.len()),
+            subject: format!(
+                "{} externally-launched process(es){suffix}",
+                uncovered.len()
+            ),
         });
     }
     for entry in &topology.excluded {
@@ -841,11 +909,14 @@ fn build_follow_ups(
             rank: follow_up_rank("sdk-client-timeout"),
             subject: subject.clone(),
             detail: format!(
-                "timeout = {}s is beyond the client-default deadline most SDKs enforce (often \
-                 ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the \
-                 call site must also pass a timeout >= the Keel value, or the SDK gives up first \
-                 and Keel just sees a retryable timeout. For submit-then-poll APIs, prefer a \
-                 `poll` policy.",
+                "timeout = {}s bounds ONE attempt of ONE call, and is beyond the client-default \
+                 deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not \
+                 raise the SDK's own deadline — the call site must also pass a timeout >= the \
+                 Keel value, or the SDK gives up first and Keel just sees a retryable timeout. \
+                 For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE \
+                 submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex \
+                 `:fetch*Operation`) cannot use `poll` yet — set `cache = {{ mode = \"off\" }}` \
+                 on the target and keep the app-level deadline.",
                 ms / 1000
             ),
         });
@@ -870,26 +941,44 @@ fn build_follow_ups(
     ups
 }
 
-/// A root `keel.toml` in a Google `agents-cli` project (an
-/// `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches the
-/// container: the generated Dockerfile only `COPY`s `pyproject.toml`,
+/// A `keel.toml` outside the agent directory of a Google `agents-cli` project
+/// (an `agents-cli-manifest.yaml` naming an `agent_directory`) never reaches
+/// the container: the generated Dockerfile only `COPY`s `pyproject.toml`,
 /// `README.md`, `uv.lock*`, and the agent directory itself. Emitted only when
-/// a manifest is found, `<project>/keel.toml` actually exists, and the agent
-/// directory is not `project` itself — when `agent_directory` names the
-/// project root, the root `keel.toml` already sits inside the one directory
-/// the Dockerfile ships, so there is no placement problem to report.
+/// a manifest is found, `<project>/keel.toml` actually exists, and that file is
+/// NOT inside the agent directory — a policy already under `agent_dir` ships
+/// fine, which covers both the `agent_directory`-names-the-project-root case
+/// and (since issue #87 made the upward walk actually work) a `keel.toml` in a
+/// subdirectory of the agent directory.
+///
+/// Containment is decided on CANONICALIZED paths, the house pattern from
+/// `init::agents_cli_toml_path`: `project` is the relative `"."` `main.rs`
+/// passes, while a manifest found above it yields an absolute `agent_dir`, so
+/// a syntactic comparison of the two would be meaningless. Fails open — if
+/// either side cannot be canonicalized (a TOCTOU removal), say nothing rather
+/// than guess.
 fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
     let layout = agents_cli::find_agents_cli_layout(project)?;
-    if layout.agent_dir == project || !evidence::keel_toml(project).exists() {
+    let keel_toml = evidence::keel_toml(project);
+    if !keel_toml.exists() {
         return None;
     }
-    // Display paths relative to `project` (the common case: `agent_directory`
-    // names a subdirectory of the project it's declared in) rather than the
-    // absolute filesystem path — keeps the finding's text, and therefore
-    // `--json`, reproducible across checkouts instead of embedding wherever
-    // this particular clone happens to sit on disk.
-    let agent_dir = relative_display(project, &layout.agent_dir);
-    let moved_to = relative_display(project, &layout.agent_dir.join("keel.toml"));
+    let canonical_toml = std::fs::canonicalize(&keel_toml).ok()?;
+    let canonical_agent_dir = std::fs::canonicalize(&layout.agent_dir).ok()?;
+    if canonical_toml.starts_with(&canonical_agent_dir) {
+        return None;
+    }
+    // Display paths relative to the MANIFEST directory — the agents-cli
+    // project root, which is the anchor `agent_directory` is itself declared
+    // against and the only one that is stable at every walk level. Relative to
+    // `project` would be identical at level 0 (manifest_dir IS project there)
+    // but degrade to an absolute machine path once the walk climbs, since
+    // `agent_dir` is then never under `project` — and the whole point of this
+    // is to keep the finding's text, and therefore `--json`, reproducible
+    // across checkouts instead of embedding wherever this particular clone
+    // happens to sit on disk.
+    let agent_dir = relative_display(&layout.manifest_dir, &layout.agent_dir);
+    let moved_to = relative_display(&layout.manifest_dir, &layout.agent_dir.join("keel.toml"));
     Some(Finding {
         action: format!(
             "Move keel.toml to {moved_to} (or add a `COPY keel.toml` line to the Dockerfile)."
@@ -974,7 +1063,7 @@ fn relative_display(base: &Path, target: &Path) -> String {
 /// Build the [`Boundaries`] frame for `project`. Only `governance_files` touches
 /// the filesystem; the rest are standing properties of this tool, kept in one
 /// place so there is a single edit when the scan learns a new language or file
-/// class. The `protocol` line enumerates the skill's five phases verbatim — if
+/// class. The `protocol` line enumerates the skill's six phases verbatim — if
 /// `skills/keel/SKILL.md`'s protocol changes, change this with it.
 fn boundaries(project: &Path) -> Boundaries {
     let mut governance_files = Vec::new();
@@ -986,12 +1075,14 @@ fn boundaries(project: &Path) -> Boundaries {
     }
     Boundaries {
         governance_files,
+        parsed_files: &["dockerfile (COPY/ADD directives only)"],
         parsed_languages: &["python", "js-ts"],
         protocol: "Static + adapter-interception evidence, not a verdict. Drive an \
-                   evaluate/adopt/review task through the keel skill's five phases: Scope every \
+                   evaluate/adopt/review task through the keel skill's six phases: Scope every \
                    I/O process (including shell/CI launchers) -> Explore how each call is \
                    dispatched -> Collect this report -> Baseline real failure classes in observe \
-                   mode (`keel record run`) -> Analyze & propose. Retry only helps \
+                   mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, \
+                   activation reaching the I/O process, durable evidence). Retry only helps \
                    genuinely-transient classes (conn/timeout/5xx/429).",
         unparsed: &["shell", "makefile", "ci-workflow", "governance-prose"],
     }
@@ -1012,20 +1103,21 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the eight evidence inputs. Pure, so the golden test
+/// Assemble the report from the nine evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3` — the filesystem-dependent
 /// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
 /// check for a root `keel.toml`; `config_above_cwd_finding`, since it walks
 /// parent directories for a `keel.toml` — issue #85; `boundaries`, since it
-/// stats the project root for governance files; `stale_flows`, since it
+/// stats the project root for governance files; `build_files`, since it reads
+/// the root `Dockerfile`s and `.dockerignore`; `stale_flows`, since it
 /// needs to read `.keel/journal.db` and stat scripts on disk) are computed
 /// by the caller and passed in already resolved, the same pattern
 /// `policy`/`journal` already use.
 #[allow(clippy::too_many_lines)]
 // straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
-#[allow(clippy::too_many_arguments)] // eight already-resolved evidence inputs (see doc
-// comment above); issue #85 added the eighth, config_above_cwd_finding.
+#[allow(clippy::too_many_arguments)] // nine already-resolved evidence inputs (see doc
+// comment above); issue #85 added config_above_cwd_finding, WS3 added build_files.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1034,6 +1126,7 @@ fn build_report(
     agents_cli_finding: Option<Finding>,
     config_above_cwd_finding: Option<Finding>,
     boundaries: Boundaries,
+    build_files: &[crate::dockerfile::BuildFile],
     stale_flows: &[crate::flows::StaleFlow],
 ) -> DoctorReport {
     let PolicyValidation {
@@ -1081,7 +1174,18 @@ fn build_report(
 
     // Findings + suggested actions.
     let mut findings = Vec::new();
-    for target in &visible_unwrapped {
+    // WS5: a host the topology already excluded (loopback, a reserved name, a
+    // test-only sighting, a dependency-averse file) must not ALSO raise a
+    // `visible-unwrapped` warn — that was the same host counted twice, once as
+    // a warn and once as the info explaining why it is not a dependency. The
+    // raw `coverage.visible_unwrapped` list is deliberately unchanged: it is
+    // the unfiltered set-difference fact, not a finding.
+    let excluded_hosts: BTreeSet<&str> =
+        topology.excluded.iter().map(|e| e.host.as_str()).collect();
+    for target in visible_unwrapped
+        .iter()
+        .filter(|t| !excluded_hosts.contains(t.as_str()))
+    {
         findings.push(Finding {
             action:
                 "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime."
@@ -1177,6 +1281,11 @@ fn build_report(
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
     findings.extend(agents_cli_finding);
+    // WS3: only meaningful when there IS a policy file to ship — with no
+    // keel.toml in the checkout there is nothing for the image to be missing.
+    if policy.present {
+        findings.extend(packaging_findings(build_files));
+    }
     // Issue #85: only meaningful when this project has no keel.toml of its
     // own — `config_above_cwd_finding` already checks this independently,
     // but gating here too keeps the rule visible at the one call site that
@@ -1203,6 +1312,91 @@ fn build_report(
     }
 }
 
+/// WS3: the policy file exists in the checkout — does the image get it?
+fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Finding> {
+    use crate::dockerfile::Reach;
+    let mut out = Vec::new();
+    for bf in build_files {
+        match bf.reach {
+            Reach::NotReached => out.push(Finding {
+                action:
+                    "Add `COPY keel.toml ./` (before the layer that runs the app). At runtime the \
+                         policy is read from KEEL_CWD or the working directory; without the file \
+                         Keel refuses to activate under KEEL_CWD and runs production defaults \
+                         otherwise."
+                        .to_owned(),
+                detail: format!(
+                    "`{}` has no COPY/ADD directive that reaches keel.toml — the policy in this \
+                     checkout will not be in the image.",
+                    bf.file
+                ),
+                fix: None,
+                level: "warn",
+                topic: "keel-toml-not-in-image",
+            }),
+            Reach::Reached if !bf.reached_in_final_stage => out.push(Finding {
+                action:
+                    "Copy keel.toml into the final stage too (`COPY keel.toml ./` after the last \
+                         FROM), or `COPY --from=<stage>` it across."
+                        .to_owned(),
+                detail: format!(
+                    "`{}` copies keel.toml only in a non-final build stage — the runtime image \
+                     will not have it.",
+                    bf.file
+                ),
+                fix: None,
+                level: "warn",
+                topic: "keel-toml-not-in-image",
+            }),
+            Reach::Indeterminate => out.push(Finding {
+                action: "Confirm the expanded source includes keel.toml, or add an explicit \
+                         `COPY keel.toml ./`."
+                    .to_owned(),
+                detail: format!(
+                    "`{}`: could not tell whether keel.toml reaches the image — `{}` depends on a \
+                     build variable.",
+                    bf.file,
+                    bf.directive.as_deref().unwrap_or_default()
+                ),
+                fix: None,
+                level: "info",
+                topic: "keel-toml-image-indeterminate",
+            }),
+            Reach::Reached => {}
+        }
+    }
+    out
+}
+
+/// RFC 2606 reserved names (`example.com/net/org`, `.example`, `.test`,
+/// `.invalid`, `.localhost`) and RFC 5737 / RFC 3849 documentation address
+/// ranges: fixtures by definition, never a dependency (WS5).
+fn reserved_name(host: &str) -> bool {
+    const HOSTS: &[&str] = &["example.com", "example.net", "example.org"];
+    const TLDS: &[&str] = &["example", "test", "invalid", "localhost"];
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                matches!(
+                    (o[0], o[1], o[2]),
+                    (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+                )
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                s[0] == 0x2001 && s[1] == 0x0db8
+            }
+        };
+    }
+    let last_label = h.rsplit('.').next().unwrap_or("");
+    HOSTS
+        .iter()
+        .any(|r| h == *r || h.ends_with(&format!(".{r}")))
+        || TLDS.contains(&last_label)
+}
+
 /// Sort every host the static scan saw into exactly one of the three honesty
 /// buckets (dx-spec §2 — "wrap it" / "can't reach it" / "shouldn't reach
 /// it"), plus the host-independent external-process signal. Precedence: a
@@ -1210,14 +1404,18 @@ fn build_report(
 /// construction regardless of transport class (runtime evidence, or the LLM
 /// pack's own wrapping, beats static doubt); otherwise a statically-seen
 /// `localhost`/loopback/unspecified target (#64 — e.g. a test server, not a
-/// real dependency) is excluded ahead of any other check; otherwise a target
-/// seen ONLY inside a dependency-averse file is excluded (shouldn't reach it)
-/// ahead of any transport check; otherwise the transport class decides
+/// real dependency) is excluded ahead of any other check; otherwise an RFC
+/// 2606/5737 reserved or documentation name, then a target seen ONLY inside
+/// test files, are excluded (WS5 — fixtures, not dependencies); otherwise a
+/// target seen ONLY inside a dependency-averse file is excluded (shouldn't
+/// reach it) ahead of any transport check; otherwise the transport class decides
 /// wrappable (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
 /// `init.rs` reuses this directly for `keel init --diff` to skip proposing
 /// policy for excluded hosts and print why (passing an empty `cmd_match` —
 /// `--diff` never touches `external_processes`, so cross-referencing it
 /// there would be dead work).
+#[allow(clippy::too_many_lines)] // one straight-line exclusion check per bucket,
+// in documented precedence order; WS5 added two more, not new branching depth.
 pub(crate) fn classify_topology(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1247,6 +1445,31 @@ pub(crate) fn classify_topology(
                 reason: "local/loopback host — run under keel to gather runtime evidence, or \
                          add it to keel.toml explicitly"
                     .to_owned(),
+            });
+            continue;
+        }
+        if reserved_name(target) {
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                kind: "reserved-name",
+                reason: "RFC 2606/5737 reserved or documentation name — a fixture, not a \
+                         dependency; add it to keel.toml explicitly if it is real"
+                    .to_owned(),
+            });
+            continue;
+        }
+        let test_only =
+            !ev.sightings.is_empty() && ev.sightings.iter().all(|s| scan::is_test_path(&s.file));
+        if test_only {
+            let files: BTreeSet<&str> = ev.sightings.iter().map(|s| s.file.as_str()).collect();
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                kind: "test-only",
+                reason: format!(
+                    "seen only in test file(s) {} — run under keel to gather runtime evidence, \
+                     or add it to keel.toml explicitly",
+                    files.into_iter().collect::<Vec<_>>().join(", ")
+                ),
             });
             continue;
         }
@@ -1300,6 +1523,7 @@ pub(crate) fn classify_topology(
             command: s.command.clone(),
             covered_by: cmd_flow_covering(&cmd_rules, s),
             file: s.file.clone(),
+            in_tests: scan::is_test_path(&s.file),
             launcher: s.launcher.clone(),
             line: s.line,
         })
@@ -1361,6 +1585,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -1413,6 +1638,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 check: PolicyCheck {
                     field: None,
                     message: None,
+                    path: Some("keel.toml".to_owned()),
                     present: true,
                     valid: true,
                 },
@@ -1434,6 +1660,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
         check: PolicyCheck {
             field,
             message: Some(message.to_owned()),
+            path: Some("keel.toml".to_owned()),
             present: true,
             valid: false,
         },
@@ -1646,6 +1873,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -1661,6 +1889,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -1752,6 +1981,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -1830,6 +2060,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -1913,6 +2144,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             r.topology
@@ -1990,6 +2222,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let retry = r
             .findings
@@ -2007,7 +2240,13 @@ mod tests {
             .expect("poll finding");
         assert_eq!(poll.level, "info", "unreachable target → once-wrapped lead");
         assert!(poll.detail.contains("fetch_short_metrics.py:83"));
-        assert!(poll.action.contains("poll"), "names the poll primitive");
+        assert_eq!(
+            poll.action,
+            "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
+             bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
+             GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
+             loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
+        );
         // The WS2 closed follow-up vocabulary is NOT extended by WS3.
         assert!(
             r.follow_ups
@@ -2091,6 +2330,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -2140,6 +2380,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let hit: Vec<_> = r
             .follow_ups
@@ -2150,6 +2391,38 @@ mod tests {
         assert_eq!(hit[0].rank, 5);
         assert_eq!(hit[0].subject, "target.\"llm:google-genai\"");
         assert!(hit[0].detail.contains("1800s"));
+    }
+
+    /// Deployment-honesty slice, WS6/WS10: the `sdk-client-timeout` detail
+    /// must name all three clocks (Keel's `timeout`, the SDK's own
+    /// client-default deadline, and `poll.deadline`) and the POST-poll
+    /// caveat (poll is GET/HEAD-only until poll v2; a POST-shaped poll like
+    /// Vertex's `:fetch*Operation` needs `cache = { mode = "off" }` instead).
+    #[test]
+    fn sdk_client_timeout_names_the_three_clocks_and_the_post_poll_caveat() {
+        let ups = build_follow_ups(
+            &Topology {
+                excluded: vec![],
+                external_processes: vec![],
+                unreachable: vec![],
+                wrappable: vec![],
+            },
+            None,
+            &ScanResult::default(),
+            &[],
+            &[("target.\"llm:google-genai\"".to_owned(), 1_800_000)],
+        );
+        let fu = ups.iter().find(|u| u.code == "sdk-client-timeout").unwrap();
+        assert_eq!(
+            fu.detail,
+            "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default \
+             deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise \
+             the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or \
+             the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled \
+             APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) \
+             replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` \
+             yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline."
+        );
     }
 
     /// No `lro_timeouts` entries (the common case — `validate_policy` never
@@ -2167,6 +2440,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
     }
@@ -2175,11 +2449,11 @@ mod tests {
     #[test]
     fn no_signals_means_empty_follow_ups() {
         use crate::scan::TransportClass;
-        let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        let scan = scan_with("api.vendor.com", TargetClass::Host, &["httpx"]);
         // httpx is a tracked transport for this host.
         let mut scan = scan;
         scan.host_transports
-            .insert("api.example.com".into(), TransportClass::Tracked);
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
         let r = build_report(
             &scan,
             &BTreeSet::new(),
@@ -2188,6 +2462,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
@@ -2276,6 +2551,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
 
         assert!(
@@ -2353,6 +2629,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -2422,6 +2699,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(
@@ -2508,6 +2786,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -2523,6 +2802,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
 
@@ -2590,6 +2870,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let mcp = r
             .adapters
@@ -2613,6 +2894,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: None,
                 present: false,
                 valid: true,
             },
@@ -2639,6 +2921,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         let row = r
@@ -2675,6 +2958,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let finding = r
             .findings
@@ -2705,6 +2989,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.findings
@@ -2725,6 +3010,7 @@ mod tests {
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(
             !r.findings
@@ -2741,6 +3027,7 @@ mod tests {
             check: PolicyCheck {
                 field: Some("target.x.retry.attempts".to_owned()),
                 message: Some("invalid value: integer `0`".to_owned()),
+                path: Some("keel.toml".to_owned()),
                 present: true,
                 valid: false,
             },
@@ -2756,6 +3043,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(!r.ok);
@@ -2777,6 +3065,7 @@ mod tests {
             check: PolicyCheck {
                 field: None,
                 message: None,
+                path: Some("keel.toml".to_owned()),
                 present: true,
                 valid: true,
             },
@@ -2798,6 +3087,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(!r.ok, "an unbootable configuration must not be ok");
@@ -3227,7 +3517,7 @@ import httpx
 import tenacity
 # CANARY_COMMENT_9f31 must never appear in any report
 TOKEN = "CANARY_SECRET_9f31"
-U = "https://api.leak.example/v1?key=CANARY_QUERY_9f31"
+U = "https://api.leak.vendor.com/v1?key=CANARY_QUERY_9f31"
 
 def caller():
     attempt = 0
@@ -3250,7 +3540,7 @@ def caller():
             dir.path().join("risk_gate.py"),
             "\"\"\"risk gate. CANARY_DOCSTRING_9f31 stdlib only.\"\"\"\n\
              import json\n\
-             G = \"https://api.gateonly.example/v2?tok=CANARY_QUERY2_9f31\"\n",
+             G = \"https://api.gateonly.vendor.com/v2?tok=CANARY_QUERY2_9f31\"\n",
         )
         .unwrap();
         let doctor = run(dir.path());
@@ -3281,7 +3571,7 @@ def caller():
         }
         // Sanity: the report DID see the project (hosts present) — the canaries
         // are absent because of scoping, not because the scan saw nothing.
-        assert!(doctor_json.contains("api.leak.example"));
+        assert!(doctor_json.contains("api.leak.vendor.com"));
         // Sanity: the fixture's hand-rolled retry loop (Task 3.3's `--diff`
         // notes path) actually fired — proving the canary-absence assertions
         // above exercised the new note-rendering code, not an empty notes
@@ -3316,6 +3606,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
         assert!(r.boundaries.unparsed.contains(&"ci-workflow"));
@@ -3348,6 +3639,15 @@ def caller():
         assert!(b.protocol.contains("Baseline"));
     }
 
+    /// Deployment-honesty slice, WS6/WS10: the keel skill's evaluation
+    /// protocol grew a sixth phase ("Ship") — this string must say so.
+    #[test]
+    fn protocol_string_has_six_phases() {
+        let b = boundaries(Path::new("."));
+        assert!(b.protocol.contains("six phases"), "{}", b.protocol);
+        assert!(b.protocol.contains("-> Ship"), "{}", b.protocol);
+    }
+
     #[test]
     fn human_report_carries_a_compact_boundaries_section() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3361,6 +3661,7 @@ def caller():
             None,
             None,
             boundaries(dir.path()),
+            &[],
             &[],
         );
         let text = human(&r);
@@ -3401,6 +3702,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let f = r
             .findings
@@ -3440,6 +3742,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let f = r
             .findings
@@ -3461,6 +3764,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
         );
         assert!(
@@ -3488,6 +3792,7 @@ def caller():
             None,
             empty_boundaries(),
             &[],
+            &[],
         );
         let up = r
             .follow_ups
@@ -3498,5 +3803,277 @@ def caller():
         assert!(!up.detail.is_empty());
         // follow_ups never affect ok.
         assert!(r.ok);
+    }
+
+    #[test]
+    fn reserved_names_are_excluded_not_warned() {
+        for host in [
+            "example.com",
+            "api.example.com",
+            "e.com.example",
+            "n.example",
+            "web.test",
+            "x.invalid",
+            "192.0.2.10",
+            "203.0.113.7",
+            "2001:db8::1",
+        ] {
+            let mut scan = scan_with(host, TargetClass::Host, &["httpx"]);
+            scan.host_transports
+                .insert(host.to_owned(), TransportClass::Tracked);
+            let r = build_report(
+                &scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+            );
+            let entry = r
+                .topology
+                .excluded
+                .iter()
+                .find(|e| e.host == host)
+                .unwrap_or_else(|| panic!("{host} must be excluded: {:?}", r.topology));
+            assert_eq!(entry.kind, "reserved-name");
+            assert!(
+                !r.findings.iter().any(|f| f.topic == "visible-unwrapped"),
+                "{host}: no duplicate warn"
+            );
+            assert!(
+                r.findings
+                    .iter()
+                    .any(|f| f.topic == "reserved-name-excluded" && f.level == "info")
+            );
+            let fu = r.follow_ups.iter().find(|f| f.subject == host).unwrap();
+            assert_eq!((fu.code, fu.rank), ("reserved-name-excluded", 4));
+        }
+        // Real hosts are untouched.
+        assert!(!reserved_name("api.stripe.com"));
+        assert!(!reserved_name("example.company.com"));
+        assert!(!reserved_name("testing.internal"));
+    }
+
+    #[test]
+    fn hosts_seen_only_in_test_files_are_excluded() {
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.targets.insert(
+            "api.vendor.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [
+                    Sighting {
+                        file: "tests/test_client.py".into(),
+                        line: 3,
+                    },
+                    Sighting {
+                        file: "tests/conftest.py".into(),
+                        line: 9,
+                    },
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        let e = r
+            .topology
+            .excluded
+            .iter()
+            .find(|e| e.host == "api.vendor.com")
+            .expect("excluded");
+        assert_eq!(e.kind, "test-only");
+        assert!(e.reason.contains("tests/conftest.py"));
+        // One production sighting flips it back to wrappable.
+        scan.targets
+            .get_mut("api.vendor.com")
+            .unwrap()
+            .sightings
+            .insert(Sighting {
+                file: "app/client.py".into(),
+                line: 1,
+            });
+        let r2 = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
+    }
+
+    #[test]
+    fn runtime_evidence_beats_test_only_and_reserved_exclusion() {
+        let mut scan = scan_with("example.com", TargetClass::Host, &["httpx"]);
+        scan.host_transports
+            .insert("example.com".into(), TransportClass::Tracked);
+        let wrapped: BTreeSet<String> = ["example.com".to_owned()].into_iter().collect();
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r.topology.wrappable.contains(&"example.com".to_owned()));
+        assert!(r.topology.excluded.is_empty());
+
+        // The other half of the name: a host sighted ONLY in test files, which
+        // `classify_topology` would otherwise exclude as `test-only`. Runtime
+        // evidence has to beat that check too — it sits below the
+        // `wrapped_targets` shortcut, and this pins that ordering.
+        let mut test_only = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        test_only.targets.insert(
+            "api.vendor.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "tests/test_client.py".into(),
+                    line: 3,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        test_only
+            .host_transports
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
+        let observed: BTreeSet<String> = ["api.vendor.com".to_owned()].into_iter().collect();
+        let r2 = build_report(
+            &test_only,
+            &observed,
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
+        assert!(r2.topology.excluded.is_empty(), "{:?}", r2.topology);
+    }
+
+    #[test]
+    fn loopback_no_longer_gets_a_duplicate_visible_unwrapped_warn() {
+        let mut scan = scan_with("127.0.0.1", TargetClass::Host, &["httpx"]);
+        scan.host_transports
+            .insert("127.0.0.1".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(!r.findings.iter().any(|f| f.topic == "visible-unwrapped"));
+        assert_eq!(
+            r.coverage.visible_unwrapped,
+            vec!["127.0.0.1".to_owned()],
+            "the raw coverage list is unchanged"
+        );
+    }
+
+    #[test]
+    fn subprocess_sightings_in_test_files_are_counted_separately() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses = vec![
+            SubprocessSighting {
+                file: "services/render.py".into(),
+                line: 493,
+                launcher: "subprocess.run".into(),
+                command: "ffmpeg -i in.mp4".into(),
+                argv: None,
+            },
+            SubprocessSighting {
+                file: "tests/test_stitch.py".into(),
+                line: 12,
+                launcher: "subprocess.run".into(),
+                command: "ffmpeg -version".into(),
+                argv: None,
+            },
+        ];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        let procs = &r.topology.external_processes;
+        assert_eq!(procs.iter().filter(|p| p.in_tests).count(), 1);
+        let fu = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "subprocess-blind-spot")
+            .unwrap();
+        assert_eq!(
+            fu.subject,
+            "1 externally-launched process(es) (+1 in test files)"
+        );
+        assert!(fu.detail.contains("services/render.py:493"));
+        assert!(!fu.detail.contains("tests/test_stitch.py"));
+        let warn = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "subprocess-blind-spot" && f.level == "warn")
+            .unwrap();
+        assert!(!warn.detail.contains("tests/test_stitch.py"));
+    }
+
+    #[test]
+    fn follow_up_closed_set_ranks_the_two_new_codes_at_four() {
+        assert_eq!(follow_up_rank("reserved-name-excluded"), 4);
+        assert_eq!(follow_up_rank("test-only-excluded"), 4);
+        assert_eq!(
+            excluded_kind_topic("reserved-name"),
+            "reserved-name-excluded"
+        );
+        assert_eq!(excluded_kind_topic("test-only"), "test-only-excluded");
     }
 }

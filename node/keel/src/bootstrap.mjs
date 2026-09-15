@@ -11,7 +11,7 @@
  * a silent fall-back to defaults.
  */
 
-import { register } from "node:module";
+import { createRequire, register } from "node:module";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -23,10 +23,11 @@ import {
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
-import { createSummary, formatSummary, keelOnPath } from "./summary.mjs";
+import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
+import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
-import { resolveDevCache } from "./packs/llm.mjs";
+import { devCacheOffReason, resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
 import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
 import { installPgPack } from "./packs/pg.mjs";
@@ -57,13 +58,110 @@ const FRAMEWORK_PACKS = [
 ];
 
 let installed = false;
+// The refusal, once printed — never print the same one twice. Carries the
+// `(root, cwdSource)` it was printed FOR; `refusalResult()` is the public shape
+// (that pair's `cwdSource` is latch bookkeeping, not part of the result).
+let refused = null;
 
-export async function installKeel({ cwd = process.cwd(), env = process.env } = {}) {
+function refusalResult() {
+  return { enabled: refused.enabled, reason: refused.reason, root: refused.root };
+}
+
+/**
+ * This package's own version, for the JSON log lines' `version` field.
+ *
+ * Fail-open, deliberately: this is a module-load-time file read for a field
+ * only `KEEL_LOG_FORMAT=json` ever uses, and Keel's activation contract is
+ * fail-open. An unreadable/absent `package.json` (an exotic bundler, a
+ * pruned install) must degrade this ONE field to "unknown", not throw out of
+ * `import "./bootstrap.mjs"` and leave the app with no Keel at all — least
+ * of all in the default text mode, which never reads it.
+ */
+function readVersion() {
+  try {
+    return createRequire(import.meta.url)("../package.json").version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const VERSION = readVersion();
+
+export function policyOptional(env = process.env) {
+  return String(env?.KEEL_POLICY ?? "").trim().toLowerCase() === "optional";
+}
+
+export function missingPolicyError(root) {
+  return (
+    `keel ▸ error: KEEL_CWD=${root} is set but ${join(root, "keel.toml")} does not exist — ` +
+    "Keel NOT activated; the app continues without keel " +
+    "(set KEEL_POLICY=optional to run on production defaults instead)\n"
+  );
+}
+
+/**
+ * `String(cwd)` normalized the way Python's `str(Path(cwd))` normalizes it —
+ * every user-visible line that names the root (the refusal error, the banner's
+ * three notes, the JSON `root` field) must be byte-identical across the two
+ * front ends, and `ENV KEEL_CWD=/app/` in a Dockerfile is an entirely ordinary
+ * input. pathlib collapses duplicate separators and `.` segments and strips a
+ * trailing separator, but does NOT resolve `..` (so this is not
+ * `path.normalize`, which does), does NOT resolve symlinks, and does NOT
+ * absolutize a relative path.
+ *
+ * POSIX rules only: the Windows twin (drive letters, UNC roots, `/`→`\`) has
+ * its own pathlib semantics and no Node/Python Windows parity test to hold it
+ * honest, so a win32 path is passed through untouched rather than normalized
+ * by guesswork.
+ */
+export function normalizeCwd(cwd) {
+  const raw = String(cwd);
+  if (process.platform === "win32") return raw;
+  const lead = /^\/*/.exec(raw)[0].length;
+  // POSIX (and pathlib) keep EXACTLY two leading slashes as an implementation-
+  // defined root; one, or three or more, all mean "/".
+  const root = lead === 0 ? "" : lead === 2 ? "//" : "/";
+  const body = raw.split("/").filter((p) => p !== "" && p !== ".").join("/");
+  if (root) return root + body;
+  return body === "" ? "." : body;
+}
+
+export async function installKeel({ cwd = process.cwd(), env = process.env, cwdSource = "cwd" } = {}) {
   if (isDisabled(env)) return { enabled: false, reason: "KEEL_DISABLE" };
+  cwd = normalizeCwd(cwd);
+  // The refusal is printed once per process, but the latch is keyed on WHAT was
+  // refused: a later `installKeel({ cwd })` naming a DIFFERENT root (the public
+  // API, and what the `keel run` dispatcher uses after the `.pth`/register shim
+  // already ran) was never asked about, and must be answered on its own merits
+  // rather than inheriting a stale refusal. Python twin: `bootstrap.py`.
+  if (refused && refused.root === cwd && refused.cwdSource === cwdSource) {
+    return refusalResult();
+  }
   if (installed) return { enabled: true, reason: "already-installed" };
-  installed = true;
 
   const { policy: raw, source } = loadPolicy(cwd); // throws KEEL-E001 on bad syntax
+  if (source === "defaults" && cwdSource === "KEEL_CWD" && !policyOptional(env)) {
+    const text = missingPolicyError(cwd);
+    emit(env, text, {
+      keel: "error",
+      code: "policy-missing-at-keel-cwd",
+      keel_cwd: String(cwd),
+      message: text.slice("keel ▸ error: ".length).replace(/\n$/, ""),
+      version: VERSION,
+    });
+    refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd, cwdSource };
+    return refusalResult();
+  }
+  installed = true;
+  // Policy provenance, captured once: the two fields ("did my policy ship?",
+  // "how many calls were served from cache?") that would have named the
+  // 2026-09-15 outage in one log query (F10). Read again at exit by the flush.
+  const meta = {
+    keel_cwd: env.KEEL_CWD || null,
+    policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),
+    policy_source: source,
+    version: VERSION,
+  };
   // Backend first: whether it's persistent (native + attached journal) decides
   // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
   const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
@@ -163,8 +261,8 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
     });
   }
 
-  installExitFlush(discovery, { backend: effectiveBackend, summary });
-  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd);
+  installExitFlush(discovery, { backend: effectiveBackend, summary, meta, env });
+  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource);
   return {
     enabled: true,
     backend: effectiveBackend,
@@ -207,7 +305,10 @@ export function applyJournalEnvOverride(policy, env) {
  * terminates with code 128+signum) or step aside (when the app has its own
  * handler that owns termination). We never swallow the signal.
  */
-export function installExitFlush(discovery, { proc = process, backend = null, summary = null } = {}) {
+export function installExitFlush(
+  discovery,
+  { proc = process, backend = null, summary = null, meta = null, env = process.env } = {}
+) {
   let flushed = false;
   const flush = () => {
     if (flushed) return;
@@ -232,8 +333,15 @@ export function installExitFlush(discovery, { proc = process, backend = null, su
     // never cost a discovery write.
     try {
       if (summary) {
-        const text = formatSummary(summary.counts(), keelOnPath());
-        if (text) proc.stderr.write(text);
+        if (jsonLogs(env)) {
+          // Unconditional, unlike the text form: a zero line proves Keel was
+          // live and intercepted nothing, which is exactly what the outage
+          // post-mortem had no way to establish.
+          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}));
+        } else {
+          const text = formatSummary(summary.counts(), keelOnPath());
+          if (text) proc.stderr.write(text);
+        }
       }
     } catch {
       /* observability never fails the process */
@@ -291,31 +399,63 @@ function policyAboveCwd(cwd, maxLevels = 8) {
   return null;
 }
 
-function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
+function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd") {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
   for (const p of packs) if (p.active) seams.push(p.label);
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
-  const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
-  // #85: on the defaults path only (a real policy loaded means this cwd is
-  // already the right one — zero cost there), check whether a keel.toml
-  // exists somewhere above cwd that loadPolicy never looked at. If so, the
-  // usual "keel init to customize" nudge reads as if nothing is wrong, when
-  // actually the adopter's policy silently never loaded — name both paths
-  // and the fix instead.
-  const found = source === "defaults" && cwd ? policyAboveCwd(cwd) : null;
-  if (found) {
-    process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — found keel.toml at ${found} ` +
-        `but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
-    );
-  } else {
-    process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${policyDesc} — \`keel init\` to customize\n`
-    );
+  let desc = source === "defaults" ? "production defaults" : `policy ${join(cwd, "keel.toml")}`;
+  // WHY the dev cache is off, read from the SAME resolution the cache itself
+  // uses (`devCacheOffReason`), so the JSON form can carry it as a field:
+  // "was the dev cache on in that container, and if not why" is one of the
+  // questions the 2026-09-15 post-mortem had to answer by inference, and a
+  // log pipeline can only index what the object names (F10). Note this is
+  // WIDER than the banner's parenthetical, which stays marker-only prose
+  // (byte-unchanged): an explicit `KEEL_ENV=prod` also turns the cache off,
+  // and a field named `dev_cache_off` reporting null there would be a lie.
+  const devCacheOff = devCacheOffReason(env);
+  if (!String(env.KEEL_ENV ?? "").trim()) {
+    const marker = serverlessMarker(env);
+    if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
   }
+  const head = `keel ▸ wrapped ${seams.join(" + ")} with ${desc}`;
+  // `note` is the text after the em-dash — the one place the tail variants
+  // differ. Held as a value (rather than written inline per variant) so the
+  // JSON form can carry it as a field; the text assembled below is
+  // byte-identical to what each variant used to write directly.
+  let note = null;
+  if (source === "defaults") {
+    // On the defaults path only (a real policy loaded means this cwd is
+    // already the right one — zero cost there), check whether a keel.toml
+    // exists somewhere above cwd that loadPolicy never looked at (#85). If
+    // so, the usual "keel init to customize" nudge reads as if nothing is
+    // wrong, when actually the adopter's policy silently never loaded — name
+    // both paths and the fix instead.
+    const found = policyAboveCwd(cwd);
+    if (found) {
+      note = `found keel.toml at ${found} but running from ${cwd}; set KEEL_CWD=${found} to load it`;
+    } else if (cwdSource === "KEEL_CWD") {
+      // Only reachable under KEEL_POLICY=optional (installKeel refuses otherwise).
+      note = `KEEL_CWD=${cwd} is set but ${join(cwd, "keel.toml")} does not exist (KEEL_POLICY=optional)`;
+    } else {
+      note = `no keel.toml in ${cwd}; \`keel init\` to customize`;
+    }
+  }
+  const text = note === null ? `${head}\n` : `${head} — ${note}\n`;
+  const obj = {
+    dev_cache_off: devCacheOff,
+    keel: "activation",
+    policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),
+    policy_source: source,
+    root: String(cwd),
+    root_source: cwdSource,
+    version: VERSION,
+    wrapped: seams.join(" + "),
+  };
+  if (note !== null) obj.note = note;
+  emit(env, text, obj);
 }
 
 // Cross-language parity with the Python front end's `.strip().lower() in

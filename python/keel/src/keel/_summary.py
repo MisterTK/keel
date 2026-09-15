@@ -104,6 +104,19 @@ def format_summary(counts: dict[str, int], keel_on_path: bool) -> str:
     return f"{PREFIX}{' · '.join(segments)}\n{INDENT}{command} for the full picture\n"
 
 
+def format_summary_json(counts: dict[str, int], meta: dict[str, Any]) -> str:
+    """The `KEEL_LOG_FORMAT=json` twin of `format_summary`: one line, sorted
+    keys, no spaces. Unlike the text form it prints even at zero calls — in a
+    container "Keel activated and intercepted nothing" is itself the evidence
+    the outage post-mortem needed. Pinned by conformance/console_summary_json/,
+    which the Node front end reads too (identical bytes, both languages)."""
+    from ._log import dumps_line
+
+    obj: dict[str, Any] = {k: int(counts.get(k, 0)) for k in COUNT_KEYS}
+    obj.update({"keel": "summary", **meta})
+    return dumps_line(obj)
+
+
 def keel_on_path() -> bool:
     """Whether the `keel` CLI binary is installed — decides which bridge line
     to print. Checked once, at emit time."""

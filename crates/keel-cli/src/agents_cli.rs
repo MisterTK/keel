@@ -33,7 +33,12 @@ const MAX_WALK_LEVELS: usize = 8;
 /// ships).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsCliLayout {
-    /// The directory containing `agents-cli-manifest.yaml`.
+    /// The directory containing `agents-cli-manifest.yaml`. Exactly the
+    /// caller's `project` when the manifest sits there (the overwhelmingly
+    /// common case, and the one every golden pins); a CANONICAL absolute path
+    /// when the manifest was found further up — the walk has to canonicalize
+    /// to move at all (see [`find_agents_cli_layout`], issue #87), and there is
+    /// no faithful way back to a caller-relative spelling from there.
     pub manifest_dir: PathBuf,
     /// `<manifest_dir>/<agent_directory>`, resolved from the manifest's
     /// `agent_directory` key. Guaranteed to exist on disk (as a directory) by
@@ -47,8 +52,14 @@ pub struct AgentsCliLayout {
 /// the key is missing or the directory it names does not exist.
 #[must_use]
 pub fn find_agents_cli_layout(project: &Path) -> Option<AgentsCliLayout> {
-    let mut dir = project;
-    for _ in 0..=MAX_WALK_LEVELS {
+    // `main.rs` passes "." — `Path::new(".").parent()` is `Some("")`, whose
+    // parent is `None`, so a lexical walk dies after one step (issue #87,
+    // the same defect #85's config-above-cwd finding had). Walk the
+    // canonical path; report level 0 in terms of the caller's `project` so
+    // display paths and goldens are unchanged.
+    let canonical = std::fs::canonicalize(project).ok()?;
+    let mut dir: &Path = &canonical;
+    for level in 0..=MAX_WALK_LEVELS {
         let candidate = dir.join(MANIFEST_FILENAME);
         if candidate.is_file() {
             let text = std::fs::read_to_string(&candidate).ok()?;
@@ -67,9 +78,14 @@ pub fn find_agents_cli_layout(project: &Path) -> Option<AgentsCliLayout> {
             {
                 return None;
             }
-            let agent_dir = dir.join(agent_directory);
-            return agent_dir.is_dir().then(|| AgentsCliLayout {
-                manifest_dir: dir.to_owned(),
+            let base: PathBuf = if level == 0 {
+                project.to_owned()
+            } else {
+                dir.to_owned()
+            };
+            let agent_dir = base.join(agent_directory);
+            return agent_dir.is_dir().then_some(AgentsCliLayout {
+                manifest_dir: base,
                 agent_dir,
             });
         }
@@ -131,6 +147,15 @@ mod tests {
         std::fs::write(dir.join(MANIFEST_FILENAME), body).unwrap();
     }
 
+    /// A layout found ABOVE the starting directory reports canonical paths (see
+    /// [`AgentsCliLayout::manifest_dir`]) — on macOS a `TempDir` lives under
+    /// the `/var` → `/private/var` symlink, so the expectations for those
+    /// cases have to be canonicalized too or they compare two spellings of the
+    /// same directory.
+    fn canonical(dir: &Path) -> PathBuf {
+        std::fs::canonicalize(dir).unwrap()
+    }
+
     #[test]
     fn found_at_project_root() {
         let dir = TempDir::new().unwrap();
@@ -151,8 +176,8 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let layout = find_agents_cli_layout(&nested).expect("layout found by walking up");
-        assert_eq!(layout.manifest_dir, dir.path());
-        assert_eq!(layout.agent_dir, dir.path().join("app"));
+        assert_eq!(layout.manifest_dir, canonical(dir.path()));
+        assert_eq!(layout.agent_dir, canonical(dir.path()).join("app"));
     }
 
     #[test]
@@ -212,7 +237,7 @@ mod tests {
 
         let layout =
             find_agents_cli_layout(&nested).expect("manifest exactly at the bound is found");
-        assert_eq!(layout.manifest_dir, dir.path());
+        assert_eq!(layout.manifest_dir, canonical(dir.path()));
     }
 
     /// A manifest sitting one level *beyond* `MAX_WALK_LEVELS` parents above

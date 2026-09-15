@@ -321,12 +321,14 @@ fn init_writes_into_the_agent_dir_for_the_agents_cli_fixture() {
 
 // ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
 
-/// Two-target project for the `--diff` fixtures: `api.example.com` is already
-/// in keel.toml (kept, untouched), `api.new.example` is new (added block).
+/// Two-target project for the `--diff` fixtures: `api.vendor.com` is already
+/// in keel.toml (kept, untouched), `api.new-vendor.com` is new (added block).
+/// Neither is an RFC 2606 reserved name — those are excluded as fixtures (WS5)
+/// and would never be proposed.
 const DIFF_APP_MJS: &str = "\
 // two targets, one already in keel.toml
-const KEPT = await fetch(\"https://api.example.com/v1/x\");
-const ADDED = await fetch(\"https://api.new.example/v2/y\");
+const KEPT = await fetch(\"https://api.vendor.com/v1/x\");
+const ADDED = await fetch(\"https://api.new-vendor.com/v2/y\");
 ";
 
 /// The pre-existing keel.toml: one kept target with user tuning + comments,
@@ -334,7 +336,7 @@ const ADDED = await fetch(\"https://api.new.example/v2/y\");
 const DIFF_KEEL_TOML: &str = "\
 # hand-tuned: keep this comment
 
-[target.\"api.example.com\"]
+[target.\"api.vendor.com\"]
 timeout = \"9s\"   # user tuning survives
 
 [target.\"api.gone.example\"]  # stale
@@ -409,8 +411,8 @@ fn init_diff_patch_applies_cleanly_with_git_apply() {
     let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
     let value: toml::Value = applied.parse().expect("applied file parses");
     let targets = value["target"].as_table().unwrap();
-    assert!(targets.contains_key("api.example.com"));
-    assert!(targets.contains_key("api.new.example"));
+    assert!(targets.contains_key("api.vendor.com"));
+    assert!(targets.contains_key("api.new-vendor.com"));
     assert!(!targets.contains_key("api.gone.example"));
     // Untouched regions byte-preserved: header comment + user tuning.
     assert!(applied.contains("# hand-tuned: keep this comment"));
@@ -531,7 +533,7 @@ fn doctor_json_matches_golden_for_agents_cli_placement() {
     .unwrap();
     std::fs::write(
         dir.path().join("keel.toml"),
-        "[target.\"api.example.com\"]\nretry = { attempts = 5 }\n",
+        "[target.\"api.vendor.com\"]\nretry = { attempts = 5 }\n",
     )
     .unwrap();
     // A root CLAUDE.md so one golden pins `boundaries.governance_files`
@@ -669,6 +671,233 @@ fn doctor_reports_config_above_cwd_when_run_from_a_subdirectory() {
         !has_topic(&from_root, "config-above-cwd"),
         "running from the root that OWNS the keel.toml must not warn: {}",
         json_string(&from_root)
+    );
+}
+
+/// WS3: a root Dockerfile whose COPY/ADD directives never reach keel.toml —
+/// the exact shape of the 2026-09-15 field outage. Doctor must say so, and
+/// `policy.path` must be machine-checkable.
+#[test]
+fn doctor_json_matches_golden_for_dockerfile_without_keel_toml() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in ["app.py", "keel.toml", "Dockerfile"] {
+        std::fs::copy(
+            fixtures().join("py_dockerfile_no_copy").join(f),
+            dir.path().join(f),
+        )
+        .unwrap();
+    }
+    let r = doctor::run(dir.path());
+    assert_eq!(
+        r.exit,
+        keel_cli::EXIT_OK,
+        "a packaging warning does not flip ok"
+    );
+    assert_eq!(r.json["policy"]["path"], "keel.toml");
+    assert!(
+        has_topic(&r.json, "keel-toml-not-in-image"),
+        "{}",
+        json_string(&r.json)
+    );
+    check_golden("doctor_dockerfile_no_copy.json", &json_string(&r.json));
+}
+
+/// An agents-cli project root with `agent_directory: app`, `app/` present, and
+/// a `keel.toml` written at `<root>/<toml_at>`. Returns the root TempDir.
+fn agents_cli_tree(toml_at: &str) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("agents-cli-manifest.yaml"),
+        "agent_directory: app\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    let toml = root.join(toml_at);
+    std::fs::create_dir_all(toml.parent().unwrap()).unwrap();
+    std::fs::write(toml, "").unwrap();
+    dir
+}
+
+/// The first finding with `topic`, or `None`.
+fn finding_by_topic<'a>(
+    report: &'a serde_json::Value,
+    topic: &str,
+) -> Option<&'a serde_json::Value> {
+    report["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .find(|f| f["topic"] == topic)
+}
+
+/// #87: the agents-cli manifest walk must find a manifest ABOVE a relative
+/// project path (`main.rs` passes "."), same defect class as #85's C1.
+///
+/// Run from `<root>/svc/sub` — two levels below the manifest, and OUTSIDE the
+/// `app/` directory the generated Dockerfile ships — with a `keel.toml` right
+/// there. The walk has to climb two levels for the finding to exist at all, so
+/// its presence is the #87 regression proof. Its *text* is asserted too: at
+/// level > 0 the layout carries canonical absolute paths, and the finding is
+/// documented (`doctor.rs::agents_cli_placement_finding`) to stay reproducible
+/// across checkouts — so nothing machine-specific may leak into `--json`.
+#[test]
+fn doctor_finds_the_agents_cli_manifest_from_a_nested_subdirectory() {
+    let dir = agents_cli_tree("svc/sub/keel.toml");
+    let nested = dir.path().join("svc").join("sub");
+    let report = doctor_json_from(&nested);
+    let finding = finding_by_topic(&report, "agents-cli-config-placement")
+        .unwrap_or_else(|| panic!("walk must reach the manifest two levels up: {report}"));
+
+    let action = finding["action"].as_str().unwrap();
+    let detail = finding["detail"].as_str().unwrap();
+    assert_eq!(
+        action,
+        "Move keel.toml to app/keel.toml (or add a `COPY keel.toml` line to the Dockerfile).",
+        "the agent dir must be named relative to the agents-cli project root"
+    );
+    assert!(
+        detail.ends_with(
+            "uv.lock*, and app into the image, so the keel.toml at the project root never \
+             ships to the container."
+        ),
+        "{detail}"
+    );
+    // The real regression guard: no machine-specific path anywhere in the text.
+    let abs_root = std::fs::canonicalize(dir.path()).unwrap();
+    let abs_root = abs_root.to_str().unwrap();
+    assert!(
+        !action.contains(abs_root) && !detail.contains(abs_root),
+        "absolute path leaked into --json: {action} / {detail}"
+    );
+}
+
+/// The other half of the same newly-live walk: a `keel.toml` that is ALREADY
+/// inside the agent directory ships fine, so there is no placement problem to
+/// report — even though the manifest is two levels up and the walk therefore
+/// succeeds. Before the containment fix this emitted a factually wrong warning
+/// ("the keel.toml at the project root never ships") about a file that does
+/// ship, which is exactly the crying-wolf class WS5 exists to remove.
+#[test]
+fn doctor_does_not_flag_a_keel_toml_already_inside_the_agent_directory() {
+    let dir = agents_cli_tree("app/pkg/keel.toml");
+    let nested = dir.path().join("app").join("pkg");
+    let report = doctor_json_from(&nested);
+    assert!(
+        !has_topic(&report, "agents-cli-config-placement"),
+        "a keel.toml inside the shipped agent directory is correctly placed: {report}"
+    );
+}
+
+/// WS1 production pin: `keel run` under an ambient KEEL_CWD that names a
+/// directory with no keel.toml must fail before launching anything. Child env
+/// only — never `std::env::set_var` (issue #72).
+#[test]
+fn run_refuses_a_stale_keel_cwd_before_launching() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('RAN')\n").unwrap();
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .current_dir(dir.path())
+        .env("KEEL_CWD", stale.path())
+        .args(["run", "app.py"])
+        .output()
+        .expect("spawn keel run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Keel NOT activated"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "target must not run"
+    );
+}
+
+/// The kill switch must still work under a stale `KEEL_CWD` — that operator
+/// (policy never shipped, app misbehaving) is exactly who reaches for
+/// `--disable`. README: "`KEEL_DISABLE=1` always wins". Command mode keeps this
+/// independent of whether a `keelrun` wheel happens to be importable here.
+#[test]
+fn run_disable_flag_still_launches_under_a_stale_keel_cwd() {
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .env("KEEL_CWD", stale.path())
+        .args(["run", "--disable", "--", "sh", "-c", "echo RAN"])
+        .output()
+        .expect("spawn keel run --disable");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "the program must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The other arm: no CLI flag at all, just an ambient `KEEL_DISABLE=1`. Both
+/// front ends check `is_disabled` before the refusal, so the child would run
+/// keel-free; `keel run` must not refuse on its behalf.
+#[test]
+fn run_ambient_keel_disable_still_launches_under_a_stale_keel_cwd() {
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .env("KEEL_CWD", stale.path())
+        .env("KEEL_DISABLE", "1")
+        .args(["run", "--", "sh", "-c", "echo RAN"])
+        .output()
+        .expect("spawn keel run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("RAN"),
+        "the program must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A refused `keel record run` must leave nothing behind — the preflight runs
+/// before the recordings directory is created, not after.
+#[test]
+fn record_run_refused_by_a_stale_keel_cwd_creates_no_recordings_dir() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('RAN')\n").unwrap();
+    let stale = tempfile::TempDir::new().unwrap();
+    let out = Command::new(keel_bin())
+        .current_dir(dir.path())
+        .env("KEEL_CWD", stale.path())
+        .args(["record", "run", "app.py"])
+        .output()
+        .expect("spawn keel record run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Keel NOT activated"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.path().join(".keel").join("recordings").exists(),
+        "a refused record must not create .keel/recordings/"
     );
 }
 

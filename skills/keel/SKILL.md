@@ -84,6 +84,15 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
   shows exactly what evidence would add or remove.
 - Every command has a deterministic `--json` twin (sorted keys, no
   timestamps) — diff two calls to see real change, don't parse prose.
+- Every run prints one summary to **stderr** at exit saying what Keel did.
+  In a container, stderr is the surface that survives — a parent that
+  captures a child's stderr silently swallows it. `KEEL_LOG_FORMAT=json`
+  makes that summary and the startup line one JSON object per line.
+- **Not logs, not remote.** OpenTelemetry export is spans and metrics only,
+  needs a source build with the `otel` feature (published wheels and the npm
+  addon do not include it), and never reaches a logging backend. `.keel/`
+  evidence (`status`, `trace`, `report`) is host-local and ephemeral on
+  serverless platforms.
 - `keel explain <KEEL-E0NN>` gives the exact what/why/next for an error code
   without needing a web search.
 - Uninstalling Keel (removing the package) restores the original behavior
@@ -93,7 +102,7 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
 
 When asked whether/how Keel should cover a project — a fresh adoption or an
 audit of an existing one — do NOT stop at grepping for HTTP libraries. Work
-the five phases in order; the static scan is evidence, not the verdict.
+the six phases in order; the static scan is evidence, not the verdict.
 
 1. **Scope.** Enumerate every process that does I/O, not just the entrypoint:
    the main app, MCP servers in `.mcp.json`, shell-script launchers, cron
@@ -110,16 +119,20 @@ the five phases in order; the static scan is evidence, not the verdict.
    tool). Read `topology` first — every sighted host lands in exactly one of
    `wrappable` ("wrap it"), `unreachable` ("can't reach it, here's why"), or
    `excluded` ("shouldn't reach it — seen only in dependency-averse gate
-   files, or a local/loopback host; the dependency-averse kind is deliberate
-   and overridable with `# keel: include`, the local/loopback kind is not a
-   real dependency at all"), plus `external_processes` for the
-   sibling-process blind spots. Then work `follow_ups` strictly top-down: it
-   is ranked with rank 1 = the claim Keel is least able to verify itself (an
-   unattributed URL) down to mechanical facts awaiting a decision. Codes are
-   a closed set: `url-no-transport`, `orchestration-blind-spot`,
-   `subprocess-blind-spot`, `dependency-averse-excluded`,
-   `local-host-excluded`, `preexisting-resilience`, `sdk-client-timeout`,
-   `code-hash-stale`.
+   files, a local/loopback host, an RFC 2606/5737 reserved name such as
+   `example.com`, or a host seen only in test files; the dependency-averse
+   kind is deliberate and overridable with `# keel: include`, loopback and
+   reserved names are fixtures by definition, and a test-only host needs
+   policy only if production code reaches it too"), plus
+   `external_processes` for the sibling-process blind spots (test-file
+   launches are counted separately). Then work `follow_ups` strictly
+   top-down: it is ranked with rank 1 = the claim Keel is least able to
+   verify itself (an unattributed URL) down to mechanical facts awaiting a
+   decision. Codes are a closed set: `url-no-transport`,
+   `orchestration-blind-spot`, `subprocess-blind-spot`,
+   `dependency-averse-excluded`, `local-host-excluded`,
+   `reserved-name-excluded`, `test-only-excluded`, `preexisting-resilience`,
+   `sdk-client-timeout`, `code-hash-stale`.
    Then read `boundaries` — it names what this report could not parse (source
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
@@ -167,6 +180,20 @@ the five phases in order; the static scan is evidence, not the verdict.
    confirm the flow should still resume before doing so. Finish with
    `keel init --diff --json` / `propose_policy` and present the diff, never
    a hand-written policy guess.
+6. **Ship.** The evaluation above is scoped to the repository; production
+   runs an artifact. Before declaring coverage, confirm the four deployment
+   invariants: (a) `keel.toml` is inside the image — `keel doctor --json`
+   reports `keel-toml-not-in-image` when a root Dockerfile's `COPY`/`ADD`
+   never reach it; (b) `KEEL_ENABLE=1` reaches the process that does the
+   I/O (a subprocess needs it in *its* env; Node children also need
+   `NODE_OPTIONS="--import keelrun/register"`); (c) `KEEL_CWD`, if set,
+   names the directory holding `keel.toml` — otherwise Keel refuses to
+   activate and prints `keel ▸ error: … Keel NOT activated`; (d) `.keel/`
+   is on storage that survives a redeploy if durable flows are used. Then
+   read the deploy logs for the one startup line: `with policy <path>` is
+   proof, `with production defaults` means the policy did not ship. Set
+   `KEEL_LOG_FORMAT=json` in containers so that line and the exit summary
+   are queryable fields.
 
 ## Driving Keel via MCP
 

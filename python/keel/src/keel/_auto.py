@@ -40,7 +40,12 @@ def _activate() -> None:
 
         if is_disabled(os.environ):
             return
-        install_keel(cwd=os.environ.get("KEEL_CWD") or None, env=os.environ)
+        keel_cwd = os.environ.get("KEEL_CWD") or None
+        install_keel(
+            cwd=keel_cwd,
+            env=os.environ,
+            cwd_source="KEEL_CWD" if keel_cwd else "cwd",
+        )
     except Exception as err:  # noqa: BLE001 — the host app must survive us
         sys.stderr.write(f"keel ▸ auto-activation failed ({err}); continuing without keel\n")
 

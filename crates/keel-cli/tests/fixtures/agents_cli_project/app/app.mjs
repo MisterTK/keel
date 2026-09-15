@@ -4,7 +4,7 @@
 // root (one level up, where agents-cli-manifest.yaml lives) is not. JS scan
 // is pure Rust (no python3), so tests built on this fixture stay
 // deterministic without an interpreter on PATH.
-const DATA_API = "https://api.example.com/v1/data";
+const DATA_API = "https://api.vendor.com/v1/data";
 
 export async function fetchData() {
   const res = await fetch(DATA_API);

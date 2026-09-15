@@ -28,6 +28,7 @@
 pub mod agents_cli;
 mod cmd_match;
 pub mod diff;
+pub mod dockerfile;
 pub mod doctor;
 pub mod effective;
 pub mod exec;

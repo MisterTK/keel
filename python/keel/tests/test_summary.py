@@ -85,6 +85,35 @@ class SummaryFormatCorpusTest(unittest.TestCase):
                 self.assertEqual(format_summary(case["counts"], case["keel_on_path"]), case["expected"])
 
 
+class JsonSummaryCorpusTest(unittest.TestCase):
+    """`KEEL_LOG_FORMAT=json` (F10): the summary as one JSON object per line,
+    pinned by a second shared corpus the Node front end reads too — the bytes
+    must be identical in both languages (sorted keys, no spaces)."""
+
+    CORPUS = REPO_ROOT / "conformance" / "console_summary_json"
+
+    def test_every_json_corpus_case_formats_byte_identically(self) -> None:
+        from keel._summary import format_summary_json
+
+        files = sorted(self.CORPUS.glob("*.json"))
+        self.assertGreaterEqual(len(files), 3)
+        for f in files:
+            case = json.loads(f.read_text(encoding="utf-8"))
+            with self.subTest(case["name"]):
+                self.assertEqual(format_summary_json(case["counts"], case["meta"]), case["expected"])
+
+
+class JsonLogsTest(unittest.TestCase):
+    def test_only_the_exact_value_json_switches_format(self) -> None:
+        from keel._log import json_logs
+
+        for value in ("json", "JSON", "  json  ", "Json"):
+            self.assertTrue(json_logs({"KEEL_LOG_FORMAT": value}), value)
+        for value in ("", "1", "true", "ndjson", "text", "jsonl"):
+            self.assertFalse(json_logs({"KEEL_LOG_FORMAT": value}), value)
+        self.assertFalse(json_logs({}))
+
+
 class KeelOnPathTest(unittest.TestCase):
     def test_uses_shutil_which(self) -> None:
         import shutil

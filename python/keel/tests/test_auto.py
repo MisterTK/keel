@@ -10,6 +10,7 @@ site's `.pth` processing itself.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -274,6 +275,214 @@ class DoubleActivationEndToEndTest(unittest.TestCase):
         self.assertNotIn(b"AssertionError", proc.stderr)
         self.assertNotIn(b"Traceback", proc.stderr)
         self.assertNotIn(b"stdout-line-1", proc.stdout, "the fixture must never run on a broken config")
+
+
+_PROBE_INSTALLED = "import keel._auto; from keel import bootstrap; print('INSTALLED', bootstrap._STATE.installed)"
+
+
+class StrictKeelCwdTest(unittest.TestCase):
+    """WS1: KEEL_CWD asserts where policy lives. Pointing it at a directory
+    with no keel.toml refuses activation (keel-free, one error line) unless
+    KEEL_POLICY=optional."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _keel_lines(self, proc: subprocess.CompletedProcess[bytes]) -> list[str]:
+        return [l for l in proc.stderr.decode().splitlines() if l.startswith("keel ▸")]
+
+    def test_missing_policy_at_keel_cwd_refuses_to_activate(self) -> None:
+        proc = _run(_PROBE_INSTALLED, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"INSTALLED False", proc.stdout)
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertEqual(
+            lines[0],
+            f"keel ▸ error: KEEL_CWD={self.root} is set but {self.root / 'keel.toml'} does not exist — "
+            "Keel NOT activated; the app continues without keel "
+            "(set KEEL_POLICY=optional to run on production defaults instead)",
+        )
+
+    def test_refusal_prints_once_even_when_install_is_called_twice(self) -> None:
+        code = "import keel._auto; from keel.bootstrap import install_keel; import os; " \
+               "install_keel(cwd=os.environ['KEEL_CWD'], env=os.environ, cwd_source='KEEL_CWD'); print('OK')"
+        proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertIn(b"OK", proc.stdout)
+        self.assertEqual(len(self._keel_lines(proc)), 1, proc.stderr)
+
+    def test_the_latch_does_not_answer_a_later_call_about_a_different_root(self) -> None:
+        """The refusal latch is a PRINT-once latch, not a process-wide verdict.
+
+        The `.pth` shim refuses an ambient, stale KEEL_CWD; a later
+        `install_keel(cwd=<a real project root>)` — the public API, and the
+        path `_run.run_target` takes — was never asked about that root and must
+        activate normally instead of inheriting the refusal (which `_run.py`
+        would turn into SystemExit(2) on a perfectly valid root).
+        Node twin: node/keel/test/bootstrap-refusal-latch.test.mjs.
+        """
+        good = self.root / "good"
+        good.mkdir()
+        (good / "keel.toml").write_text("")
+        code = (
+            "import keel._auto; from keel.bootstrap import install_keel; import os; "
+            "r = install_keel(cwd=os.environ['GOOD_ROOT'], env={}, cwd_source='cwd'); "
+            "print('ENABLED', r['enabled'])"
+        )
+        proc = _run(
+            code,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), GOOD_ROOT=str(good)),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"ENABLED True", proc.stdout, proc.stderr)
+        # The shim's refusal still printed exactly once, and the good root's
+        # own activation line joins it — never a second refusal.
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 2, proc.stderr)
+        self.assertIn("Keel NOT activated", lines[0])
+        self.assertIn(f"with policy {good / 'keel.toml'}", lines[1])
+
+    def test_path_normalization_corpus_matches_the_node_twin(self) -> None:
+        """The shared corpus behind Node's `normalizeCwd` (bootstrap.mjs):
+        Node reimplements exactly these rows, so if pathlib's behavior ever
+        shifts under us this side fails first. Twin:
+        node/keel/test/bootstrap-refusal-latch.test.mjs
+        `normalizeCwd reproduces pathlib's normalization byte for byte`.
+        Note `/a/../b`: pathlib does NOT resolve `..`, so Node must not
+        either (which is why `path.normalize` is the wrong tool there)."""
+        corpus = [
+            ("/app/", "/app"),
+            ("/app", "/app"),
+            ("/app//x/./y", "/app/x/y"),
+            ("//app", "//app"),
+            ("///app", "/app"),
+            (".", "."),
+            ("./foo", "foo"),
+            ("/", "/"),
+            ("a/b/", "a/b"),
+            ("/a/../b", "/a/../b"),
+            ("", "."),
+            ("/a/./b/", "/a/b"),
+        ]
+        if os.name == "nt":  # POSIX rows only — the Node twin skips on win32 too
+            self.skipTest("POSIX path corpus")
+        for raw, expected in corpus:
+            with self.subTest(raw=raw):
+                self.assertEqual(str(Path(raw)), expected)
+
+    def test_a_trailing_slash_on_keel_cwd_is_normalized_like_pathlib(self) -> None:
+        """`ENV KEEL_CWD=/app/` in a Dockerfile is an ordinary input; Python
+        echoes it through `str(Path(cwd))`, which strips the trailing
+        separator. Node normalizes the same way (bootstrap.mjs `normalizeCwd`)
+        so both front ends print the same bytes. Twin:
+        node/keel/test/banner-parent-policy.test.mjs."""
+        import json as _json
+
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=f"{self.root}/", KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1, proc.stderr)
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root), "no trailing slash survives")
+
+        text = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=f"{self.root}/"),
+            cwd=str(self.root),
+        )
+        lines = self._keel_lines(text)
+        self.assertEqual(len(lines), 1, text.stderr)
+        self.assertEqual(
+            lines[0],
+            f"keel ▸ error: KEEL_CWD={self.root} is set but {self.root / 'keel.toml'} does not exist — "
+            "Keel NOT activated; the app continues without keel "
+            "(set KEEL_POLICY=optional to run on production defaults instead)",
+        )
+
+    def test_keel_policy_optional_restores_defaults_with_a_warning(self) -> None:
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_POLICY="optional"),
+            cwd=str(self.root),
+        )
+        self.assertIn(b"INSTALLED True", proc.stdout)
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertIn("with production defaults — KEEL_CWD=", lines[0])
+        self.assertIn("(KEEL_POLICY=optional)", lines[0])
+
+    def test_keel_cwd_with_a_policy_file_activates_normally(self) -> None:
+        (self.root / "keel.toml").write_text("")
+        proc = _run(_PROBE_INSTALLED, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertIn(b"INSTALLED True", proc.stdout)
+        self.assertIn(f"with policy {self.root / 'keel.toml'}", proc.stderr.decode())
+
+    def test_python_m_keel_run_exits_2_under_a_stale_keel_cwd(self) -> None:
+        proc = _run(
+            "import sys; sys.argv=['keel','run',%r]; from keel._run import main_module; main_module()" % HELLO,
+            env=child_env(KEEL_CWD=str(self.root)),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(b"Keel NOT activated", proc.stderr)
+        self.assertNotIn(b"hello", proc.stdout, "the target must not run")
+
+    def test_json_log_format_emits_one_object_per_line(self) -> None:
+        import json as _json
+        # R10: `note` carries the activation line's em-dash tail whenever the
+        # text form has one, and the key is ABSENT when it does not. Pin both
+        # sides — the defaults run first, before a keel.toml exists anywhere
+        # at or above it, so the tail is the plain `keel init` nudge.
+        # The child's own getcwd() drops symlink hops (macOS /var → /private/var)
+        # before the banner ever renders the path, so compare against the
+        # REALPATH, not the tempdir path TemporaryDirectory handed back.
+        sub = (self.root / "sub").resolve()
+        sub.mkdir()
+        defaults = _run(
+            "import keel._auto",
+            env=child_env(KEEL_ENABLE="1", KEEL_LOG_FORMAT="json"),
+            cwd=str(sub),
+        )
+        activation = _json.loads(defaults.stderr.decode().splitlines()[0])
+        self.assertEqual(activation["keel"], "activation", defaults.stderr)
+        self.assertEqual(activation["policy_source"], "defaults")
+        self.assertEqual(activation["note"], f"no keel.toml in {sub}; `keel init` to customize")
+
+        (self.root / "keel.toml").write_text("")
+        proc = _run(
+            "import keel._auto; import sample_targets; sample_targets.enrich_a(1)",
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        lines = [l for l in proc.stderr.decode().splitlines() if l.strip()]
+        objs = [_json.loads(l) for l in lines]
+        kinds = [o["keel"] for o in objs]
+        self.assertEqual(kinds, ["activation", "summary"], proc.stderr)
+        self.assertEqual(objs[0]["policy_source"], "keel.toml")
+        self.assertEqual(objs[0]["policy_path"], str(self.root / "keel.toml"))
+        self.assertEqual(objs[0]["root_source"], "KEEL_CWD")
+        self.assertNotIn("note", objs[0], "a loaded policy has no em-dash tail — no note key")
+        self.assertEqual(objs[1]["keel_cwd"], str(self.root))
+
+    def test_json_log_format_refusal_is_an_error_object(self) -> None:
+        import json as _json
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]["keel"], "error")
+        self.assertEqual(objs[0]["code"], "policy-missing-at-keel-cwd")
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root))
 
 
 if __name__ == "__main__":

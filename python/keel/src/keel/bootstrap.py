@@ -19,10 +19,12 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import __version__
 from ._backend import load_backend
 from ._defaults import apply_pack_defaults
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
+from ._log import emit, json_logs
 from ._policy import (
     extract_cmd_flows,
     extract_flow_entrypoints,
@@ -36,9 +38,15 @@ from ._runtime import (
     set_flow_entrypoints,
     set_runtime,
 )
-from ._summary import Summary, format_summary, keel_on_path
+from ._summary import Summary, format_summary, format_summary_json, keel_on_path
 from .adapters import Detection, install_adapters, uninstall_adapters
-from .packs import install_mcp_pack, present_provider_defaults, resolve_dev_cache
+from .packs import (
+    dev_cache_off_reason,
+    install_mcp_pack,
+    present_provider_defaults,
+    resolve_dev_cache,
+    serverless_marker,
+)
 
 _TRUTHY = {"1", "true", "yes"}
 
@@ -46,6 +54,22 @@ _TRUTHY = {"1", "true", "yes"}
 def is_disabled(env: Mapping[str, str] | None = None) -> bool:
     env = env if env is not None else os.environ
     return env.get("KEEL_DISABLE", "").strip().lower() in _TRUTHY
+
+
+def policy_optional(env: Mapping[str, str] | None = None) -> bool:
+    """`KEEL_POLICY=optional` restores the pre-0.5.5 fallback: an explicit
+    KEEL_CWD with no keel.toml runs on production defaults (with a warning)
+    instead of refusing to activate. The only recognized value."""
+    env = env if env is not None else os.environ
+    return env.get("KEEL_POLICY", "").strip().lower() == "optional"
+
+
+def missing_policy_error(root: Path) -> str:
+    return (
+        f"keel ▸ error: KEEL_CWD={root} is set but {root / 'keel.toml'} does not exist — "
+        "Keel NOT activated; the app continues without keel "
+        "(set KEEL_POLICY=optional to run on production defaults instead)\n"
+    )
 
 
 def _console_enabled(policy: Mapping[str, Any], env: Mapping[str, str]) -> bool:
@@ -65,18 +89,45 @@ class _State:
     exit_registered: bool = False
     mcp_uninstall: Any = None
     state: dict[str, Any] | None = None
+    refused: dict[str, Any] | None = None
+    # The `(cwd, cwd_source)` the refusal above was printed FOR. The latch is a
+    # print-once latch, not a process-wide verdict: a later call naming a
+    # DIFFERENT root was never asked about (see `install_keel`).
+    refused_key: tuple[str, str] | None = None
+    # Captured for the atexit flush, which runs long after `install_keel`
+    # returned and has no other way to reach the environment (KEEL_LOG_FORMAT)
+    # or the policy provenance the JSON summary reports.
+    env: Mapping[str, str] | None = None
+    meta: dict[str, Any] | None = None
 
 
 _STATE = _State()
 
 
 def install_keel(
-    *, cwd: str | Path | None = None, env: Mapping[str, str] | None = None
+    *,
+    cwd: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd_source: str = "cwd",
 ) -> dict[str, Any]:
-    """Install Keel's Tier 1 machinery. Idempotent within a process."""
+    """Install Keel's Tier 1 machinery. Idempotent within a process.
+
+    `cwd_source` is "KEEL_CWD" when `cwd` came from that env var: pointing
+    KEEL_CWD at a directory with no keel.toml is a misconfiguration (the
+    policy did not ship — issue #85's second occurrence), so Keel refuses to
+    activate rather than silently running production defaults.
+    """
     env = env if env is not None else os.environ
     if is_disabled(env):
         return {"enabled": False, "reason": "KEEL_DISABLE"}
+    cwd = Path(cwd or Path.cwd())
+    # The refusal is printed once per process, but the latch is keyed on WHAT
+    # was refused: a later `install_keel(cwd=…)` naming a DIFFERENT root (the
+    # public API, and what `_run.run_target` uses after the `.pth` shim already
+    # ran) was never asked about, and must be answered on its own merits rather
+    # than inheriting a stale refusal. Node twin: `bootstrap.mjs`.
+    if _STATE.refused is not None and _STATE.refused_key == (str(cwd), cwd_source):
+        return dict(_STATE.refused)  # already said so once this process
     if _STATE.installed:
         # Return the SAME full state the first install produced (backend,
         # discovery, flow_entrypoints, …) rather than a bare marker — callers
@@ -89,8 +140,33 @@ def install_keel(
         # reaching this branch guarantees `_STATE.state` is populated.
         return {**_STATE.state, "reason": "already-installed"}
 
-    cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
+    if source == "defaults" and cwd_source == "KEEL_CWD" and not policy_optional(env):
+        text = missing_policy_error(cwd)
+        emit(
+            env,
+            text,
+            {
+                "keel": "error",
+                "code": "policy-missing-at-keel-cwd",
+                "keel_cwd": str(cwd),
+                "message": text[len("keel ▸ error: ") :].rstrip("\n"),
+                "version": __version__,
+            },
+        )
+        _STATE.refused = {"enabled": False, "reason": "policy-missing-at-keel-cwd", "root": str(cwd)}
+        _STATE.refused_key = (str(cwd), cwd_source)
+        return dict(_STATE.refused)
+    # Policy provenance, captured once: the two fields ("did my policy ship?",
+    # "how many calls were served from cache?") that would have named the
+    # 2026-09-15 outage in one log query (F10). Read again at exit by `_flush`.
+    _STATE.env = env
+    _STATE.meta = {
+        "keel_cwd": env.get("KEEL_CWD") or None,
+        "policy_path": str(cwd / "keel.toml") if source != "defaults" else None,
+        "policy_source": source,
+        "version": __version__,
+    }
     # Backend first: whether it's persistent (native + attached journal) decides
     # whether the LLM dev cache resolves to `scope=persistent` (cross-run replay).
     backend = load_backend(env.get("KEEL_BACKEND"), cwd=cwd, env=env)
@@ -147,7 +223,7 @@ def install_keel(
     _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
 
     _register_exit_flush()
-    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd)
+    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd, cwd_source)
 
     state = {
         "enabled": True,
@@ -206,6 +282,10 @@ def uninstall_keel() -> None:
     clear_runtime()
     _STATE.installed = False
     _STATE.state = None
+    _STATE.refused = None
+    _STATE.refused_key = None
+    _STATE.env = None
+    _STATE.meta = None
 
 
 def _register_exit_flush() -> None:
@@ -218,9 +298,16 @@ def _register_exit_flush() -> None:
         # the store closes"). It reads only its own counters and never raises.
         if _STATE.summary is not None:
             try:
-                text = format_summary(_STATE.summary.counts(), keel_on_path())
-                if text:
-                    sys.stderr.write(text)
+                counts = _STATE.summary.counts()
+                if json_logs(_STATE.env if _STATE.env is not None else os.environ):
+                    # Unconditional, unlike the text form: a zero line proves
+                    # Keel was live and intercepted nothing, which is exactly
+                    # what the outage post-mortem had no way to establish.
+                    sys.stderr.write(format_summary_json(counts, _STATE.meta or {}))
+                else:
+                    text = format_summary(counts, keel_on_path())
+                    if text:
+                        sys.stderr.write(text)
             except Exception:  # noqa: BLE001 — observability never fails the process
                 pass
         if _STATE.discovery is not None:
@@ -279,10 +366,30 @@ def _banner(
     adapters: list[Detection],
     mcp: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
+    cwd_source: str = "cwd",
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
-    desc = "production defaults" if source == "defaults" else "policy keel.toml"
+    root = Path(cwd) if cwd is not None else None
+    if source == "defaults":
+        desc = "production defaults"
+    elif root is not None:
+        desc = f"policy {root / 'keel.toml'}"
+    else:
+        desc = "policy keel.toml"
+    # WHY the dev cache is off, read from the SAME resolution the cache itself
+    # uses (`dev_cache_off_reason`), so the JSON form can carry it as a field:
+    # "was the dev cache on in that container, and if not why" is one of the
+    # questions the 2026-09-15 post-mortem had to answer by inference, and a
+    # log pipeline can only index what the object names (F10). Note this is
+    # WIDER than the banner's parenthetical, which stays marker-only prose
+    # (byte-unchanged): an explicit `KEEL_ENV=prod` also turns the cache off,
+    # and a field named `dev_cache_off` reporting null there would be a lie.
+    dev_cache_off = dev_cache_off_reason(env)
+    if not env.get("KEEL_ENV", "").strip():
+        marker = serverless_marker(env)
+        if marker is not None:
+            desc = f"{desc} (dev cache off: {marker} detected)"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".
@@ -296,17 +403,43 @@ def _banner(
     if mcp and mcp.get("active"):
         pieces.append("mcp: transports")
     wrapped = " + ".join(pieces) if pieces else "nothing yet"
-    # #85: on the defaults path only (a real policy loaded means this cwd is
-    # already the right one — zero cost there), check whether a keel.toml
-    # exists somewhere above cwd that load_policy never looked at. If so, the
-    # usual "keel init to customize" nudge reads as if nothing is wrong, when
-    # actually the adopter's policy silently never loaded — name both paths
-    # and the fix instead.
-    found = _policy_above_cwd(cwd) if source == "defaults" and cwd is not None else None
-    if found is not None:
-        sys.stderr.write(
-            f"keel ▸ wrapped {wrapped} with {desc} — found keel.toml at {found} but "
-            f"running from {Path(cwd)}; set KEEL_CWD={found} to load it\n"
-        )
+    head = f"keel ▸ wrapped {wrapped} with {desc}"
+    # `note` is the text after the em-dash — the one place the four tail
+    # variants differ. Held as a value (rather than four `write` calls) so the
+    # JSON form can carry it as a field; the text assembled below is
+    # byte-identical to what each variant used to write directly.
+    note: str | None
+    if source != "defaults":
+        note = None
     else:
-        sys.stderr.write(f"keel ▸ wrapped {wrapped} with {desc} — `keel init` to customize\n")
+        # #85: a keel.toml above cwd that load_policy never looked at.
+        found = _policy_above_cwd(root) if root is not None else None
+        if found is not None:
+            note = (
+                f"found keel.toml at {found} but running from {root}; "
+                f"set KEEL_CWD={found} to load it"
+            )
+        elif cwd_source == "KEEL_CWD" and root is not None:
+            # Only reachable under KEEL_POLICY=optional (install_keel refuses otherwise).
+            note = (
+                f"KEEL_CWD={root} is set but {root / 'keel.toml'} does not exist "
+                "(KEEL_POLICY=optional)"
+            )
+        elif root is not None:
+            note = f"no keel.toml in {root}; `keel init` to customize"
+        else:
+            note = "`keel init` to customize"
+    text = f"{head}\n" if note is None else f"{head} — {note}\n"
+    obj: dict[str, Any] = {
+        "dev_cache_off": dev_cache_off,
+        "keel": "activation",
+        "policy_path": str(root / "keel.toml") if source != "defaults" and root is not None else None,
+        "policy_source": source,
+        "root": str(root) if root is not None else None,
+        "root_source": cwd_source,
+        "version": __version__,
+        "wrapped": wrapped,
+    }
+    if note is not None:
+        obj["note"] = note
+    emit(env, text, obj)

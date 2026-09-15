@@ -326,6 +326,24 @@ def _canonical_json(body: bytes | str | None) -> bytes | None:
     ).encode("utf-8")
 
 
+def lro_shaped_path(path: str) -> bool:
+    """True when the URL path's last segment names a Google custom method
+    that SUBMITS or POLLS a long-running operation: ``…:predictLongRunning``
+    (submit — returns an operation handle that must never be replayed),
+    ``…:fetchPredictOperation`` / ``…:fetchOperation`` / any ``:fetch*Operation``
+    (poll — an identical POST body every interval, issue #83). Matched by
+    verb SHAPE, not an enumerated list, so a new Vertex surface with the same
+    grammar is covered without a release. Twin of Node's
+    ``judge.mjs::lroShapedPath``; keep identical."""
+    last = path.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return False
+    verb = last.rsplit(":", 1)[-1]
+    return verb.endswith("LongRunning") or (
+        verb.startswith("fetch") and verb.endswith("Operation")
+    )
+
+
 def derive_args_hash(
     target: str, method: str, url: str, body: bytes | str | None
 ) -> str | None:
@@ -342,7 +360,10 @@ def derive_args_hash(
         ``None`` (a live stream is not cache-replayable), and so does a
         STREAMING generate call (SSE — issue #84): its response is never
         buffered (see ``streaming_response``), so a cache hit would rebuild an
-        empty body.
+        empty body, and so does an LRO submit/poll shape
+        (``:predictLongRunning``, ``:fetch*Operation`` — issue #83): a
+        replayed poll is a stale status, a replayed submit is a stale
+        operation handle.
       * everything else     → ``None``.
     """
     if method == "GET":
@@ -364,7 +385,9 @@ def derive_args_hash(
         # without `?alt=sse`); OpenAI/Anthropic flag it in the body
         # (`"stream": true`). Mirrors judge.mjs's deriveArgsHash exactly.
         path = urlsplit(url).path
-        if path.endswith(":streamGenerateContent"):
+        if path.endswith(":streamGenerateContent") or lro_shaped_path(path):
+            # Streaming (issue #84) or LRO submit/poll (issue #83): neither is
+            # a prompt whose response is safe to replay.
             return None
         try:
             parsed = json.loads(canon)
@@ -572,6 +595,7 @@ __all__ = [
     "resolve_idempotency_injection",
     "args_hash",
     "derive_args_hash",
+    "lro_shaped_path",
     "parse_retry_after",
     "is_transient_status",
     "build_request",

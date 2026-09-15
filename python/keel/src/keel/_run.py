@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import Mapping, Sequence
 
 from ._errors import is_keel_error
@@ -42,10 +43,13 @@ def run_target(
 
     from .bootstrap import install_keel, is_disabled
 
+    keel_cwd = env.get("KEEL_CWD") or None
+    root = cwd or keel_cwd
+    cwd_source = "KEEL_CWD" if (cwd is None and keel_cwd) else "cwd"
     state: dict | None = None
     if not is_disabled(env):
         try:
-            state = install_keel(cwd=cwd, env=env)
+            state = install_keel(cwd=root, env=env, cwd_source=cwd_source)
         except BaseException as exc:  # config error: loud, then exit 1
             if is_keel_error(exc):
                 code = getattr(exc, "code", "KEEL-E040")
@@ -53,12 +57,20 @@ def run_target(
                 sys.stderr.write(f"keel ▸ {code}: {message}\n")
                 raise SystemExit(1) from exc
             raise
+        if state is not None and state.get("reason") == "policy-missing-at-keel-cwd":
+            # An explicit `keel run` deserves a hard failure (the .pth path cannot
+            # give one); the error line was already written by install_keel.
+            raise SystemExit(2)
 
     if state is not None and state.get("enabled", True):
         # Children this script spawns self-activate via the wheel's .pth
-        # (KEEL_ENABLE gate) and resolve the same config root (#63).
+        # (KEEL_ENABLE gate) and resolve the same config root (#63) — but only
+        # advertise a root that actually holds a policy (WS1: KEEL_CWD is now
+        # an assertion, so never export one that would make the child refuse).
         os.environ.setdefault("KEEL_ENABLE", "1")
-        os.environ.setdefault("KEEL_CWD", str(cwd or os.getcwd()))
+        root_dir = Path(root or os.getcwd())
+        if (root_dir / "keel.toml").is_file():
+            os.environ.setdefault("KEEL_CWD", str(root_dir))
 
     # Mirror CPython's `python <target>` semantics exactly. runpy.run_path
     # does NOT put the script's directory on sys.path for a file target, but a

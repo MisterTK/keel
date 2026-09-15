@@ -134,6 +134,64 @@ class ResolveDevCacheTest(unittest.TestCase):
         self.assertEqual(raw["target"]["llm:openai"]["cache"], {"mode": "dev"})
 
 
+class ServerlessDevCacheTest(unittest.TestCase):
+    _POLICY = {"defaults": {"llm": {"cache": {"mode": "dev"}}}}
+
+    def test_cloud_run_marker_disables_the_dev_cache(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {"K_SERVICE": "render"})
+        self.assertNotIn("cache", out["defaults"]["llm"])
+
+    def test_every_marker_is_recognized(self) -> None:
+        from keel.packs.llm import SERVERLESS_MARKERS, serverless_marker
+
+        self.assertEqual(
+            SERVERLESS_MARKERS,
+            ("K_SERVICE", "K_REVISION", "CLOUD_RUN_JOB", "AWS_LAMBDA_FUNCTION_NAME",
+             "FUNCTIONS_WORKER_RUNTIME", "WEBSITE_SITE_NAME"),
+        )
+        for name in SERVERLESS_MARKERS:
+            self.assertEqual(serverless_marker({name: "x"}), name)
+        self.assertIsNone(serverless_marker({"K_SERVICE": "   "}), "blank values do not count")
+        self.assertIsNone(serverless_marker({}))
+
+    def test_explicit_keel_env_dev_wins_over_a_marker(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {"K_SERVICE": "render", "KEEL_ENV": "dev"})
+        self.assertEqual(out["defaults"]["llm"]["cache"]["ttl"], DEV_CACHE_TTL)
+
+    def test_no_marker_and_no_keel_env_keeps_the_dev_cache(self) -> None:
+        out = resolve_dev_cache(self._POLICY, {})
+        self.assertEqual(out["defaults"]["llm"]["cache"]["ttl"], DEV_CACHE_TTL)
+
+    def test_dev_cache_off_reason_names_every_way_the_cache_goes_off(self) -> None:
+        """The activation line's `dev_cache_off` field reads from this, so it
+        must agree with `resolve_dev_cache` in EVERY configuration — a null
+        there is a positive claim that the dev cache is on."""
+        from keel.packs.llm import dev_cache_off_reason
+
+        cases = [
+            ({}, None),
+            ({"K_SERVICE": "render"}, "K_SERVICE"),
+            ({"WEBSITE_SITE_NAME": "app"}, "WEBSITE_SITE_NAME"),
+            ({"KEEL_ENV": "prod"}, "KEEL_ENV"),  # the explicit override: NOT null
+            ({"KEEL_ENV": "  PROD  "}, "KEEL_ENV"),
+            ({"KEEL_ENV": "dev"}, None),
+            ({"KEEL_ENV": "dev", "K_SERVICE": "render"}, None),  # explicit dev wins
+            ({"KEEL_ENV": "prod", "K_SERVICE": "render"}, "KEEL_ENV"),
+            # A third value is NOT a dev declaration: it must not defeat the
+            # marker (that would be the 2026-09-15 outage class again). With no
+            # marker it changes nothing — the cache stays on, as before.
+            ({"KEEL_ENV": "staging", "K_SERVICE": "render"}, "K_SERVICE"),
+            ({"KEEL_ENV": "staging"}, None),
+            ({"KEEL_ENV": "  ", "K_SERVICE": "render"}, "K_SERVICE"),
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env):
+                self.assertEqual(dev_cache_off_reason(env), expected)
+                # …and it never disagrees with what the cache resolution does.
+                has_cache = "cache" in resolve_dev_cache(self._POLICY, env)["defaults"]["llm"]
+                self.assertEqual(has_cache, expected is None)
+
+
 class DevCacheReplayCountersTest(unittest.TestCase):
     """The report-counter parity contract with the Node twin, driven through the
     stub core directly (as Node drives its AsyncEngine)."""
@@ -403,6 +461,43 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
             "llm:google-genai", "POST",
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
             b'{"contents": []}',
+        ))
+
+    def test_lro_shaped_paths_are_recognized(self) -> None:
+        for path in (
+            "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning",
+            "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation",
+            "/v1beta1/projects/p/locations/global/operations/op:fetchOperation",
+            "/v1/models/m:fetchFooOperation",
+        ):
+            self.assertTrue(_http.lro_shaped_path(path), path)
+        for path in (
+            "/v1beta/models/gemini-2.0-flash:generateContent",
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            "/v1/chat/completions",
+            "/v1/operations/op1",  # GET-shaped; irrelevant here but must not match
+            "/v1/models/m:fetch",
+            "/v1/models/m:Operation",
+        ):
+            self.assertFalse(_http.lro_shaped_path(path), path)
+
+    def test_llm_post_lro_submit_and_poll_derive_no_hash(self) -> None:
+        # #83: Vertex polls with a POST whose body is identical every 10s; the
+        # submit leg returns an operation handle that must never be replayed.
+        base = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1"
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:fetchPredictOperation",
+            b'{"operationName": "projects/p/operations/op1"}',
+        ))
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:predictLongRunning",
+            b'{"instances": [{"prompt": "a cat"}]}',
+        ))
+        # A non-llm host with the same path shape is untouched (still no hash: non-llm POST).
+        self.assertIsNone(_http.derive_args_hash("example.com", "POST", f"https://example.com/x:fetchOperation", b"{}"))
+        # generateContent still hashes (dev-cache replay of a prompt is the feature).
+        self.assertIsNotNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:generateContent", b'{"contents": []}',
         ))
 
 

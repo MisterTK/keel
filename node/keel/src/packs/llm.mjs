@@ -32,11 +32,60 @@ function isTable(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
-function isProd(env) {
+/** Environment variables that identify a serverless/container platform
+ *  (Cloud Run services and jobs, Lambda, Azure Functions and App Service).
+ *  Their presence means "production" for the dev cache when KEEL_ENV is
+ *  unset — replaying an LLM response from a cache in a deployed container is
+ *  never the dev loop the cache exists for (field report 2026-09-15, F0/F6). */
+export const SERVERLESS_MARKERS = [
+  "K_SERVICE",
+  "K_REVISION",
+  "CLOUD_RUN_JOB",
+  "AWS_LAMBDA_FUNCTION_NAME",
+  "FUNCTIONS_WORKER_RUNTIME",
+  "WEBSITE_SITE_NAME",
+];
+
+/** The first present, non-blank serverless marker variable, or null. */
+export function serverlessMarker(env = process.env) {
+  for (const name of SERVERLESS_MARKERS) {
+    if (String(env?.[name] ?? "").trim()) return name;
+  }
+  return null;
+}
+
+/**
+ * WHY the LLM dev cache is off in this process, as a machine-readable token —
+ * `"KEEL_ENV"` when an explicit `KEEL_ENV=prod` demoted it, the serverless
+ * marker's variable name when a container did, or `null` when the cache is
+ * genuinely ON.
+ *
+ * Single source of truth for `isProd` (below) AND for the activation line's
+ * `dev_cache_off` field, so the field can never claim something the cache
+ * resolution does not do: a field literally named `dev_cache_off` reporting
+ * null is a positive claim that the cache is on, and `KEEL_ENV=prod` is a
+ * reachable production configuration where that would be a lie. Twin of
+ * Python's `dev_cache_off_reason`; keep identical.
+ *
+ * Only the two declarations Keel actually understands short-circuit the
+ * marker: `prod` (off) and `dev` (on — someone saying "this IS my dev loop"
+ * may have one inside a container). Every other value, blank included, falls
+ * through to the serverless marker: `KEEL_ENV=staging` on Cloud Run must not
+ * silently re-arm the dev cache, which is the 2026-09-15 outage class itself
+ * (spec §2: a detected serverless environment counts as `KEEL_ENV=prod` for
+ * dev-cache resolution).
+ */
+export function devCacheOffReason(env = process.env) {
   // Trim + lowercase before comparing — cross-language parity with the Python
-  // twin's `.strip().lower()`, so `KEEL_ENV=" prod "` disables the dev cache
-  // identically in both front ends.
-  return String(env?.KEEL_ENV ?? "").trim().toLowerCase() === "prod";
+  // twin's `.strip().lower()`.
+  const keelEnv = String(env?.KEEL_ENV ?? "").trim().toLowerCase();
+  if (keelEnv === "prod") return "KEEL_ENV";
+  if (keelEnv === "dev") return null; // an explicit dev declaration beats a marker
+  return serverlessMarker(env);
+}
+
+function isProd(env) {
+  return devCacheOffReason(env) !== null;
 }
 
 /** The `llm:` adapter pack — the four uniform operations (adapter-pack.md). */
