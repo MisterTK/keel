@@ -148,7 +148,7 @@
       "python",
       "js-ts"
     ],
-    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's five phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose. Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
+    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's six phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, activation reaching the I/O process, durable evidence). Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
     "unparsed": [
       "shell",
       "makefile",
@@ -186,7 +186,7 @@
   "follow_ups": [
     {
       "code": "sdk-client-timeout",
-      "detail": "timeout = 1800s is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For submit-then-poll APIs, prefer a `poll` policy.",
+      "detail": "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline.",
       "rank": 5,
       "subject": "target.\"llm:google-genai\""
     }

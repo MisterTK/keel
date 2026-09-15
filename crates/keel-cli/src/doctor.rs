@@ -726,8 +726,10 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
                      policy (interval / deadline / until) replaces the whole loop",
                     s.function, s.file, s.line, targets, when
                 ),
-                "Wrap the target, then replace the loop with a `poll` policy — the poll \
-                 primitive (CCR-3) is the designated replacement for submit-then-poll loops."
+                "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
+                 bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
+                 GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
+                 loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
                     .to_owned(),
             ),
             "silent-swallow" => (
@@ -907,11 +909,14 @@ fn build_follow_ups(
             rank: follow_up_rank("sdk-client-timeout"),
             subject: subject.clone(),
             detail: format!(
-                "timeout = {}s is beyond the client-default deadline most SDKs enforce (often \
-                 ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the \
-                 call site must also pass a timeout >= the Keel value, or the SDK gives up first \
-                 and Keel just sees a retryable timeout. For submit-then-poll APIs, prefer a \
-                 `poll` policy.",
+                "timeout = {}s bounds ONE attempt of ONE call, and is beyond the client-default \
+                 deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not \
+                 raise the SDK's own deadline — the call site must also pass a timeout >= the \
+                 Keel value, or the SDK gives up first and Keel just sees a retryable timeout. \
+                 For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE \
+                 submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex \
+                 `:fetch*Operation`) cannot use `poll` yet — set `cache = {{ mode = \"off\" }}` \
+                 on the target and keep the app-level deadline.",
                 ms / 1000
             ),
         });
@@ -1058,7 +1063,7 @@ fn relative_display(base: &Path, target: &Path) -> String {
 /// Build the [`Boundaries`] frame for `project`. Only `governance_files` touches
 /// the filesystem; the rest are standing properties of this tool, kept in one
 /// place so there is a single edit when the scan learns a new language or file
-/// class. The `protocol` line enumerates the skill's five phases verbatim — if
+/// class. The `protocol` line enumerates the skill's six phases verbatim — if
 /// `skills/keel/SKILL.md`'s protocol changes, change this with it.
 fn boundaries(project: &Path) -> Boundaries {
     let mut governance_files = Vec::new();
@@ -1073,10 +1078,11 @@ fn boundaries(project: &Path) -> Boundaries {
         parsed_files: &["dockerfile (COPY/ADD directives only)"],
         parsed_languages: &["python", "js-ts"],
         protocol: "Static + adapter-interception evidence, not a verdict. Drive an \
-                   evaluate/adopt/review task through the keel skill's five phases: Scope every \
+                   evaluate/adopt/review task through the keel skill's six phases: Scope every \
                    I/O process (including shell/CI launchers) -> Explore how each call is \
                    dispatched -> Collect this report -> Baseline real failure classes in observe \
-                   mode (`keel record run`) -> Analyze & propose. Retry only helps \
+                   mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, \
+                   activation reaching the I/O process, durable evidence). Retry only helps \
                    genuinely-transient classes (conn/timeout/5xx/429).",
         unparsed: &["shell", "makefile", "ci-workflow", "governance-prose"],
     }
@@ -2234,7 +2240,13 @@ mod tests {
             .expect("poll finding");
         assert_eq!(poll.level, "info", "unreachable target → once-wrapped lead");
         assert!(poll.detail.contains("fetch_short_metrics.py:83"));
-        assert!(poll.action.contains("poll"), "names the poll primitive");
+        assert_eq!(
+            poll.action,
+            "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
+             bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
+             GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
+             loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
+        );
         // The WS2 closed follow-up vocabulary is NOT extended by WS3.
         assert!(
             r.follow_ups
@@ -2379,6 +2391,38 @@ mod tests {
         assert_eq!(hit[0].rank, 5);
         assert_eq!(hit[0].subject, "target.\"llm:google-genai\"");
         assert!(hit[0].detail.contains("1800s"));
+    }
+
+    /// Deployment-honesty slice, WS6/WS10: the `sdk-client-timeout` detail
+    /// must name all three clocks (Keel's `timeout`, the SDK's own
+    /// client-default deadline, and `poll.deadline`) and the POST-poll
+    /// caveat (poll is GET/HEAD-only until poll v2; a POST-shaped poll like
+    /// Vertex's `:fetch*Operation` needs `cache = { mode = "off" }` instead).
+    #[test]
+    fn sdk_client_timeout_names_the_three_clocks_and_the_post_poll_caveat() {
+        let ups = build_follow_ups(
+            &Topology {
+                excluded: vec![],
+                external_processes: vec![],
+                unreachable: vec![],
+                wrappable: vec![],
+            },
+            None,
+            &ScanResult::default(),
+            &[],
+            &[("target.\"llm:google-genai\"".to_owned(), 1_800_000)],
+        );
+        let fu = ups.iter().find(|u| u.code == "sdk-client-timeout").unwrap();
+        assert_eq!(
+            fu.detail,
+            "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default \
+             deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise \
+             the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or \
+             the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled \
+             APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) \
+             replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` \
+             yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline."
+        );
     }
 
     /// No `lro_timeouts` entries (the common case — `validate_policy` never
@@ -3593,6 +3637,15 @@ def caller():
         assert!(b.parsed_languages.contains(&"python"));
         assert!(b.unparsed.contains(&"shell"));
         assert!(b.protocol.contains("Baseline"));
+    }
+
+    /// Deployment-honesty slice, WS6/WS10: the keel skill's evaluation
+    /// protocol grew a sixth phase ("Ship") — this string must say so.
+    #[test]
+    fn protocol_string_has_six_phases() {
+        let b = boundaries(Path::new("."));
+        assert!(b.protocol.contains("six phases"), "{}", b.protocol);
+        assert!(b.protocol.contains("-> Ship"), "{}", b.protocol);
     }
 
     #[test]
