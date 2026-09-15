@@ -173,6 +173,26 @@ class ChildActivationEnvTest(unittest.TestCase):
         self.assertEqual(enable, "1")
         self.assertTrue(cwd)  # points at the activation root
 
+    def test_defaults_run_exports_enable_but_not_a_policy_less_cwd(self) -> None:
+        # WS1 negative case: a plain defaults run (no keel.toml anywhere, no
+        # ambient KEEL_CWD) must still export KEEL_ENABLE to children (so
+        # they self-activate) but must NOT export KEEL_CWD — exporting a
+        # policy-less root would make a child that self-activates via the
+        # .pth wrongly refuse under the new strict-KEEL_CWD rule, silently
+        # reintroducing the cascading-refusal bug this task exists to close.
+        with TemporaryDirectory() as d:
+            out = subprocess.run(
+                [sys.executable, "-m", "keel", "run", SPAWN_PROBE],
+                capture_output=True,
+                text=True,
+                env=child_env(),
+                cwd=d,
+                check=True,
+            )
+        enable, _, cwd = out.stdout.strip().partition("|")
+        self.assertEqual(enable, "1")
+        self.assertEqual(cwd, "", "no keel.toml at the run root: KEEL_CWD must not be exported")
+
     def test_disabled_run_exports_nothing(self) -> None:
         with TemporaryDirectory() as d:
             out = subprocess.run(
