@@ -1436,10 +1436,10 @@ mod tests {
     #[test]
     fn diff_reports_added_and_removed_targets_precisely() {
         let dir = TempDir::new().unwrap();
-        // JS scan (pure Rust, no python3) will find `api.example.com`.
+        // JS scan (pure Rust, no python3) will find `api.vendor.com`.
         fs::write(
             dir.path().join("app.mjs"),
-            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+            "const r = await fetch(\"https://api.vendor.com/v1/x\");\n",
         )
         .unwrap();
         // An existing keel.toml declares a target the scan will NOT find.
@@ -1461,14 +1461,14 @@ mod tests {
         assert_eq!(r.exit, crate::EXIT_OK);
         assert_eq!(
             r.json["added"].as_array().unwrap(),
-            &vec![serde_json::json!("api.example.com")]
+            &vec![serde_json::json!("api.vendor.com")]
         );
         assert_eq!(
             r.json["removed"].as_array().unwrap(),
             &vec![serde_json::json!("api.gone.example")]
         );
         assert!(r.json["unchanged"].as_array().unwrap().is_empty());
-        assert!(r.human.contains("+ [target.\"api.example.com\"]"));
+        assert!(r.human.contains("+ [target.\"api.vendor.com\"]"));
         assert!(r.human.contains("- [target.\"api.gone.example\"]"));
         // --diff never writes.
         assert_eq!(
@@ -1487,7 +1487,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("app.mjs"),
-            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+            "const r = await fetch(\"https://api.vendor.com/v1/x\");\n",
         )
         .unwrap();
         // No .keel/discovery.db is created — discovery is empty.
@@ -1523,7 +1523,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("app.mjs"),
-            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+            "const r = await fetch(\"https://api.vendor.com/v1/x\");\n",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join(".keel")).unwrap();
@@ -1535,7 +1535,7 @@ mod tests {
             .unwrap();
             store
                 .record(&keel_journal::CallObservation {
-                    target: "api.example.com".to_owned(),
+                    target: "api.vendor.com".to_owned(),
                     result: keel_journal::CallResult::Success,
                     attempts: 1,
                     latency_ms: 10,
@@ -1599,7 +1599,7 @@ mod tests {
             .unwrap();
             store
                 .record(&keel_journal::CallObservation {
-                    target: "api.example.com".to_owned(),
+                    target: "api.vendor.com".to_owned(),
                     result: keel_journal::CallResult::Success,
                     attempts: 1,
                     latency_ms: 10,
@@ -1630,13 +1630,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("app.mjs"),
-            "// two targets, one already in keel.toml\nconst KEPT = await fetch(\"https://api.example.com/v1/x\");\nconst ADDED = await fetch(\"https://api.new.example/v2/y\");\n",
+            "// two targets, one already in keel.toml\nconst KEPT = await fetch(\"https://api.vendor.com/v1/x\");\nconst ADDED = await fetch(\"https://api.new-vendor.com/v2/y\");\n",
         )
         .unwrap();
         let old = "\
 # hand-tuned: keep this comment
 
-[target.\"api.example.com\"]
+[target.\"api.vendor.com\"]
 timeout = \"9s\"   # user tuning survives
 
 [target.\"api.gone.example\"]  # stale
@@ -1668,11 +1668,11 @@ timeout = \"5s\"
         let applied = crate::diff::apply_unified(old, patch).unwrap();
         let value: toml::Value = applied.parse().expect("applied file parses");
         assert!(value["target"].get("api.gone.example").is_none());
-        assert!(value["target"].get("api.new.example").is_some());
+        assert!(value["target"].get("api.new-vendor.com").is_some());
         assert!(applied.contains("# hand-tuned: keep this comment"));
         assert!(applied.contains("timeout = \"9s\"   # user tuning survives"));
         // The added block is byte-identical to what a fresh init would write.
-        assert!(applied.contains("[target.\"api.new.example\"]"));
+        assert!(applied.contains("[target.\"api.new-vendor.com\"]"));
         assert!(applied.contains("# seen in: app.mjs:3"));
 
         // Structured hunks: one removal, one addition, sorted by path.
@@ -1683,7 +1683,10 @@ timeout = \"5s\"
             .collect();
         assert_eq!(
             paths,
-            ["target.\"api.gone.example\"", "target.\"api.new.example\""]
+            [
+                "target.\"api.gone.example\"",
+                "target.\"api.new-vendor.com\""
+            ]
         );
         assert!(changes[0]["after"].is_null());
         assert!(changes[1]["before"].is_null());
@@ -1865,7 +1868,7 @@ def caller():
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("app.mjs"),
-            "const r = await fetch(\"https://api.example.com/v1/x\");\n",
+            "const r = await fetch(\"https://api.vendor.com/v1/x\");\n",
         )
         .unwrap();
 
@@ -1889,7 +1892,7 @@ def caller():
         assert_eq!(crate::diff::apply_unified("", patch).unwrap(), expected);
         assert_eq!(
             r.json["added"].as_array().unwrap(),
-            &vec![serde_json::json!("api.example.com")]
+            &vec![serde_json::json!("api.vendor.com")]
         );
     }
 

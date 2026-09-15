@@ -321,12 +321,14 @@ fn init_writes_into_the_agent_dir_for_the_agents_cli_fixture() {
 
 // ---- init --diff: applyable policy diffs (dx-spec §5, lingua franca) ----
 
-/// Two-target project for the `--diff` fixtures: `api.example.com` is already
-/// in keel.toml (kept, untouched), `api.new.example` is new (added block).
+/// Two-target project for the `--diff` fixtures: `api.vendor.com` is already
+/// in keel.toml (kept, untouched), `api.new-vendor.com` is new (added block).
+/// Neither is an RFC 2606 reserved name — those are excluded as fixtures (WS5)
+/// and would never be proposed.
 const DIFF_APP_MJS: &str = "\
 // two targets, one already in keel.toml
-const KEPT = await fetch(\"https://api.example.com/v1/x\");
-const ADDED = await fetch(\"https://api.new.example/v2/y\");
+const KEPT = await fetch(\"https://api.vendor.com/v1/x\");
+const ADDED = await fetch(\"https://api.new-vendor.com/v2/y\");
 ";
 
 /// The pre-existing keel.toml: one kept target with user tuning + comments,
@@ -334,7 +336,7 @@ const ADDED = await fetch(\"https://api.new.example/v2/y\");
 const DIFF_KEEL_TOML: &str = "\
 # hand-tuned: keep this comment
 
-[target.\"api.example.com\"]
+[target.\"api.vendor.com\"]
 timeout = \"9s\"   # user tuning survives
 
 [target.\"api.gone.example\"]  # stale
@@ -409,8 +411,8 @@ fn init_diff_patch_applies_cleanly_with_git_apply() {
     let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
     let value: toml::Value = applied.parse().expect("applied file parses");
     let targets = value["target"].as_table().unwrap();
-    assert!(targets.contains_key("api.example.com"));
-    assert!(targets.contains_key("api.new.example"));
+    assert!(targets.contains_key("api.vendor.com"));
+    assert!(targets.contains_key("api.new-vendor.com"));
     assert!(!targets.contains_key("api.gone.example"));
     // Untouched regions byte-preserved: header comment + user tuning.
     assert!(applied.contains("# hand-tuned: keep this comment"));
@@ -531,7 +533,7 @@ fn doctor_json_matches_golden_for_agents_cli_placement() {
     .unwrap();
     std::fs::write(
         dir.path().join("keel.toml"),
-        "[target.\"api.example.com\"]\nretry = { attempts = 5 }\n",
+        "[target.\"api.vendor.com\"]\nretry = { attempts = 5 }\n",
     )
     .unwrap();
     // A root CLAUDE.md so one golden pins `boundaries.governance_files`

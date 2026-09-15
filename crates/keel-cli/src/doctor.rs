@@ -266,8 +266,9 @@ struct Finding {
 /// One ranked follow-up: a lead Keel cannot chase itself, phrased for the
 /// agent/human reading the report to work top-down. `code` is a CLOSED set —
 /// url-no-transport | orchestration-blind-spot | subprocess-blind-spot |
-/// dependency-averse-excluded | local-host-excluded | preexisting-resilience |
-/// sdk-client-timeout | code-hash-stale — ranked lowest-Keel-confidence first
+/// dependency-averse-excluded | local-host-excluded | reserved-name-excluded |
+/// test-only-excluded | preexisting-resilience | sdk-client-timeout |
+/// code-hash-stale — ranked lowest-Keel-confidence first
 /// (rank 1 = Keel knows least, investigate first). Text is entirely
 /// keel-authored; only hostnames, file paths, and lib names are interpolated.
 #[derive(Debug, Serialize)]
@@ -342,6 +343,10 @@ pub(crate) struct ExternalProcess {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) covered_by: Option<String>,
     pub(crate) file: String,
+    /// Whether the sighting's file is test code ([`scan::is_test_path`]) — a
+    /// test-only launch is counted separately from the production blind spots
+    /// rather than warned about (WS5).
+    pub(crate) in_tests: bool,
     pub(crate) launcher: String,
     pub(crate) line: u32,
 }
@@ -350,9 +355,10 @@ pub(crate) struct ExternalProcess {
 /// scan saw, sorted into exactly one of "wrap it" (a tracked transport is in
 /// reach, or the target is wrapped-at-runtime/`llm:*` by construction),
 /// "can't reach it" (no adapted transport in reach — Keel is blind here
-/// regardless of policy), or "shouldn't reach it" (sighted only inside a
-/// file the scan judged dependency-averse — excluded from proposed policy on
-/// purpose). `external_processes` is the adjacent, host-independent honesty
+/// regardless of policy), or "shouldn't reach it" (a local/loopback host, an
+/// RFC 2606/5737 reserved name, a host sighted only in test files, or one
+/// sighted only inside a file the scan judged dependency-averse — all
+/// excluded from proposed policy on purpose). `external_processes` is the adjacent, host-independent honesty
 /// signal: traffic inside an externally-launched process Keel cannot see at
 /// all, no matter which bucket its host would otherwise land in.
 ///
@@ -544,6 +550,8 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
 /// never gets the dependency-averse-specific `# keel: include` advice, which
 /// does not apply to it. None of these are configuration errors — they
 /// never affect `ok`.
+#[allow(clippy::too_many_lines)] // one straight-line section per finding topic;
+// WS5 added the test-only subprocess section, not new branching depth.
 fn topology_findings(topology: &Topology) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in &topology.unreachable {
@@ -558,10 +566,14 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             topic: "url-no-transport",
         });
     }
-    let (covered, uncovered): (Vec<_>, Vec<_>) = topology
+    let (covered, unmatched): (Vec<_>, Vec<_>) = topology
         .external_processes
         .iter()
         .partition(|p| p.covered_by.is_some());
+    // WS5: a launch that only ever happens from test code is not a production
+    // blind spot. It is still reported — dropping evidence silently would be
+    // its own honesty violation — but as `info`, out of the `warn` list.
+    let (in_tests, uncovered): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|p| p.in_tests);
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
@@ -578,6 +590,23 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             ),
             fix: None,
             level: "warn",
+            topic: "subprocess-blind-spot",
+        });
+    }
+    if !in_tests.is_empty() {
+        let cmds: Vec<String> = in_tests
+            .iter()
+            .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
+            .collect();
+        findings.push(Finding {
+            action: "No action needed for test-only launches.".to_owned(),
+            detail: format!(
+                "{} externally-launched process(es) in test files only: {}.",
+                in_tests.len(),
+                cmds.join(", ")
+            ),
+            fix: None,
+            level: "info",
             topic: "subprocess-blind-spot",
         });
     }
@@ -622,6 +651,13 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                                   run under keel to gather runtime evidence, or add it to \
                                   keel.toml explicitly."
             }
+            "reserved-name" => {
+                "Nothing to do — a reserved/documentation name is a fixture by definition."
+            }
+            "test-only" => {
+                "Nothing to do unless production code also reaches this host; if it does, \
+                 run under keel so runtime evidence promotes it."
+            }
             _ => {
                 "Confirm the exclusion is intended; add `# keel: include` to the file to \
                   override."
@@ -643,11 +679,14 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
 /// (#64) — shared between [`topology_findings`] and [`build_follow_ups`] so
 /// the two surfaces never disagree about an excluded host's category slug.
 /// `"dependency-averse"` is the pre-#64 default: any kind other than the
-/// loopback one added here falls back to it, with a debug-build assertion
-/// (not a release panic) catching genuine `classify_topology` drift.
+/// loopback one (#64) and the two WS5 fixture kinds added here falls back to
+/// it, with a debug-build assertion (not a release panic) catching genuine
+/// `classify_topology` drift.
 fn excluded_kind_topic(kind: &str) -> &'static str {
     match kind {
         "local/loopback" => "local-host-excluded",
+        "reserved-name" => "reserved-name-excluded",
+        "test-only" => "test-only-excluded",
         other => {
             debug_assert!(
                 other == "dependency-averse",
@@ -738,10 +777,11 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
 /// (orchestration-blind-spot) is a coarse substring match on a file Keel
 /// cannot parse at all — strictly less verifiable than rank 3
 /// (subprocess-blind-spot), which comes from an AST sighting of a real call
-/// — so it sorts above it. Rank 4 covers BOTH `topology.excluded` kinds
-/// (dependency-averse-excluded and, since #64, local-host-excluded) — same
-/// confidence tier, "Keel saw why this was excluded and just wants it
-/// confirmed", ties broken by `code` then `subject`. Rank 5 also covers
+/// — so it sorts above it. Rank 4 covers EVERY `topology.excluded` kind
+/// (dependency-averse-excluded; since #64, local-host-excluded; since WS5,
+/// reserved-name-excluded and test-only-excluded) — same confidence tier,
+/// "Keel saw why this was excluded and just wants it confirmed", ties broken
+/// by `code` then `subject`. Rank 5 also covers
 /// `sdk-client-timeout` (since #80): a mechanically-verified fact from the
 /// declared policy itself (Keel is fully confident an LRO-sized timeout is
 /// set), same tier as `preexisting-resilience`'s "Keel is confident about
@@ -753,7 +793,10 @@ fn follow_up_rank(code: &str) -> u32 {
         "url-no-transport" => 1,
         "orchestration-blind-spot" => 2,
         "subprocess-blind-spot" => 3,
-        "dependency-averse-excluded" | "local-host-excluded" => 4,
+        "dependency-averse-excluded"
+        | "local-host-excluded"
+        | "reserved-name-excluded"
+        | "test-only-excluded" => 4,
         "preexisting-resilience" | "sdk-client-timeout" => 5,
         _ => 6, // code-hash-stale (WS6)
     }
@@ -800,16 +843,24 @@ fn build_follow_ups(
     // is covered when Keel is active, so it drops out of this "investigate
     // top-down" list entirely — it needs no chasing, only the lower-priority
     // `info` finding `topology_findings` still emits for it.
-    let uncovered: Vec<&ExternalProcess> = topology
+    // WS5: a launch seen only in test files is not a production blind spot
+    // either — it stays out of the detail list and is surfaced only as a count
+    // on the subject, so the reader knows the evidence was seen, not dropped.
+    let (in_tests, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = topology
         .external_processes
         .iter()
         .filter(|p| p.covered_by.is_none())
-        .collect();
+        .partition(|p| p.in_tests);
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
             .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
             .collect();
+        let suffix = if in_tests.is_empty() {
+            String::new()
+        } else {
+            format!(" (+{} in test files)", in_tests.len())
+        };
         ups.push(FollowUp {
             code: "subprocess-blind-spot",
             detail: format!(
@@ -818,7 +869,10 @@ fn build_follow_ups(
                 cmds.join(", ")
             ),
             rank: follow_up_rank("subprocess-blind-spot"),
-            subject: format!("{} externally-launched process(es)", uncovered.len()),
+            subject: format!(
+                "{} externally-launched process(es){suffix}",
+                uncovered.len()
+            ),
         });
     }
     for entry in &topology.excluded {
@@ -1113,7 +1167,18 @@ fn build_report(
 
     // Findings + suggested actions.
     let mut findings = Vec::new();
-    for target in &visible_unwrapped {
+    // WS5: a host the topology already excluded (loopback, a reserved name, a
+    // test-only sighting, a dependency-averse file) must not ALSO raise a
+    // `visible-unwrapped` warn — that was the same host counted twice, once as
+    // a warn and once as the info explaining why it is not a dependency. The
+    // raw `coverage.visible_unwrapped` list is deliberately unchanged: it is
+    // the unfiltered set-difference fact, not a finding.
+    let excluded_hosts: BTreeSet<&str> =
+        topology.excluded.iter().map(|e| e.host.as_str()).collect();
+    for target in visible_unwrapped
+        .iter()
+        .filter(|t| !excluded_hosts.contains(t.as_str()))
+    {
         findings.push(Finding {
             action:
                 "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime."
@@ -1296,6 +1361,35 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
     out
 }
 
+/// RFC 2606 reserved names (`example.com/net/org`, `.example`, `.test`,
+/// `.invalid`, `.localhost`) and RFC 5737 / RFC 3849 documentation address
+/// ranges: fixtures by definition, never a dependency (WS5).
+fn reserved_name(host: &str) -> bool {
+    const HOSTS: &[&str] = &["example.com", "example.net", "example.org"];
+    const TLDS: &[&str] = &["example", "test", "invalid", "localhost"];
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                matches!(
+                    (o[0], o[1], o[2]),
+                    (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+                )
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                s[0] == 0x2001 && s[1] == 0x0db8
+            }
+        };
+    }
+    let last_label = h.rsplit('.').next().unwrap_or("");
+    HOSTS
+        .iter()
+        .any(|r| h == *r || h.ends_with(&format!(".{r}")))
+        || TLDS.contains(&last_label)
+}
+
 /// Sort every host the static scan saw into exactly one of the three honesty
 /// buckets (dx-spec §2 — "wrap it" / "can't reach it" / "shouldn't reach
 /// it"), plus the host-independent external-process signal. Precedence: a
@@ -1303,14 +1397,18 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
 /// construction regardless of transport class (runtime evidence, or the LLM
 /// pack's own wrapping, beats static doubt); otherwise a statically-seen
 /// `localhost`/loopback/unspecified target (#64 — e.g. a test server, not a
-/// real dependency) is excluded ahead of any other check; otherwise a target
-/// seen ONLY inside a dependency-averse file is excluded (shouldn't reach it)
-/// ahead of any transport check; otherwise the transport class decides
+/// real dependency) is excluded ahead of any other check; otherwise an RFC
+/// 2606/5737 reserved or documentation name, then a target seen ONLY inside
+/// test files, are excluded (WS5 — fixtures, not dependencies); otherwise a
+/// target seen ONLY inside a dependency-averse file is excluded (shouldn't
+/// reach it) ahead of any transport check; otherwise the transport class decides
 /// wrappable (tracked) vs. unreachable (untracked-known/unknown). `pub(crate)`:
 /// `init.rs` reuses this directly for `keel init --diff` to skip proposing
 /// policy for excluded hosts and print why (passing an empty `cmd_match` —
 /// `--diff` never touches `external_processes`, so cross-referencing it
 /// there would be dead work).
+#[allow(clippy::too_many_lines)] // one straight-line exclusion check per bucket,
+// in documented precedence order; WS5 added two more, not new branching depth.
 pub(crate) fn classify_topology(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1340,6 +1438,31 @@ pub(crate) fn classify_topology(
                 reason: "local/loopback host — run under keel to gather runtime evidence, or \
                          add it to keel.toml explicitly"
                     .to_owned(),
+            });
+            continue;
+        }
+        if reserved_name(target) {
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                kind: "reserved-name",
+                reason: "RFC 2606/5737 reserved or documentation name — a fixture, not a \
+                         dependency; add it to keel.toml explicitly if it is real"
+                    .to_owned(),
+            });
+            continue;
+        }
+        let test_only =
+            !ev.sightings.is_empty() && ev.sightings.iter().all(|s| scan::is_test_path(&s.file));
+        if test_only {
+            let files: BTreeSet<&str> = ev.sightings.iter().map(|s| s.file.as_str()).collect();
+            excluded.push(TopologyEntry {
+                host: target.clone(),
+                kind: "test-only",
+                reason: format!(
+                    "seen only in test file(s) {} — run under keel to gather runtime evidence, \
+                     or add it to keel.toml explicitly",
+                    files.into_iter().collect::<Vec<_>>().join(", ")
+                ),
             });
             continue;
         }
@@ -1393,6 +1516,7 @@ pub(crate) fn classify_topology(
             command: s.command.clone(),
             covered_by: cmd_flow_covering(&cmd_rules, s),
             file: s.file.clone(),
+            in_tests: scan::is_test_path(&s.file),
             launcher: s.launcher.clone(),
             line: s.line,
         })
@@ -2280,11 +2404,11 @@ mod tests {
     #[test]
     fn no_signals_means_empty_follow_ups() {
         use crate::scan::TransportClass;
-        let scan = scan_with("api.example.com", TargetClass::Host, &["httpx"]);
+        let scan = scan_with("api.vendor.com", TargetClass::Host, &["httpx"]);
         // httpx is a tracked transport for this host.
         let mut scan = scan;
         scan.host_transports
-            .insert("api.example.com".into(), TransportClass::Tracked);
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
         let r = build_report(
             &scan,
             &BTreeSet::new(),
@@ -3348,7 +3472,7 @@ import httpx
 import tenacity
 # CANARY_COMMENT_9f31 must never appear in any report
 TOKEN = "CANARY_SECRET_9f31"
-U = "https://api.leak.example/v1?key=CANARY_QUERY_9f31"
+U = "https://api.leak.vendor.com/v1?key=CANARY_QUERY_9f31"
 
 def caller():
     attempt = 0
@@ -3371,7 +3495,7 @@ def caller():
             dir.path().join("risk_gate.py"),
             "\"\"\"risk gate. CANARY_DOCSTRING_9f31 stdlib only.\"\"\"\n\
              import json\n\
-             G = \"https://api.gateonly.example/v2?tok=CANARY_QUERY2_9f31\"\n",
+             G = \"https://api.gateonly.vendor.com/v2?tok=CANARY_QUERY2_9f31\"\n",
         )
         .unwrap();
         let doctor = run(dir.path());
@@ -3402,7 +3526,7 @@ def caller():
         }
         // Sanity: the report DID see the project (hosts present) — the canaries
         // are absent because of scoping, not because the scan saw nothing.
-        assert!(doctor_json.contains("api.leak.example"));
+        assert!(doctor_json.contains("api.leak.vendor.com"));
         // Sanity: the fixture's hand-rolled retry loop (Task 3.3's `--diff`
         // notes path) actually fired — proving the canary-absence assertions
         // above exercised the new note-rendering code, not an empty notes
@@ -3625,5 +3749,238 @@ def caller():
         assert!(!up.detail.is_empty());
         // follow_ups never affect ok.
         assert!(r.ok);
+    }
+
+    #[test]
+    fn reserved_names_are_excluded_not_warned() {
+        for host in [
+            "example.com",
+            "api.example.com",
+            "e.com.example",
+            "n.example",
+            "web.test",
+            "x.invalid",
+            "192.0.2.10",
+            "203.0.113.7",
+            "2001:db8::1",
+        ] {
+            let mut scan = scan_with(host, TargetClass::Host, &["httpx"]);
+            scan.host_transports
+                .insert(host.to_owned(), TransportClass::Tracked);
+            let r = build_report(
+                &scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+            );
+            let entry = r
+                .topology
+                .excluded
+                .iter()
+                .find(|e| e.host == host)
+                .unwrap_or_else(|| panic!("{host} must be excluded: {:?}", r.topology));
+            assert_eq!(entry.kind, "reserved-name");
+            assert!(
+                !r.findings.iter().any(|f| f.topic == "visible-unwrapped"),
+                "{host}: no duplicate warn"
+            );
+            assert!(
+                r.findings
+                    .iter()
+                    .any(|f| f.topic == "reserved-name-excluded" && f.level == "info")
+            );
+            let fu = r.follow_ups.iter().find(|f| f.subject == host).unwrap();
+            assert_eq!((fu.code, fu.rank), ("reserved-name-excluded", 4));
+        }
+        // Real hosts are untouched.
+        assert!(!reserved_name("api.stripe.com"));
+        assert!(!reserved_name("example.company.com"));
+        assert!(!reserved_name("testing.internal"));
+    }
+
+    #[test]
+    fn hosts_seen_only_in_test_files_are_excluded() {
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.targets.insert(
+            "api.vendor.com".into(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [
+                    Sighting {
+                        file: "tests/test_client.py".into(),
+                        line: 3,
+                    },
+                    Sighting {
+                        file: "tests/conftest.py".into(),
+                        line: 9,
+                    },
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+        scan.host_transports
+            .insert("api.vendor.com".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        let e = r
+            .topology
+            .excluded
+            .iter()
+            .find(|e| e.host == "api.vendor.com")
+            .expect("excluded");
+        assert_eq!(e.kind, "test-only");
+        assert!(e.reason.contains("tests/conftest.py"));
+        // One production sighting flips it back to wrappable.
+        scan.targets
+            .get_mut("api.vendor.com")
+            .unwrap()
+            .sightings
+            .insert(Sighting {
+                file: "app/client.py".into(),
+                line: 1,
+            });
+        let r2 = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
+    }
+
+    #[test]
+    fn runtime_evidence_beats_test_only_and_reserved_exclusion() {
+        let mut scan = scan_with("example.com", TargetClass::Host, &["httpx"]);
+        scan.host_transports
+            .insert("example.com".into(), TransportClass::Tracked);
+        let wrapped: BTreeSet<String> = ["example.com".to_owned()].into_iter().collect();
+        let r = build_report(
+            &scan,
+            &wrapped,
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(r.topology.wrappable.contains(&"example.com".to_owned()));
+        assert!(r.topology.excluded.is_empty());
+    }
+
+    #[test]
+    fn loopback_no_longer_gets_a_duplicate_visible_unwrapped_warn() {
+        let mut scan = scan_with("127.0.0.1", TargetClass::Host, &["httpx"]);
+        scan.host_transports
+            .insert("127.0.0.1".into(), TransportClass::Tracked);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        assert!(!r.findings.iter().any(|f| f.topic == "visible-unwrapped"));
+        assert_eq!(
+            r.coverage.visible_unwrapped,
+            vec!["127.0.0.1".to_owned()],
+            "the raw coverage list is unchanged"
+        );
+    }
+
+    #[test]
+    fn subprocess_sightings_in_test_files_are_counted_separately() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 2,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses = vec![
+            SubprocessSighting {
+                file: "services/render.py".into(),
+                line: 493,
+                launcher: "subprocess.run".into(),
+                command: "ffmpeg -i in.mp4".into(),
+                argv: None,
+            },
+            SubprocessSighting {
+                file: "tests/test_stitch.py".into(),
+                line: 12,
+                launcher: "subprocess.run".into(),
+                command: "ffmpeg -version".into(),
+                argv: None,
+            },
+        ];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+        );
+        let procs = &r.topology.external_processes;
+        assert_eq!(procs.iter().filter(|p| p.in_tests).count(), 1);
+        let fu = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "subprocess-blind-spot")
+            .unwrap();
+        assert_eq!(
+            fu.subject,
+            "1 externally-launched process(es) (+1 in test files)"
+        );
+        assert!(fu.detail.contains("services/render.py:493"));
+        assert!(!fu.detail.contains("tests/test_stitch.py"));
+        let warn = r
+            .findings
+            .iter()
+            .find(|f| f.topic == "subprocess-blind-spot" && f.level == "warn")
+            .unwrap();
+        assert!(!warn.detail.contains("tests/test_stitch.py"));
+    }
+
+    #[test]
+    fn follow_up_closed_set_ranks_the_two_new_codes_at_four() {
+        assert_eq!(follow_up_rank("reserved-name-excluded"), 4);
+        assert_eq!(follow_up_rank("test-only-excluded"), 4);
+        assert_eq!(
+            excluded_kind_topic("reserved-name"),
+            "reserved-name-excluded"
+        );
+        assert_eq!(excluded_kind_topic("test-only"), "test-only-excluded");
     }
 }

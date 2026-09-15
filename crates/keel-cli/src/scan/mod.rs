@@ -649,11 +649,69 @@ pub(crate) fn plausible_host(host: &str) -> bool {
         })
 }
 
+/// Whether a project-relative path is test code: a `tests/`, `test/`,
+/// `__tests__/`, or `spec/` directory component, or a conventional test file
+/// name in either ecosystem. Used to keep fixture URLs and test-only
+/// subprocess launches out of the production findings (WS5).
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // `lower` is already
+// ASCII-lowercased above, so the suffix comparisons below ARE case-insensitive.
+pub(crate) fn is_test_path(rel: &str) -> bool {
+    let mut parts = rel.split('/').peekable();
+    let mut file = "";
+    while let Some(p) = parts.next() {
+        if parts.peek().is_none() {
+            file = p;
+            break;
+        }
+        if matches!(p, "tests" | "test" | "__tests__" | "spec") {
+            return true;
+        }
+    }
+    let lower = file.to_ascii_lowercase();
+    (lower.starts_with("test_") && lower.ends_with(".py"))
+        || lower.ends_with("_test.py")
+        || lower == "conftest.py"
+        || lower.ends_with("_spec.rb")
+        || [".test.", ".spec."].iter().any(|m| {
+            lower.contains(m)
+                && [".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".mts", ".cts"]
+                    .iter()
+                    .any(|ext| lower.ends_with(ext))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_paths_are_recognized_across_both_ecosystems() {
+        for p in [
+            "tests/test_render.py",
+            "services/media/tests/conftest.py",
+            "pkg/test_x.py",
+            "pkg/x_test.py",
+            "test/unit/a.py",
+            "web/__tests__/page.test.tsx",
+            "web/src/page.test.ts",
+            "web/src/page.spec.js",
+            "spec/models/user_spec.rb",
+        ] {
+            assert!(is_test_path(p), "{p}");
+        }
+        for p in [
+            "services/media/src/render.py",
+            "agents/app/agent.py",
+            "web/src/page.tsx",
+            "testing_utils.py",
+            "contest/app.py",
+            "latest/app.py",
+        ] {
+            assert!(!is_test_path(p), "{p}");
+        }
+    }
 
     #[test]
     fn host_extraction_strips_port_userinfo_and_path() {
