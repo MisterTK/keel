@@ -10,6 +10,7 @@ site's `.pth` processing itself.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -313,6 +314,97 @@ class StrictKeelCwdTest(unittest.TestCase):
         proc = _run(code, env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
         self.assertIn(b"OK", proc.stdout)
         self.assertEqual(len(self._keel_lines(proc)), 1, proc.stderr)
+
+    def test_the_latch_does_not_answer_a_later_call_about_a_different_root(self) -> None:
+        """The refusal latch is a PRINT-once latch, not a process-wide verdict.
+
+        The `.pth` shim refuses an ambient, stale KEEL_CWD; a later
+        `install_keel(cwd=<a real project root>)` — the public API, and the
+        path `_run.run_target` takes — was never asked about that root and must
+        activate normally instead of inheriting the refusal (which `_run.py`
+        would turn into SystemExit(2) on a perfectly valid root).
+        Node twin: node/keel/test/bootstrap-refusal-latch.test.mjs.
+        """
+        good = self.root / "good"
+        good.mkdir()
+        (good / "keel.toml").write_text("")
+        code = (
+            "import keel._auto; from keel.bootstrap import install_keel; import os; "
+            "r = install_keel(cwd=os.environ['GOOD_ROOT'], env={}, cwd_source='cwd'); "
+            "print('ENABLED', r['enabled'])"
+        )
+        proc = _run(
+            code,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), GOOD_ROOT=str(good)),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"ENABLED True", proc.stdout, proc.stderr)
+        # The shim's refusal still printed exactly once, and the good root's
+        # own activation line joins it — never a second refusal.
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 2, proc.stderr)
+        self.assertIn("Keel NOT activated", lines[0])
+        self.assertIn(f"with policy {good / 'keel.toml'}", lines[1])
+
+    def test_path_normalization_corpus_matches_the_node_twin(self) -> None:
+        """The shared corpus behind Node's `normalizeCwd` (bootstrap.mjs):
+        Node reimplements exactly these rows, so if pathlib's behavior ever
+        shifts under us this side fails first. Twin:
+        node/keel/test/bootstrap-refusal-latch.test.mjs
+        `normalizeCwd reproduces pathlib's normalization byte for byte`.
+        Note `/a/../b`: pathlib does NOT resolve `..`, so Node must not
+        either (which is why `path.normalize` is the wrong tool there)."""
+        corpus = [
+            ("/app/", "/app"),
+            ("/app", "/app"),
+            ("/app//x/./y", "/app/x/y"),
+            ("//app", "//app"),
+            ("///app", "/app"),
+            (".", "."),
+            ("./foo", "foo"),
+            ("/", "/"),
+            ("a/b/", "a/b"),
+            ("/a/../b", "/a/../b"),
+            ("", "."),
+            ("/a/./b/", "/a/b"),
+        ]
+        if os.name == "nt":  # POSIX rows only — the Node twin skips on win32 too
+            self.skipTest("POSIX path corpus")
+        for raw, expected in corpus:
+            with self.subTest(raw=raw):
+                self.assertEqual(str(Path(raw)), expected)
+
+    def test_a_trailing_slash_on_keel_cwd_is_normalized_like_pathlib(self) -> None:
+        """`ENV KEEL_CWD=/app/` in a Dockerfile is an ordinary input; Python
+        echoes it through `str(Path(cwd))`, which strips the trailing
+        separator. Node normalizes the same way (bootstrap.mjs `normalizeCwd`)
+        so both front ends print the same bytes. Twin:
+        node/keel/test/banner-parent-policy.test.mjs."""
+        import json as _json
+
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=f"{self.root}/", KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1, proc.stderr)
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root), "no trailing slash survives")
+
+        text = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=f"{self.root}/"),
+            cwd=str(self.root),
+        )
+        lines = self._keel_lines(text)
+        self.assertEqual(len(lines), 1, text.stderr)
+        self.assertEqual(
+            lines[0],
+            f"keel ▸ error: KEEL_CWD={self.root} is set but {self.root / 'keel.toml'} does not exist — "
+            "Keel NOT activated; the app continues without keel "
+            "(set KEEL_POLICY=optional to run on production defaults instead)",
+        )
 
     def test_keel_policy_optional_restores_defaults_with_a_warning(self) -> None:
         proc = _run(

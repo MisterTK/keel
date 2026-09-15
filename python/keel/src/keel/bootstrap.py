@@ -90,6 +90,10 @@ class _State:
     mcp_uninstall: Any = None
     state: dict[str, Any] | None = None
     refused: dict[str, Any] | None = None
+    # The `(cwd, cwd_source)` the refusal above was printed FOR. The latch is a
+    # print-once latch, not a process-wide verdict: a later call naming a
+    # DIFFERENT root was never asked about (see `install_keel`).
+    refused_key: tuple[str, str] | None = None
     # Captured for the atexit flush, which runs long after `install_keel`
     # returned and has no other way to reach the environment (KEEL_LOG_FORMAT)
     # or the policy provenance the JSON summary reports.
@@ -116,7 +120,13 @@ def install_keel(
     env = env if env is not None else os.environ
     if is_disabled(env):
         return {"enabled": False, "reason": "KEEL_DISABLE"}
-    if _STATE.refused is not None:
+    cwd = Path(cwd or Path.cwd())
+    # The refusal is printed once per process, but the latch is keyed on WHAT
+    # was refused: a later `install_keel(cwd=…)` naming a DIFFERENT root (the
+    # public API, and what `_run.run_target` uses after the `.pth` shim already
+    # ran) was never asked about, and must be answered on its own merits rather
+    # than inheriting a stale refusal. Node twin: `bootstrap.mjs`.
+    if _STATE.refused is not None and _STATE.refused_key == (str(cwd), cwd_source):
         return dict(_STATE.refused)  # already said so once this process
     if _STATE.installed:
         # Return the SAME full state the first install produced (backend,
@@ -130,7 +140,6 @@ def install_keel(
         # reaching this branch guarantees `_STATE.state` is populated.
         return {**_STATE.state, "reason": "already-installed"}
 
-    cwd = Path(cwd or Path.cwd())
     raw, source = load_policy(cwd)  # raises KEEL-E001 on unreadable/invalid TOML
     if source == "defaults" and cwd_source == "KEEL_CWD" and not policy_optional(env):
         text = missing_policy_error(cwd)
@@ -146,6 +155,7 @@ def install_keel(
             },
         )
         _STATE.refused = {"enabled": False, "reason": "policy-missing-at-keel-cwd", "root": str(cwd)}
+        _STATE.refused_key = (str(cwd), cwd_source)
         return dict(_STATE.refused)
     # Policy provenance, captured once: the two fields ("did my policy ship?",
     # "how many calls were served from cache?") that would have named the
@@ -273,6 +283,7 @@ def uninstall_keel() -> None:
     _STATE.installed = False
     _STATE.state = None
     _STATE.refused = None
+    _STATE.refused_key = None
     _STATE.env = None
     _STATE.meta = None
 

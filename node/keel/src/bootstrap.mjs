@@ -58,7 +58,14 @@ const FRAMEWORK_PACKS = [
 ];
 
 let installed = false;
-let refused = null; // the refusal result, once printed — never print it twice
+// The refusal, once printed — never print the same one twice. Carries the
+// `(root, cwdSource)` it was printed FOR; `refusalResult()` is the public shape
+// (that pair's `cwdSource` is latch bookkeeping, not part of the result).
+let refused = null;
+
+function refusalResult() {
+  return { enabled: refused.enabled, reason: refused.reason, root: refused.root };
+}
 
 /**
  * This package's own version, for the JSON log lines' `version` field.
@@ -92,9 +99,44 @@ export function missingPolicyError(root) {
   );
 }
 
+/**
+ * `String(cwd)` normalized the way Python's `str(Path(cwd))` normalizes it —
+ * every user-visible line that names the root (the refusal error, the banner's
+ * three notes, the JSON `root` field) must be byte-identical across the two
+ * front ends, and `ENV KEEL_CWD=/app/` in a Dockerfile is an entirely ordinary
+ * input. pathlib collapses duplicate separators and `.` segments and strips a
+ * trailing separator, but does NOT resolve `..` (so this is not
+ * `path.normalize`, which does), does NOT resolve symlinks, and does NOT
+ * absolutize a relative path.
+ *
+ * POSIX rules only: the Windows twin (drive letters, UNC roots, `/`→`\`) has
+ * its own pathlib semantics and no Node/Python Windows parity test to hold it
+ * honest, so a win32 path is passed through untouched rather than normalized
+ * by guesswork.
+ */
+export function normalizeCwd(cwd) {
+  const raw = String(cwd);
+  if (process.platform === "win32") return raw;
+  const lead = /^\/*/.exec(raw)[0].length;
+  // POSIX (and pathlib) keep EXACTLY two leading slashes as an implementation-
+  // defined root; one, or three or more, all mean "/".
+  const root = lead === 0 ? "" : lead === 2 ? "//" : "/";
+  const body = raw.split("/").filter((p) => p !== "" && p !== ".").join("/");
+  if (root) return root + body;
+  return body === "" ? "." : body;
+}
+
 export async function installKeel({ cwd = process.cwd(), env = process.env, cwdSource = "cwd" } = {}) {
   if (isDisabled(env)) return { enabled: false, reason: "KEEL_DISABLE" };
-  if (refused) return { ...refused };
+  cwd = normalizeCwd(cwd);
+  // The refusal is printed once per process, but the latch is keyed on WHAT was
+  // refused: a later `installKeel({ cwd })` naming a DIFFERENT root (the public
+  // API, and what the `keel run` dispatcher uses after the `.pth`/register shim
+  // already ran) was never asked about, and must be answered on its own merits
+  // rather than inheriting a stale refusal. Python twin: `bootstrap.py`.
+  if (refused && refused.root === cwd && refused.cwdSource === cwdSource) {
+    return refusalResult();
+  }
   if (installed) return { enabled: true, reason: "already-installed" };
 
   const { policy: raw, source } = loadPolicy(cwd); // throws KEEL-E001 on bad syntax
@@ -107,8 +149,8 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
       message: text.slice("keel ▸ error: ".length).replace(/\n$/, ""),
       version: VERSION,
     });
-    refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd };
-    return { ...refused };
+    refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd, cwdSource };
+    return refusalResult();
   }
   installed = true;
   // Policy provenance, captured once: the two fields ("did my policy ship?",

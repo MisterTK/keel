@@ -170,6 +170,49 @@ test("KEEL_CWD without a keel.toml refuses to activate with one error line", () 
   }
 });
 
+// `ENV KEEL_CWD=/app/` in a Dockerfile is an entirely ordinary input, and
+// Python echoes it through `str(Path(cwd))` (which strips the trailing
+// separator). Node normalizes the same way at the top of installKeel, so the
+// two front ends print the same bytes for the same input — twin:
+// python/keel/tests/test_bootstrap_keel_cwd.py
+// `test_a_trailing_slash_is_normalized_away_like_python_pathlib`.
+test("a trailing slash on KEEL_CWD prints the same bytes as a canonical root", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-strict-cwd-slash-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: `${realRoot}/` });
+    assert.equal(proc.status, 7, proc.stderr);
+    const lines = proc.stderr.split("\n").filter((l) => l.startsWith("keel ▸"));
+    assert.equal(lines.length, 1, `expected exactly one keel line in: ${proc.stderr}`);
+    assert.equal(
+      lines[0],
+      `keel ▸ error: KEEL_CWD=${realRoot} is set but ${join(realRoot, "keel.toml")} does not exist — ` +
+        "Keel NOT activated; the app continues without keel " +
+        "(set KEEL_POLICY=optional to run on production defaults instead)"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The same normalization has to reach the JSON `root` field, not just the
+// prose line — that field is what a log query in a container actually reads.
+test("a trailing slash on KEEL_CWD is normalized in the JSON root field too", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-strict-cwd-slash-json-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: `${realRoot}/`, KEEL_LOG_FORMAT: "json" });
+    assert.equal(proc.status, 7, proc.stderr);
+    const objs = keelJsonLines(proc.stderr);
+    assert.equal(objs.length, 1, proc.stderr);
+    assert.equal(objs[0].keel, "error");
+    assert.equal(objs[0].code, "policy-missing-at-keel-cwd");
+    assert.equal(objs[0].keel_cwd, realRoot);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("KEEL_POLICY=optional runs on defaults under a stale KEEL_CWD, with a warning", () => {
   const root = mkdtempSync(join(tmpdir(), "keel-optional-cwd-"));
   try {
