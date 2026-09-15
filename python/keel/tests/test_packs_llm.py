@@ -434,6 +434,43 @@ class DevCacheArgsHashJudgeTest(unittest.TestCase):
             b'{"contents": []}',
         ))
 
+    def test_lro_shaped_paths_are_recognized(self) -> None:
+        for path in (
+            "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning",
+            "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation",
+            "/v1beta1/projects/p/locations/global/operations/op:fetchOperation",
+            "/v1/models/m:fetchFooOperation",
+        ):
+            self.assertTrue(_http.lro_shaped_path(path), path)
+        for path in (
+            "/v1beta/models/gemini-2.0-flash:generateContent",
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            "/v1/chat/completions",
+            "/v1/operations/op1",  # GET-shaped; irrelevant here but must not match
+            "/v1/models/m:fetch",
+            "/v1/models/m:Operation",
+        ):
+            self.assertFalse(_http.lro_shaped_path(path), path)
+
+    def test_llm_post_lro_submit_and_poll_derive_no_hash(self) -> None:
+        # #83: Vertex polls with a POST whose body is identical every 10s; the
+        # submit leg returns an operation handle that must never be replayed.
+        base = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1"
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:fetchPredictOperation",
+            b'{"operationName": "projects/p/operations/op1"}',
+        ))
+        self.assertIsNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:predictLongRunning",
+            b'{"instances": [{"prompt": "a cat"}]}',
+        ))
+        # A non-llm host with the same path shape is untouched (still no hash: non-llm POST).
+        self.assertIsNone(_http.derive_args_hash("example.com", "POST", f"https://example.com/x:fetchOperation", b"{}"))
+        # generateContent still hashes (dev-cache replay of a prompt is the feature).
+        self.assertIsNotNone(_http.derive_args_hash(
+            "llm:google-genai", "POST", f"{base}:generateContent", b'{"contents": []}',
+        ))
+
 
 class StreamingResponseTest(unittest.TestCase):
     """The response-side twin of the args_hash streaming exception above: a

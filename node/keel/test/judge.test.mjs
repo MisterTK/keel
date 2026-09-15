@@ -13,6 +13,7 @@ import {
   defaultMintIdempotencyKey,
   replayHeaders,
   deriveArgsHash,
+  lroShapedPath,
   streamingResponse,
 } from "../src/judge.mjs";
 
@@ -185,6 +186,33 @@ test("deriveArgsHash: an unparseable URL falls through to the normal hash path, 
     deriveArgsHash("llm:openai", "POST", "/v1/chat/completions", JSON.stringify({ model: "x" })),
     /^[0-9a-f]{64}$/,
   );
+});
+
+// --- lroShapedPath / deriveArgsHash: LRO submit/poll POST shapes derive no
+// cache key (#83) ------------------------------------------------------------
+
+test("lroShapedPath: Google LRO submit/poll verbs, and nothing else", () => {
+  for (const p of [
+    "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning",
+    "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation",
+    "/v1beta1/projects/p/locations/global/operations/op:fetchOperation",
+    "/v1/models/m:fetchFooOperation",
+  ]) assert.equal(lroShapedPath(p), true, p);
+  for (const p of [
+    "/v1beta/models/gemini-2.0-flash:generateContent",
+    "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+    "/v1/chat/completions",
+    "/v1/operations/op1",
+    "/v1/models/m:fetch",
+    "/v1/models/m:Operation",
+  ]) assert.equal(lroShapedPath(p), false, p);
+});
+
+test("deriveArgsHash: llm POST LRO submit and poll shapes derive no hash (#83)", () => {
+  const base = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1";
+  assert.equal(deriveArgsHash("llm:google-genai", "POST", `${base}:fetchPredictOperation`, JSON.stringify({ operationName: "projects/p/operations/op1" })), null);
+  assert.equal(deriveArgsHash("llm:google-genai", "POST", `${base}:predictLongRunning`, JSON.stringify({ instances: [{ prompt: "a cat" }] })), null);
+  assert.notEqual(deriveArgsHash("llm:google-genai", "POST", `${base}:generateContent`, JSON.stringify({ contents: [] })), null);
 });
 
 // --- streamingResponse: the response-side twin of the args_hash streaming

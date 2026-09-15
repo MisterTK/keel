@@ -169,6 +169,21 @@ function canonicalBody(body) {
 }
 
 /**
+ * True when the URL path's last segment names a Google custom method that
+ * SUBMITS or POLLS a long-running operation — `…:predictLongRunning`,
+ * `…:fetchPredictOperation`, `…:fetchOperation`, any `:fetch*Operation`.
+ * Verb SHAPE, not an enumerated list (issue #83). Twin of Python's
+ * `_http.lro_shaped_path`; keep identical.
+ */
+export function lroShapedPath(pathname) {
+  const last = String(pathname ?? "").split("/").pop() ?? "";
+  const colon = last.lastIndexOf(":");
+  if (colon < 0) return false;
+  const verb = last.slice(colon + 1);
+  return verb.endsWith("LongRunning") || (verb.startsWith("fetch") && verb.endsWith("Operation"));
+}
+
+/**
  * Cache-key material for one intercepted call, or null to disable caching for
  * it. The Node twin of the Python `derive_args_hash` — the two front ends MUST
  * agree on which calls are cacheable:
@@ -182,7 +197,9 @@ function canonicalBody(body) {
  *     idempotency; a RETRY does). A streaming/unbuffered body yields null, and
  *     so does a STREAMING generate call (SSE — issue #84): its response is
  *     never buffered (see `streamingResponse`), so a cache hit would rebuild
- *     an empty body.
+ *     an empty body, and so does an LRO submit/poll shape
+ *     (`:predictLongRunning`, `:fetch*Operation` — issue #83): a replayed
+ *     poll is a stale status, a replayed submit is a stale operation handle.
  *   - everything else  → null.
  */
 export function deriveArgsHash(target, method, url, body) {
@@ -214,7 +231,7 @@ export function deriveArgsHash(target, method, url, body) {
     } catch {
       pathname = null;
     }
-    if (pathname !== null && pathname.endsWith(":streamGenerateContent")) return null;
+    if (pathname !== null && (pathname.endsWith(":streamGenerateContent") || lroShapedPath(pathname))) return null;
     let parsed;
     try {
       parsed = JSON.parse(canon);
