@@ -72,7 +72,7 @@ test("defaults banner stays unchanged when no keel.toml exists above cwd", () =>
     // own node_modules) may add to the "wrapped …" list — pin only the
     // decision this test is actually about: the tail stays the ordinary
     // `keel init` nudge, byte-unchanged, with no parent-policy text.
-    assert.match(proc.stderr, /^keel ▸ wrapped .* with production defaults — `keel init` to customize\n/m);
+    assert.match(proc.stderr, /^keel ▸ wrapped .* with production defaults — no keel\.toml in .*; `keel init` to customize\n/m);
     assert.ok(!proc.stderr.includes("found keel.toml"), `unexpected parent-policy text: ${proc.stderr}`);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -98,7 +98,7 @@ test("KEEL_CWD relocates the config root the preload loads keel.toml from", () =
     assert.equal(proc.status, 7, proc.stderr);
     const lines = proc.stderr.split("\n").filter((l) => l.startsWith("keel ▸"));
     assert.equal(lines.length, 1, `expected exactly one banner line in: ${proc.stderr}`);
-    assert.match(lines[0], /with policy keel\.toml/);
+    assert.match(lines[0], new RegExp(`with policy ${esc(join(realRoot, "keel.toml"))}`));
     assert.match(lines[0], /1 function target/);
     assert.ok(
       !lines[0].includes("found keel.toml"),
@@ -117,9 +117,10 @@ test("an empty KEEL_CWD falls back to the real cwd", () => {
   const root = mkdtempSync(join(tmpdir(), "keel-hook-keelcwd-empty-"));
   try {
     writeFileSync(join(root, "keel.toml"), "");
+    const realRoot = realpathSync(root);
     const proc = run(root, { KEEL_CWD: "" });
     assert.equal(proc.status, 7, proc.stderr);
-    assert.match(proc.stderr, /with policy keel\.toml/);
+    assert.match(proc.stderr, new RegExp(`with policy ${esc(join(realRoot, "keel.toml"))}`));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -135,6 +136,73 @@ test("KEEL_QUIET suppresses the banner even with a parent keel.toml", () => {
     const proc = run(sub, { KEEL_QUIET: "1" });
     assert.equal(proc.status, 7, proc.stderr);
     assert.ok(!proc.stderr.includes("keel ▸"), `expected no banner: ${proc.stderr}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("KEEL_CWD without a keel.toml refuses to activate with one error line", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-strict-cwd-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: realRoot });
+    assert.equal(proc.status, 7, proc.stderr); // the app still runs, keel-free
+    const lines = proc.stderr.split("\n").filter((l) => l.startsWith("keel ▸"));
+    assert.equal(lines.length, 1, `expected exactly one keel line in: ${proc.stderr}`);
+    assert.equal(
+      lines[0],
+      `keel ▸ error: KEEL_CWD=${realRoot} is set but ${join(realRoot, "keel.toml")} does not exist — ` +
+        "Keel NOT activated; the app continues without keel " +
+        "(set KEEL_POLICY=optional to run on production defaults instead)"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("KEEL_POLICY=optional runs on defaults under a stale KEEL_CWD, with a warning", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-optional-cwd-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: realRoot, KEEL_POLICY: "optional" });
+    assert.equal(proc.status, 7, proc.stderr);
+    const lines = proc.stderr.split("\n").filter((l) => l.startsWith("keel ▸"));
+    assert.equal(lines.length, 1, proc.stderr);
+    assert.match(
+      lines[0],
+      new RegExp(
+        `^keel ▸ wrapped .* with production defaults — KEEL_CWD=${esc(realRoot)} is set but ` +
+          `${esc(join(realRoot, "keel.toml"))} does not exist \\(KEEL_POLICY=optional\\)$`
+      )
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the defaults banner names the directory it searched", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-banner-root-"));
+  try {
+    const realRoot = realpathSync(root);
+    const proc = run(root);
+    assert.equal(proc.status, 7, proc.stderr);
+    assert.match(
+      proc.stderr,
+      new RegExp(`^keel ▸ wrapped .* with production defaults — no keel\\.toml in ${esc(realRoot)}; \`keel init\` to customize\n`, "m")
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the policy banner names the file", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-banner-policy-path-"));
+  try {
+    writeFileSync(join(root, "keel.toml"), "");
+    const realRoot = realpathSync(root);
+    const proc = run(root);
+    assert.equal(proc.status, 7, proc.stderr);
+    assert.match(proc.stderr, new RegExp(`with policy ${esc(join(realRoot, "keel.toml"))}`));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

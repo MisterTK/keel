@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +45,8 @@ test("loader wraps a ts: function target and drives it through retry", () => {
     assert.match(run.stdout, /RESULT:ok-after-2/);
     // banner reflects the wrapped function target, on stderr only.
     assert.match(run.stderr, /1 function target/);
-    assert.match(run.stderr, /policy keel\.toml/);
+    const realDir = realpathSync(dir);
+    assert.match(run.stderr, new RegExp(`policy ${join(realDir, "keel.toml").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
     const dbPath = join(dir, ".keel", "discovery.db");
     assert.ok(existsSync(dbPath), "discovery.db should be written on exit");

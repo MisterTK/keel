@@ -57,13 +57,32 @@ const FRAMEWORK_PACKS = [
 ];
 
 let installed = false;
+let refused = null; // the refusal result, once printed — never print it twice
 
-export async function installKeel({ cwd = process.cwd(), env = process.env } = {}) {
+export function policyOptional(env = process.env) {
+  return String(env?.KEEL_POLICY ?? "").trim().toLowerCase() === "optional";
+}
+
+export function missingPolicyError(root) {
+  return (
+    `keel ▸ error: KEEL_CWD=${root} is set but ${join(root, "keel.toml")} does not exist — ` +
+    "Keel NOT activated; the app continues without keel " +
+    "(set KEEL_POLICY=optional to run on production defaults instead)\n"
+  );
+}
+
+export async function installKeel({ cwd = process.cwd(), env = process.env, cwdSource = "cwd" } = {}) {
   if (isDisabled(env)) return { enabled: false, reason: "KEEL_DISABLE" };
+  if (refused) return { ...refused };
   if (installed) return { enabled: true, reason: "already-installed" };
-  installed = true;
 
   const { policy: raw, source } = loadPolicy(cwd); // throws KEEL-E001 on bad syntax
+  if (source === "defaults" && cwdSource === "KEEL_CWD" && !policyOptional(env)) {
+    process.stderr.write(missingPolicyError(cwd));
+    refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd };
+    return { ...refused };
+  }
+  installed = true;
   // Backend first: whether it's persistent (native + attached journal) decides
   // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
   const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
@@ -164,7 +183,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env } = {
   }
 
   installExitFlush(discovery, { backend: effectiveBackend, summary });
-  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd);
+  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource);
   return {
     enabled: true,
     backend: effectiveBackend,
@@ -291,18 +310,22 @@ function policyAboveCwd(cwd, maxLevels = 8) {
   return null;
 }
 
-function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
+function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd") {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
   for (const p of packs) if (p.active) seams.push(p.label);
   if (eve?.matched) seams.push("eve tool modules");
   if (aiSdk?.matched) seams.push(`ai-sdk ${aiSdk.version ?? ""}`.trim());
-  const policyDesc = source === "defaults" ? "production defaults" : `policy ${source}`;
-  let desc = policyDesc;
+  let desc = source === "defaults" ? "production defaults" : `policy ${join(cwd, "keel.toml")}`;
   if (!String(env.KEEL_ENV ?? "").trim()) {
     const marker = serverlessMarker(env);
     if (marker !== null) desc = `${desc} (dev cache off: ${marker} detected)`;
+  }
+  const head = `keel ▸ wrapped ${seams.join(" + ")} with ${desc}`;
+  if (source !== "defaults") {
+    process.stderr.write(`${head}\n`);
+    return;
   }
   // #85: on the defaults path only (a real policy loaded means this cwd is
   // already the right one — zero cost there), check whether a keel.toml
@@ -310,16 +333,18 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd) {
   // usual "keel init to customize" nudge reads as if nothing is wrong, when
   // actually the adopter's policy silently never loaded — name both paths
   // and the fix instead.
-  const found = source === "defaults" && cwd ? policyAboveCwd(cwd) : null;
+  const found = policyAboveCwd(cwd);
   if (found) {
     process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${desc} — found keel.toml at ${found} ` +
-        `but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
+      `${head} — found keel.toml at ${found} but running from ${cwd}; set KEEL_CWD=${found} to load it\n`
+    );
+  } else if (cwdSource === "KEEL_CWD") {
+    // Only reachable under KEEL_POLICY=optional (installKeel refuses otherwise).
+    process.stderr.write(
+      `${head} — KEEL_CWD=${cwd} is set but ${join(cwd, "keel.toml")} does not exist (KEEL_POLICY=optional)\n`
     );
   } else {
-    process.stderr.write(
-      `keel ▸ wrapped ${seams.join(" + ")} with ${desc} — \`keel init\` to customize\n`
-    );
+    process.stderr.write(`${head} — no keel.toml in ${cwd}; \`keel init\` to customize\n`);
   }
 }
 
