@@ -333,7 +333,8 @@ def lro_shaped_path(path: str) -> bool:
     ``…:fetchPredictOperation`` / ``…:fetchOperation`` / any ``:fetch*Operation``
     (poll — an identical POST body every interval, issue #83). Matched by
     verb SHAPE, not an enumerated list, so a new Vertex surface with the same
-    grammar is covered without a release."""
+    grammar is covered without a release. Twin of Node's
+    ``judge.mjs::lroShapedPath``; keep identical."""
     last = path.rsplit("/", 1)[-1]
     if ":" not in last:
         return False

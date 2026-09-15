@@ -74,7 +74,9 @@ def provider_targets(provider: str, host: str) -> list[TargetDecl]:
                 "retried unless it carries an idempotency key (Level 0 hard rule)"
             ),
             args_hash_rule=(
-                "None for GET (state queries — issue #76); sha256 over "
+                "None for GET (state queries — issue #76) and for LRO "
+                "submit/poll POST shapes (:predictLongRunning, "
+                ":fetch*Operation — issue #83); sha256 over "
                 "(method, url, canonicalized JSON body) for LLM POSTs "
                 "(dev-cache replay key); None for streaming bodies"
             ),
