@@ -60,8 +60,25 @@ const FRAMEWORK_PACKS = [
 let installed = false;
 let refused = null; // the refusal result, once printed — never print it twice
 
-/** This package's own version, for the JSON log lines' `version` field. */
-const VERSION = createRequire(import.meta.url)("../package.json").version;
+/**
+ * This package's own version, for the JSON log lines' `version` field.
+ *
+ * Fail-open, deliberately: this is a module-load-time file read for a field
+ * only `KEEL_LOG_FORMAT=json` ever uses, and Keel's activation contract is
+ * fail-open. An unreadable/absent `package.json` (an exotic bundler, a
+ * pruned install) must degrade this ONE field to "unknown", not throw out of
+ * `import "./bootstrap.mjs"` and leave the app with no Keel at all — least
+ * of all in the default text mode, which never reads it.
+ */
+function readVersion() {
+  try {
+    return createRequire(import.meta.url)("../package.json").version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const VERSION = readVersion();
 
 export function policyOptional(env = process.env) {
   return String(env?.KEEL_POLICY ?? "").trim().toLowerCase() === "optional";

@@ -1,7 +1,11 @@
-"""`KEEL_LOG_FORMAT=json`: every line Keel writes to stderr becomes one JSON
-object (sorted keys, no spaces) so container log pipelines index its fields
-(field report 2026-09-15, F10). Text is the default; there is no auto-detect
-(byte-identity tests and `keel run` piping depend on the text form).
+"""`KEEL_LOG_FORMAT=json`: Keel's three deployment-evidence lines — the
+activation banner, the exit summary, and the activation refusal — each become
+one JSON object (sorted keys, no spaces) so container log pipelines index
+their fields (field report 2026-09-15, F10). Nothing else converts: other
+`keel ▸ …` prose Keel can write at runtime (a pack's unwrapped-tool warning,
+a `KEEL_SIM_PLAN` read failure, …) stays prose. Text is the default; there is
+no auto-detect (byte-identity tests and `keel run` piping depend on the text
+form).
 
 The Node front end's `src/log.mjs` is the byte-for-byte twin: same recognized
 value, same separators, same key ordering. Keep every emitted value a string,

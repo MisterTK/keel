@@ -344,6 +344,25 @@ class StrictKeelCwdTest(unittest.TestCase):
 
     def test_json_log_format_emits_one_object_per_line(self) -> None:
         import json as _json
+        # R10: `note` carries the activation line's em-dash tail whenever the
+        # text form has one, and the key is ABSENT when it does not. Pin both
+        # sides — the defaults run first, before a keel.toml exists anywhere
+        # at or above it, so the tail is the plain `keel init` nudge.
+        # The child's own getcwd() drops symlink hops (macOS /var → /private/var)
+        # before the banner ever renders the path, so compare against the
+        # REALPATH, not the tempdir path TemporaryDirectory handed back.
+        sub = (self.root / "sub").resolve()
+        sub.mkdir()
+        defaults = _run(
+            "import keel._auto",
+            env=child_env(KEEL_ENABLE="1", KEEL_LOG_FORMAT="json"),
+            cwd=str(sub),
+        )
+        activation = _json.loads(defaults.stderr.decode().splitlines()[0])
+        self.assertEqual(activation["keel"], "activation", defaults.stderr)
+        self.assertEqual(activation["policy_source"], "defaults")
+        self.assertEqual(activation["note"], f"no keel.toml in {sub}; `keel init` to customize")
+
         (self.root / "keel.toml").write_text("")
         proc = _run(
             "import keel._auto; import sample_targets; sample_targets.enrich_a(1)",
@@ -357,6 +376,7 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(objs[0]["policy_source"], "keel.toml")
         self.assertEqual(objs[0]["policy_path"], str(self.root / "keel.toml"))
         self.assertEqual(objs[0]["root_source"], "KEEL_CWD")
+        self.assertNotIn("note", objs[0], "a loaded policy has no em-dash tail — no note key")
         self.assertEqual(objs[1]["keel_cwd"], str(self.root))
 
     def test_json_log_format_refusal_is_an_error_object(self) -> None:

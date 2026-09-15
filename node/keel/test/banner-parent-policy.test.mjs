@@ -212,6 +212,14 @@ test("the defaults banner names the directory it searched", () => {
 test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
   const root = mkdtempSync(join(tmpdir(), "keel-json-logs-"));
   try {
+    // R10: `note` carries the activation line's em-dash tail whenever the
+    // text form has one, and the key is ABSENT when it does not. Pin both
+    // sides — the defaults run first, before a keel.toml exists at or above
+    // this directory, so the tail is the plain `keel init` nudge.
+    const defaults = keelJsonLines(run(root, { KEEL_LOG_FORMAT: "json" }).stderr);
+    assert.equal(defaults[0].policy_source, "defaults");
+    assert.equal(defaults[0].note, `no keel.toml in ${realpathSync(root)}; \`keel init\` to customize`);
+
     writeFileSync(join(root, "keel.toml"), "");
     const realRoot = realpathSync(root);
     const proc = run(root, { KEEL_LOG_FORMAT: "json" });
@@ -223,6 +231,7 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
     assert.equal(objs[0].policy_path, join(realRoot, "keel.toml"));
     assert.equal(objs[0].root, realRoot);
     assert.equal(objs[0].root_source, "cwd");
+    assert.ok(!("note" in objs[0]), `a loaded policy has no em-dash tail — no note key: ${objs[0].note}`);
     assert.equal(objs[1].calls, 0);
     assert.equal(objs[1].policy_source, "keel.toml");
   } finally {
