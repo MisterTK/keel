@@ -75,11 +75,21 @@ def dev_cache_off_reason(env: Mapping[str, str] | None = None) -> str | None:
     something the cache resolution does not do: a field literally named
     `dev_cache_off` reporting null is a positive claim that the cache is on,
     and `KEEL_ENV=prod` is a reachable production configuration where that
-    would be a lie. Twin of Node's `devCacheOffReason`; keep identical."""
+    would be a lie. Twin of Node's `devCacheOffReason`; keep identical.
+
+    Only the two declarations Keel actually understands short-circuit the
+    marker: ``prod`` (off) and ``dev`` (on — someone saying "this IS my dev
+    loop" may have one inside a container). Every other value, blank
+    included, falls through to the serverless marker: ``KEEL_ENV=staging``
+    on Cloud Run must not silently re-arm the dev cache, which is the
+    2026-09-15 outage class itself (spec §2: a detected serverless
+    environment counts as ``KEEL_ENV=prod`` for dev-cache resolution)."""
     env = env if env is not None else os.environ
     keel_env = str(env.get("KEEL_ENV", "")).strip().lower()
-    if keel_env:
-        return "KEEL_ENV" if keel_env == "prod" else None  # explicit always wins, either way
+    if keel_env == "prod":
+        return "KEEL_ENV"
+    if keel_env == "dev":
+        return None  # an explicit dev declaration beats a marker
     return serverless_marker(env)
 
 

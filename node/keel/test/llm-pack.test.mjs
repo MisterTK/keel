@@ -11,7 +11,7 @@ import {
   outboundDefaults,
   llmDefaults,
 } from "../src/defaults.mjs";
-import { llmPack, resolveDevCache, DEV_CACHE_TTL, SERVERLESS_MARKERS, serverlessMarker } from "../src/packs/llm.mjs";
+import { llmPack, resolveDevCache, DEV_CACHE_TTL, SERVERLESS_MARKERS, serverlessMarker, devCacheOffReason } from "../src/packs/llm.mjs";
 
 const ok = (payload) => async () => ({ status: "ok", payload });
 const req = (target, args_hash) => ({ v: 1, target, op: target, idempotent: true, args_hash });
@@ -129,6 +129,36 @@ test("every serverless marker is recognized, blank values are not", () => {
 test("an explicit KEEL_ENV=dev wins over a marker", () => {
   const out = resolveDevCache(DEV_POLICY, { K_SERVICE: "render", KEEL_ENV: "dev" });
   assert.equal(out.defaults.llm.cache.ttl, DEV_CACHE_TTL);
+});
+
+test("devCacheOffReason names every way the cache goes off (Python parity table)", () => {
+  // Mirror of python/keel/tests/test_packs_llm.py
+  // `test_dev_cache_off_reason_names_every_way_the_cache_goes_off`. The
+  // activation line's `dev_cache_off` field reads from this, so it must agree
+  // with resolveDevCache in EVERY configuration — a null there is a positive
+  // claim that the dev cache is on.
+  const cases = [
+    [{}, null],
+    [{ K_SERVICE: "render" }, "K_SERVICE"],
+    [{ WEBSITE_SITE_NAME: "app" }, "WEBSITE_SITE_NAME"],
+    [{ KEEL_ENV: "prod" }, "KEEL_ENV"], // the explicit override: NOT null
+    [{ KEEL_ENV: "  PROD  " }, "KEEL_ENV"],
+    [{ KEEL_ENV: "dev" }, null],
+    [{ KEEL_ENV: "dev", K_SERVICE: "render" }, null], // explicit dev wins
+    [{ KEEL_ENV: "prod", K_SERVICE: "render" }, "KEEL_ENV"],
+    // A third value is NOT a dev declaration: it must not defeat the marker
+    // (that would be the 2026-09-15 outage class again). With no marker it
+    // changes nothing — the cache stays on, as before.
+    [{ KEEL_ENV: "staging", K_SERVICE: "render" }, "K_SERVICE"],
+    [{ KEEL_ENV: "staging" }, null],
+    [{ KEEL_ENV: "  ", K_SERVICE: "render" }, "K_SERVICE"],
+  ];
+  for (const [env, expected] of cases) {
+    assert.equal(devCacheOffReason(env), expected, JSON.stringify(env));
+    // …and it never disagrees with what the cache resolution does.
+    const hasCache = resolveDevCache(DEV_POLICY, env).defaults.llm.cache !== undefined;
+    assert.equal(hasCache, expected === null, JSON.stringify(env));
+  }
 });
 
 test("dev-cache replay parity: identical calls → cache hit off-prod (counters)", async () => {

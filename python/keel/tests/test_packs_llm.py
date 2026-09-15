@@ -175,8 +175,14 @@ class ServerlessDevCacheTest(unittest.TestCase):
             ({"KEEL_ENV": "prod"}, "KEEL_ENV"),  # the explicit override: NOT null
             ({"KEEL_ENV": "  PROD  "}, "KEEL_ENV"),
             ({"KEEL_ENV": "dev"}, None),
-            ({"KEEL_ENV": "dev", "K_SERVICE": "render"}, None),  # explicit wins
+            ({"KEEL_ENV": "dev", "K_SERVICE": "render"}, None),  # explicit dev wins
             ({"KEEL_ENV": "prod", "K_SERVICE": "render"}, "KEEL_ENV"),
+            # A third value is NOT a dev declaration: it must not defeat the
+            # marker (that would be the 2026-09-15 outage class again). With no
+            # marker it changes nothing — the cache stays on, as before.
+            ({"KEEL_ENV": "staging", "K_SERVICE": "render"}, "K_SERVICE"),
+            ({"KEEL_ENV": "staging"}, None),
+            ({"KEEL_ENV": "  ", "K_SERVICE": "render"}, "K_SERVICE"),
         ]
         for env, expected in cases:
             with self.subTest(env=env):

@@ -66,13 +66,21 @@ export function serverlessMarker(env = process.env) {
  * null is a positive claim that the cache is on, and `KEEL_ENV=prod` is a
  * reachable production configuration where that would be a lie. Twin of
  * Python's `dev_cache_off_reason`; keep identical.
+ *
+ * Only the two declarations Keel actually understands short-circuit the
+ * marker: `prod` (off) and `dev` (on — someone saying "this IS my dev loop"
+ * may have one inside a container). Every other value, blank included, falls
+ * through to the serverless marker: `KEEL_ENV=staging` on Cloud Run must not
+ * silently re-arm the dev cache, which is the 2026-09-15 outage class itself
+ * (spec §2: a detected serverless environment counts as `KEEL_ENV=prod` for
+ * dev-cache resolution).
  */
 export function devCacheOffReason(env = process.env) {
   // Trim + lowercase before comparing — cross-language parity with the Python
-  // twin's `.strip().lower()`. An explicit KEEL_ENV always wins; otherwise a
-  // serverless marker means production (see SERVERLESS_MARKERS).
+  // twin's `.strip().lower()`.
   const keelEnv = String(env?.KEEL_ENV ?? "").trim().toLowerCase();
-  if (keelEnv) return keelEnv === "prod" ? "KEEL_ENV" : null;
+  if (keelEnv === "prod") return "KEEL_ENV";
+  if (keelEnv === "dev") return null; // an explicit dev declaration beats a marker
   return serverlessMarker(env);
 }
 
