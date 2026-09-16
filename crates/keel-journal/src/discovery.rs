@@ -44,6 +44,19 @@
 //!     unwrapped_calls INTEGER NOT NULL DEFAULT 0,
 //!     PRIMARY KEY (target, day)
 //! ) WITHOUT ROWID;
+//!
+//! CREATE TABLE activations (                          -- v3: activation evidence
+//!     ts_ms            INTEGER NOT NULL,               -- (kept newest 50)
+//!     pid              INTEGER NOT NULL,
+//!     language         TEXT    NOT NULL,               -- "python" | "node"
+//!     version          TEXT    NOT NULL,               -- the Keel package version
+//!     cwd              TEXT    NOT NULL,
+//!     keel_cwd         TEXT,                           -- the resolved KEEL_CWD, if set
+//!     policy_source    TEXT    NOT NULL,               -- "keel.toml" | "defaults" | …
+//!     policy_path      TEXT,
+//!     flows_configured INTEGER NOT NULL DEFAULT 0,
+//!     argv0            TEXT    NOT NULL DEFAULT ''
+//! );
 //! ```
 //!
 //! Accounting: a cache hit is a `call` and a `cache_hit` only — it consumed no
@@ -70,7 +83,11 @@
 //! file), the daily table is created, and `user_version` is stamped. Read-only
 //! opens never migrate: on a v1 file the snapshot fills the new counters with
 //! zero and the daily snapshot is empty. Old writers keep working against a v2
-//! file (their 15-column INSERT leaves the new columns at their defaults).
+//! file (their 15-column INSERT leaves the new columns at their defaults). A v2
+//! file is upgraded to v3 by adding the `activations` table alone — the v1→v2
+//! block above is gated on its own version check, so it never re-runs. A v2 (or
+//! v1) file opened read-only reads back an empty [`DiscoveryStore::activations_snapshot`]
+//! rather than an error, since the table does not exist yet.
 //!
 //! Every mutation is a single UPSERT (one per table), so two processes
 //! recording into one file accumulate correctly without a transaction.
@@ -81,7 +98,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keel_core_api::ErrorClass;
 use rusqlite::{Connection, OpenFlags, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::error::{Error, Result};
@@ -89,7 +106,9 @@ use crate::types::{error_class_from_db, error_class_str};
 
 /// Current discovery schema version, stamped in `PRAGMA user_version`.
 /// Version 0 is the legacy v1 schema (no counter columns, no daily table).
-pub const DISCOVERY_SCHEMA_VERSION: i64 = 2;
+/// Version 2 added `not_retried`/`unwrapped_calls` plus `discovery_daily`.
+/// Version 3 added the `activations` table (see [`Activation`]).
+pub const DISCOVERY_SCHEMA_VERSION: i64 = 3;
 
 /// How many trailing UTC days of `discovery_daily` buckets are kept (the
 /// current day plus `RETENTION_DAYS - 1` before it). Weekly windows need 7;
@@ -136,6 +155,23 @@ CREATE TABLE IF NOT EXISTS discovery_daily (
     unwrapped_calls INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target, day)
 ) WITHOUT ROWID;";
+
+/// The `activations` table (v3): one row per Keel activation, the evidence
+/// behind "was Keel on, with which policy" (WS8, #92). Retention keeps the
+/// newest 50 rows, enforced on every [`DiscoveryStore::record_activation`].
+pub const ACTIVATIONS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS activations (
+    ts_ms            INTEGER NOT NULL,
+    pid              INTEGER NOT NULL,
+    language         TEXT    NOT NULL,
+    version          TEXT    NOT NULL,
+    cwd              TEXT    NOT NULL,
+    keel_cwd         TEXT,
+    policy_source    TEXT    NOT NULL,
+    policy_path      TEXT,
+    flows_configured INTEGER NOT NULL DEFAULT 0,
+    argv0            TEXT    NOT NULL DEFAULT ''
+);";
 
 const CONNECTION_PRAGMAS: &str = "\
 PRAGMA journal_mode = WAL;
@@ -314,6 +350,33 @@ pub struct DailyStats {
     pub not_retried: i64,
     /// Calls that ran with no explicit `[target."…"]` policy entry.
     pub unwrapped_calls: i64,
+}
+
+/// One Keel activation, as observed at process startup — the evidence behind
+/// "was Keel on, with which policy" (WS8, #92). [`DiscoveryStore`] keeps the
+/// newest 50 (see [`DiscoveryStore::record_activation`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activation {
+    /// When the activation happened (ms since epoch, writer's clock).
+    pub ts_ms: i64,
+    /// The activating process's PID.
+    pub pid: i64,
+    /// The front end that activated: `"python"` or `"node"`.
+    pub language: String,
+    /// The Keel package version that activated.
+    pub version: String,
+    /// The process's working directory at activation.
+    pub cwd: String,
+    /// The resolved `KEEL_CWD`, if the environment set one.
+    pub keel_cwd: Option<String>,
+    /// Where policy came from: e.g. `"keel.toml"` or `"defaults"`.
+    pub policy_source: String,
+    /// The resolved `keel.toml` path, when policy came from a file.
+    pub policy_path: Option<String>,
+    /// Whether `[flows]` entrypoints were configured at activation.
+    pub flows_configured: bool,
+    /// The invoking process's `argv[0]`.
+    pub argv0: String,
 }
 
 /// One `discovery` row's worth of values to feed the [`UPSERT`], borrowing its
@@ -511,6 +574,70 @@ impl<C: Clock> DiscoveryStore<C> {
         Ok(rows)
     }
 
+    /// Record one Keel activation, then trim to the newest 50 (by `ts_ms`,
+    /// `rowid` breaking ties). No-op on a read-only store's caller — this is a
+    /// write path.
+    pub fn record_activation(&self, a: &Activation) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source, \
+             policy_path, flows_configured, argv0) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                a.ts_ms,
+                a.pid,
+                a.language,
+                a.version,
+                a.cwd,
+                a.keel_cwd,
+                a.policy_source,
+                a.policy_path,
+                i64::from(a.flows_configured),
+                a.argv0
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM activations WHERE rowid NOT IN \
+             (SELECT rowid FROM activations ORDER BY ts_ms DESC, rowid DESC LIMIT 50)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded activations, newest first. Empty (not an error) on a
+    /// v1/v2 file that has no `activations` table yet.
+    pub fn activations_snapshot(&self) -> Result<Vec<Activation>> {
+        let conn = self.lock();
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'activations')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, pid, language, version, cwd, keel_cwd, policy_source, policy_path, \
+             flows_configured, argv0 FROM activations ORDER BY ts_ms DESC, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Activation {
+                    ts_ms: r.get(0)?,
+                    pid: r.get(1)?,
+                    language: r.get(2)?,
+                    version: r.get(3)?,
+                    cwd: r.get(4)?,
+                    keel_cwd: r.get(5)?,
+                    policy_source: r.get(6)?,
+                    policy_path: r.get(7)?,
+                    flows_configured: r.get::<_, i64>(8)? != 0,
+                    argv0: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Drop daily buckets that fell out of the retention window, at most once
     /// per advanced day (the atomic keeps the hot path at two UPSERTs).
     fn prune(&self, conn: &Connection, day: i64) -> Result<()> {
@@ -560,33 +687,39 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 fn migrate_locked(conn: &Connection) -> Result<()> {
-    if schema_version(conn)? >= DISCOVERY_SCHEMA_VERSION {
+    let v = schema_version(conn)?;
+    if v >= DISCOVERY_SCHEMA_VERSION {
         return Ok(()); // another process won the race
     }
-    let has_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery')",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_table {
-        let has_column: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') \
-             WHERE name = 'not_retried')",
+    if v < 2 {
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery')",
             [],
             |r| r.get(0),
         )?;
-        if !has_column {
-            // Appended, so a migrated file's column order matches a fresh v2 one.
-            conn.execute_batch(
-                "ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0;",
+        if has_table {
+            let has_column: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') \
+                 WHERE name = 'not_retried')",
+                [],
+                |r| r.get(0),
             )?;
+            if !has_column {
+                // Appended, so a migrated file's column order matches a fresh v2 one.
+                conn.execute_batch(
+                    "ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+        } else {
+            conn.execute_batch(DISCOVERY_SCHEMA)?;
         }
-    } else {
-        conn.execute_batch(DISCOVERY_SCHEMA)?;
+        conn.execute_batch(DAILY_SCHEMA)?;
     }
-    conn.execute_batch(DAILY_SCHEMA)?;
-    conn.execute_batch("PRAGMA user_version = 2")?;
+    if v < 3 {
+        conn.execute_batch(ACTIVATIONS_SCHEMA)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 3")?;
     Ok(())
 }
 
@@ -1067,6 +1200,70 @@ CREATE TABLE IF NOT EXISTS discovery (
         // The file was not mutated: still v1.
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn activations_round_trip_newest_first_and_cap_at_fifty() {
+        let dir = TempDir::new().unwrap();
+        let store = DiscoveryStore::open(dir.path().join("d.db"), ManualClock::new(1_000)).unwrap();
+        for i in 0..55 {
+            store
+                .record_activation(&Activation {
+                    ts_ms: 1_000 + i,
+                    pid: 100 + i,
+                    language: "python".into(),
+                    version: "0.5.6".into(),
+                    cwd: "/code".into(),
+                    keel_cwd: Some("/code".into()),
+                    policy_source: "keel.toml".into(),
+                    policy_path: Some("/code/keel.toml".into()),
+                    flows_configured: i % 2 == 0,
+                    argv0: "app.py".into(),
+                })
+                .unwrap();
+        }
+        let rows = store.activations_snapshot().unwrap();
+        assert_eq!(rows.len(), 50, "newest 50 retained");
+        assert_eq!(rows[0].ts_ms, 1_054);
+        assert_eq!(rows[49].ts_ms, 1_005);
+        assert_eq!(rows[0].policy_path.as_deref(), Some("/code/keel.toml"));
+        assert!(rows[0].flows_configured);
+    }
+
+    #[test]
+    fn v2_file_migrates_to_v3_and_readonly_v2_reads_empty_activations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("d.db");
+        {
+            // Build a v2 file by hand: v2 schema, user_version = 2.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DISCOVERY_SCHEMA).unwrap();
+            conn.execute_batch(DAILY_SCHEMA).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+        let ro = DiscoveryStore::open_readonly(&path, ManualClock::new(0)).unwrap();
+        assert!(
+            ro.activations_snapshot().unwrap().is_empty(),
+            "no table yet → empty, not an error"
+        );
+        drop(ro);
+        let rw = DiscoveryStore::open(&path, ManualClock::new(0)).unwrap();
+        assert_eq!(schema_version(&rw.lock()).unwrap(), 3);
+        rw.record_activation(&Activation {
+            ts_ms: 1,
+            pid: 1,
+            language: "node".into(),
+            version: "0.5.6".into(),
+            cwd: "/a".into(),
+            keel_cwd: None,
+            policy_source: "defaults".into(),
+            policy_path: None,
+            flows_configured: false,
+            argv0: String::new(),
+        })
+        .unwrap();
+        assert_eq!(rw.activations_snapshot().unwrap().len(), 1);
+        assert_eq!(rw.snapshot().unwrap().len(), 0, "v2 tables untouched");
     }
 
     #[test]

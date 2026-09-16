@@ -33,8 +33,8 @@ mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use discovery::{
-    CallObservation, CallResult, DISCOVERY_SCHEMA_VERSION, DailyStats, DiscoveryStore, MS_PER_DAY,
-    ObservedError, RETENTION_DAYS, TargetStats,
+    Activation, CallObservation, CallResult, DISCOVERY_SCHEMA_VERSION, DailyStats, DiscoveryStore,
+    MS_PER_DAY, ObservedError, RETENTION_DAYS, TargetStats,
 };
 pub use error::{Error, Result};
 pub use journal::Journal;

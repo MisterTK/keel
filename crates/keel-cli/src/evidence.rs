@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use keel_core_api::policy::{JournalLocation, Policy};
-use keel_journal::{DailyStats, DiscoveryStore, SystemClock, TargetStats};
+use keel_journal::{Activation, DailyStats, DiscoveryStore, SystemClock, TargetStats};
 
 /// `<project>/keel.toml` — the policy file.
 pub fn keel_toml(project: &Path) -> PathBuf {
@@ -181,6 +181,25 @@ pub fn read_discovery_daily(project: &Path) -> Result<Vec<DailyStats>, String> {
         .map_err(|e| format!("could not open {}: {e}", path.display()))?;
     store
         .daily_snapshot()
+        .map_err(|e| format!("could not read {}: {e}", path.display()))
+}
+
+/// Read recorded activations if `.keel/discovery.db` exists, else an empty
+/// vec (and, on a v1/v2 file with no `activations` table yet,
+/// [`DiscoveryStore::activations_snapshot`] itself returns empty).
+#[allow(
+    dead_code,
+    reason = "consumed by doctor/status in a later WS8 task (#92)"
+)]
+pub fn read_activations(project: &Path) -> Result<Vec<Activation>, String> {
+    let path = discovery_db(project);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = DiscoveryStore::open_readonly(&path, SystemClock)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    store
+        .activations_snapshot()
         .map_err(|e| format!("could not read {}: {e}", path.display()))
 }
 
