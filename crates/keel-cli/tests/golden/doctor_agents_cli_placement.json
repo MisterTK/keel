@@ -200,6 +200,7 @@
     "present": true,
     "valid": true
   },
+  "runtime_activation": "unverified",
   "topology": {
     "excluded": [],
     "external_processes": [],

@@ -17,7 +17,7 @@ use keel_cli::render::json_string;
 use keel_cli::{
     doctor, effective, explain, flows, flows_add, flows_suggest, init, replay, scan, status,
 };
-use keel_journal::{DiscoveryStore, ManualClock, TargetStats};
+use keel_journal::{Activation, DiscoveryStore, ManualClock, TargetStats};
 
 /// The completed/interrupted/dead flow fixtures (2026-07-11T00:00:00Z base).
 const JOURNAL_SCHEMA: &str = include_str!("../../../contracts/journal.sql");
@@ -150,6 +150,22 @@ fn build_discovery(project: &Path) {
                 unwrapped_calls: 5,
             },
         ])
+        .unwrap();
+    // `/code` is a literal, not the tempdir, so the golden stays stable
+    // across machines (#92).
+    store
+        .record_activation(&Activation {
+            ts_ms: T0,
+            pid: 4242,
+            language: "python".to_owned(),
+            version: "0.5.6".to_owned(),
+            cwd: "/code".to_owned(),
+            keel_cwd: Some("/code".to_owned()),
+            policy_source: "keel.toml".to_owned(),
+            policy_path: Some("/code/keel.toml".to_owned()),
+            flows_configured: true,
+            argv0: "app.py".to_owned(),
+        })
         .unwrap();
 }
 

@@ -20,9 +20,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use keel_core_api::policy::{FlowMatchRule, Policy};
+use keel_journal::Activation;
 use serde::Serialize;
 
 use crate::cmd_match::{compile_cmd_rules, match_argv};
@@ -422,6 +423,10 @@ struct DoctorReport {
     journal: JournalReport,
     ok: bool,
     policy: PolicyCheck,
+    /// `"verified"` when some recorded activation row matches this project's
+    /// resolved policy identity, `"unverified"` otherwise — including when
+    /// there is no discovery evidence at all (#92).
+    runtime_activation: &'static str,
     topology: Topology,
 }
 
@@ -480,6 +485,17 @@ pub fn run(project: &Path) -> Rendered {
             };
         }
     };
+    let activations = match evidence::read_activations(project) {
+        Ok(a) => a,
+        Err(e) => {
+            return Rendered {
+                human: format!("keel \u{25b8} doctor unavailable: {e}"),
+                json: to_json(&serde_json::json!({ "error": e })),
+                exit: crate::EXIT_FAILURE,
+                to_stderr: true,
+            };
+        }
+    };
     let policy = validate_policy(&evidence::keel_toml(project));
     let journal = JournalReport::from_resolved(&evidence::resolved_journal(project));
     let agents_cli_finding = agents_cli_placement_finding(project);
@@ -487,6 +503,7 @@ pub fn run(project: &Path) -> Rendered {
     let boundaries = boundaries(project);
     let build_files = crate::dockerfile::analyze(project);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
+    let runtime_activation_value = runtime_activation(project, policy.check.present, &activations);
     let report = build_report(
         &scan,
         &discovery,
@@ -497,6 +514,7 @@ pub fn run(project: &Path) -> Rendered {
         boundaries,
         &build_files,
         &stale_flows,
+        runtime_activation_value,
     );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
@@ -1103,21 +1121,53 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
-/// Assemble the report from the nine evidence inputs. Pure, so the golden test
+/// Canonicalize both sides before comparing, falling back to the raw
+/// (non-canonicalized) form when a path does not exist on disk — a recorded
+/// activation may point at a path that no longer exists, and a project under
+/// test may not exist either; string equality is still a meaningful check in
+/// that case.
+fn same_path(a: &str, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| PathBuf::from(a));
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+/// Whether any recorded activation row matches this project's resolved
+/// policy identity (#92) — see the interface doc comment in the task brief
+/// for the exact predicate. `"verified"` requires a row whose policy
+/// identity (path when a `keel.toml` is present, else defaults-rooted-here)
+/// matches; otherwise `"unverified"`, including when there are no rows at
+/// all.
+fn runtime_activation(project: &Path, policy_present: bool, rows: &[Activation]) -> &'static str {
+    let verified = rows.iter().any(|r| {
+        if policy_present {
+            r.policy_path
+                .as_deref()
+                .is_some_and(|p| same_path(p, &project.join("keel.toml")))
+        } else {
+            r.policy_source == "defaults" && same_path(&r.cwd, project)
+        }
+    });
+    if verified { "verified" } else { "unverified" }
+}
+
+/// Assemble the report from the ten evidence inputs. Pure, so the golden test
 /// pins it without a filesystem or `python3` — the filesystem-dependent
 /// inputs (`agents_cli_finding`, since it needs to walk for a manifest and
 /// check for a root `keel.toml`; `config_above_cwd_finding`, since it walks
 /// parent directories for a `keel.toml` — issue #85; `boundaries`, since it
 /// stats the project root for governance files; `build_files`, since it reads
 /// the root `Dockerfile`s and `.dockerignore`; `stale_flows`, since it
-/// needs to read `.keel/journal.db` and stat scripts on disk) are computed
-/// by the caller and passed in already resolved, the same pattern
-/// `policy`/`journal` already use.
+/// needs to read `.keel/journal.db` and stat scripts on disk; `runtime_activation`,
+/// since it is computed from a read of `.keel/discovery.db`'s activations
+/// table — #92) are computed by the caller and passed in already resolved,
+/// the same pattern `policy`/`journal` already use.
 #[allow(clippy::too_many_lines)]
 // straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
-#[allow(clippy::too_many_arguments)] // nine already-resolved evidence inputs (see doc
-// comment above); issue #85 added config_above_cwd_finding, WS3 added build_files.
+#[allow(clippy::too_many_arguments)] // ten already-resolved evidence inputs (see doc
+// comment above); issue #85 added config_above_cwd_finding, WS3 added build_files,
+// #92 added runtime_activation.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1128,6 +1178,7 @@ fn build_report(
     boundaries: Boundaries,
     build_files: &[crate::dockerfile::BuildFile],
     stale_flows: &[crate::flows::StaleFlow],
+    runtime_activation: &'static str,
 ) -> DoctorReport {
     let PolicyValidation {
         check: policy,
@@ -1308,6 +1359,7 @@ fn build_report(
         journal,
         ok,
         policy,
+        runtime_activation,
         topology,
     }
 }
@@ -1749,6 +1801,7 @@ fn human(r: &DoctorReport) -> String {
         );
         out.push_str(&line);
     }
+    let _ = writeln!(out, "  runtime activation: {}", r.runtime_activation);
 
     out.push_str("\njournal\n");
     let journal_line = if r.journal.supported {
@@ -1863,6 +1916,52 @@ mod tests {
     }
 
     #[test]
+    fn runtime_activation_is_verified_only_by_a_matching_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path();
+        std::fs::write(project.join("keel.toml"), "").unwrap();
+        let row = |src: &str, path: Option<String>, cwd: String| Activation {
+            ts_ms: 1,
+            pid: 1,
+            language: "python".into(),
+            version: "x".into(),
+            cwd,
+            keel_cwd: None,
+            policy_source: src.into(),
+            policy_path: path,
+            flows_configured: false,
+            argv0: String::new(),
+        };
+        let here = project.to_string_lossy().into_owned();
+        let mine = row(
+            "keel.toml",
+            Some(project.join("keel.toml").to_string_lossy().into_owned()),
+            here.clone(),
+        );
+        let elsewhere = row(
+            "keel.toml",
+            Some("/somewhere/else/keel.toml".into()),
+            "/somewhere/else".into(),
+        );
+        assert_eq!(
+            runtime_activation(project, true, std::slice::from_ref(&mine)),
+            "verified"
+        );
+        assert_eq!(
+            runtime_activation(project, true, std::slice::from_ref(&elsewhere)),
+            "unverified"
+        );
+        assert_eq!(runtime_activation(project, true, &[]), "unverified");
+        // A project with no keel.toml is verified by a defaults activation rooted here.
+        std::fs::remove_file(project.join("keel.toml")).unwrap();
+        assert_eq!(
+            runtime_activation(project, false, &[row("defaults", None, here)]),
+            "verified"
+        );
+        assert_eq!(runtime_activation(project, false, &[mine]), "unverified");
+    }
+
+    #[test]
     fn wrapped_visible_and_invisible_are_classified() {
         // "django" stands in for any effect library with no adapter in the
         // registry (boto3/psycopg both gained one — see REGISTRY above).
@@ -1891,6 +1990,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
@@ -1982,6 +2082,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -2062,6 +2163,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
 
         assert_eq!(r.topology.external_processes.len(), 2);
@@ -2145,6 +2247,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             r.topology
@@ -2223,6 +2326,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let retry = r
             .findings
@@ -2331,6 +2435,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -2381,6 +2486,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let hit: Vec<_> = r
             .follow_ups
@@ -2441,6 +2547,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
     }
@@ -2464,6 +2571,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
     }
@@ -2552,6 +2660,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
 
         assert!(
@@ -2630,6 +2739,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             !r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -2701,6 +2811,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -2804,6 +2915,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
 
         assert!(
@@ -2871,6 +2983,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let mcp = r
             .adapters
@@ -2923,6 +3036,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let row = r
             .adapters
@@ -2959,6 +3073,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let finding = r
             .findings
@@ -2990,6 +3105,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             !r.findings
@@ -3011,6 +3127,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             !r.findings
@@ -3045,6 +3162,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(!r.ok);
         assert!(
@@ -3089,6 +3207,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
@@ -3607,6 +3726,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
         assert!(r.boundaries.unparsed.contains(&"ci-workflow"));
@@ -3663,6 +3783,7 @@ def caller():
             boundaries(dir.path()),
             &[],
             &[],
+            "unverified",
         );
         let text = human(&r);
         assert!(text.contains("\nboundaries\n"), "{text}");
@@ -3703,6 +3824,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let f = r
             .findings
@@ -3743,6 +3865,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let f = r
             .findings
@@ -3766,6 +3889,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(
             !r.findings
@@ -3793,6 +3917,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let up = r
             .follow_ups
@@ -3831,6 +3956,7 @@ def caller():
                 empty_boundaries(),
                 &[],
                 &[],
+                "unverified",
             );
             let entry = r
                 .topology
@@ -3894,6 +4020,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let e = r
             .topology
@@ -3922,6 +4049,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
     }
@@ -3942,6 +4070,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(r.topology.wrappable.contains(&"example.com".to_owned()));
         assert!(r.topology.excluded.is_empty());
@@ -3981,6 +4110,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
         assert!(r2.topology.excluded.is_empty(), "{:?}", r2.topology);
@@ -4001,6 +4131,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         assert!(!r.findings.iter().any(|f| f.topic == "visible-unwrapped"));
         assert_eq!(
@@ -4044,6 +4175,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            "unverified",
         );
         let procs = &r.topology.external_processes;
         assert_eq!(procs.iter().filter(|p| p.in_tests).count(), 1);

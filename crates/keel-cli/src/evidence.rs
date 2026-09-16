@@ -187,10 +187,6 @@ pub fn read_discovery_daily(project: &Path) -> Result<Vec<DailyStats>, String> {
 /// Read recorded activations if `.keel/discovery.db` exists, else an empty
 /// vec (and, on a v1/v2 file with no `activations` table yet,
 /// [`DiscoveryStore::activations_snapshot`] itself returns empty).
-#[allow(
-    dead_code,
-    reason = "consumed by doctor/status in a later WS8 task (#92)"
-)]
 pub fn read_activations(project: &Path) -> Result<Vec<Activation>, String> {
     let path = discovery_db(project);
     if !path.exists() {

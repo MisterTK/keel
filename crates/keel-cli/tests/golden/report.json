@@ -281,6 +281,10 @@
     "started_at_ms": 1783728000000
   },
   "status": {
+    "activation": {
+      "count": 0,
+      "last": null
+    },
     "breaker_opens": 1,
     "cache_hit_rate": 0.2143,
     "cache_hits": 30,

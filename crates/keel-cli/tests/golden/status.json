@@ -1,4 +1,19 @@
 {
+  "activation": {
+    "count": 1,
+    "last": {
+      "argv0": "app.py",
+      "cwd": "/code",
+      "flows_configured": true,
+      "keel_cwd": "/code",
+      "language": "python",
+      "pid": 4242,
+      "policy_path": "/code/keel.toml",
+      "policy_source": "keel.toml",
+      "ts_ms": 1783728000000,
+      "version": "0.5.6"
+    }
+  },
   "breaker_opens": 1,
   "cache_hit_rate": 0.2143,
   "cache_hits": 30,
