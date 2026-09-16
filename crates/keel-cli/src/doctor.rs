@@ -1076,7 +1076,6 @@ fn simplification_findings(
 ) -> Vec<Finding> {
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
-    // Key sets already proposed in this report (see the dedupe note above).
     // Key sets already proposed in this report -> the `file:line` of the
     // sighting whose finding carries that patch (the `fix_ref` a later
     // duplicate points at, so the pointer survives reordering/filtering).

@@ -166,12 +166,21 @@ export function installFetch(
     const bodyRetrySafe = isBodyRetrySafe(input, body);
     // `op`/`args_hash`/`request` are per-hop (a fallback hop dispatches a
     // different URL/body), so they are (re)computed inside the hop loop
-    // below. `idempotent` and the per-attempt `timeoutMs` MUST be too
-    // (issue #106): a Google operation-read POST (CCR-8) is exempted by
-    // `(hostname, pathname)`, and a fallback hop can land somewhere that
-    // exemption does not apply — judging it from hop 0's URL would wrongly
-    // carry `idempotent: true` (and hop 0's timeout) into a hop it was never
-    // judged for. `idemHeader`/`injectedKey` stay fixed across hops: the
+    // below. `idempotent` MUST be too (issue #106): a Google operation-read
+    // POST (CCR-8) is exempted by `(hostname, pathname)`, and a fallback hop
+    // can land somewhere that exemption does not apply — judging it from
+    // hop 0's URL would wrongly carry `idempotent: true` into a hop it was
+    // never judged for. The per-attempt `timeoutMs` is read from
+    // `backend.layer(target, "timeout")` inside the same loop, but `target`
+    // itself is resolved ONCE above, from hop 0's URL (deliberately, like
+    // `idemHeader`/`injectedKey` below) — re-resolving it per hop would also
+    // move the cache key, budget accounting, discovery attribution, and
+    // `request.target`, all far outside #106's scope. So re-entering the
+    // loop per hop re-judges WHETHER a timeout applies (via the hop's own
+    // `(hostname, pathname)`), but the VALUE, when one applies, is still
+    // hop 0's target's timeout on every hop. Per-hop target resolution is a
+    // possible future change, not a gap this commit leaves open by
+    // accident. `idemHeader`/`injectedKey` stay fixed across hops: the
     // minted key is ONE per logical call (adapter-pack.md rule 2), not
     // re-minted per hop.
 

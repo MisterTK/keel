@@ -380,15 +380,32 @@ TIMEOUT_NAME_HINTS = ("timeout", "deadline", "elapsed", "waited", "max_wait",
                       "max_seconds")
 
 
+SECONDS_PLAUSIBILITY_CEILING = 7200  # two hours
+
+
 def _int_seconds(node):
     """A positive WHOLE-second literal, or None. `True`/`False` are ints in
     Python and are never seconds; a fractional literal (`sleep(0.5)`) is not a
     whole number of seconds and yields None rather than a rounded guess — the
-    proposal falls back to its documented default when this is None."""
+    proposal falls back to its documented default when this is None.
+
+    Values above SECONDS_PLAUSIBILITY_CEILING (two hours) also yield None:
+    two hours comfortably covers a real long-running-operation poll bound
+    (the motivating adopter shape is 900s, and even long video-generation
+    LROs sit well inside it), while a unit-less name (`timeout`, not
+    `timeout_ms`) holding a value that large is far more likely a
+    millisecond quantity mislabeled as seconds (`timeout=30000` meaning 30s,
+    not 30000s / 8.3h — the shape this guard exists for) than a genuine poll
+    deadline. Above the ceiling Keel does not know what unit it is looking
+    at, so — the same never-guess rule as the rest of this module — it reads
+    nothing; the proposal falls back to Keel's documented 30-minute default
+    instead of an 8.3-hour one."""
     if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
         return None
     v = node.value
     if not isinstance(v, int) or not 0 < v < 2 ** 31:
+        return None
+    if v > SECONDS_PLAUSIBILITY_CEILING:
         return None
     return v
 
@@ -1778,6 +1795,7 @@ def poller(request_id, timeout_s: int = 900):
     /// statically CERTAIN stays `None` so the proposal falls back to its
     /// documented default rather than inventing a number.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn poll_sighting_cadence_is_none_whenever_it_is_not_statically_certain() {
         if !python3_present() {
             eprintln!("skip: python3 not available");
@@ -1845,6 +1863,23 @@ def poller(timeout_s: int = 60, deadline_s: int = 120):
         )
         .unwrap();
         fs::write(
+            dir.path().join("implausible.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(timeout=30000):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(2)
+"#,
+        )
+        .unwrap();
+        fs::write(
             dir.path().join("millis.py"),
             r#"import time
 import urllib.request
@@ -1852,6 +1887,40 @@ import urllib.request
 API = "https://api.tavily.com/research"
 
 def poller(timeout_ms: int = 5000):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(2)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("boundary_ok.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(timeout_s: int = 7200):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(2)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("boundary_over.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(timeout_s: int = 7201):
     while True:
         with urllib.request.urlopen(API) as r:
             data = r.read().decode()
@@ -1871,6 +1940,10 @@ def poller(timeout_ms: int = 5000):
         assert_eq!(
             got,
             vec![
+                // Right at the two-hour ceiling: still plausible, accepted.
+                ("boundary_ok.py", Some(2), Some(7200)),
+                // One second over the ceiling: rejected outright.
+                ("boundary_over.py", Some(2), None),
                 // A computed backoff is not a number Keel knows.
                 ("computed.py", None, None),
                 // `waited > 60` counts iterations, not seconds: interval is
@@ -1878,6 +1951,13 @@ def poller(timeout_ms: int = 5000):
                 ("counter.py", Some(5), None),
                 // `sleep(0.5)` is not whole seconds; 60 and 120 disagree.
                 ("fractional.py", None, None),
+                // `timeout` has no unit suffix, so 30000 is read as SECONDS
+                // by name — but 30000s (8.3h) is well over the two-hour
+                // plausibility ceiling, so it's far more likely a
+                // millisecond value (30 real seconds) under a unit-less
+                // name. Rejected rather than proposing an 8.3-hour
+                // deadline — the real motivating shape for this guard.
+                ("implausible.py", Some(2), None),
                 // 5000 MILLISECONDS is not 5000 seconds — read as neither.
                 ("millis.py", Some(2), None),
             ]
