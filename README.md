@@ -179,7 +179,7 @@ dashboard — pick whichever fits the moment:
    prints one summary to **stderr** at exit, no CLI required:
 
    ```
-   keel ▸ 185 calls · 78 calls unprotected (storage.googleapis.com 41, metadata.google.internal 22, +3 others)
+   keel ▸ 185 calls · 1 failure not retried · 78 calls unprotected (storage.googleapis.com 41, metadata.google.internal 22, oauth2.googleapis.com 9, +2 others)
           keel report --open for the full picture
    ```
 
