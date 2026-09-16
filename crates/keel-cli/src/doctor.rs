@@ -1125,11 +1125,14 @@ fn build_follow_ups(
     let (inheriting, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = unmatched
         .into_iter()
         .partition(|p| p.inherits_activation == Some("python-pth"));
-    if !uncovered.is_empty() {
-        let cmds: Vec<String> = uncovered
-            .iter()
-            .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
-            .collect();
+    // Issue #102: even when every sighting self-activates (no uncovered blind
+    // spot at all), the inheriting count must still be reachable from
+    // `follow_ups`, not only from the lower-priority `info` finding — a
+    // project whose children ALL self-activate previously never saw this
+    // follow-up. The detail branches on whether there is anything left to
+    // chase; the subject/suffix formatting for the already-working uncovered
+    // case is unchanged.
+    if !uncovered.is_empty() || !inheriting.is_empty() {
         let mut extra = Vec::new();
         if !in_tests.is_empty() {
             extra.push(format!("+{} in test files", in_tests.len()));
@@ -1150,13 +1153,32 @@ fn build_follow_ups(
         } else {
             format!(" ({})", extra.join(", "))
         };
-        ups.push(FollowUp {
-            code: "subprocess-blind-spot",
-            detail: format!(
+        let detail = if uncovered.is_empty() {
+            let (noun, verb) = if inheriting.len() == 1 {
+                ("child", "self-activates")
+            } else {
+                ("children", "self-activate")
+            };
+            format!(
+                "No externally-launched process here is a blind spot — the {} Python {noun} \
+                 that {verb} when it inherits KEEL_ENABLE. There is no blind spot to chase, \
+                 only to confirm the self-activation covers what you expect.",
+                inheriting.len()
+            )
+        } else {
+            let cmds: Vec<String> = uncovered
+                .iter()
+                .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
+                .collect();
+            format!(
                 "Keel cannot see traffic inside externally-launched processes; confirm none of \
                  these carry traffic you care about: {}.",
                 cmds.join(", ")
-            ),
+            )
+        };
+        ups.push(FollowUp {
+            code: "subprocess-blind-spot",
+            detail,
             rank: follow_up_rank("subprocess-blind-spot"),
             subject: format!(
                 "{} externally-launched process(es){suffix}",
@@ -4899,5 +4921,54 @@ def caller():
             })
             .expect("an info finding for the inheriting child");
         assert!(info.detail.contains("self-activates"), "{}", info.detail);
+    }
+
+    #[test]
+    fn inheriting_children_alone_still_produce_a_follow_up() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses = vec![SubprocessSighting {
+            file: "agent.py".into(),
+            line: 10,
+            launcher: "subprocess.run".into(),
+            command: "<dynamic>".into(),
+            argv: None,
+            child_runtime: Some("python".into()),
+            env_inheritance: "inherited".into(),
+        }];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+            &[],
+            "unverified",
+        );
+        let fu = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "subprocess-blind-spot")
+            .expect(
+                "#102: the count must be reachable from follow_ups, not only from the info finding",
+            );
+        assert!(
+            fu.subject.contains("1 Python child that self-activates"),
+            "{}",
+            fu.subject
+        );
+        assert!(
+            fu.detail.contains("no blind spot to chase"),
+            "{}",
+            fu.detail
+        );
     }
 }
