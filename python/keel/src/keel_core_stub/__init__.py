@@ -310,7 +310,9 @@ def _terminal_match(value: Any, terminal: list[Any]) -> bool:
     """Same-JSON-type equality (CCR-8): "true" != true, 1 != true, 100 == 100.0.
     `bool` is guarded before numbers because `True == 1` in Python. Numbers are
     compared in the f64 domain (integers beyond 2^53 collapse, by design) so
-    every implementation agrees."""
+    every implementation agrees. An integer literal beyond the f64 range
+    (`float()` raises `OverflowError`) never matches and is judged pending,
+    never raised."""
     for t in terminal:
         if isinstance(value, bool) or isinstance(t, bool):
             if isinstance(value, bool) and isinstance(t, bool) and value is t:
@@ -318,8 +320,14 @@ def _terminal_match(value: Any, terminal: list[Any]) -> bool:
             continue
         if isinstance(value, str) and isinstance(t, str) and value == t:
             return True
-        if isinstance(value, (int, float)) and isinstance(t, (int, float)) and float(value) == float(t):
-            return True
+        if isinstance(value, (int, float)) and isinstance(t, (int, float)):
+            try:
+                if float(value) == float(t):
+                    return True
+            except OverflowError:
+                # An integer beyond the f64 range can never equal a terminal
+                # (which parsed within it); judge pending, never raise.
+                continue
     return False
 
 

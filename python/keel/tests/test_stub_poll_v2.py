@@ -90,6 +90,13 @@ class TypedTerminalTest(unittest.TestCase):
             core.configure({"target": {"ops.internal": {"poll": _poll({"field": field, "terminal": ["done"]})}}})
             self.assertEqual(_run(core, "GET ops.internal/op", True, [{"status": "running"}])["attempts"], 1, field)
 
+    def test_out_of_f64_range_integer_is_pending_not_a_crash(self) -> None:
+        core = KeelCoreStub()
+        core.configure({"target": {"ops.internal": {"poll": _poll({"field": "progress", "terminal": [100]})}}})
+        huge = int("1" + "0" * 400)
+        out = _run(core, "GET ops.internal/op", True, [{"progress": huge}, {"progress": 100}])
+        self.assertEqual(out["attempts"], 2)  # pending, then terminal — no OverflowError
+
     def test_dotted_field_walks_objects_and_fails_open(self) -> None:
         core = KeelCoreStub()
         core.configure({"target": {"ops.internal": {"poll": _poll({"field": "response.state", "terminal": ["SUCCEEDED"]})}}})
