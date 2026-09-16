@@ -181,7 +181,7 @@
     "poll": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3). Applies to GET/HEAD at Level 0 only. A JSON response whose `until.field` is not in `until.terminal` is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
+      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3; widened by CCR-8). Applies to requests the front end judged idempotent (safe to re-issue); the HTTP method is not consulted. A JSON response whose `until.field` value is not terminal is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
       "properties": {
         "interval": {
           "type": "string",
@@ -196,12 +196,13 @@
             "field": {
               "type": "string",
               "minLength": 1,
-              "description": "Top-level JSON key to judge (v1: no path expressions)."
+              "description": "JSON key to judge. A dotted path walks nested objects (`response.state`); a missing segment, or a non-object along the way, fails open exactly as a missing top-level key does. Keys containing a literal `.` are not addressable. (CCR-8; CCR-3 was top-level only.)"
             },
             "terminal": {
               "type": "array",
-              "items": { "type": "string" },
-              "minItems": 1
+              "items": { "type": ["string", "boolean", "number"] },
+              "minItems": 1,
+              "description": "Values of `until.field` that end the poll. A value is terminal when it is JSON-equal to an item of the SAME JSON type: \"true\" does not match true, 1 does not match true; numbers compare by value (100 matches 100.0). (CCR-8)"
             }
           },
           "required": ["field", "terminal"]
