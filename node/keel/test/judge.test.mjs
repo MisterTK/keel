@@ -6,6 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   classifyThrow,
   parseRetryAfter,
@@ -15,7 +16,11 @@ import {
   deriveArgsHash,
   lroShapedPath,
   streamingResponse,
+  operationRead,
+  isIdempotent,
 } from "../src/judge.mjs";
+
+const operationReadCorpus = new URL("../../../conformance/operation_read/cases.json", import.meta.url);
 
 test("parseRetryAfter: delta-seconds, RFC 5322 date, and ISO 8601 date (Python parity)", () => {
   const now = Date.parse("2015-10-21T07:00:00Z"); // fixed reference
@@ -226,5 +231,23 @@ test("streamingResponse: text/event-stream (any casing, params tolerated) is tru
   assert.equal(streamingResponse(null), false);
   assert.equal(streamingResponse(undefined), false);
   assert.equal(streamingResponse(""), false);
+});
+
+test("operation-read corpus: every row agrees with the Python front end (CCR-8)", () => {
+  const rows = JSON.parse(readFileSync(operationReadCorpus, "utf8"));
+  assert.ok(rows.length >= 12);
+  for (const row of rows) {
+    assert.equal(operationRead(row.host, row.path), row.operation_read, row.name);
+    const headers = new Headers(row.headers.map((h) => [h, "x"]));
+    assert.equal(isIdempotent(row.method, headers, undefined, row.host, row.path), row.idempotent, row.name);
+  }
+});
+
+test("injection is skipped for an operation read (CCR-8)", () => {
+  const vertex = "us-central1-aiplatform.googleapis.com";
+  const fetch = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation";
+  const submit = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning";
+  assert.equal(resolveIdempotencyInjection("POST", new Headers(), "Idempotency-Key", () => "k", null, vertex, fetch), null);
+  assert.equal(resolveIdempotencyInjection("POST", new Headers(), "Idempotency-Key", () => "k", null, vertex, submit), "k");
 });
 

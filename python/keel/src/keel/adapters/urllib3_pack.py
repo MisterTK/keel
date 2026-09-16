@@ -183,7 +183,7 @@ def _judge(pool: Any, method: str, url: str, headers: Any, body: Any) -> tuple[s
     )
     op = f"{method} {host}{url}"
     idem_header = _http.idempotency_header(target)
-    idempotent = _http.is_idempotent(method, _header_names(headers), idem_header)
+    idempotent = _http.is_idempotent(method, _header_names(headers), idem_header, host=host, path=path)
     netloc = f"{host}:{port}" if port else host
     full_url = f"{scheme}://{netloc}{url}"
     # Only a buffered (bytes/str) body is hashed — a file-like/generator body

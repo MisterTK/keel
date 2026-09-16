@@ -214,7 +214,7 @@ def _judge(session: Any, method: str, str_or_url: Any, kwargs: dict[str, Any]) -
     )
     op = f"{method} {host}{path}"
     idem_header = _http.idempotency_header(target)
-    idempotent = _http.is_idempotent(method, _header_names(kwargs.get("headers")), idem_header)
+    idempotent = _http.is_idempotent(method, _header_names(kwargs.get("headers")), idem_header, host=host, path=path)
     hash_ = _http.derive_args_hash(target, method, str(url), _body_for_hash(kwargs))
     return target, op, idempotent, hash_
 

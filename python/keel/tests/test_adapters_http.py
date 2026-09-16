@@ -7,6 +7,7 @@ Retry-After parsing (both RFC forms), and the transient-status boundary."""
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,10 @@ from requests.models import PreparedRequest
 from keel import _runtime
 from keel.adapters import _http, httpx_pack, requests_pack
 from keel_core_stub import KeelCoreStub
+
+from . import REPO_ROOT
+
+OPERATION_READ_CORPUS = REPO_ROOT / "conformance" / "operation_read" / "cases.json"
 
 try:
     import keel_core  # noqa: F401
@@ -331,6 +336,33 @@ class ReplayHeadersTest(unittest.TestCase):
     def test_tolerates_none_and_malformed_pairs(self) -> None:
         self.assertEqual(_http.replay_headers(None), [])
         self.assertEqual(_http.replay_headers([["only-key"], ["k", "v", "extra"]]), [])
+
+
+class OperationReadCorpusTest(unittest.TestCase):
+    """CCR-8 operation-read rule, pinned by the corpus Node's judge.test.mjs
+    reads too — the two front ends must agree row for row."""
+
+    def test_every_corpus_row(self) -> None:
+        rows = json.loads(OPERATION_READ_CORPUS.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(rows), 12)
+        for row in rows:
+            with self.subTest(row["name"]):
+                self.assertIs(_http.operation_read(row["host"], row["path"]), row["operation_read"])
+                self.assertIs(
+                    _http.is_idempotent(row["method"], row["headers"], host=row["host"], path=row["path"]),
+                    row["idempotent"],
+                )
+
+    def test_injection_is_skipped_for_an_operation_read(self) -> None:
+        vertex = "us-central1-aiplatform.googleapis.com"
+        fetch = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation"
+        submit = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning"
+        self.assertIsNone(_http.resolve_idempotency_injection("POST", [], "Idempotency-Key", host=vertex, path=fetch))
+        self.assertIsNotNone(_http.resolve_idempotency_injection("POST", [], "Idempotency-Key", host=vertex, path=submit))
+
+    def test_host_and_path_are_optional_for_legacy_callers(self) -> None:
+        self.assertFalse(_http.is_idempotent("POST", []))
+        self.assertTrue(_http.is_idempotent("GET", []))
 
 
 if __name__ == "__main__":

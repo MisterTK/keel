@@ -51,12 +51,34 @@ export function normalizeRequest(input, init) {
 }
 
 /**
+ * True iff (hostname, pathname) is a Google long-running-operation READ:
+ * a host under `googleapis.com` (apex or any `*.googleapis.com`, case-
+ * insensitive) whose last path segment carries a `fetch…Operation` custom
+ * method. contracts/adapter-pack.md "Operation reads" (CCR-8). Twin of
+ * Python's `_http.operation_read`; keep identical (corpus:
+ * conformance/operation_read/). Narrower than `lroShapedPath` on purpose.
+ */
+export function operationRead(hostname, pathname) {
+  if (!hostname || !pathname) return false;
+  const h = String(hostname).toLowerCase();
+  if (h !== "googleapis.com" && !h.endsWith(".googleapis.com")) return false;
+  const last = String(pathname).split("/").pop() ?? "";
+  const colon = last.lastIndexOf(":");
+  if (colon < 0) return false;
+  const verb = last.slice(colon + 1);
+  return verb.startsWith("fetch") && verb.endsWith("Operation");
+}
+
+/**
  * Decide idempotency. `idempotencyHeader` is the target's configured header
  * (from policy `idempotency.header`), if any. A POST/PATCH is retryable only
- * when a recognized idempotency header is actually present on the request.
+ * when a recognized idempotency header is actually present on the request —
+ * or, for a POST, when `(hostname, pathname)` is a Google operation read
+ * (CCR-8).
  */
-export function isIdempotent(method, headers, idempotencyHeader) {
+export function isIdempotent(method, headers, idempotencyHeader, hostname = null, pathname = null) {
   if (IDEMPOTENT_METHODS.has(method)) return true;
+  if (method === "POST" && operationRead(hostname, pathname)) return true;
   const candidates = idempotencyHeader
     ? [idempotencyHeader.toLowerCase()]
     : DEFAULT_IDEMPOTENCY_HEADERS;
@@ -109,8 +131,11 @@ export function resolveIdempotencyInjection(
   idempotencyHeader,
   mint = defaultMintIdempotencyKey,
   recordedKey = null,
+  hostname = null,
+  pathname = null,
 ) {
   if (!idempotencyHeader || IDEMPOTENT_METHODS.has(method)) return null;
+  if (method === "POST" && operationRead(hostname, pathname)) return null; // CCR-8: nothing to make safe
   if (headers.has(idempotencyHeader.toLowerCase())) return null;
   return recordedKey ?? mint();
 }

@@ -214,12 +214,12 @@ def _judge(request: Any) -> tuple[str, str, bool, str | None, str | None]:
     # a Tier 2 flow, a crashed predecessor's key (`recorded_key`, peeked above)
     # is reused verbatim instead of minting a fresh one (rule 3).
     injected = _http.resolve_idempotency_injection(
-        method, request.headers.keys(), idem_header, recorded_key=recorded_key
+        method, request.headers.keys(), idem_header, recorded_key=recorded_key, host=host, path=url.path
     )
     if injected is not None:
         request.headers[idem_header] = injected  # type: ignore[index]
     idempotent = injected is not None or _http.is_idempotent(
-        method, request.headers.keys(), idem_header
+        method, request.headers.keys(), idem_header, host=host, path=url.path
     )
     return target, op, idempotent, hash_, injected
 
