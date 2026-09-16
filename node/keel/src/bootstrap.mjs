@@ -349,13 +349,14 @@ export function installExitFlush(
     // never cost a discovery write.
     try {
       if (summary) {
+        const byTarget = summary.unprotectedByTarget();
         if (jsonLogs(env)) {
           // Unconditional, unlike the text form: a zero line proves Keel was
           // live and intercepted nothing, which is exactly what the outage
           // post-mortem had no way to establish.
-          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}));
+          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}, byTarget));
         } else {
-          const text = formatSummary(summary.counts(), keelOnPath());
+          const text = formatSummary(summary.counts(), keelOnPath(), byTarget);
           if (text) proc.stderr.write(text);
         }
       }

@@ -23,12 +23,27 @@ export function jsonLogs(env = process.env) {
   return String(env?.KEEL_LOG_FORMAT ?? "").trim().toLowerCase() === "json";
 }
 
+/**
+ * Recursively sort plain-object keys; arrays keep their order, primitives
+ * pass through unchanged. Python's `json.dumps(sort_keys=True)` already
+ * sorts nested objects — this is `dumpsLine`'s twin for that behavior, so a
+ * value like `unprotected_by_target` (a nested target -> count object)
+ * serializes identically in both languages (#96).
+ */
+function sortKeys(value) {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value !== null && typeof value === "object") {
+    const sorted = {};
+    for (const k of Object.keys(value).sort()) sorted[k] = sortKeys(value[k]);
+    return sorted;
+  }
+  return value;
+}
+
 /** Sorted keys, no spaces — byte-identical to Python's
  *  `json.dumps(sort_keys=True, separators=(",", ":"))`. */
 export function dumpsLine(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return `${JSON.stringify(sorted)}\n`;
+  return `${JSON.stringify(sortKeys(obj))}\n`;
 }
 
 /** Write `text` (already newline-terminated) or the JSON form of `obj`. */

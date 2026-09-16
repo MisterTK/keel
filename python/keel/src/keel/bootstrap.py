@@ -324,13 +324,14 @@ def _register_exit_flush() -> None:
         if _STATE.summary is not None:
             try:
                 counts = _STATE.summary.counts()
+                by_target = _STATE.summary.unprotected_by_target()
                 if json_logs(_STATE.env if _STATE.env is not None else os.environ):
                     # Unconditional, unlike the text form: a zero line proves
                     # Keel was live and intercepted nothing, which is exactly
                     # what the outage post-mortem had no way to establish.
-                    sys.stderr.write(format_summary_json(counts, _STATE.meta or {}))
+                    sys.stderr.write(format_summary_json(counts, _STATE.meta or {}, by_target))
                 else:
-                    text = format_summary(counts, keel_on_path())
+                    text = format_summary(counts, keel_on_path(), by_target)
                     if text:
                         sys.stderr.write(text)
             except Exception:  # noqa: BLE001 — observability never fails the process

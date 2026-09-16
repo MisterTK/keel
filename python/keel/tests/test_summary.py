@@ -71,6 +71,17 @@ class SummaryCountsTest(unittest.TestCase):
         self.assertEqual(s.counts()["throttled"], 1)
         self.assertEqual(s.counts()["unprotected"], 1)
 
+    def test_summary_tracks_unprotected_per_target(self) -> None:
+        from keel._summary import Summary
+
+        s = Summary()
+        s.observe(_outcome(), wrapped=False, target="a.example")
+        s.observe(_outcome(), wrapped=False, target="a.example")
+        s.observe(_outcome(), wrapped=False, target="b.example")
+        s.observe(_outcome(), wrapped=True, target="c.example")
+        self.assertEqual(s.unprotected_by_target(), {"a.example": 2, "b.example": 1})
+        self.assertEqual(s.counts()["unprotected"], 3)
+
 
 class SummaryFormatCorpusTest(unittest.TestCase):
     def test_corpus_present(self) -> None:
@@ -82,7 +93,12 @@ class SummaryFormatCorpusTest(unittest.TestCase):
         for path in sorted(CORPUS.glob("*.json")):
             case = json.loads(path.read_text(encoding="utf-8"))
             with self.subTest(case=case["name"]):
-                self.assertEqual(format_summary(case["counts"], case["keel_on_path"]), case["expected"])
+                self.assertEqual(
+                    format_summary(
+                        case["counts"], case["keel_on_path"], case.get("unprotected_by_target")
+                    ),
+                    case["expected"],
+                )
 
 
 class JsonSummaryCorpusTest(unittest.TestCase):
@@ -100,7 +116,12 @@ class JsonSummaryCorpusTest(unittest.TestCase):
         for f in files:
             case = json.loads(f.read_text(encoding="utf-8"))
             with self.subTest(case["name"]):
-                self.assertEqual(format_summary_json(case["counts"], case["meta"]), case["expected"])
+                self.assertEqual(
+                    format_summary_json(
+                        case["counts"], case["meta"], case.get("unprotected_by_target")
+                    ),
+                    case["expected"],
+                )
 
 
 class JsonLogsTest(unittest.TestCase):

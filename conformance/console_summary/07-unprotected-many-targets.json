@@ -1,0 +1,7 @@
+{
+  "name": "unprotected-many-targets",
+  "counts": { "calls": 11, "throttled": 0, "retries_succeeded": 0, "breaker_trips": 0, "cache_hits": 0, "not_retried": 0, "unprotected": 11 },
+  "unprotected_by_target": { "a.example": 5, "b.example": 5, "c.example": 1 },
+  "keel_on_path": true,
+  "expected": "keel ▸ 11 calls · 11 calls unprotected (a.example 5, b.example 5, c.example 1)\n       keel report --open for the full picture\n"
+}

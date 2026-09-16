@@ -266,7 +266,7 @@ class Discovery:
         wrapped = target in self._known_targets
         if self._summary is not None:
             try:
-                self._summary.observe(outcome, wrapped)
+                self._summary.observe(outcome, wrapped, target=target)
             except Exception:  # noqa: BLE001 — the summary never breaks a call
                 pass
         row = _row_from_outcome(target, outcome, latency_ms, wrapped)

@@ -93,7 +93,7 @@ export function createDiscovery(
       // The exit-time console summary (src/summary.mjs) is fed here because
       // this is the one place that knows whether the target was wrapped.
       try {
-        summary?.observe(outcome, knownTargets.has(target));
+        summary?.observe(outcome, knownTargets.has(target), target);
       } catch {
         /* the summary never breaks a call */
       }

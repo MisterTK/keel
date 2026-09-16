@@ -15,5 +15,5 @@
     "policy_source": "defaults",
     "version": "0.5.5"
   },
-  "expected": "{\"breaker_trips\":0,\"cache_hits\":0,\"calls\":0,\"keel\":\"summary\",\"keel_cwd\":\"/code\",\"not_retried\":0,\"policy_path\":null,\"policy_source\":\"defaults\",\"retries_succeeded\":0,\"throttled\":0,\"unprotected\":0,\"version\":\"0.5.5\"}\n"
+  "expected": "{\"breaker_trips\":0,\"cache_hits\":0,\"calls\":0,\"keel\":\"summary\",\"keel_cwd\":\"/code\",\"not_retried\":0,\"policy_path\":null,\"policy_source\":\"defaults\",\"retries_succeeded\":0,\"throttled\":0,\"unprotected\":0,\"unprotected_by_target\":{},\"version\":\"0.5.5\"}\n"
 }
