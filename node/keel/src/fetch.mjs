@@ -88,6 +88,15 @@ export function installFetch(
   {
     globalObj = globalThis,
     mintIdempotencyKey = defaultMintIdempotencyKey,
+    // Test-only seam: `llm-policy.mjs`'s real `rewriteModel` can only ever
+    // rewrite the MODEL portion of a URL/body, never the host or the verb
+    // after a path segment's last colon (its documented v0.1 limitation) —
+    // so no fallback hop reachable through the real fallback chain can ever
+    // land on a different (hostname, pathname) shape than hop 0. That makes
+    // the per-hop re-judgment fixed by issue #106 unobservable end-to-end
+    // without a substitute rewriter. Defaults to the real `rewriteModel`;
+    // production callers never pass this.
+    rewriteFallback = rewriteModel,
   } = {},
 ) {
   const original = globalObj.fetch;
@@ -143,21 +152,25 @@ export function installFetch(
       parsed.pathname,
     );
     if (injectedKey !== null) headers.set(idemHeader, injectedKey);
-    // A call is only retried if it is BOTH idempotent by method/header/injection
-    // AND its body can be re-sent on a retry: an unbuffered stream body is
-    // consumed once, so a call carrying one is downgraded to non-idempotent
-    // (Level 0: can't wrap safely → observed, not retried). In-memory bodies
-    // (string/bytes) are re-sent unchanged on each attempt.
-    const idempotent =
-      (injectedKey !== null || isIdempotent(method, headers, idemHeader, hostname, parsed.pathname)) &&
-      isBodyRetrySafe(input, body);
+    // A call is only retried if its body can be re-sent on a retry: an
+    // unbuffered stream body is consumed once, so a call carrying one is
+    // downgraded to non-idempotent (Level 0: can't wrap safely → observed,
+    // not retried). In-memory bodies (string/bytes) are re-sent unchanged on
+    // each attempt. This is a property of the ORIGINAL request only — a
+    // fallback hop's body is always a freshly (re)serialized in-memory value
+    // (llm-policy.mjs's `rewriteModel`), so this does not need re-checking
+    // per hop.
+    const bodyRetrySafe = isBodyRetrySafe(input, body);
     // `op`/`args_hash`/`request` are per-hop (a fallback hop dispatches a
-    // different URL/body), so they are (re)computed inside the hop loop below.
-
-    // Per-attempt timeout is enforced only for idempotent calls: a timeout we
-    // impose becomes a new thrown error, and we must never inject one into a
-    // non-idempotent success path.
-    const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
+    // different URL/body), so they are (re)computed inside the hop loop
+    // below. `idempotent` and the per-attempt `timeoutMs` MUST be too
+    // (issue #106): a Google operation-read POST (CCR-8) is exempted by
+    // `(hostname, pathname)`, and a fallback hop can land somewhere that
+    // exemption does not apply — judging it from hop 0's URL would wrongly
+    // carry `idempotent: true` (and hop 0's timeout) into a hop it was never
+    // judged for. `idemHeader`/`injectedKey` stay fixed across hops: the
+    // minted key is ONE per logical call (adapter-pack.md rule 2), not
+    // re-minted per hop.
 
     // Only a call the core may actually cache OR poll-judge needs its body
     // buffered into the payload envelope (for a cross-call / cross-run
@@ -198,6 +211,16 @@ export function installFetch(
       const hopParsed = new URL(hopUrl);
       const op = `${method} ${hostname}${hopParsed.pathname}`;
       const hash = deriveArgsHash(target, method, hopParsed.href, hopBody);
+      // Re-judged from THIS hop's own (hostname, pathname) — see the note
+      // above the loop (issue #106).
+      const idempotent =
+        (injectedKey !== null ||
+          isIdempotent(method, headers, idemHeader, hopParsed.hostname, hopParsed.pathname)) &&
+        bodyRetrySafe;
+      // Per-attempt timeout is enforced only for idempotent calls: a timeout
+      // we impose becomes a new thrown error, and we must never inject one
+      // into a non-idempotent success path.
+      const timeoutMs = idempotent ? durationMs(backend.layer(target, "timeout")) : null;
       const request = { v: 1, target, op, idempotent, args_hash: hash };
       // A cache ttl needs a hash to key it by; a poll table judges the body
       // regardless of args_hash — an llm:* GET derives none (issue #76), but
@@ -273,7 +296,7 @@ export function installFetch(
       // may fail (unrecognized request shape) — then we stop and deliver THIS
       // failure, honestly, rather than pretend a hop happened.
       if (hopIndex >= fallbackChain.length || !shouldFallback(outcome.error)) break;
-      const rewritten = rewriteModel(hopUrl, hopBody, fallbackChain[hopIndex]);
+      const rewritten = rewriteFallback(hopUrl, hopBody, fallbackChain[hopIndex]);
       if (!rewritten) break;
       hopUrl = rewritten.url;
       hopBody = rewritten.body;
