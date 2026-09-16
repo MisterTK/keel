@@ -29,7 +29,14 @@ def sqlite_journal_path(policy: Mapping[str, Any], cwd: Path) -> Path | None:
     if loc is None:
         return cwd / ".keel" / "journal.db"
     if isinstance(loc, str) and loc.startswith("file:"):
-        return (cwd / loc[len("file:") :]).resolve()
+        # Lexical-only (parity with Node's `path.resolve`, which never touches
+        # the filesystem): `Path.resolve()` would also resolve symlinks, and
+        # on macOS `/tmp`/`/var` themselves are symlinks, so that diverges
+        # from Node's purely-lexical `resolve()` for the exact same input.
+        # This string is for a human-facing warning + a JSON field, not to
+        # open a file — canonicalizing symlinks buys nothing and costs
+        # cross-language identity.
+        return Path(os.path.normpath(os.path.join(str(cwd), loc[len("file:") :])))
     return None
 
 

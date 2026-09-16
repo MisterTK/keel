@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { ephemeralJournalWarning } from "../src/deploy.mjs";
 
@@ -57,6 +57,12 @@ test("dockerenv and read-only cwd are markers", () => {
     rmSync(d, { recursive: true, force: true });
   }
 
+  // POSIX access(2)'s write check is bypassed for the superuser on a normal
+  // filesystem — chmod(0o500) does not stop root writing, so under a root CI
+  // container the probe below would (correctly) report writable and this
+  // assertion is meaningless.
+  if (typeof process.getuid === "function" && process.getuid() === 0) return;
+
   d = tmp();
   try {
     const ro = join(d, "ro");
@@ -86,6 +92,33 @@ test("no flows, postgres, or no marker is silent", () => {
       null
     );
     assert.equal(ephemeralJournalWarning(FLOWS, {}, d, { dockerenv: join(d, "nope") }), null);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("file: journal is resolved lexically, not against the filesystem", () => {
+  // Issue caught in review: Python's `Path.resolve()` also resolves
+  // symlinks, which diverges from Node's purely-lexical `path.resolve()`
+  // (macOS /tmp and /var are themselves symlinks). Both sides must stay
+  // lexical-only; the `..` segment is where lexical vs. filesystem
+  // normalization differ. Byte-identity with Python's exact expected string
+  // (built independently here, same shape as the default-path test above).
+  const d = tmp();
+  try {
+    const pol = { ...FLOWS, journal: "file:sub/../other/journal.db" };
+    const [, obj] = ephemeralJournalWarning(pol, { K_SERVICE: "x" }, d, {
+      dockerenv: join(d, "nope"),
+    });
+    const expectedRelative = resolve(d, "other", "journal.db");
+    assert.equal(obj.journal, expectedRelative);
+    assert.equal(obj.journal, join(d, "other", "journal.db"));
+
+    const polAbs = { ...FLOWS, journal: "file:/var/data/../other/journal.db" };
+    const [, objAbs] = ephemeralJournalWarning(polAbs, { K_SERVICE: "x" }, d, {
+      dockerenv: join(d, "nope"),
+    });
+    assert.equal(objAbs.journal, "/var/other/journal.db");
   } finally {
     rmSync(d, { recursive: true, force: true });
   }

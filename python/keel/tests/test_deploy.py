@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,6 +25,12 @@ class EphemeralJournalWarningTest(unittest.TestCase):
             marker = Path(d, ".dockerenv"); marker.write_text("")
             _, obj = ephemeral_journal_warning(FLOWS, {}, Path(d), dockerenv=marker)
             self.assertEqual(obj["marker"], "/.dockerenv")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            # POSIX access(2)'s write check is bypassed for the superuser on a
+            # normal filesystem — chmod(0o500) does not stop root writing, so
+            # the probe below would (correctly) report writable and this
+            # assertion is meaningless under a root CI container.
+            return
         with TemporaryDirectory() as d:
             ro = Path(d, "ro"); ro.mkdir(); ro.chmod(0o500)
             try:
@@ -43,3 +50,17 @@ class EphemeralJournalWarningTest(unittest.TestCase):
         with TemporaryDirectory() as d:
             pol = {"flows": {"entrypoints": ["cmd:etl"], "match": {"cmd:etl": {"argv": ["run_etl.sh"]}}}}
             self.assertIsNotNone(ephemeral_journal_warning(pol, {"K_SERVICE": "x"}, Path(d), dockerenv=Path(d, "nope")))
+
+    def test_file_journal_is_resolved_lexically_not_against_the_filesystem(self) -> None:
+        # Issue caught in review: `Path.resolve()` also resolves symlinks,
+        # which diverges from Node's purely-lexical `path.resolve()` — this
+        # must stay lexical-only on both sides. The `..` segment is the case
+        # where lexical vs. filesystem normalization differ.
+        with TemporaryDirectory() as d:
+            pol = {**FLOWS, "journal": "file:sub/../other/journal.db"}
+            _, obj = ephemeral_journal_warning(pol, {"K_SERVICE": "x"}, Path(d), dockerenv=Path(d, "nope"))
+            self.assertEqual(obj["journal"], str(Path(d) / "other" / "journal.db"))
+
+            pol_abs = {**FLOWS, "journal": "file:/var/data/../other/journal.db"}
+            _, obj_abs = ephemeral_journal_warning(pol_abs, {"K_SERVICE": "x"}, Path(d), dockerenv=Path(d, "nope"))
+            self.assertEqual(obj_abs["journal"], "/var/other/journal.db")
