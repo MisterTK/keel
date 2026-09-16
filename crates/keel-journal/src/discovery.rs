@@ -522,7 +522,7 @@ impl<C: Clock> DiscoveryStore<C> {
     /// as zero.
     pub fn snapshot(&self) -> Result<Vec<TargetStats>> {
         let conn = self.lock();
-        let legacy = schema_version(&conn)? < DISCOVERY_SCHEMA_VERSION;
+        let legacy = schema_version(&conn)? < 2;
         let sql = if legacy {
             "SELECT target, calls, attempts, retries, successes, failures, cache_hits, \
              throttled, breaker_opens, total_latency_ms, max_latency_ms, first_seen_ms, \
@@ -545,7 +545,7 @@ impl<C: Clock> DiscoveryStore<C> {
     /// Empty on a legacy (v1) file, which has no bucket table.
     pub fn daily_snapshot(&self) -> Result<Vec<DailyStats>> {
         let conn = self.lock();
-        if schema_version(&conn)? < DISCOVERY_SCHEMA_VERSION {
+        if schema_version(&conn)? < 2 {
             return Ok(Vec::new());
         }
         let mut stmt = conn.prepare(
@@ -1264,6 +1264,56 @@ CREATE TABLE IF NOT EXISTS discovery (
         .unwrap();
         assert_eq!(rw.activations_snapshot().unwrap().len(), 1);
         assert_eq!(rw.snapshot().unwrap().len(), 0, "v2 tables untouched");
+    }
+
+    /// A genuine v2 file (real `not_retried`/`unwrapped_calls` columns, a
+    /// populated `discovery_daily` bucket) opened READ-ONLY — never migrated
+    /// to v3 — must still read its real v2 data back, not degrade to zeros.
+    /// Regression test for a v3 bump that widened `snapshot()`/
+    /// `daily_snapshot()`'s "legacy" gate from `< 2` (true v1) to
+    /// `< DISCOVERY_SCHEMA_VERSION` (now 3), which silently swallowed every
+    /// v2 file's `not_retried`/`unwrapped_calls`/daily buckets on a read-only
+    /// open — exactly the path `keel doctor`/`status`/`report` use.
+    #[test]
+    fn readonly_v2_file_reads_its_real_v2_data_not_zeros() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("d.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DISCOVERY_SCHEMA).unwrap();
+            conn.execute_batch(DAILY_SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO discovery VALUES \
+                 ('api.v2', 10, 12, 2, 8, 2, 0, 1, 0, 500, 90, ?1, ?2, 'http', 503, 3, 4)",
+                params![T0, T0 + 1_000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO discovery_daily VALUES ('api.v2', ?1, 10, 12, 2, 8, 2, 0, 1, 0, 3, 4)",
+                params![T0_DAY],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+
+        let ro = DiscoveryStore::open_readonly(&path, ManualClock::new(0)).unwrap();
+        let t = &ro.snapshot().unwrap()[0];
+        assert_eq!(t.not_retried, 3, "real v2 column, not degraded to zero");
+        assert_eq!(t.unwrapped_calls, 4, "real v2 column, not degraded to zero");
+
+        let daily = ro.daily_snapshot().unwrap();
+        assert_eq!(
+            daily.len(),
+            1,
+            "real v2 daily bucket, not degraded to empty"
+        );
+        assert_eq!(daily[0].not_retried, 3);
+        assert_eq!(daily[0].unwrapped_calls, 4);
+
+        // The file was not mutated by a read-only open: still v2.
+        drop(ro);
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
     }
 
     #[test]
