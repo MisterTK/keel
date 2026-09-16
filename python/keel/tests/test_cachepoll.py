@@ -84,10 +84,15 @@ class CachePollConcurrencyTest(unittest.TestCase):
 
     NOT a lock-regression guard: it passes with the lock removed, because
     CPython's default switch interval (5ms) makes the window vanishingly
-    narrow at this scale. The race is real and was reproduced separately with
-    `sys.setswitchinterval(1e-6)` at larger scale (lost hits in 1 of 20 runs
-    unlocked, 0 of 20 locked). Do not read a pass here as proof the lock is
-    still needed (#100)."""
+    narrow at this scale. An earlier session reported reproducing lost hits
+    in 1 of 20 unlocked runs with a lowered switch interval
+    (`sys.setswitchinterval(1e-6)`); a later attempt to reproduce that —
+    scaled up to 512 threads and millions of operations, both with and
+    without the lock — saw 0 of 20 losses either way. The race remains
+    theoretically real (the read-modify-write on `run[0]` is unguarded
+    without the lock) but is unreproduced here; this is not a claim that the
+    race does not exist. Do not read a pass here as proof the lock is still
+    needed (#100)."""
 
     def test_concurrent_hits_on_one_key_fire_exactly_once_and_lose_no_hits(self) -> None:
         # Real threads, the real clock, min_span_s=0 so firing depends only
