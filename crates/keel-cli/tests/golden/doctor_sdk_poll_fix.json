@@ -185,7 +185,7 @@
             "after": {
               "poll": {
                 "deadline": "30m",
-                "interval": "1s",
+                "interval": "10s",
                 "until": {
                   "field": "done",
                   "terminal": [
@@ -202,7 +202,7 @@
             "after": {
               "poll": {
                 "deadline": "30m",
-                "interval": "1s",
+                "interval": "10s",
                 "until": {
                   "field": "done",
                   "terminal": [
@@ -216,7 +216,7 @@
             "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\""
           }
         ],
-        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces the hand-rolled poll in inline.py:6 (wait)\n+timeout = \"30s\"\n+poll    = { interval = \"1s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces the hand-rolled poll in inline.py:6 (wait)\n+timeout = \"30s\"\n+poll    = { interval = \"1s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval/deadline are the slowest of them\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval/deadline are the slowest of them\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
       },
       "level": "warn",
       "topic": "hand-rolled-poll"

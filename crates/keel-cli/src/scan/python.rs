@@ -404,12 +404,6 @@ def _timeout_named(name):
     return any(h in lowered for h in TIMEOUT_NAME_HINTS)
 
 
-def _mentions_timeout_name(expr):
-    return any((isinstance(n, ast.Name) and _timeout_named(n.id))
-               or (isinstance(n, ast.Attribute) and _timeout_named(n.attr))
-               for n in ast.walk(expr))
-
-
 def loop_interval_s(node, aliases):
     """The loop's OWN sleep interval in whole seconds — but only when every
     sleep call in the loop names the same integer literal. A computed backoff
@@ -430,11 +424,16 @@ def loop_interval_s(node, aliases):
 
 
 def fn_deadline_s(fn):
-    """A whole-second deadline the FUNCTION itself states, when it states
-    exactly one: the default of a timeout-named parameter (`timeout_s: int =
-    900`) or a comparison of a timeout-named expression against a literal
-    (`if elapsed > 900:`). Zero candidates, or two that disagree, yield None —
-    an ambiguous deadline is not a deadline Keel knows."""
+    """A whole-second deadline the FUNCTION itself declares, when it declares
+    exactly one: the default of a timeout-named PARAMETER (`timeout_s: int =
+    900`). Zero candidates, or two that disagree, yield None — an ambiguous
+    deadline is not a deadline Keel knows.
+
+    A comparison against a literal (`if waited > 60:`) is deliberately NOT a
+    source. In the textbook counter poll `waited` counts ITERATIONS, so the
+    literal beside it is a count, not seconds, and reading it as a deadline
+    put a wrong number into an applyable patch. A parameter default is the
+    only form whose units the name can be trusted for."""
     vals = set()
     a = fn.args
     positional = list(getattr(a, "posonlyargs", [])) + list(a.args)
@@ -448,14 +447,6 @@ def fn_deadline_s(fn):
         if default is not None and _timeout_named(arg.arg):
             v = _int_seconds(default)
             if v is not None:
-                vals.add(v)
-    for n in ast.walk(fn):
-        if not (isinstance(n, ast.Compare) and len(n.comparators) == 1):
-            continue
-        left, right = n.left, n.comparators[0]
-        for lit, other in ((left, right), (right, left)):
-            v = _int_seconds(lit)
-            if v is not None and _mentions_timeout_name(other):
                 vals.add(v)
     return vals.pop() if len(vals) == 1 else None
 
@@ -1747,11 +1738,8 @@ def fetcher(path):
     }
 
     /// #107.1: a sighting carries the loop's OWN cadence when the source
-    /// states it — the sleep literal and a single whole-second deadline
-    /// literal the function names. Anything not statically certain (a
-    /// computed backoff, a fractional sleep, two disagreeing deadline
-    /// literals) stays `None`, so the proposal falls back to its documented
-    /// default instead of inventing a number.
+    /// states it — the sleep literal, plus the one whole-second deadline the
+    /// function DECLARES as a timeout-named parameter default.
     #[test]
     fn poll_sightings_carry_the_loops_own_interval_and_deadline() {
         if !python3_present() {
@@ -1773,6 +1761,52 @@ def poller(request_id, timeout_s: int = 900):
         if data == "completed":
             return data
         time.sleep(10)
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, Option<u32>, Option<u32>)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.file.as_str(), x.interval_s, x.deadline_s))
+            .collect();
+        assert_eq!(got, vec![("literal.py", Some(10), Some(900))]);
+    }
+
+    /// The other half of #107.1, and the more important one: anything not
+    /// statically CERTAIN stays `None` so the proposal falls back to its
+    /// documented default rather than inventing a number.
+    #[test]
+    fn poll_sighting_cadence_is_none_whenever_it_is_not_statically_certain() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // The textbook counter poll: `waited` counts ITERATIONS, so the `60`
+        // beside it is not seconds (the real deadline here is 60 × 5s). Only
+        // a timeout-named PARAMETER DEFAULT is read as a deadline — a
+        // comparison against a literal is not, precisely because of this
+        // shape.
+        fs::write(
+            dir.path().join("counter.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller():
+    waited = 0
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(5)
+        waited += 1
+        if waited > 60:
+            raise TimeoutError("gave up")
 "#,
         )
         .unwrap();
@@ -1839,10 +1873,11 @@ def poller(timeout_ms: int = 5000):
             vec![
                 // A computed backoff is not a number Keel knows.
                 ("computed.py", None, None),
+                // `waited > 60` counts iterations, not seconds: interval is
+                // still read, the deadline is NOT invented from it.
+                ("counter.py", Some(5), None),
                 // `sleep(0.5)` is not whole seconds; 60 and 120 disagree.
                 ("fractional.py", None, None),
-                // `time.sleep(10)` + one `timeout_s: int = 900` default.
-                ("literal.py", Some(10), Some(900)),
                 // 5000 MILLISECONDS is not 5000 seconds — read as neither.
                 ("millis.py", Some(2), None),
             ]

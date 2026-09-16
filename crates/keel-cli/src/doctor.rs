@@ -878,41 +878,89 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
     out
 }
 
-/// The TOML block for one proposal, carrying its own evidence comment (the
-/// loop it replaces) — the no-raw-source rule holds: only the file, line and
-/// function name are interpolated.
+/// The cadence ONE route-key patch proposes, folded over every sighting that
+/// shares that key set (#107). One patch governs a route all of those loops
+/// travel, so each column is the most conservative value across them — the
+/// MAXIMUM — and drops to the block's documented default the moment any one
+/// member's value is unknown. Speeding a loop up is the failure mode that
+/// matters here (an LRO poll storm); slowing one down is not.
+#[derive(Debug, Clone, Copy, Default)]
+struct RouteCadence {
+    /// Max `interval_s` across the set, or `None` if any member has none.
+    interval_s: Option<u32>,
+    /// Max `deadline_s` across the set, or `None` if any member has none.
+    deadline_s: Option<u32>,
+    /// How many sightings share this key set (>= 1), for the provenance
+    /// comment.
+    sightings: usize,
+}
+
+impl RouteCadence {
+    fn of(s: &SimplificationSighting) -> Self {
+        Self {
+            interval_s: s.interval_s,
+            deadline_s: s.deadline_s,
+            sightings: 1,
+        }
+    }
+
+    fn fold(&mut self, s: &SimplificationSighting) {
+        // `zip` is the whole rule: `None` on either side erases the column.
+        self.interval_s = self.interval_s.zip(s.interval_s).map(|(a, b)| a.max(b));
+        self.deadline_s = self.deadline_s.zip(s.deadline_s).map(|(a, b)| a.max(b));
+        self.sightings += 1;
+    }
+}
+
+/// The TOML block for one proposal, carrying its own evidence comment — the
+/// no-raw-source rule holds: only the file, line, function name and a count
+/// are interpolated.
 ///
-/// `interval`/`deadline` restate the loop's OWN cadence when the scanner could
-/// read it as a literal (#107), and fall back to `10s` / `30m` when it could
-/// not. The two are independent: a loop whose sleep is a literal but whose
-/// deadline is not gets its real interval and the default deadline.
-fn render_route_block(p: &RouteKeyProposal, s: &SimplificationSighting) -> String {
-    let interval = s
+/// `interval`/`deadline` come from [`RouteCadence`], i.e. the slowest values
+/// observed across every loop on this route, defaulting to `10s` / `30m` per
+/// column. The comment says so whenever more than one loop is involved, so it
+/// never reads as "these are that one named loop's numbers".
+fn render_route_block(
+    p: &RouteKeyProposal,
+    s: &SimplificationSighting,
+    cadence: RouteCadence,
+) -> String {
+    let interval = cadence
         .interval_s
         .map_or_else(|| "10s".to_owned(), |v| format!("{v}s"));
-    let deadline = s
+    let deadline = cadence
         .deadline_s
         .map_or_else(|| "30m".to_owned(), |v| format!("{v}s"));
+    let provenance = if cadence.sightings > 1 {
+        format!(
+            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}); \
+             interval/deadline are the slowest of them",
+            cadence.sightings, s.file, s.line, s.function
+        )
+    } else {
+        format!(
+            "replaces the hand-rolled poll in {}:{} ({})",
+            s.file, s.line, s.function
+        )
+    };
     format!(
-        "[target.\"{}\"]   # keel doctor: {} — replaces the hand-rolled poll in {}:{} ({})\n\
+        "[target.\"{}\"]   # keel doctor: {} — {}\n\
          timeout = \"30s\"\n\
          poll    = {{ interval = \"{}\", deadline = \"{}\", until = {{ field = \"{}\", terminal = {} }} }}\n",
-        p.key, p.note, s.file, s.line, s.function, interval, deadline, p.field, p.terminal
+        p.key, p.note, provenance, interval, deadline, p.field, p.terminal
     )
 }
 
-/// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
-/// the sorted key set it would append (the dedupe identity — see
-/// [`simplification_findings`]). `None` when no shape is known, every proposed
-/// key is already configured, or the resulting document would not parse.
-fn route_key_fix(
+/// The route keys one `hand-rolled-poll` sighting would append to
+/// `policy_text`, already filtered against what that document configures.
+/// `None` when there is no base document to edit (absent or invalid
+/// `keel.toml`: propose nothing rather than a patch that would create/clobber
+/// the file), or when the sighting names no proposable route.
+fn route_key_candidates(
     s: &SimplificationSighting,
     policy_text: Option<&str>,
-) -> Option<(Vec<&'static str>, Proposal)> {
-    // `None` = no base document to edit (absent or invalid keel.toml): propose
-    // nothing rather than a patch that would create/clobber the file.
-    let text = policy_text?;
-    let existing: toml_edit::DocumentMut = text.parse().ok()?;
+) -> Option<Vec<RouteKeyProposal>> {
+    let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
     let has_key = |k: &str| {
         existing
             .get("target")
@@ -925,19 +973,59 @@ fn route_key_fix(
         .flat_map(|t| route_key_proposals(t, &s.sdk_polls))
         .filter(|p| !has_key(p.key))
         .collect();
-    if proposals.is_empty() {
-        return None;
-    }
+    (!proposals.is_empty()).then_some(proposals)
+}
+
+/// The sorted key set a sighting's candidates form — the dedupe identity and
+/// the [`RouteCadence`] fold key (see [`simplification_findings`]).
+fn route_key_set(proposals: &[RouteKeyProposal]) -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = proposals.iter().map(|p| p.key).collect();
     keys.sort_unstable();
+    keys
+}
+
+/// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
+/// the key set it would append. `None` when no shape is known, every proposed
+/// key is already configured, or the resulting document would not parse. The
+/// cadence is looked up by key set, NOT read off `s` — see [`RouteCadence`].
+fn route_key_fix(
+    s: &SimplificationSighting,
+    policy_text: Option<&str>,
+    cadences: &BTreeMap<Vec<&'static str>, RouteCadence>,
+) -> Option<(Vec<&'static str>, Proposal)> {
+    let proposals = route_key_candidates(s, policy_text)?;
+    let keys = route_key_set(&proposals);
+    let cadence = cadences.get(&keys).copied().unwrap_or_default();
     let ops: Vec<PolicyOp> = proposals
         .iter()
         .map(|p| PolicyOp::AppendBlock {
-            text: render_route_block(p, s),
+            text: render_route_block(p, s, cadence),
         })
         .collect();
     let proposal = propose(policy_text, &ops).ok()?;
     (!proposal.patch.is_empty()).then_some((keys, proposal))
+}
+
+/// Fold every `hand-rolled-poll` sighting into the cadence of the route-key
+/// set it would propose, BEFORE any finding is rendered — the patch the first
+/// sighting carries has to speak for all of them.
+fn route_cadences(
+    scan: &ScanResult,
+    policy_text: Option<&str>,
+) -> BTreeMap<Vec<&'static str>, RouteCadence> {
+    let mut out: BTreeMap<Vec<&'static str>, RouteCadence> = BTreeMap::new();
+    for s in &scan.simplifications {
+        if s.kind != "hand-rolled-poll" {
+            continue;
+        }
+        let Some(proposals) = route_key_candidates(s, policy_text) else {
+            continue;
+        };
+        out.entry(route_key_set(&proposals))
+            .and_modify(|c| c.fold(s))
+            .or_insert_with(|| RouteCadence::of(s));
+    }
+    out
 }
 
 /// The WS3 simplification findings: each hand-rolled pattern the scan
@@ -975,6 +1063,7 @@ fn simplification_findings(
     // sighting whose finding carries that patch (the `fix_ref` a later
     // duplicate points at, so the pointer survives reordering/filtering).
     let mut proposed: BTreeMap<Vec<&'static str>, String> = BTreeMap::new();
+    let cadences = route_cadences(scan, policy_text);
     for s in &scan.simplifications {
         let mut fix_ref = None;
         let targets = s.targets.join(", ");
@@ -990,7 +1079,7 @@ fn simplification_findings(
                 // The first sighting for a key set carries the patch; later
                 // ones name it, since only one of two identical patches can
                 // apply against the same base file.
-                if let Some((keys, proposal)) = route_key_fix(s, policy_text) {
+                if let Some((keys, proposal)) = route_key_fix(s, policy_text, &cadences) {
                     if let Some(holder) = proposed.get(&keys) {
                         fix_ref = Some(holder.clone());
                     } else {
@@ -2930,6 +3019,78 @@ mod tests {
         assert!(
             neither.contains("interval = \"10s\", deadline = \"30m\""),
             "{neither}"
+        );
+    }
+
+    /// #107.2, multi-sighting: ONE patch governs a route key that ALL the
+    /// loops sharing it travel, so its cadence must be the most conservative
+    /// of them — the MAXIMUM interval and the MAXIMUM deadline — never one
+    /// member's numbers imposed on the rest. A single `None` in either column
+    /// drops that column to its documented default; the two are independent.
+    #[test]
+    fn route_key_cadence_is_the_most_conservative_across_the_key_set() {
+        use crate::scan::SimplificationSighting;
+        let sighting = |line, interval_s, deadline_s| SimplificationSighting {
+            file: "render.py".into(),
+            line,
+            kind: "hand-rolled-poll".into(),
+            function: "poll".into(),
+            targets: vec!["llm:openai".into()],
+            sdk_polls: vec!["batches.retrieve".into()],
+            interval_s,
+            deadline_s,
+        };
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:openai".to_owned()],
+        };
+        let patch_for = |sightings: Vec<SimplificationSighting>| {
+            let scan = ScanResult {
+                simplifications: sightings,
+                ..ScanResult::default()
+            };
+            let findings = simplification_findings(&scan, &topology, Some("[flows]\n"));
+            findings
+                .iter()
+                .find_map(|f| f.fix.as_ref())
+                .expect("route-key proposal attached")
+                .patch
+                .clone()
+        };
+        // Two loops on one route: the slower cadence wins both columns, so
+        // the patch never speeds up the 3s loop to the 1s loop's pace.
+        let both = patch_for(vec![
+            sighting(8, Some(1), Some(120)),
+            sighting(40, Some(3), Some(600)),
+        ]);
+        assert!(
+            both.contains("interval = \"3s\", deadline = \"600s\""),
+            "{both}"
+        );
+        // A third loop whose interval Keel could not read: the interval falls
+        // back to the default while the deadline stays the maximum — the two
+        // reasons are visibly distinct in one patch.
+        let partial = patch_for(vec![
+            sighting(8, Some(1), Some(120)),
+            sighting(40, Some(3), Some(600)),
+            sighting(70, None, Some(300)),
+        ]);
+        assert!(
+            partial.contains("interval = \"10s\", deadline = \"600s\""),
+            "{partial}"
+        );
+        // Provenance: a multi-loop patch must not name one loop as if the
+        // numbers were its own.
+        assert!(
+            both.contains("replaces 2 hand-rolled polls on this route"),
+            "{both}"
+        );
+        assert!(
+            !patch_for(vec![sighting(8, Some(3), Some(600))])
+                .contains("hand-rolled polls on this route"),
+            "a single sighting keeps the singular provenance"
         );
     }
 

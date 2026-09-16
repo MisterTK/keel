@@ -133,10 +133,14 @@ pub struct SimplificationSighting {
     /// disagreeing sleeps, or a non-loop kind. Never a guess: a consumer
     /// falls back to its own documented default on `None`.
     pub interval_s: Option<u32>,
-    /// A whole-second deadline the sighting's function itself states, when it
-    /// states exactly one (a timeout-named parameter default, or a comparison
-    /// of a timeout-named expression against a literal). `None` under the same
-    /// never-guess rule as [`Self::interval_s`].
+    /// A whole-second deadline the sighting's enclosing FUNCTION declares —
+    /// the default of a timeout-named parameter (`timeout_s: int = 900`), and
+    /// only when the function declares exactly one. It is a property of the
+    /// function, not of this loop: it is computed once per function and
+    /// stamped on every loop sighting inside it. `None` under the same
+    /// never-guess rule as [`Self::interval_s`]; a literal in a comparison
+    /// (`waited > 60`) is deliberately not a source, since such a literal is
+    /// usually an iteration count rather than seconds.
     pub deadline_s: Option<u32>,
 }
 
