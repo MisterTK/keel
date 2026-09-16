@@ -18,6 +18,7 @@ import {
   streamingResponse,
   operationRead,
   isIdempotent,
+  customMethodVerb,
 } from "../src/judge.mjs";
 
 const operationReadCorpus = new URL("../../../conformance/operation_read/cases.json", import.meta.url);
@@ -211,6 +212,20 @@ test("lroShapedPath: Google LRO submit/poll verbs, and nothing else", () => {
     "/v1/models/m:fetch",
     "/v1/models/m:Operation",
   ]) assert.equal(lroShapedPath(p), false, p);
+});
+
+// The one shared parser (#107.3) both `operationRead` and `lroShapedPath` sit
+// on top of. Twin of Python's `_http._custom_method_verb`.
+test("customMethodVerb: the last segment's text after its last colon, else null", () => {
+  for (const [p, verb] of [
+    ["/v1/models/veo:fetchOperation", "fetchOperation"],
+    ["/v1/models/veo:predictLongRunning", "predictLongRunning"],
+    ["models/veo:a:b", "b"],
+    [":fetchOperation", "fetchOperation"],
+  ]) assert.equal(customMethodVerb(p), verb, p);
+  for (const p of ["/v1/operations/abc", "", "/a:b/c", "/", null, undefined]) {
+    assert.equal(customMethodVerb(p), null, String(p));
+  }
 });
 
 test("deriveArgsHash: llm POST LRO submit and poll shapes derive no hash (#83)", () => {

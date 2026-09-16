@@ -376,6 +376,90 @@ def is_sleep(node, aliases):
     return lib in SLEEP_LIBS and name == "sleep"
 
 
+TIMEOUT_NAME_HINTS = ("timeout", "deadline", "elapsed", "waited", "max_wait",
+                      "max_seconds")
+
+
+def _int_seconds(node):
+    """A positive WHOLE-second literal, or None. `True`/`False` are ints in
+    Python and are never seconds; a fractional literal (`sleep(0.5)`) is not a
+    whole number of seconds and yields None rather than a rounded guess — the
+    proposal falls back to its documented default when this is None."""
+    if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
+        return None
+    v = node.value
+    if not isinstance(v, int) or not 0 < v < 2 ** 31:
+        return None
+    return v
+
+
+def _timeout_named(name):
+    """A name that plausibly holds a timeout/deadline IN SECONDS. A sub-second
+    unit in the name (`timeout_ms`, `elapsed_millis`) disqualifies it outright:
+    the literal beside it is not a number of seconds, and reading it as one
+    would propose a deadline 1000x too long."""
+    lowered = name.lower()
+    if any(u in lowered for u in ("_ms", "milli", "micro", "_us", "nano")):
+        return False
+    return any(h in lowered for h in TIMEOUT_NAME_HINTS)
+
+
+def _mentions_timeout_name(expr):
+    return any((isinstance(n, ast.Name) and _timeout_named(n.id))
+               or (isinstance(n, ast.Attribute) and _timeout_named(n.attr))
+               for n in ast.walk(expr))
+
+
+def loop_interval_s(node, aliases):
+    """The loop's OWN sleep interval in whole seconds — but only when every
+    sleep call in the loop names the same integer literal. A computed backoff
+    (`time.sleep(backoff)`), a fractional sleep, a bare `sleep()`, or two
+    sleeps that disagree all yield None: #107 says read the loop's literals,
+    never guess a number."""
+    vals = set()
+    for sub in ast.walk(node):
+        if not is_sleep(sub, aliases):
+            continue
+        if not sub.args:
+            return None
+        v = _int_seconds(sub.args[0])
+        if v is None:
+            return None
+        vals.add(v)
+    return vals.pop() if len(vals) == 1 else None
+
+
+def fn_deadline_s(fn):
+    """A whole-second deadline the FUNCTION itself states, when it states
+    exactly one: the default of a timeout-named parameter (`timeout_s: int =
+    900`) or a comparison of a timeout-named expression against a literal
+    (`if elapsed > 900:`). Zero candidates, or two that disagree, yield None —
+    an ambiguous deadline is not a deadline Keel knows."""
+    vals = set()
+    a = fn.args
+    positional = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    if a.defaults:
+        for arg, default in zip(positional[len(positional) - len(a.defaults):], a.defaults):
+            if _timeout_named(arg.arg):
+                v = _int_seconds(default)
+                if v is not None:
+                    vals.add(v)
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        if default is not None and _timeout_named(arg.arg):
+            v = _int_seconds(default)
+            if v is not None:
+                vals.add(v)
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Compare) and len(n.comparators) == 1):
+            continue
+        left, right = n.left, n.comparators[0]
+        for lit, other in ((left, right), (right, left)):
+            v = _int_seconds(lit)
+            if v is not None and _mentions_timeout_name(other):
+                vals.add(v)
+    return vals.pop() if len(vals) == 1 else None
+
+
 def is_broad_handler(h):
     if h.type is None:
         return True
@@ -505,6 +589,7 @@ def detect_simplifications(fn, aliases, imported_llm_libs):
     construct, not a second finding."""
     found = []
     covered = set()
+    deadline_s = fn_deadline_s(fn)
     for node in ast.walk(fn):
         if not isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
             continue
@@ -532,7 +617,9 @@ def detect_simplifications(fn, aliases, imported_llm_libs):
         shapes = sorted({sdk_poll_shape(sub, imported_llm_libs)
                          for sub in ast.walk(node) if isinstance(sub, ast.Call)} - {None})
         found.append({"kind": kind, "line": node.lineno,
-                      "sdk_polls": shapes if kind == "hand-rolled-poll" else []})
+                      "sdk_polls": shapes if kind == "hand-rolled-poll" else [],
+                      "interval_s": loop_interval_s(node, aliases),
+                      "deadline_s": deadline_s})
         covered.update(id(sub) for sub in ast.walk(node))
     for node in ast.walk(fn):
         if (isinstance(node, ast.ExceptHandler) and id(node) not in covered
@@ -730,7 +817,9 @@ for dirpath, dirnames, filenames in os.walk(root):
                             "file": rel, "function": node.name,
                             "kind": hit["kind"], "line": hit["line"],
                             "targets": facts["targets"],
-                            "sdk_polls": hit.get("sdk_polls", [])})
+                            "sdk_polls": hit.get("sdk_polls", []),
+                            "interval_s": hit.get("interval_s"),
+                            "deadline_s": hit.get("deadline_s")})
 
         # Dependency-averse detection: stdlib-only files with a risk/gate/
         # guard/auth/valid/safety/kill name or docstring signal, or an
@@ -840,6 +929,10 @@ struct WalkerSimplification {
     targets: Vec<String>,
     #[serde(default)]
     sdk_polls: Vec<String>,
+    #[serde(default)]
+    interval_s: Option<u32>,
+    #[serde(default)]
+    deadline_s: Option<u32>,
 }
 
 /// One dependency-averse file from the walker (see [`DepAverseFile`]).
@@ -951,6 +1044,8 @@ pub fn scan(project: &Path) -> PyScan {
             function: s.function,
             targets: s.targets,
             sdk_polls: s.sdk_polls,
+            interval_s: s.interval_s,
+            deadline_s: s.deadline_s,
         });
     }
     for d in output.dependency_averse {
@@ -1649,6 +1744,109 @@ def fetcher(path):
         let poll = &s.findings.simplifications[0];
         assert_eq!(poll.line, 7);
         assert_eq!(poll.targets, vec!["api.tavily.com".to_owned()]);
+    }
+
+    /// #107.1: a sighting carries the loop's OWN cadence when the source
+    /// states it — the sleep literal and a single whole-second deadline
+    /// literal the function names. Anything not statically certain (a
+    /// computed backoff, a fractional sleep, two disagreeing deadline
+    /// literals) stays `None`, so the proposal falls back to its documented
+    /// default instead of inventing a number.
+    #[test]
+    fn poll_sightings_carry_the_loops_own_interval_and_deadline() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("literal.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(request_id, timeout_s: int = 900):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(10)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("computed.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(backoff):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(backoff)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fractional.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(timeout_s: int = 60, deadline_s: int = 120):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(0.5)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("millis.py"),
+            r#"import time
+import urllib.request
+
+API = "https://api.tavily.com/research"
+
+def poller(timeout_ms: int = 5000):
+    while True:
+        with urllib.request.urlopen(API) as r:
+            data = r.read().decode()
+        if data == "completed":
+            return data
+        time.sleep(2)
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(&str, Option<u32>, Option<u32>)> = s
+            .findings
+            .simplifications
+            .iter()
+            .map(|x| (x.file.as_str(), x.interval_s, x.deadline_s))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // A computed backoff is not a number Keel knows.
+                ("computed.py", None, None),
+                // `sleep(0.5)` is not whole seconds; 60 and 120 disagree.
+                ("fractional.py", None, None),
+                // `time.sleep(10)` + one `timeout_s: int = 900` default.
+                ("literal.py", Some(10), Some(900)),
+                // 5000 MILLISECONDS is not 5000 seconds — read as neither.
+                ("millis.py", Some(2), None),
+            ]
+        );
     }
 
     #[test]

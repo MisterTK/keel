@@ -254,12 +254,21 @@ struct PolicyCheck {
 /// One actionable finding. Where the finding implies a policy edit, `fix`
 /// carries the applyable form (dx-spec §5, diffs as the lingua franca): a
 /// unified `patch` for `git apply` plus structured `changes`.
+///
+/// `fix_ref` is the structured half of "this finding's fix lives elsewhere":
+/// the `file:line` of the sighting whose finding holds the patch, for the case
+/// where two findings would propose the SAME edit and only one patch can apply
+/// (#107). Absent — and omitted from the JSON entirely — on every finding that
+/// either carries its own `fix` or needs none, so existing consumers see the
+/// exact bytes they saw before.
 #[derive(Debug, Serialize)]
 struct Finding {
     action: String,
     detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fix: Option<Proposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix_ref: Option<String>,
     level: &'static str,
     topic: &'static str,
 }
@@ -614,6 +623,7 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
             if libs.len() == 1 { "it" } else { "they" }
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "preexisting-resilience",
     })
@@ -639,6 +649,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 .to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "url-no-transport",
         });
@@ -674,6 +685,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "subprocess-blind-spot",
         });
@@ -695,6 +707,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -712,6 +725,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -746,6 +760,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -773,6 +788,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             action: action.to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: excluded_kind_topic(entry.kind),
         });
@@ -865,12 +881,23 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
 /// The TOML block for one proposal, carrying its own evidence comment (the
 /// loop it replaces) — the no-raw-source rule holds: only the file, line and
 /// function name are interpolated.
+///
+/// `interval`/`deadline` restate the loop's OWN cadence when the scanner could
+/// read it as a literal (#107), and fall back to `10s` / `30m` when it could
+/// not. The two are independent: a loop whose sleep is a literal but whose
+/// deadline is not gets its real interval and the default deadline.
 fn render_route_block(p: &RouteKeyProposal, s: &SimplificationSighting) -> String {
+    let interval = s
+        .interval_s
+        .map_or_else(|| "10s".to_owned(), |v| format!("{v}s"));
+    let deadline = s
+        .deadline_s
+        .map_or_else(|| "30m".to_owned(), |v| format!("{v}s"));
     format!(
         "[target.\"{}\"]   # keel doctor: {} — replaces the hand-rolled poll in {}:{} ({})\n\
          timeout = \"30s\"\n\
-         poll    = {{ interval = \"10s\", deadline = \"30m\", until = {{ field = \"{}\", terminal = {} }} }}\n",
-        p.key, p.note, s.file, s.line, s.function, p.field, p.terminal
+         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {{ field = \"{}\", terminal = {} }} }}\n",
+        p.key, p.note, s.file, s.line, s.function, interval, deadline, p.field, p.terminal
     )
 }
 
@@ -928,8 +955,10 @@ fn route_key_fix(
 /// blocks against the same base file, and only one such patch can apply — so
 /// the proposal is attached to the FIRST sighting (in `scan.simplifications`
 /// order: file, line, kind) for a given key set, and later sightings with that
-/// same key set point at it instead. Dedupe is by key SET, not by target, so a
-/// google-genai loop and an openai loop each still get their own patch.
+/// same key set point at it through `fix_ref` — the holder's `file:line`, a
+/// structured reference rather than prose about report order (#107). Dedupe is
+/// by key SET, not by target, so a google-genai loop and an openai loop each
+/// still get their own patch.
 ///
 /// `policy_text` is the base document a proposal edits; the caller passes
 /// `None` for an invalid `keel.toml` — the removal fix on the policy finding
@@ -942,8 +971,12 @@ fn simplification_findings(
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
     // Key sets already proposed in this report (see the dedupe note above).
-    let mut proposed: BTreeSet<Vec<&'static str>> = BTreeSet::new();
+    // Key sets already proposed in this report -> the `file:line` of the
+    // sighting whose finding carries that patch (the `fix_ref` a later
+    // duplicate points at, so the pointer survives reordering/filtering).
+    let mut proposed: BTreeMap<Vec<&'static str>, String> = BTreeMap::new();
     for s in &scan.simplifications {
+        let mut fix_ref = None;
         let targets = s.targets.join(", ");
         let actionable_now = s.targets.iter().any(|t| wrappable.contains(t.as_str()));
         let (level, when) = if actionable_now {
@@ -957,17 +990,14 @@ fn simplification_findings(
                 // The first sighting for a key set carries the patch; later
                 // ones name it, since only one of two identical patches can
                 // apply against the same base file.
-                let already_proposed = match route_key_fix(s, policy_text) {
-                    Some((keys, proposal)) => {
-                        if proposed.insert(keys) {
-                            fix = Some(proposal);
-                            false
-                        } else {
-                            true
-                        }
+                if let Some((keys, proposal)) = route_key_fix(s, policy_text) {
+                    if let Some(holder) = proposed.get(&keys) {
+                        fix_ref = Some(holder.clone());
+                    } else {
+                        proposed.insert(keys, format!("{}:{}", s.file, s.line));
+                        fix = Some(proposal);
                     }
-                    None => false,
-                };
+                }
                 let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
                      `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
                      POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
@@ -980,10 +1010,11 @@ fn simplification_findings(
                         " Or apply the attached patch (`git apply`): it adds the route-key \
                          `poll` block for this provider — tune `interval`/`deadline` to the job.",
                     );
-                } else if already_proposed {
-                    action.push_str(
-                        " The route-key patch for this provider is attached to the first \
-                         hand-rolled-poll finding above.",
+                } else if let Some(holder) = &fix_ref {
+                    let _ = write!(
+                        action,
+                        " The route-key patch for this provider is attached to the \
+                         `hand-rolled-poll` finding for {holder} (`fix_ref`)."
                     );
                 }
                 (
@@ -1031,6 +1062,7 @@ fn simplification_findings(
             action,
             detail: format!("{what}."),
             fix,
+            fix_ref,
             level,
             topic,
         });
@@ -1297,6 +1329,7 @@ fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
              keel.toml at the project root never ships to the container."
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "agents-cli-config-placement",
     })
@@ -1348,6 +1381,7 @@ fn config_above_cwd_finding(project: &Path) -> Option<Finding> {
                     here.display()
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "config-above-cwd",
             });
@@ -1406,6 +1440,7 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
             journal.backend, journal.backend
         ),
         fix: None,
+        fix_ref: None,
         level: "error",
         topic: "journal",
     })
@@ -1453,6 +1488,7 @@ fn journal_ephemeral_finding(
             artifacts.join(", ")
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "journal-ephemeral-storage",
     })
@@ -1585,6 +1621,7 @@ fn build_report(
                 "`{target}` is visible in your code but has no observed runtime evidence."
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "visible-unwrapped",
         });
@@ -1594,6 +1631,7 @@ fn build_report(
             action: format!("No adapter for `{lib}` yet — its calls are invisible to Keel. Track adapter support or wrap manually."),
             detail: format!("`{lib}` is imported but has no adapter in the registry."),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "invisible",
         });
@@ -1603,6 +1641,7 @@ fn build_report(
         action: "If a dependency makes calls Keel never reports, file an adapter request.".to_owned(),
         detail: "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.".to_owned(),
         fix: None,
+        fix_ref: None,
         level: "info",
         topic: "invisible",
     });
@@ -1636,6 +1675,7 @@ fn build_report(
                  at-most-once-dispatch signature in: {list}."
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "orchestration-blind-spot",
         });
@@ -1663,6 +1703,7 @@ fn build_report(
                 policy.message.clone().unwrap_or_default()
             ),
             fix,
+            fix_ref: None,
             level: "error",
             topic: "policy",
         });
@@ -1734,6 +1775,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.file
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "keel-toml-not-in-image",
             }),
@@ -1748,6 +1790,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.file
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "keel-toml-not-in-image",
             }),
@@ -1762,6 +1805,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.directive.as_deref().unwrap_or_default()
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "info",
                 topic: "keel-toml-image-indeterminate",
             }),
@@ -2719,6 +2763,8 @@ mod tests {
             function: "poll_video_takes".into(),
             targets: vec!["llm:google-genai".into()],
             sdk_polls: vec!["operations.get".into()],
+            interval_s: None,
+            deadline_s: None,
         });
         let topology = Topology {
             excluded: vec![],
@@ -2788,6 +2834,8 @@ mod tests {
             function: "poll_again".into(),
             targets: vec!["llm:google-genai".into()],
             sdk_polls: vec!["operations.get".into()],
+            interval_s: None,
+            deadline_s: None,
         });
         let dedup = simplification_findings(
             &scan,
@@ -2800,10 +2848,14 @@ mod tests {
             "same key set → not proposed twice: {:?}",
             dedup[1].fix
         );
+        // #107.3: the pointer is structured (`fix_ref`) and the prose names
+        // the holder by file:line instead of relying on report ORDER.
+        assert_eq!(dedup[0].fix_ref, None, "the holder points at nobody");
+        assert_eq!(dedup[1].fix_ref.as_deref(), Some("render.py:8"));
         assert!(
             dedup[1].action.contains(
-                "The route-key patch for this provider is attached to the first \
-                 hand-rolled-poll finding above."
+                "The route-key patch for this provider is attached to the `hand-rolled-poll` \
+                 finding for render.py:8 (`fix_ref`)."
             ),
             "{}",
             dedup[1].action
@@ -2826,6 +2878,58 @@ mod tests {
             !f3[0].action.contains("attached"),
             "no patch exists to point at: {}",
             f3[0].action
+        );
+    }
+
+    /// #107.2: the proposed `poll` block states the loop's OWN cadence when
+    /// the scanner could read it, and falls back to the documented defaults
+    /// (`10s` / `30m`) when it could not — a sighting that knows nothing must
+    /// not have a number invented for it.
+    #[test]
+    fn route_key_proposal_uses_the_loops_own_interval_and_deadline() {
+        use crate::scan::SimplificationSighting;
+        let sighting = |interval_s, deadline_s| SimplificationSighting {
+            file: "render.py".into(),
+            line: 8,
+            kind: "hand-rolled-poll".into(),
+            function: "poll_video_takes".into(),
+            targets: vec!["llm:openai".into()],
+            sdk_polls: vec!["batches.retrieve".into()],
+            interval_s,
+            deadline_s,
+        };
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:openai".to_owned()],
+        };
+        let patch_for = |s: SimplificationSighting| {
+            let mut scan = ScanResult::default();
+            scan.simplifications.push(s);
+            simplification_findings(&scan, &topology, Some("[flows]\n"))[0]
+                .fix
+                .as_ref()
+                .expect("route-key proposal attached")
+                .patch
+                .clone()
+        };
+        let own = patch_for(sighting(Some(20), Some(900)));
+        assert!(
+            own.contains("interval = \"20s\", deadline = \"900s\""),
+            "{own}"
+        );
+        // Partially known: the half Keel read is used, the half it did not
+        // falls back — the two are independent.
+        let half = patch_for(sighting(Some(20), None));
+        assert!(
+            half.contains("interval = \"20s\", deadline = \"30m\""),
+            "{half}"
+        );
+        let neither = patch_for(sighting(None, None));
+        assert!(
+            neither.contains("interval = \"10s\", deadline = \"30m\""),
+            "{neither}"
         );
     }
 
@@ -2864,6 +2968,8 @@ mod tests {
             function: "caller".into(),
             targets: vec!["api.ok.com".into()],
             sdk_polls: vec![],
+            interval_s: None,
+            deadline_s: None,
         });
         // Unreachable target (stdlib urllib) with a hand-rolled poll — the
         // claude-trader shape until WS4 flips urllib to tracked.
@@ -2888,6 +2994,8 @@ mod tests {
             function: "_poll_research".into(),
             targets: vec!["api.tavily.com".into()],
             sdk_polls: vec![],
+            interval_s: None,
+            deadline_s: None,
         });
         let r = build_report(
             &scan,
