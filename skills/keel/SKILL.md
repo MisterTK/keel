@@ -161,7 +161,9 @@ the six phases in order; the static scan is evidence, not the verdict.
    Then read `boundaries` — it names what this report could not parse (source
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
-   codes.
+   codes. `runtime_activation` says whether this checkout has ever activated
+   with this policy; `journal-ephemeral-storage` fires when `[flows]` meets
+   SQLite in a container artifact.
 4. **Baseline before you mutate.** Before proposing any *behavior-changing*
    policy — retry, breaker, or a timeout that alters an outcome, as opposed to
    a pure simplification swap like a poll loop → `poll` policy — measure what
@@ -218,7 +220,8 @@ the six phases in order; the static scan is evidence, not the verdict.
    read the deploy logs for the one startup line: `with policy <path>` is
    proof, `with production defaults` means the policy did not ship. Set
    `KEEL_LOG_FORMAT=json` in containers so that line and the exit summary
-   are queryable fields.
+   are queryable fields. Locally, `keel status` shows the last activation:
+   language, version, the policy it loaded, and the pid.
 
 ## Driving Keel via MCP
 

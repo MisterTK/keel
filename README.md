@@ -179,7 +179,7 @@ dashboard — pick whichever fits the moment:
    prints one summary to **stderr** at exit, no CLI required:
 
    ```
-   keel ▸ 47 calls · absorbed 3 rate limits · 2 retries succeeded · 4 calls unprotected
+   keel ▸ 185 calls · 78 calls unprotected (storage.googleapis.com 41, metadata.google.internal 22, +3 others)
           keel report --open for the full picture
    ```
 
@@ -187,6 +187,21 @@ dashboard — pick whichever fits the moment:
    installed, that second line prints `uvx --from keelrun-cli keel report
    --open` instead — the summary itself never needs the CLI. Turn it off
    with `console = false` under `[telemetry]` in `keel.toml`, or `KEEL_QUIET=1`.
+
+   `keel status` and `keel report` now show the **last activation**:
+   language, version, the policy file it loaded (or `production defaults`
+   and the directory it searched), and the pid — the local answer to "was
+   Keel on, with which policy". `keel doctor --json` carries the same fact
+   as `runtime_activation: verified | unverified`.
+
+   Two runtime warnings name conditions the summary alone can't show: `keel
+   ▸ warning: durable flows are configured but the journal is SQLite … on
+   ephemeral storage` fires when `[flows]` is configured, the journal is
+   SQLite, and a serverless marker, `/.dockerenv`, or a read-only cwd says
+   this instance's filesystem won't survive a redeploy. `keel ▸ warning:
+   <target> served 5 consecutive cache hits for one identical call over
+   20s` fires when the default dev cache has been silently replaying what
+   looks like a status-poll loop for at least 20 seconds.
 
    In a container, stderr is the surface that survives — though a parent
    that captures a child's stderr silently swallows it. Set
@@ -445,11 +460,19 @@ Keel is a file plus an env var, so reaching production has four invariants:
    of view — point it at a directory with no `keel.toml` and Keel refuses to
    activate rather than run defaults (see above).
 4. **`.keel/` outlives the instance** if you use durable flows — a volume
-   or a Postgres journal.
+   or a Postgres journal. `keel doctor` warns `journal-ephemeral-storage`
+   when `[flows]` is configured, the journal is SQLite, and the project
+   root itself shows a deploy artifact (a build file, or
+   `app.yaml`/`fly.toml`/`serverless.yaml`/`serverless.yml`) — a redeploy or
+   scale-to-zero would otherwise discard every resumable flow silently.
 
 Verify from the logs: exactly one `keel ▸ wrapped … with policy /code/keel.toml`
-line per process. `keel init --agents` writes the same four invariants into
-`AGENTS.md` so the agent that edits your Dockerfile has them in context.
+line per process, and — once the process has made at least one call, or at
+exit — `keel doctor --json`'s `runtime_activation: "verified"`, which
+requires an actual recorded activation whose policy matches this project,
+not just a plausible-looking config. `keel init --agents` writes the same
+four invariants into `AGENTS.md` so the agent that edits your Dockerfile has
+them in context.
 
 ### Keel for Google ADK + agents-cli
 
