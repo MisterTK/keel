@@ -29,7 +29,7 @@ use serde::Serialize;
 use crate::cmd_match::{compile_cmd_rules, match_argv};
 use crate::diff::{PolicyOp, PolicyPath, Proposal, propose, resolve_dotted_path};
 use crate::render::to_json;
-use crate::scan::{ScanResult, TransportClass};
+use crate::scan::{ScanResult, SimplificationSighting, TransportClass};
 use crate::{EXIT_OK, EXIT_USAGE, Rendered, agents_cli, evidence, scan};
 
 /// One known adapter/pack: its library, the language(s), the semantic target
@@ -496,6 +496,11 @@ struct PolicyValidation {
     /// `defaults.llm`, then `policy.target`'s `BTreeMap` iteration order).
     lro_timeouts: Vec<(String, u64)>,
     fix: Option<Proposal>,
+    /// The raw `keel.toml` text this validation read — the base document a
+    /// proposal edits (`None` when the file is absent or unreadable, which
+    /// is distinct from `Some("")`: only the former selects the `/dev/null`
+    /// creation header).
+    text: Option<String>,
     /// `[flows] entrypoints` non-empty or `[flows.match]` non-empty (issue
     /// #90) — whether this project has anything durable for an ephemeral
     /// journal to lose. `false` when `keel.toml` is absent or invalid.
@@ -807,7 +812,109 @@ fn excluded_kind_topic(kind: &str) -> &'static str {
 /// stdlib-urllib transport before the urllib pack lands). Never affects
 /// `ok`. Interpolates only hosts, file paths, line numbers, and function
 /// names (the no-raw-source hardening rule).
-fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Finding> {
+/// One route-key `poll` block doctor proposes for an SDK poll shape (spec
+/// §3.4 table). `interval`/`deadline` are proposal defaults an operator tunes.
+struct RouteKeyProposal {
+    key: &'static str,
+    field: &'static str,
+    terminal: &'static str,
+    note: &'static str,
+}
+
+/// The route keys that carry an operation read for one `(target, SDK poll
+/// shape)` pair. Unknown pairs propose nothing — doctor never guesses a route.
+fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyProposal> {
+    let mut out = Vec::new();
+    for shape in sdk_polls {
+        match (target, shape.as_str()) {
+            ("llm:google-genai", "operations.get") => {
+                out.push(RouteKeyProposal {
+                    key: "POST *-aiplatform.googleapis.com/*:fetchPredictOperation",
+                    field: "done",
+                    terminal: "[true]",
+                    note: "Vertex AI operation read (delete if you use the Gemini API)",
+                });
+                out.push(RouteKeyProposal {
+                    key: "GET generativelanguage.googleapis.com/*/operations/*",
+                    field: "done",
+                    terminal: "[true]",
+                    note: "Gemini API operation read (delete if you use Vertex AI)",
+                });
+            }
+            ("llm:openai", "batches.retrieve") => out.push(RouteKeyProposal {
+                key: "GET api.openai.com/v1/batches/*",
+                field: "status",
+                terminal: "[\"completed\", \"failed\", \"expired\", \"cancelled\"]",
+                note: "OpenAI batch status",
+            }),
+            ("llm:openai", "videos.retrieve") => out.push(RouteKeyProposal {
+                key: "GET api.openai.com/v1/videos/*",
+                field: "status",
+                terminal: "[\"completed\", \"failed\"]",
+                note: "OpenAI video status",
+            }),
+            ("llm:openai", "fine_tuning.jobs.retrieve") => out.push(RouteKeyProposal {
+                key: "GET api.openai.com/v1/fine_tuning/jobs/*",
+                field: "status",
+                terminal: "[\"succeeded\", \"failed\", \"cancelled\"]",
+                note: "OpenAI fine-tuning job status",
+            }),
+            ("llm:anthropic", "batches.retrieve") => out.push(RouteKeyProposal {
+                key: "GET api.anthropic.com/v1/messages/batches/*",
+                field: "processing_status",
+                terminal: "[\"ended\"]",
+                note: "Anthropic message batch status",
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The TOML block for one proposal, carrying its own evidence comment (the
+/// loop it replaces) — the no-raw-source rule holds: only the file, line and
+/// function name are interpolated.
+fn render_route_block(p: &RouteKeyProposal, s: &SimplificationSighting) -> String {
+    format!(
+        "[target.\"{}\"]   # keel doctor: {} — replaces the hand-rolled poll in {}:{} ({})\n\
+         timeout = \"30s\"\n\
+         poll    = {{ interval = \"10s\", deadline = \"30m\", until = {{ field = \"{}\", terminal = {} }} }}\n",
+        p.key, p.note, s.file, s.line, s.function, p.field, p.terminal
+    )
+}
+
+/// The applyable route-key proposal for one `hand-rolled-poll` sighting, or
+/// `None` when no shape is known, every proposed key is already configured,
+/// or the resulting document would not parse.
+fn route_key_fix(s: &SimplificationSighting, policy_text: Option<&str>) -> Option<Proposal> {
+    let existing: toml_edit::DocumentMut = policy_text.unwrap_or("").parse().ok()?;
+    let has_key = |k: &str| {
+        existing
+            .get("target")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|t| t.contains_key(k))
+    };
+    let ops: Vec<PolicyOp> = s
+        .targets
+        .iter()
+        .flat_map(|t| route_key_proposals(t, &s.sdk_polls))
+        .filter(|p| !has_key(p.key))
+        .map(|p| PolicyOp::AppendBlock {
+            text: render_route_block(&p, s),
+        })
+        .collect();
+    if ops.is_empty() {
+        return None;
+    }
+    let proposal = propose(policy_text, &ops).ok()?;
+    (!proposal.patch.is_empty()).then_some(proposal)
+}
+
+fn simplification_findings(
+    scan: &ScanResult,
+    topology: &Topology,
+    policy_text: Option<&str>,
+) -> Vec<Finding> {
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
     for s in &scan.simplifications {
@@ -818,20 +925,33 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
         } else {
             ("info", "once Keel can wrap this target")
         };
+        let mut fix = None;
         let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
-            "hand-rolled-poll" => (
-                "hand-rolled-poll",
-                format!(
-                    "`{}` ({}:{}) hand-rolls poll-until-terminal against `{}` — {}, a `poll` \
-                     policy (interval / deadline / until) replaces the whole loop",
-                    s.function, s.file, s.line, targets, when
-                ),
-                "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
-                 bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
-                 GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
-                 loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
-                    .to_owned(),
-            ),
+            "hand-rolled-poll" => {
+                fix = route_key_fix(s, policy_text);
+                let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
+                     `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
+                     POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
+                     `poll` on a route key (`[target.\"POST \
+                     *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the \
+                     LLM host map for that route."
+                    .to_owned();
+                if fix.is_some() {
+                    action.push_str(
+                        " Or apply the attached patch (`git apply`): it adds the route-key \
+                         `poll` block for this provider — tune `interval`/`deadline` to the job.",
+                    );
+                }
+                (
+                    "hand-rolled-poll",
+                    format!(
+                        "`{}` ({}:{}) hand-rolls poll-until-terminal against `{}` — {}, a `poll` \
+                         policy (interval / deadline / until) replaces the whole loop",
+                        s.function, s.file, s.line, targets, when
+                    ),
+                    action,
+                )
+            }
             "silent-swallow" => (
                 "silent-swallow",
                 format!(
@@ -866,7 +986,7 @@ fn simplification_findings(scan: &ScanResult, topology: &Topology) -> Vec<Findin
         findings.push(Finding {
             action,
             detail: format!("{what}."),
-            fix: None,
+            fix,
             level,
             topic,
         });
@@ -1035,10 +1155,10 @@ fn build_follow_ups(
                  deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not \
                  raise the SDK's own deadline — the call site must also pass a timeout >= the \
                  Keel value, or the SDK gives up first and Keel just sees a retryable timeout. \
-                 For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE \
-                 submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex \
-                 `:fetch*Operation`) cannot use `poll` yet — set `cache = {{ mode = \"off\" }}` \
-                 on the target and keep the app-level deadline.",
+                 For a submit-then-poll API a `poll` policy (whose `deadline` bounds the WHOLE \
+                 loop) replaces the loop; a POST-shaped operation read (Vertex \
+                 `:fetch*Operation`) takes it on a route key — see `hand-rolled-poll` findings \
+                 for an applyable patch.",
                 ms / 1000
             ),
         });
@@ -1337,6 +1457,7 @@ fn build_report(
         cmd_match,
         lro_timeouts,
         fix,
+        text: policy_text,
         flows_configured,
     } = policy;
     let registry_libs = registry_libs();
@@ -1454,7 +1575,11 @@ fn build_report(
         });
     }
     findings.extend(topology_findings(&topology));
-    findings.extend(simplification_findings(scan, &topology));
+    findings.extend(simplification_findings(
+        scan,
+        &topology,
+        policy_text.as_deref(),
+    ));
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
         let mut action = "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json.".to_owned();
@@ -1804,15 +1929,23 @@ fn validate_policy(path: &Path) -> PolicyValidation {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         };
     }
     let Ok(text) = std::fs::read_to_string(path) else {
-        return invalid(None, "keel.toml exists but could not be read", None);
+        return invalid(None, "keel.toml exists but could not be read", None, None);
     };
     let toml_value: toml::Value = match text.parse() {
         Ok(v) => v,
-        Err(e) => return invalid(None, &format!("keel.toml is not valid TOML: {e}"), None),
+        Err(e) => {
+            return invalid(
+                None,
+                &format!("keel.toml is not valid TOML: {e}"),
+                None,
+                Some(text),
+            );
+        }
     };
     let json_value = match serde_json::to_value(&toml_value) {
         Ok(v) => v,
@@ -1821,6 +1954,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 None,
                 &format!("keel.toml could not be normalized: {e}"),
                 None,
+                Some(text),
             );
         }
     };
@@ -1863,18 +1997,24 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 cmd_match: policy.flows.and_then(|f| f.match_).unwrap_or_default(),
                 lro_timeouts,
                 fix: None,
+                text: Some(text),
                 flows_configured,
             }
         }
         Err(e) => {
             let field = e.path().to_string();
             let fix = suggest_removal(&text, &field);
-            invalid(Some(field), &e.inner().to_string(), fix)
+            invalid(Some(field), &e.inner().to_string(), fix, Some(text))
         }
     }
 }
 
-fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> PolicyValidation {
+fn invalid(
+    field: Option<String>,
+    message: &str,
+    fix: Option<Proposal>,
+    text: Option<String>,
+) -> PolicyValidation {
     PolicyValidation {
         check: PolicyCheck {
             field,
@@ -1886,6 +2026,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
         cmd_match: BTreeMap::new(),
         lro_timeouts: Vec::new(),
         fix,
+        text,
         flows_configured: false,
     }
 }
@@ -2197,6 +2338,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         };
         let r = build_report(
@@ -2493,6 +2635,87 @@ mod tests {
         );
     }
 
+    /// Poll v2: a `hand-rolled-poll` whose scanner sighting carries an SDK
+    /// poll shape gets an APPLYABLE route-key `poll` block — the shape names
+    /// the provider's operation-read route, which beats the LLM host map.
+    /// Already-configured route keys are not proposed twice, and a poll with
+    /// no SDK shape (a URL-literal loop) gets the updated action with no fix.
+    #[test]
+    fn hand_rolled_poll_with_an_sdk_shape_carries_a_route_key_fix() {
+        use crate::scan::SimplificationSighting;
+        let mut scan = ScanResult::default();
+        scan.simplifications.push(SimplificationSighting {
+            file: "render.py".into(),
+            line: 8,
+            kind: "hand-rolled-poll".into(),
+            function: "poll_video_takes".into(),
+            targets: vec!["llm:google-genai".into()],
+            sdk_polls: vec!["operations.get".into()],
+        });
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:google-genai".to_owned()],
+        };
+        let findings = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+        );
+        let poll = findings
+            .iter()
+            .find(|f| f.topic == "hand-rolled-poll")
+            .unwrap();
+        let fix = poll.fix.as_ref().expect("route-key proposal attached");
+        assert!(
+            fix.patch
+                .contains("[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]"),
+            "{}",
+            fix.patch
+        );
+        assert!(
+            fix.patch
+                .contains("[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]"),
+            "{}",
+            fix.patch
+        );
+        assert!(
+            fix.patch
+                .contains("until = { field = \"done\", terminal = [true] }"),
+            "{}",
+            fix.patch
+        );
+        assert!(
+            poll.action.contains("apply the attached patch"),
+            "{}",
+            poll.action
+        );
+        assert!(
+            !poll.action.contains("GET/HEAD"),
+            "slice-1 caveat is gone: {}",
+            poll.action
+        );
+        // Already-present route key → that block is not proposed twice.
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\ntimeout = \"30s\"\n";
+        let f2 = simplification_findings(&scan, &topology, Some(present));
+        let fix2 = f2[0].fix.as_ref().unwrap();
+        assert!(
+            !fix2.patch.contains("+[target.\"POST *-aiplatform"),
+            "{}",
+            fix2.patch
+        );
+        assert!(
+            fix2.patch.contains("+[target.\"GET generativelanguage"),
+            "{}",
+            fix2.patch
+        );
+        // URL-literal poll (no SDK shape) → no fix, action still updated.
+        scan.simplifications[0].sdk_polls.clear();
+        let f3 = simplification_findings(&scan, &topology, Some(""));
+        assert!(f3[0].fix.is_none());
+    }
+
     /// WS3: each hand-rolled pattern the scan sighted becomes ONE paired
     /// finding. The pairing is with the topology bucket: a wrappable target
     /// makes the finding actionable now (warn); an unreachable one is a
@@ -2527,6 +2750,7 @@ mod tests {
             kind: "hand-rolled-retry".into(),
             function: "caller".into(),
             targets: vec!["api.ok.com".into()],
+            sdk_polls: vec![],
         });
         // Unreachable target (stdlib urllib) with a hand-rolled poll — the
         // claude-trader shape until WS4 flips urllib to tracked.
@@ -2550,6 +2774,7 @@ mod tests {
             kind: "hand-rolled-poll".into(),
             function: "_poll_research".into(),
             targets: vec!["api.tavily.com".into()],
+            sdk_polls: vec![],
         });
         let r = build_report(
             &scan,
@@ -2583,9 +2808,10 @@ mod tests {
         assert_eq!(
             poll.action,
             "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
-             bounds the whole loop, `timeout` bounds one attempt. Caveat: `poll` applies to \
-             GET/HEAD polls only; for a POST-shaped poll (Vertex `:fetch*Operation`) keep the \
-             loop, set `cache = { mode = \"off\" }` on the target, and track poll v2."
+             bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read \
+             (Vertex `:fetch*Operation`) polls too: put `poll` on a route key \
+             (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which \
+             beats the LLM host map for that route."
         );
         // The WS2 closed follow-up vocabulary is NOT extended by WS3.
         assert!(
@@ -2741,9 +2967,10 @@ mod tests {
 
     /// Deployment-honesty slice, WS6/WS10: the `sdk-client-timeout` detail
     /// must name all three clocks (Keel's `timeout`, the SDK's own
-    /// client-default deadline, and `poll.deadline`) and the POST-poll
-    /// caveat (poll is GET/HEAD-only until poll v2; a POST-shaped poll like
-    /// Vertex's `:fetch*Operation` needs `cache = { mode = "off" }` instead).
+    /// client-default deadline, and `poll.deadline`) and, since poll v2,
+    /// point a POST-shaped operation read (Vertex's `:fetch*Operation`) at a
+    /// route key rather than at the retired `cache = { mode = "off" }`
+    /// workaround.
     #[test]
     fn sdk_client_timeout_names_the_three_clocks_and_the_post_poll_caveat() {
         let ups = build_follow_ups(
@@ -2764,10 +2991,10 @@ mod tests {
             "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default \
              deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise \
              the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or \
-             the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled \
-             APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) \
-             replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` \
-             yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline."
+             the SDK gives up first and Keel just sees a retryable timeout. For a submit-then-poll \
+             API a `poll` policy (whose `deadline` bounds the WHOLE loop) replaces the loop; a \
+             POST-shaped operation read (Vertex `:fetch*Operation`) takes it on a route key — see \
+             `hand-rolled-poll` findings for an applyable patch."
         );
     }
 
@@ -3149,6 +3376,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         };
         let r = build_report(
@@ -3262,6 +3490,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         }
     }
@@ -3404,6 +3633,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         };
         let r = build_report(
@@ -3445,6 +3675,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            text: None,
             flows_configured: false,
         };
         let journal = JournalReport {

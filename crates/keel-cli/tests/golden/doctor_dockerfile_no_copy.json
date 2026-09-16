@@ -186,7 +186,7 @@
   "follow_ups": [
     {
       "code": "sdk-client-timeout",
-      "detail": "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For GET/HEAD-polled APIs a `poll` policy (whose `deadline` bounds the WHOLE submit-then-poll loop) replaces the loop; POST-shaped polls (Vertex `:fetch*Operation`) cannot use `poll` yet — set `cache = { mode = \"off\" }` on the target and keep the app-level deadline.",
+      "detail": "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For a submit-then-poll API a `poll` policy (whose `deadline` bounds the WHOLE loop) replaces the loop; a POST-shaped operation read (Vertex `:fetch*Operation`) takes it on a route key — see `hand-rolled-poll` findings for an applyable patch.",
       "rank": 5,
       "subject": "target.\"llm:google-genai\""
     }
