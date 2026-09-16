@@ -88,15 +88,18 @@ export function installFetch(
   {
     globalObj = globalThis,
     mintIdempotencyKey = defaultMintIdempotencyKey,
-    // Test-only seam: `llm-policy.mjs`'s real `rewriteModel` can only ever
-    // rewrite the MODEL portion of a URL/body, never the host or the verb
-    // after a path segment's last colon (its documented v0.1 limitation) —
-    // so no fallback hop reachable through the real fallback chain can ever
-    // land on a different (hostname, pathname) shape than hop 0. That makes
-    // the per-hop re-judgment fixed by issue #106 unobservable end-to-end
-    // without a substitute rewriter. Defaults to the real `rewriteModel`;
-    // production callers never pass this.
-    rewriteFallback = rewriteModel,
+    // TEST-ONLY SEAM, NOT A SUPPORTED OPTION (see `__keelWrapped`/
+    // `__keelOriginal` below for this file's existing private-marker
+    // convention — this follows it, unlike the two options above, which are
+    // real, documented, caller-facing overrides). `llm-policy.mjs`'s real
+    // `rewriteModel` can only ever rewrite the MODEL portion of a URL/body,
+    // never the host or the verb after a path segment's last colon (its
+    // documented v0.1 limitation) — so no fallback hop reachable through the
+    // real fallback chain can ever land on a different (hostname, pathname)
+    // shape than hop 0. That makes the per-hop re-judgment fixed by issue
+    // #106 unobservable end-to-end without a substitute rewriter. Defaults
+    // to the real `rewriteModel`; production code must never pass this.
+    __keelTestRewriteFallback: rewriteFallback = rewriteModel,
   } = {},
 ) {
   const original = globalObj.fetch;
@@ -296,6 +299,9 @@ export function installFetch(
       // may fail (unrecognized request shape) — then we stop and deliver THIS
       // failure, honestly, rather than pretend a hop happened.
       if (hopIndex >= fallbackChain.length || !shouldFallback(outcome.error)) break;
+      // `rewriteFallback` is the real `rewriteModel` unless a test injected
+      // `__keelTestRewriteFallback` above — test-only seam, not a supported
+      // option (see the option's declaration comment).
       const rewritten = rewriteFallback(hopUrl, hopBody, fallbackChain[hopIndex]);
       if (!rewritten) break;
       hopUrl = rewritten.url;
