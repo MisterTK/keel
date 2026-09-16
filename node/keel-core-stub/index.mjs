@@ -177,9 +177,29 @@ function strictBase64Decode(s) {
   return buf.toString("base64") === s ? buf : null;
 }
 
+/** Walk a dotted `until.field` through nested objects (CCR-8). `found:false`
+ *  when a segment is missing or an intermediate is not an object — fail-open,
+ *  identical to a missing top-level key. Literal-dot keys are not addressable. */
+function lookupField(doc, field) {
+  let current = doc;
+  for (const seg of field.split(".")) {
+    if (!isTable(current) || !(seg in current)) return { found: false, value: undefined };
+    current = current[seg];
+  }
+  return { found: true, value: current };
+}
+
+/** Same-JSON-type equality (CCR-8): "true" !== true, 1 !== true, 100 === 100.0. */
+function terminalMatch(value, terminal) {
+  const kind = (v) => (typeof v === "string" || typeof v === "boolean" || typeof v === "number" ? typeof v : null);
+  const k = kind(value);
+  return k !== null && terminal.some((t) => kind(t) === k && t === value);
+}
+
 /** Judge one successful poll iteration's payload: "terminal" | "pending" |
  *  "fail_open". Parity with keel-core's `poll_verdict`
- *  (conformance/README.md "Poll"). */
+ *  (conformance/README.md "Poll"; CCR-8 widened the gate and the field/
+ *  terminal semantics). */
 function pollVerdict(poll, payload) {
   if (!isTable(payload)) return "fail_open";
   let doc = payload;
@@ -196,12 +216,9 @@ function pollVerdict(poll, payload) {
     if (!isTable(parsed)) return "fail_open";
     doc = parsed;
   }
-  const field = poll.until.field;
-  if (!(field in doc)) return "fail_open";
-  const value = doc[field];
-  return typeof value === "string" && poll.until.terminal.includes(value)
-    ? "terminal"
-    : "pending";
+  const { found, value } = lookupField(doc, poll.until.field);
+  if (!found) return "fail_open";
+  return terminalMatch(value, poll.until.terminal) ? "terminal" : "pending";
 }
 
 function invalid(path, msg) {
@@ -328,8 +345,9 @@ function validateTargetPolicy(path, v) {
     if (typeof v.poll.until.field !== "string" || v.poll.until.field.length === 0)
       throw invalid(path, "poll.until.field must be a non-empty string");
     const terminal = v.poll.until.terminal;
-    if (!Array.isArray(terminal) || terminal.length === 0 || !terminal.every((t) => typeof t === "string"))
-      throw invalid(path, "poll.until.terminal must be a non-empty array of strings");
+    const okItem = (t) => typeof t === "string" || typeof t === "boolean" || typeof t === "number";
+    if (!Array.isArray(terminal) || terminal.length === 0 || !terminal.every(okItem))
+      throw invalid(path, "poll.until.terminal must be a non-empty array of strings, booleans, or numbers");
   }
 }
 
@@ -491,22 +509,27 @@ function patternMatches(p, method, host, effectivePort, path) {
   return p.pathGlob === null || p.pathGlob.test(path);
 }
 
+/** Most specific matching pattern key, or null. `routeOnly` keeps only ROUTE
+ *  keys (a pattern with a `/path`) — tier 0's candidate set on an LLM host. */
+function mostSpecificPattern(patterns, { method, host, scheme, port, path }, routeOnly = false) {
+  const effectivePort = port ?? SCHEME_PORTS[scheme ?? ""] ?? null;
+  const hostL = host.toLowerCase();
+  const pathN = path || "/";
+  const methodU = (method || "GET").toUpperCase();
+  for (const p of patterns) {
+    if (routeOnly && p.pathGlob === null) continue;
+    if (patternMatches(p, methodU, hostL, effectivePort, pathN)) return p.key;
+  }
+  return null;
+}
+
 /** The `[target]` policy key for one outbound request: exact host key, else
  *  the most specific matching pattern key (verbatim, so the core's exact
  *  lookup hits it), else the bare host (class-default fallthrough). */
-function resolveOutbound(policy, { method, host, scheme, port, path }) {
+function resolveOutbound(policy, req) {
   const { exact, patterns } = compileOutboundMatchers(policy);
-  if (exact.has(host)) return host;
-  if (patterns.length > 0) {
-    const effectivePort = port ?? SCHEME_PORTS[scheme ?? ""] ?? null;
-    const hostL = host.toLowerCase();
-    const pathN = path || "/";
-    const methodU = (method || "GET").toUpperCase();
-    for (const p of patterns) {
-      if (patternMatches(p, methodU, hostL, effectivePort, pathN)) return p.key;
-    }
-  }
-  return host;
+  if (exact.has(req.host)) return req.host;
+  return mostSpecificPattern(patterns, req) ?? req.host;
 }
 
 /** Token bucket: burst capacity `limit`, continuous refill of `limit` per
@@ -577,14 +600,20 @@ export class KeelCoreStub {
   }
 
   /** Resolve the policy target key for one outbound request — the LLM host
-   *  map first (exact host, then the Vertex regional suffix), else the
-   *  `[target]` table's exact-host/pattern resolution (see
+   *  map first (exact host, then the Vertex regional suffix), but a ROUTE
+   *  key (method/path-bearing) on that same host beats the map (tier 0,
+   *  CCR-8); else the `[target]` table's exact-host/pattern resolution (see
    *  `resolveOutbound`), else the bare host. Mirrors `Policy::resolve_target`
    *  (Rust) / the Python stub's `resolve_target` exactly. */
   resolveTarget(method, host, scheme = null, port = null, path = null) {
     const provider = LLM_HOST_PROVIDERS[host] ??
       (host.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
-    if (provider) return `llm:${provider}`;
+    if (provider) {
+      // Tier 0 (CCR-8): a ROUTE key on a mapped host beats the host map.
+      const { patterns } = compileOutboundMatchers(this.#policy);
+      const route = mostSpecificPattern(patterns, { method, host, scheme, port, path }, true);
+      return route ?? `llm:${provider}`;
+    }
     return resolveOutbound(this.#policy, { method, host, scheme, port, path });
   }
 
@@ -751,13 +780,10 @@ export class KeelCoreStub {
       throw new Error("loop always returns by the final attempt");
     };
 
-    // poll layer (CCR-3): wraps the retry loop; gate = resolved poll table
-    // + idempotent GET/HEAD op (conformance/README.md "Poll").
+    // poll layer (CCR-3; gate widened by CCR-8): resolved poll table + an
+    // idempotent request. The method is not consulted.
     const pollCfg = this.#layer(target, "poll");
-    const pollActive =
-      isTable(pollCfg) &&
-      request.idempotent === true &&
-      (op.startsWith("GET ") || op.startsWith("HEAD "));
+    const pollActive = isTable(pollCfg) && request.idempotent === true;
     const pollStartedMs = this.#nowMs;
     let result;
     for (;;) {
