@@ -67,20 +67,14 @@ daemon. No port. No new abstractions in your code.
   prints one summary to **stderr** at exit saying what Keel did — `keel ▸ 47
   calls · absorbed 3 rate limits · 2 retries succeeded · 4 calls
   unprotected` — and `keel report --open` turns the same evidence into a
-  self-contained HTML page (add `--serve` for a live view). In a container
-  this is the surface that survives; set `KEEL_LOG_FORMAT=json` to emit it
-  (and the startup line) as one JSON object per line for Cloud Logging /
-  CloudWatch. OpenTelemetry spans and metrics for every call and attempt are
-  a source build with the `otel` feature plus one env var away — off by
-  default, so the shipped library carries no OpenTelemetry dependency until
-  you ask for it. Set `console = false` under `[telemetry]` to silence the
-  summary.
-- **What that observability is not.** OpenTelemetry export (spans and
-  metrics, not logs) requires a source build with the `otel` feature — the
-  published wheels and npm addon do not include it — and lands in a
-  tracing/metrics backend, never in your log search. Everything under
-  `.keel/` is a local file: on a scale-to-zero platform it is gone by the
-  time you investigate.
+  self-contained HTML page you can watch live with `--watch` or `--serve`.
+  In a container this is the surface that survives; set
+  `KEEL_LOG_FORMAT=json` to emit it (and the startup line) as one JSON
+  object per line for Cloud Logging / CloudWatch. See
+  [Observability](#observability) below. OpenTelemetry spans and metrics for
+  every call and attempt are a source build with the `otel` feature plus one
+  env var away — off by default, so the shipped library carries no
+  OpenTelemetry dependency until you ask for it.
 - **Built for LLM and agent workloads.** First-class `llm:`/`tool:`/`mcp:`
   targets, per-run spend caps, model fallback chains, and a dev-mode cache
   that replays identical prompts for free — because agent code is the
@@ -174,6 +168,57 @@ policy:
    your observed mean") beats template guesses; with no observed runs the
    static scan alone still works, just with more conservative proposals.
 3. `keel init --diff` — preview what any new evidence would change, any time.
+
+## Observability
+
+"What did Keel actually do?" has four answers, from zero setup to a live
+dashboard — pick whichever fits the moment:
+
+1. **Console summary — automatic, library-only.** Every process that runs
+   under Keel (`keel run`, `python -m keel run`, the Node loader, `#[keel::wrap]`)
+   prints one summary to **stderr** at exit, no CLI required:
+
+   ```
+   keel ▸ 47 calls · absorbed 3 rate limits · 2 retries succeeded · 4 calls unprotected
+          keel report --open for the full picture
+   ```
+
+   A no-op run (nothing intercepted) stays silent. If the `keel` CLI isn't
+   installed, that second line prints `uvx --from keelrun-cli keel report
+   --open` instead — the summary itself never needs the CLI. Turn it off
+   with `console = false` under `[telemetry]` in `keel.toml`, or `KEEL_QUIET=1`.
+
+   In a container, stderr is the surface that survives — though a parent
+   that captures a child's stderr silently swallows it. Set
+   `KEEL_LOG_FORMAT=json` and this line, the startup line, and any
+   activation error each become one JSON object per line, so
+   `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are queryable
+   fields in Cloud Logging or CloudWatch rather than prose.
+
+2. **Static HTML report — one command, no persistent install needed.**
+   `keel report --open` (or, with no CLI installed at all, `uvx --from
+   keelrun-cli keel report --open`) renders `.keel/report.html`: a single
+   self-contained page — inlined CSS/JS, a strict CSP, zero external
+   requests — with per-target call/retry/breaker/cache tables, a
+   calls-vs-failures trend, the newest run's raw event stream, and durable
+   flow status. It's just a file: screenshot it, attach it to a PR, email it.
+   `keel report --json` prints the identical evidence as byte-deterministic
+   JSON, for CI artifacts or feeding another tool.
+
+3. **Live HTML report — two ways, both local-only, both CLI.**
+   - `keel report --watch` rewrites `.keel/report.html` on an interval
+     (default 2s) and the open page reloads itself — no networking, nothing
+     to bind or firewall.
+   - `keel report --serve` runs a loopback-only server (`127.0.0.1`, an
+     ephemeral port by default) that the page polls once a second; a
+     mismatched `Host` header is rejected (DNS-rebinding protection). Either
+     way, Ctrl-C stops it cleanly.
+
+4. **What this is not.** OpenTelemetry export (spans and metrics, not logs)
+   requires a source build with the `otel` feature — the published wheels
+   and npm addon do not include it — and lands in a tracing/metrics backend,
+   never in your log search. Everything under `.keel/` is a local file: on a
+   scale-to-zero platform it is gone by the time you investigate.
 
 ## See it work
 
