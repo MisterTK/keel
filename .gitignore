@@ -37,3 +37,6 @@ python/keel/build/
 /docs/
 /RELEASE_NOTES-*.md
 /SECURITY.md
+
+# Locally built napi addon (CI builds the published prebuilds)
+node/keel-core-native/*.node
