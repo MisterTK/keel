@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 
 const hookUrl = new URL("../hook.mjs", import.meta.url).href;
 const appPath = fileURLToPath(new URL("../fixtures/hello.mjs", import.meta.url));
@@ -333,6 +334,24 @@ test("the policy banner names the file", () => {
     const proc = run(root);
     assert.equal(proc.status, 7, proc.stderr);
     assert.match(proc.stderr, new RegExp(`with policy ${esc(join(realRoot, "keel.toml"))}`));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an activated process leaves one activation row naming its policy", () => {
+  const root = mkdtempSync(join(tmpdir(), "keel-activation-row-"));
+  try {
+    writeFileSync(join(root, "keel.toml"), "");
+    const realRoot = realpathSync(root);
+    const proc = run(root, { KEEL_CWD: realRoot });
+    assert.equal(proc.status, 7, proc.stderr);
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    const db = new DatabaseSync(join(realRoot, ".keel", "discovery.db"));
+    // node:sqlite rows are null-prototype objects — spread into a plain object
+    // so deepEqual compares values, not prototypes (see discovery.test.mjs).
+    const row = { ...db.prepare("SELECT language, policy_source, policy_path, keel_cwd FROM activations").get() };
+    assert.deepEqual(row, { language: "node", policy_source: "keel.toml", policy_path: join(realRoot, "keel.toml"), keel_cwd: realRoot });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

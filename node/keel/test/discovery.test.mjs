@@ -6,11 +6,18 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
-import { createDiscovery, SCHEMA_VERSION, RETENTION_DAYS, MS_PER_DAY } from "../src/discovery.mjs";
+import {
+  createDiscovery,
+  SCHEMA_VERSION,
+  RETENTION_DAYS,
+  MS_PER_DAY,
+  DISCOVERY_SCHEMA,
+  DAILY_SCHEMA,
+} from "../src/discovery.mjs";
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite");
@@ -347,5 +354,56 @@ test("daily buckets older than retention are pruned when the day advances", () =
     } finally {
       db.close();
     }
+  });
+});
+
+test("schema is v3 with an activations table; recordActivation writes one row at flush", () => {
+  withDir((dir) => {
+    const d = createDiscovery(dir, { now: () => 1_000 });
+    d.recordActivation({ ts_ms: 1_000, pid: 42, language: "node", version: "0.5.6", cwd: dir, keel_cwd: null,
+      policy_source: "defaults", policy_path: null, flows_configured: false, argv0: "app.mjs" });
+    assert.equal(d.flushSync(), true, "an activation alone is worth a flush");
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 3);
+    assert.equal(SCHEMA_VERSION, 3);
+    // node:sqlite rows are null-prototype objects (`Object.create(null)`) —
+    // spread into plain objects so deepEqual compares values, not prototypes
+    // (same convention as this file's existing CANONICAL_COLUMNS mapping).
+    const rows = db.prepare("SELECT language, policy_source, flows_configured FROM activations").all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [{ language: "node", policy_source: "defaults", flows_configured: 0 }]);
+    assert.equal(d.flushSync(), false, "second flush has nothing new");
+  });
+});
+
+test("a v2 file migrates to v3 in place and keeps its aggregates", () => {
+  withDir((dir) => {
+    const path = join(dir, ".keel", "discovery.db");
+    mkdirSync(join(dir, ".keel"), { recursive: true });
+    const seed = new DatabaseSync(path);
+    seed.exec(DISCOVERY_SCHEMA); seed.exec(DAILY_SCHEMA); seed.exec("PRAGMA user_version = 2");
+    seed.close();
+    const d = createDiscovery(dir, { now: () => 5 });
+    d.observe("api.example.com", ok(1), 3);
+    d.recordActivation({ ts_ms: 5, pid: 1, language: "node", version: "x", cwd: dir, keel_cwd: null,
+      policy_source: "keel.toml", policy_path: join(dir, "keel.toml"), flows_configured: true, argv0: "" });
+    d.flushSync();
+    const db = new DatabaseSync(path);
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 3);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM activations").get().n, 1);
+    assert.equal(db.prepare("SELECT calls FROM discovery WHERE target = 'api.example.com'").get().calls, 1);
+  });
+});
+
+test("activation retention keeps the newest fifty", () => {
+  withDir((dir) => {
+    for (let i = 0; i < 55; i++) {
+      const d = createDiscovery(dir, { now: () => 1_000 + i });
+      d.recordActivation({ ts_ms: 1_000 + i, pid: i, language: "node", version: "x", cwd: dir, keel_cwd: null,
+        policy_source: "defaults", policy_path: null, flows_configured: false, argv0: "" });
+      d.flushSync();
+    }
+    const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM activations").get().n, 50);
+    assert.equal(db.prepare("SELECT MIN(ts_ms) AS m FROM activations").get().m, 1_005);
   });
 });

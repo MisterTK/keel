@@ -250,6 +250,15 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // module (see `src/flow.mjs`'s module docs for why this must happen here,
   // before the normal ESM entry runs).
   const flowEntrypoints = extractFlowEntrypoints(policy);
+  discovery.recordActivation({
+    ...meta,
+    ts_ms: Date.now(),
+    pid: process.pid,
+    language: "node",
+    cwd,
+    flows_configured: flowEntrypoints.length > 0 || Object.keys(cmdFlows ?? {}).length > 0,
+    argv0: process.argv[1] ?? "",
+  });
   if (wrappable.length > 0 || eveDetection.matched) {
     register("./loader.mjs", import.meta.url, {
       data: {
