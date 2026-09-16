@@ -43,6 +43,16 @@ OTHER_LIBS = {"psycopg", "boto3"}
 # and must record nothing.
 AGENT_LIBS = {"pydantic_ai", "crewai", "langgraph", "agents", "mcp"}
 KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS | AGENT_LIBS | {"google.adk"}
+# SDK "poll the job" calls, per provider, as attribute-chain suffixes. A
+# function that contains one of these while its module imports that provider
+# reaches the provider's target even when the client handle is untracked
+# (built by a factory, imported from elsewhere) — the shape that made the
+# 2026-09-15 field report's poll loop invisible (#95).
+SDK_POLL_METHODS = {
+    "google.genai": {("operations", "get")},
+    "openai": {("batches", "retrieve"), ("videos", "retrieve"), ("fine_tuning", "jobs", "retrieve")},
+    "anthropic": {("batches", "retrieve")},
+}
 # Known Python resilience libraries — a `keel doctor` signal that a target may
 # already have its own retry/backoff, separate from KNOWN (which is about
 # libraries Keel *adapts*; these are libraries Keel never adapts, so mixing
@@ -415,18 +425,22 @@ def _governs_status_cmp(node):
         for sub in ast.walk(node))
 
 
-def detect_simplifications(fn, aliases):
+def detect_simplifications(fn, aliases, imported_llm_libs):
     """The three WS3 patterns inside one function def, each anchored at the
     construct to delete. Precedence inside a loop: a status-string comparison
     makes it a poll (the stronger, WS5-pairing signal) even if an attempt
-    counter is also present. An except-handler sleep inside an
-    already-matched loop is the same construct, not a second finding."""
+    counter is also present. An SDK "poll the job" call (see
+    `sdk_poll_provider`) is the same strong signal by itself — the adopter's
+    `while not op.done: ... op = client.operations.get(op)` loop has no
+    status-string comparison anywhere in it, but the SDK shape alone says
+    "polling a job" (#95). An except-handler sleep inside an already-matched
+    loop is the same construct, not a second finding."""
     found = []
     covered = set()
     for node in ast.walk(fn):
         if not isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
             continue
-        has_sleep = has_counter = False
+        has_sleep = has_counter = has_sdk_poll = False
         for sub in ast.walk(node):
             if is_sleep(sub, aliases):
                 has_sleep = True
@@ -439,9 +453,12 @@ def detect_simplifications(fn, aliases):
                     and isinstance(sub.targets[0], ast.Name)
                     and sub.targets[0].id == sub.value.left.id):
                 has_counter = True
+            if (isinstance(sub, ast.Call)
+                    and sdk_poll_provider(sub, imported_llm_libs) is not None):
+                has_sdk_poll = True
         if not has_sleep:
             continue
-        if _governs_status_cmp(node):
+        if _governs_status_cmp(node) or has_sdk_poll:
             kind = "hand-rolled-poll"
         elif has_counter:
             kind = "hand-rolled-retry"
@@ -469,7 +486,31 @@ def detect_simplifications(fn, aliases):
     return found
 
 
-def fn_facts(fn, rel, mod, aliases, url_consts):
+def attr_chain(node):
+    """`a.b.c(...)` -> ("a", "b", "c"); None for anything that is not a plain
+    Name/Attribute chain."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return tuple(reversed(parts))
+
+
+def sdk_poll_provider(call, imported_llm_libs):
+    chain = attr_chain(call.func)
+    if chain is None:
+        return None
+    for lib in imported_llm_libs:
+        for suffix in SDK_POLL_METHODS.get(lib, ()):
+            if len(chain) > len(suffix) and chain[-len(suffix):] == suffix:
+                return lib
+    return None
+
+
+def fn_facts(fn, rel, mod, aliases, url_consts, imported_llm_libs):
     effects = unsafe_idem = t_reads = r_reads = 0
     targets = set()
     reasons = []
@@ -482,6 +523,9 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
                 targets.add(h)
         if not isinstance(node, ast.Call):
             continue
+        provider = sdk_poll_provider(node, imported_llm_libs)
+        if provider is not None:
+            targets.add("llm:" + provider.replace(".", "-"))
         lib = aliases.get(call_root(node.func))
         if lib is None:
             continue
@@ -494,7 +538,7 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
             if name in {"post", "patch"}:
                 unsafe_idem += 1
             if lib in LLM_LIBS:
-                targets.add("llm:" + lib)
+                targets.add("llm:" + lib.replace(".", "-"))
         elif lib == "time" and name in TIME_NAMES:
             t_reads += 1
         elif lib == "datetime" and name in DT_NAMES:
@@ -589,16 +633,17 @@ for dirpath, dirnames, filenames in os.walk(root):
                                      "child_runtime": child_runtime(node),
                                      "env": env_mode(node)})
         consts = url_consts_of(tree)
+        imported_llm_libs = {lib for lib in set(aliases.values()) if lib in LLM_LIBS}
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                facts = fn_facts(node, rel, mod, aliases, consts)
+                facts = fn_facts(node, rel, mod, aliases, consts, imported_llm_libs)
                 functions.append(facts)
                 # Conservative emission gate (WS3 spec): only functions that
                 # also reach a Keel-relevant target get simplification
                 # sightings — a sleep loop around purely local work is none
                 # of Keel's business.
                 if facts["targets"]:
-                    for hit in detect_simplifications(node, aliases):
+                    for hit in detect_simplifications(node, aliases, imported_llm_libs):
                         simplifications.append({
                             "file": rel, "function": node.name,
                             "kind": hit["kind"], "line": hit["line"],
@@ -1772,5 +1817,87 @@ def retryer():
         let scan = scan(dir.path());
         assert_eq!(scan.files_scanned, 1, "only the parseable file counts");
         assert!(scan.findings.http_in_use);
+    }
+
+    #[test]
+    fn sdk_poll_calls_attribute_the_provider_target_without_a_url_literal() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // The ai-marketing-hub loop, verbatim shape: the client comes from a
+        // factory in another module, so no alias binding exists here.
+        fs::write(
+            dir.path().join("render.py"),
+            r#"import time
+from google import genai
+from .clients import get_client
+
+def poll_video_takes(op, model_id, timeout_s=900):
+    client = get_client()
+    deadline = time.monotonic() + timeout_s
+    while not op.done:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Video render timed out ({model_id})")
+        time.sleep(10)
+        op = client.operations.get(op)
+    return op.result
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("batches.py"),
+            r#"import time
+import openai
+
+def wait(client, batch_id):
+    while True:
+        b = client.batches.retrieve(batch_id)
+        if b.status in ("completed", "failed"):
+            return b
+        time.sleep(5)
+"#,
+        )
+        .unwrap();
+        // Same loop shape, but no provider import in the module: no attribution.
+        fs::write(
+            dir.path().join("other.py"),
+            r"import time
+
+def wait(client, job):
+    while not job.done:
+        time.sleep(1)
+        job = client.operations.get(job)
+",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let f = |module: &str, name: &str| {
+            s.functions
+                .iter()
+                .find(|f| f.entrypoint == format!("py:{module}:{name}"))
+                .unwrap_or_else(|| panic!("{module}:{name} attributed"))
+        };
+        assert_eq!(
+            f("render", "poll_video_takes").targets,
+            std::collections::BTreeSet::from(["llm:google-genai".to_owned()])
+        );
+        assert_eq!(
+            f("batches", "wait").targets,
+            std::collections::BTreeSet::from(["llm:openai".to_owned()])
+        );
+        assert!(f("other", "wait").targets.is_empty());
+        let polls: Vec<(&str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .filter(|x| x.kind == "hand-rolled-poll")
+            .map(|x| (x.file.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(
+            polls,
+            vec![("batches.py", "wait"), ("render.py", "poll_video_takes")]
+        );
     }
 }
