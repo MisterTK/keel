@@ -350,6 +350,53 @@ pub(crate) struct ExternalProcess {
     pub(crate) in_tests: bool,
     pub(crate) launcher: String,
     pub(crate) line: u32,
+    /// `"python"` / `"node"` / `None` — see [`scan::SubprocessSighting::child_runtime`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) child_runtime: Option<String>,
+    /// `"python-pth"` | `"python-pth-if-env-passed"` | `"node-needs-NODE_OPTIONS"`
+    /// | `None` — see [`inherits_activation`]. Only `Some("python-pth")` moves
+    /// a sighting out of the blind-spot list (issue #91).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inherits_activation: Option<&'static str>,
+}
+
+/// Whether the child launched by this sighting inherits Keel's activation:
+/// `"python-pth"` (a Python child whose environment is inherited — the
+/// keelrun `.pth` self-activates it when `KEEL_ENABLE` reaches it),
+/// `"python-pth-if-env-passed"` (a Python child whose env kwarg could not be
+/// statically classified — it self-activates only if the caller happens to
+/// pass `KEEL_ENABLE` through), `"node-needs-NODE_OPTIONS"` (a Node child —
+/// activation needs `NODE_OPTIONS="--import keelrun/register"`, which an
+/// inherited/unknown env alone does not supply), or `None` (an env the
+/// scanner classified as `"replaced"`, or a launcher that is not a
+/// recognizable Python/Node runtime at all). Only the first case is honest
+/// to call covered-when-active (issue #91).
+fn inherits_activation(s: &scan::SubprocessSighting) -> Option<&'static str> {
+    match (s.child_runtime.as_deref(), s.env_inheritance.as_str()) {
+        (Some("python"), "inherited") => Some("python-pth"),
+        (Some("python"), "unknown") => Some("python-pth-if-env-passed"),
+        (Some("node"), "inherited" | "unknown") => Some("node-needs-NODE_OPTIONS"),
+        _ => None,
+    }
+}
+
+/// Render one blind-spot-list entry, annotating the two cases that still
+/// self-activate under some condition (issue #91) so the warning is honest
+/// about how close each one is to being covered.
+fn format_process_entry(p: &ExternalProcess) -> String {
+    let annotation = match p.inherits_activation {
+        Some("python-pth-if-env-passed") => {
+            "; python child, env=unknown — activates only if KEEL_ENABLE is passed"
+        }
+        Some("node-needs-NODE_OPTIONS") => {
+            "; node child — needs NODE_OPTIONS=\"--import keelrun/register\""
+        }
+        _ => "",
+    };
+    format!(
+        "`{}` ({} at {}:{}{annotation})",
+        p.command, p.launcher, p.file, p.line
+    )
 }
 
 /// The three-bucket honesty topology (dx-spec §2): every host Keel's static
@@ -598,11 +645,19 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
     // WS5: a launch that only ever happens from test code is not a production
     // blind spot. It is still reported — dropping evidence silently would be
     // its own honesty violation — but as `info`, out of the `warn` list.
-    let (in_tests, uncovered): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|p| p.in_tests);
+    let (in_tests, unmatched): (Vec<_>, Vec<_>) = unmatched.into_iter().partition(|p| p.in_tests);
+    // Issue #91: a Python child that inherits our environment self-activates
+    // via the keelrun `.pth` when active — the one case Keel can honestly
+    // call covered-when-active, so it moves out of the blind-spot list into
+    // its own `info` finding rather than being warned about.
+    let (inheriting, uncovered): (Vec<_>, Vec<_>) = unmatched
+        .into_iter()
+        .partition(|p| p.inherits_activation == Some("python-pth"));
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
-            .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
+            .copied()
+            .map(format_process_entry)
             .collect();
         findings.push(Finding {
             action: "Confirm none of these processes carry traffic you care about; Keel must be \
@@ -615,6 +670,27 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             ),
             fix: None,
             level: "warn",
+            topic: "subprocess-blind-spot",
+        });
+    }
+    if !inheriting.is_empty() {
+        let cmds: Vec<String> = inheriting
+            .iter()
+            .map(|p| format!("`{}` ({} at {}:{})", p.command, p.launcher, p.file, p.line))
+            .collect();
+        findings.push(Finding {
+            action: "Confirm keelrun is installed in the child's interpreter and that the env \
+                      you pass keeps KEEL_ENABLE (and KEEL_CWD if set); `KEEL_LOG_FORMAT=json` \
+                      in the child makes its activation line greppable."
+                .to_owned(),
+            detail: format!(
+                "{} externally-launched Python process(es) inherit this process's environment \
+                 and self-activates via the keelrun .pth when KEEL_ENABLE reaches them: {}.",
+                inheriting.len(),
+                cmds.join(", ")
+            ),
+            fix: None,
+            level: "info",
             topic: "subprocess-blind-spot",
         });
     }
@@ -873,20 +949,42 @@ fn build_follow_ups(
     // WS5: a launch seen only in test files is not a production blind spot
     // either — it stays out of the detail list and is surfaced only as a count
     // on the subject, so the reader knows the evidence was seen, not dropped.
-    let (in_tests, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = topology
+    let (in_tests, unmatched): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = topology
         .external_processes
         .iter()
         .filter(|p| p.covered_by.is_none())
         .partition(|p| p.in_tests);
+    // Issue #91: a Python child that inherits our environment self-activates
+    // via the keelrun `.pth` when active — not a blind spot to chase, so it
+    // is counted in the subject (evidence is not dropped) but never listed
+    // in the detail.
+    let (inheriting, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = unmatched
+        .into_iter()
+        .partition(|p| p.inherits_activation == Some("python-pth"));
     if !uncovered.is_empty() {
         let cmds: Vec<String> = uncovered
             .iter()
             .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
             .collect();
-        let suffix = if in_tests.is_empty() {
+        let mut extra = Vec::new();
+        if !in_tests.is_empty() {
+            extra.push(format!("+{} in test files", in_tests.len()));
+        }
+        if !inheriting.is_empty() {
+            let (noun, verb) = if inheriting.len() == 1 {
+                ("child", "self-activates")
+            } else {
+                ("children", "self-activate")
+            };
+            extra.push(format!(
+                "+{} Python {noun} that {verb} when it inherits KEEL_ENABLE",
+                inheriting.len()
+            ));
+        }
+        let suffix = if extra.is_empty() {
             String::new()
         } else {
-            format!(" (+{} in test files)", in_tests.len())
+            format!(" ({})", extra.join(", "))
         };
         ups.push(FollowUp {
             code: "subprocess-blind-spot",
@@ -1638,6 +1736,8 @@ pub(crate) fn classify_topology(
             in_tests: scan::is_test_path(&s.file),
             launcher: s.launcher.clone(),
             line: s.line,
+            child_runtime: s.child_runtime.clone(),
+            inherits_activation: inherits_activation(s),
         })
         .collect();
     Topology {
@@ -2193,6 +2293,8 @@ mod tests {
             launcher: "subprocess.run".into(),
             command: "uvx alpaca-mcp-server".into(),
             argv: Some(vec!["uvx".into(), "alpaca-mcp-server".into()]),
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         let r = build_report(
             &scan,
@@ -2260,6 +2362,8 @@ mod tests {
             launcher: "subprocess.run".into(),
             command: "etl run".into(),
             argv: Some(vec!["etl".into(), "run".into()]),
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         scan.subprocesses.push(SubprocessSighting {
             file: "backup.py".into(),
@@ -2267,6 +2371,8 @@ mod tests {
             launcher: "subprocess.run".into(),
             command: "backup now".into(),
             argv: Some(vec!["backup".into(), "now".into()]),
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         let mut policy = default_policy();
         policy.check.present = true;
@@ -2345,6 +2451,8 @@ mod tests {
             launcher: "os.system".into(),
             command: "etl run".into(),
             argv: None,
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         scan.subprocesses.push(SubprocessSighting {
             file: "legacy.py".into(),
@@ -2352,6 +2460,8 @@ mod tests {
             launcher: "subprocess.Popen".into(),
             command: "etl run".into(),
             argv: Some(vec!["etl".into(), "run".into()]),
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         let mut policy = default_policy();
         policy.check.present = true;
@@ -2525,6 +2635,8 @@ mod tests {
             launcher: "subprocess.run".into(),
             command: "uvx alpaca-mcp-server".into(),
             argv: Some(vec!["uvx".into(), "alpaca-mcp-server".into()]),
+            child_runtime: None,
+            env_inheritance: "inherited".into(),
         });
         // One excluded host (rank 4).
         scan.targets.insert(
@@ -4313,6 +4425,8 @@ def caller():
                 launcher: "subprocess.run".into(),
                 command: "ffmpeg -i in.mp4".into(),
                 argv: None,
+                child_runtime: None,
+                env_inheritance: "inherited".into(),
             },
             SubprocessSighting {
                 file: "tests/test_stitch.py".into(),
@@ -4320,6 +4434,8 @@ def caller():
                 launcher: "subprocess.run".into(),
                 command: "ffmpeg -version".into(),
                 argv: None,
+                child_runtime: None,
+                env_inheritance: "inherited".into(),
             },
         ];
         let r = build_report(
@@ -4365,5 +4481,101 @@ def caller():
             "reserved-name-excluded"
         );
         assert_eq!(excluded_kind_topic("test-only"), "test-only-excluded");
+    }
+
+    #[test]
+    fn inherits_activation_is_derived_from_runtime_and_env() {
+        use crate::scan::SubprocessSighting;
+        let mk = |rt: Option<&str>, env: &str| SubprocessSighting {
+            file: "a.py".into(),
+            line: 1,
+            launcher: "subprocess.run".into(),
+            command: "x".into(),
+            argv: None,
+            child_runtime: rt.map(str::to_owned),
+            env_inheritance: env.into(),
+        };
+        assert_eq!(
+            inherits_activation(&mk(Some("python"), "inherited")),
+            Some("python-pth")
+        );
+        assert_eq!(
+            inherits_activation(&mk(Some("python"), "unknown")),
+            Some("python-pth-if-env-passed")
+        );
+        assert_eq!(inherits_activation(&mk(Some("python"), "replaced")), None);
+        assert_eq!(
+            inherits_activation(&mk(Some("node"), "inherited")),
+            Some("node-needs-NODE_OPTIONS")
+        );
+        assert_eq!(inherits_activation(&mk(None, "inherited")), None);
+    }
+
+    #[test]
+    fn subprocess_follow_up_separates_inheriting_children_from_blind_spots() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses = vec![
+            SubprocessSighting {
+                file: "agent.py".into(),
+                line: 10,
+                launcher: "subprocess.run".into(),
+                command: "<dynamic>".into(),
+                argv: None,
+                child_runtime: Some("python".into()),
+                env_inheritance: "inherited".into(),
+            },
+            SubprocessSighting {
+                file: "stitch.py".into(),
+                line: 20,
+                launcher: "subprocess.run".into(),
+                command: "ffmpeg -i in.mp4".into(),
+                argv: Some(vec!["ffmpeg".into(), "-i".into(), "in.mp4".into()]),
+                child_runtime: None,
+                env_inheritance: "inherited".into(),
+            },
+        ];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+            &[],
+            "unverified",
+        );
+        let fu = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "subprocess-blind-spot")
+            .unwrap();
+        assert_eq!(
+            fu.subject,
+            "1 externally-launched process(es) (+1 Python child that self-activates when it \
+             inherits KEEL_ENABLE)"
+        );
+        assert!(
+            fu.detail.contains("stitch.py:20") && !fu.detail.contains("agent.py:10"),
+            "{}",
+            fu.detail
+        );
+        let info = r
+            .findings
+            .iter()
+            .find(|f| {
+                f.topic == "subprocess-blind-spot"
+                    && f.level == "info"
+                    && f.detail.contains("agent.py:10")
+            })
+            .expect("an info finding for the inheriting child");
+        assert!(info.detail.contains("self-activates"), "{}", info.detail);
     }
 }

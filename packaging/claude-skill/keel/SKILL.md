@@ -148,8 +148,10 @@ the six phases in order; the static scan is evidence, not the verdict.
    reserved names are fixtures by definition, and a test-only host needs
    policy only if production code reaches it too"), plus
    `external_processes` for the sibling-process blind spots (test-file
-   launches are counted separately). Then work `follow_ups` strictly
-   top-down: it is ranked with rank 1 = the claim Keel is least able to
+   launches are counted separately; Python children that inherit the env are
+   reported as self-activating rather than as blind spots). Then work
+   `follow_ups` strictly top-down: it is ranked with rank 1 = the claim Keel
+   is least able to
    verify itself (an unattributed URL) down to mechanical facts awaiting a
    decision. Codes are a closed set: `url-no-transport`,
    `orchestration-blind-spot`, `subprocess-blind-spot`,

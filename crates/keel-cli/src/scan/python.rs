@@ -281,6 +281,75 @@ def argv_list(call):
     return None
 
 
+PY_LAUNCHERS = {"python", "python3", "uv", "uvx", "pipx", "poetry", "pdm", "hatch"}
+NODE_LAUNCHERS = {"node", "npx", "tsx", "npm", "pnpm", "yarn", "bun", "deno"}
+
+
+def _first_argv(call):
+    """The first argv element as a literal string, or the sentinel
+    "sys.executable" when it is that expression, else None."""
+    if not call.args:
+        return None
+    a = call.args[0]
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        parts = a.value.split()
+        return parts[0] if parts else None
+    if isinstance(a, (ast.List, ast.Tuple)) and a.elts:
+        e = a.elts[0]
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return e.value
+        if (isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name)
+                and e.value.id == "sys" and e.attr == "executable"):
+            return "sys.executable"
+    return None
+
+
+def child_runtime(call):
+    """"python" / "node" when the launched program is recognizably one of
+    those runtimes (a bare interpreter name, a versioned `python3.12`, a
+    Python/Node package runner, or `sys.executable`), else None (WS7)."""
+    first = _first_argv(call)
+    if first is None:
+        return None
+    if first == "sys.executable":
+        return "python"
+    base = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if base.endswith(".exe"):
+        base = base[:-4]
+    if base in PY_LAUNCHERS or base.startswith("python3.") or base.startswith("python2."):
+        return "python"
+    if base in NODE_LAUNCHERS:
+        return "node"
+    return None
+
+
+def _is_os_environ(node):
+    return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "os" and node.attr == "environ")
+
+
+def env_mode(call):
+    """How the child's environment relates to ours: "inherited" (no `env=`,
+    `env=os.environ`, `{**os.environ, …}`, `dict(os.environ, …)`),
+    "replaced" (a dict literal that does not spread os.environ), or
+    "unknown" (any other expression). Decides whether KEEL_ENABLE reaches
+    the child (WS7)."""
+    for kw in call.keywords:
+        if kw.arg != "env":
+            continue
+        v = kw.value
+        if _is_os_environ(v):
+            return "inherited"
+        if isinstance(v, ast.Dict):
+            spreads = any(k is None and _is_os_environ(val) for k, val in zip(v.keys, v.values))
+            return "inherited" if spreads else "replaced"
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "dict"
+                and v.args and _is_os_environ(v.args[0])):
+            return "inherited"
+        return "unknown"
+    return "inherited"
+
+
 def is_sleep(node, aliases):
     """Known conservative miss: `from time import sleep as pause` binds
     `pause` to the "time" MODULE in `aliases` (`import_entries` only tracks
@@ -509,12 +578,16 @@ for dirpath, dirnames, filenames in os.walk(root):
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "subprocess." + name,
                                      "command": argv_text(node),
-                                     "argv": argv_list(node)})
+                                     "argv": argv_list(node),
+                                     "child_runtime": child_runtime(node),
+                                     "env": env_mode(node)})
             elif lib == "os" and name in ("system", "popen"):
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "os." + name,
                                      "command": argv_text(node),
-                                     "argv": None})
+                                     "argv": None,
+                                     "child_runtime": child_runtime(node),
+                                     "env": env_mode(node)})
         consts = url_consts_of(tree)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -620,6 +693,12 @@ struct WalkerSubprocess {
     /// condition than `command`'s "statically extractable at all".
     #[serde(default)]
     argv: Option<Vec<String>>,
+    /// `"python"` / `"node"` / `None` — see [`SubprocessSighting::child_runtime`].
+    #[serde(default)]
+    child_runtime: Option<String>,
+    /// `"inherited"` / `"replaced"` / `"unknown"` — see
+    /// [`SubprocessSighting::env_inheritance`].
+    env: String,
 }
 
 /// One simplification sighting from the walker (see
@@ -730,6 +809,8 @@ pub fn scan(project: &Path) -> PyScan {
             launcher: sub.launcher,
             command: sub.command,
             argv: sub.argv,
+            child_runtime: sub.child_runtime,
+            env_inheritance: sub.env,
         });
     }
     for s in output.simplifications {
@@ -1294,6 +1375,51 @@ def go(cmd):
                 .subprocesses
                 .iter()
                 .all(|x| x.file == "launch.py")
+        );
+    }
+
+    #[test]
+    fn subprocess_sightings_carry_child_runtime_and_env_inheritance() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("launch.py"),
+            r#"import os, subprocess, sys
+subprocess.run([sys.executable, "-m", "amh_media.render"], env={**os.environ, "KEEL_ENABLE": "1"})
+subprocess.run(["python3.12", "worker.py"])
+subprocess.run(["uv", "run", "job.py"], env={"PATH": "/usr/bin"})
+subprocess.run(["node", "svc.mjs"], env=os.environ)
+subprocess.run(["ffmpeg", "-i", "in.mp4"])
+subprocess.run(["python", "x.py"], env=make_env())
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(u32, Option<&str>, &str)> = s
+            .findings
+            .subprocesses
+            .iter()
+            .map(|p| {
+                (
+                    p.line,
+                    p.child_runtime.as_deref(),
+                    p.env_inheritance.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, Some("python"), "inherited"), // sys.executable + {**os.environ, …}
+                (3, Some("python"), "inherited"), // python3.12, no env kwarg
+                (4, Some("python"), "replaced"),  // uv, env dict without os.environ
+                (5, Some("node"), "inherited"),   // env=os.environ
+                (6, None, "inherited"),           // ffmpeg
+                (7, Some("python"), "unknown"),   // env=make_env()
+            ]
         );
     }
 
