@@ -178,8 +178,14 @@ the six phases in order; the static scan is evidence, not the verdict.
    before recommending a behavior change.
 5. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
    yet: retry loops with sleeps, poll-until-status loops, `mkdir`-style
-   mutexes, per-day guard files, broad `except: return None` swallows. Each
-   is either replaced by policy (note which `keel.toml` key) or explicitly
+   mutexes, per-day guard files, broad `except: return None` swallows. When a
+   valid `keel.toml` is present, the first `hand-rolled-poll` finding
+   attributed to an SDK poll call (per provider) carries an applyable `fix`
+   (a route-key `poll` block that beats the LLM host map for that route;
+   Vertex `:fetch*Operation` POSTs are judged idempotent since 0.6.0) — apply
+   it with `git apply`, then tune `interval`/`deadline`; later findings for
+   the same provider point at it instead.
+   Each is either replaced by policy (note which `keel.toml` key) or explicitly
    out of Keel's reach (say so honestly). Respect dependency-averse files —
    a stdlib-only gate/validator was built that way on purpose; never propose
    adding Keel as a dependency inside one. A shell-script orchestrator that

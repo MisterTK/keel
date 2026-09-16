@@ -124,6 +124,9 @@ pub struct SimplificationSighting {
     pub kind: String,
     pub function: String,
     pub targets: Vec<String>,
+    /// SDK poll shapes seen in the loop, e.g. `operations.get`; empty for
+    /// URL-literal polls and non-poll kinds.
+    pub sdk_polls: Vec<String>,
 }
 
 /// One hand-rolled orchestration construct sighted in a file the language

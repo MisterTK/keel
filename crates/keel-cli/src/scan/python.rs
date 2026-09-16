@@ -448,7 +448,23 @@ def _sdk_poll_feeds_exit(node, imported_llm_libs):
     of one job and must not be flagged. Governance is: the call's result is
     bound to a name/attribute, and that name is referenced in either the
     loop's own `while` test, or the test of a nested `if` whose body breaks
-    or returns."""
+    or returns. #101: a call written INLINE in that same test needs no bound
+    name at all — it IS the condition."""
+
+    def sdk_poll_in(expr):
+        # #101: the call sits directly inside a loop-exit test —
+        # `while not client.operations.get(op).done:` — so it IS the
+        # condition; governance needs no bound name.
+        return any(isinstance(n, ast.Call) and sdk_poll_provider(n, imported_llm_libs) is not None
+                   for n in ast.walk(expr))
+
+    if isinstance(node, ast.While) and sdk_poll_in(node.test):
+        return True
+    if any(isinstance(sub, ast.If)
+           and any(isinstance(s, (ast.Break, ast.Return)) for s in sub.body)
+           and sdk_poll_in(sub.test)
+           for sub in ast.walk(node)):
+        return True
     bound = set()
     for sub in ast.walk(node):
         if not (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call)
@@ -513,12 +529,15 @@ def detect_simplifications(fn, aliases, imported_llm_libs):
             kind = "hand-rolled-retry"
         else:
             continue
-        found.append({"kind": kind, "line": node.lineno})
+        shapes = sorted({sdk_poll_shape(sub, imported_llm_libs)
+                         for sub in ast.walk(node) if isinstance(sub, ast.Call)} - {None})
+        found.append({"kind": kind, "line": node.lineno,
+                      "sdk_polls": shapes if kind == "hand-rolled-poll" else []})
         covered.update(id(sub) for sub in ast.walk(node))
     for node in ast.walk(fn):
         if (isinstance(node, ast.ExceptHandler) and id(node) not in covered
                 and any(is_sleep(sub, aliases) for sub in ast.walk(node))):
-            found.append({"kind": "hand-rolled-retry", "line": node.lineno})
+            found.append({"kind": "hand-rolled-retry", "line": node.lineno, "sdk_polls": []})
     for node in ast.walk(fn):
         if not isinstance(node, ast.Try):
             continue
@@ -531,7 +550,7 @@ def detect_simplifications(fn, aliases, imported_llm_libs):
         for h in node.handlers:
             if (is_broad_handler(h) and len(h.body) == 1
                     and is_default_return(h.body[0])):
-                found.append({"kind": "silent-swallow", "line": h.lineno})
+                found.append({"kind": "silent-swallow", "line": h.lineno, "sdk_polls": []})
     return found
 
 
@@ -548,15 +567,29 @@ def attr_chain(node):
     return tuple(reversed(parts))
 
 
-def sdk_poll_provider(call, imported_llm_libs):
+def _sdk_poll_match(call, imported_llm_libs):
+    """(lib, suffix) for an SDK "poll the job" call, or None."""
     chain = attr_chain(call.func)
     if chain is None:
         return None
-    for lib in imported_llm_libs:
-        for suffix in SDK_POLL_METHODS.get(lib, ()):
+    for lib in sorted(imported_llm_libs):
+        for suffix in sorted(SDK_POLL_METHODS.get(lib, ())):
             if len(chain) > len(suffix) and chain[-len(suffix):] == suffix:
-                return lib
+                return (lib, suffix)
     return None
+
+
+def sdk_poll_provider(call, imported_llm_libs):
+    m = _sdk_poll_match(call, imported_llm_libs)
+    return m[0] if m else None
+
+
+def sdk_poll_shape(call, imported_llm_libs):
+    """The dotted method suffix a poll call matched (`"operations.get"`,
+    `"fine_tuning.jobs.retrieve"`), or None — what `keel doctor` turns into
+    a route-key `poll` proposal."""
+    m = _sdk_poll_match(call, imported_llm_libs)
+    return ".".join(m[1]) if m else None
 
 
 def fn_facts(fn, rel, mod, aliases, url_consts, imported_llm_libs):
@@ -696,7 +729,8 @@ for dirpath, dirnames, filenames in os.walk(root):
                         simplifications.append({
                             "file": rel, "function": node.name,
                             "kind": hit["kind"], "line": hit["line"],
-                            "targets": facts["targets"]})
+                            "targets": facts["targets"],
+                            "sdk_polls": hit.get("sdk_polls", [])})
 
         # Dependency-averse detection: stdlib-only files with a risk/gate/
         # guard/auth/valid/safety/kill name or docstring signal, or an
@@ -804,6 +838,8 @@ struct WalkerSimplification {
     kind: String,
     line: u32,
     targets: Vec<String>,
+    #[serde(default)]
+    sdk_polls: Vec<String>,
 }
 
 /// One dependency-averse file from the walker (see [`DepAverseFile`]).
@@ -914,6 +950,7 @@ pub fn scan(project: &Path) -> PyScan {
             kind: s.kind,
             function: s.function,
             targets: s.targets,
+            sdk_polls: s.sdk_polls,
         });
     }
     for d in output.dependency_averse {
@@ -1597,6 +1634,16 @@ def fetcher(path):
                 ("swallow.py", "silent-swallow", "fetcher"),
             ]
         );
+        // A URL-literal poll used no SDK shape, so doctor has no route key to
+        // propose for it.
+        assert!(
+            s.findings
+                .simplifications
+                .iter()
+                .all(|x| x.sdk_polls.is_empty()),
+            "{:?}",
+            s.findings.simplifications
+        );
         // Anchor line: the poll sighting points at the `while` (line 7), the
         // construct to delete — not the sleep inside it (line 12).
         let poll = &s.findings.simplifications[0];
@@ -1869,6 +1916,8 @@ def retryer():
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // straight-line fixture setup, one module
+    // per poll shape (bound-result, inline #101, unattributed, not-a-poll).
     fn sdk_poll_calls_attribute_the_provider_target_without_a_url_literal() {
         if !python3_present() {
             eprintln!("skip: python3 not available");
@@ -1907,6 +1956,27 @@ def wait(client, batch_id):
             return b
         time.sleep(5)
 "#,
+        )
+        .unwrap();
+        // #101: the SDK poll call sits INSIDE the loop-exit test itself, so
+        // no name is ever bound to its result — the governance gate must see
+        // the call in the `while` test (and in a break/return-guarded `if`).
+        fs::write(
+            dir.path().join("inline.py"),
+            r"import time
+from google import genai
+
+def wait(client, op):
+    while not client.operations.get(op).done:
+        time.sleep(1)
+    return op
+
+def wait_guarded(client, op):
+    while True:
+        if client.operations.get(op).done:
+            return op
+        time.sleep(1)
+",
         )
         .unwrap();
         // Same loop shape, but no provider import in the module: no attribution.
@@ -1971,8 +2041,26 @@ def sync_batch_metadata(client, batch_ids, cache):
             .collect();
         assert_eq!(
             polls,
-            vec![("batches.py", "wait"), ("render.py", "poll_video_takes")]
+            vec![
+                ("batches.py", "wait"),
+                ("inline.py", "wait"),
+                ("inline.py", "wait_guarded"),
+                ("render.py", "poll_video_takes")
+            ]
         );
+        // The SDK shape each poll used, for doctor's route-key proposal.
+        let shape = |file: &str, function: &str| {
+            s.findings
+                .simplifications
+                .iter()
+                .find(|x| x.file == file && x.function == function)
+                .unwrap_or_else(|| panic!("{file}:{function} sighted"))
+                .sdk_polls
+                .clone()
+        };
+        assert_eq!(shape("render.py", "poll_video_takes"), ["operations.get"]);
+        assert_eq!(shape("batches.py", "wait"), ["batches.retrieve"]);
+        assert_eq!(shape("inline.py", "wait"), ["operations.get"]);
         assert!(
             !s.findings
                 .simplifications

@@ -1,0 +1,18 @@
+[
+  { "name": "vertex-fetch-predict-operation-post", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation", "headers": [], "operation_read": true, "idempotent": true },
+  { "name": "vertex-submit-post-stays-non-idempotent", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "global-fetch-operation-post", "method": "POST", "host": "aiplatform.googleapis.com", "path": "/v1beta1/projects/p/locations/global/operations/op1:fetchOperation", "headers": [], "operation_read": true, "idempotent": true },
+  { "name": "any-fetch-star-operation-verb", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/models/m:fetchFooOperation", "headers": [], "operation_read": true, "idempotent": true },
+  { "name": "host-compared-case-insensitively", "method": "POST", "host": "US-CENTRAL1-AIPLATFORM.GOOGLEAPIS.COM", "path": "/v1/models/m:fetchOperation", "headers": [], "operation_read": true, "idempotent": true },
+  { "name": "apex-googleapis-host", "method": "POST", "host": "googleapis.com", "path": "/v1/ops/op:fetchOperation", "headers": [], "operation_read": true, "idempotent": true },
+  { "name": "non-google-host-not-covered", "method": "POST", "host": "api.example.com", "path": "/v1/ops/op:fetchOperation", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "lookalike-suffix-host-not-covered", "method": "POST", "host": "googleapis.com.evil.example", "path": "/v1/ops/op:fetchOperation", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "bare-fetch-verb-not-covered", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/models/m:fetch", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "operation-verb-without-fetch-not-covered", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/models/m:Operation", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "generate-content-post-not-covered", "method": "POST", "host": "generativelanguage.googleapis.com", "path": "/v1beta/models/gemini-2.5-pro:generateContent", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "colon-not-in-last-segment", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/x:fetchOperation/status", "headers": [], "operation_read": false, "idempotent": false },
+  { "name": "patch-is-not-covered-by-the-rule", "method": "PATCH", "host": "us-central1-aiplatform.googleapis.com", "path": "/v1/models/m:fetchOperation", "headers": [], "operation_read": true, "idempotent": false },
+  { "name": "get-operations-read-idempotent-by-method", "method": "GET", "host": "generativelanguage.googleapis.com", "path": "/v1beta/operations/op1", "headers": [], "operation_read": false, "idempotent": true },
+  { "name": "post-with-idempotency-key-still-idempotent", "method": "POST", "host": "api.example.com", "path": "/v1/orders", "headers": ["Idempotency-Key"], "operation_read": false, "idempotent": true },
+  { "name": "missing-path-is-not-an-operation-read", "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "path": null, "headers": [], "operation_read": false, "idempotent": false }
+]

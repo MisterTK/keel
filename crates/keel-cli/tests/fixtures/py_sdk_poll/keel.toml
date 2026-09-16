@@ -1,0 +1,2 @@
+[target."llm:google-genai"]
+timeout = "1800s"

@@ -432,19 +432,19 @@ fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> Po
     } else {
         obj
     };
-    match doc.get(&poll.until.field) {
+    match poll.until.judge(doc) {
         None => PollVerdict::FailOpen,
-        Some(Value::String(s)) if poll.until.terminal.iter().any(|t| t == s) => {
-            PollVerdict::Terminal
-        }
-        Some(_) => PollVerdict::Pending,
+        Some(true) => PollVerdict::Terminal,
+        Some(false) => PollVerdict::Pending,
     }
 }
 
-/// The poll gate: a resolved poll table applies only to idempotent GET/HEAD
-/// ops (re-issuing a GET is as safe as retrying it — CCR-3).
+/// The poll gate: a resolved poll table applies to any idempotent request
+/// (CCR-8). Idempotency is the property CCR-3's GET/HEAD check approximated;
+/// the front end's judgment (`Request.idempotent`) now carries it alone, so a
+/// POST the adapter judged safe to re-issue (an operation read) polls too.
 fn poll_applies(request: &Request) -> bool {
-    request.idempotent && (request.op.starts_with("GET ") || request.op.starts_with("HEAD "))
+    request.idempotent
 }
 
 fn class_str(class: ErrorClass) -> &'static str {
@@ -1975,7 +1975,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn poll_fails_open_on_missing_field_and_skips_non_get() {
+    async fn poll_fails_open_on_missing_field_and_skips_non_idempotent() {
         let engine = Engine::new();
         engine.configure(&poll_policy_json("10s", "90s")).unwrap();
         // Missing field: returned as-is, one attempt.
@@ -1988,15 +1988,42 @@ mod tests {
             .await;
         assert_eq!(out.result, "ok");
         assert_eq!(out.attempts, 1);
-        // POST op: poll layer inert even with a pending-looking payload.
+        // Non-idempotent POST: poll layer inert even with a pending-looking payload.
         let mut post = req("api.jobs.internal", "h3");
         post.op = String::from("POST api.jobs.internal");
+        post.idempotent = false;
         let out = engine
             .execute(&post, async |_a| AttemptResult::Ok {
                 payload: json!({"status": "running"}),
             })
             .await;
         assert_eq!(out.attempts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_governs_an_idempotent_post_with_a_boolean_terminal() {
+        let engine = Engine::new();
+        engine
+            .configure(&json!({ "target": { "ops.internal": { "poll": {
+                "interval": "10s", "deadline": "90s",
+                "until": { "field": "done", "terminal": [true] } } } } }))
+            .unwrap();
+        let mut req = req("ops.internal", "h1");
+        req.op = "POST ops.internal/v1/op:fetchOperation".into();
+        req.idempotent = true;
+        let mut bodies = vec![
+            json!({ "done": false }),
+            json!({ "done": "true" }),
+            json!({ "done": true }),
+        ]
+        .into_iter();
+        let out = engine
+            .execute(&req, async |_a| AttemptResult::Ok {
+                payload: bodies.next().expect("script exhausted"),
+            })
+            .await;
+        assert_eq!(out.attempts, 3);
+        assert_eq!(out.payload, Some(json!({ "done": true })));
     }
 
     #[tokio::test(start_paused = true)]

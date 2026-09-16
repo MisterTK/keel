@@ -133,7 +133,15 @@ export function installFetch(
     // so the SAME key rides every attempt (rule 2). Inside a Tier 2 flow, a
     // crashed predecessor's key (`recordedKey`, peeked above) is reused
     // verbatim instead of minting a fresh one (rule 3).
-    const injectedKey = resolveIdempotencyInjection(method, headers, idemHeader, mintIdempotencyKey, recordedKey);
+    const injectedKey = resolveIdempotencyInjection(
+      method,
+      headers,
+      idemHeader,
+      mintIdempotencyKey,
+      recordedKey,
+      hostname,
+      parsed.pathname,
+    );
     if (injectedKey !== null) headers.set(idemHeader, injectedKey);
     // A call is only retried if it is BOTH idempotent by method/header/injection
     // AND its body can be re-sent on a retry: an unbuffered stream body is
@@ -141,7 +149,8 @@ export function installFetch(
     // (Level 0: can't wrap safely → observed, not retried). In-memory bodies
     // (string/bytes) are re-sent unchanged on each attempt.
     const idempotent =
-      (injectedKey !== null || isIdempotent(method, headers, idemHeader)) && isBodyRetrySafe(input, body);
+      (injectedKey !== null || isIdempotent(method, headers, idemHeader, hostname, parsed.pathname)) &&
+      isBodyRetrySafe(input, body);
     // `op`/`args_hash`/`request` are per-hop (a fallback hop dispatches a
     // different URL/body), so they are (re)computed inside the hop loop below.
 

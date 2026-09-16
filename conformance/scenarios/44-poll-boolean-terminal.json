@@ -1,0 +1,21 @@
+{
+  "name": "poll-boolean-terminal",
+  "description": "CCR-8: until.terminal accepts booleans, matched by JSON type — false is pending, the STRING \"true\" is pending, the number 1 is pending, true is terminal (Vertex/Gemini operations signal done: true).",
+  "policy": { "target": {
+    "ops.example": { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "done", "terminal": [true] } } }
+  } },
+  "steps": [
+    { "call": {
+        "target": "ops.example",
+        "request": { "op": "POST ops.example/v1/op1:fetchOperation", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "done": false } },
+          { "status": "ok", "payload": { "done": "true" } },
+          { "status": "ok", "payload": { "done": 1 } },
+          { "status": "ok", "payload": { "done": true, "response": { "ok": 1 } } }
+        ],
+        "expect": { "result": "ok", "payload": { "done": true, "response": { "ok": 1 } }, "attempts": 4 }
+    } },
+    { "report_expect": { "clock_ms": 30000, "targets": { "ops.example": { "calls": 1, "attempts": 4, "successes": 1 } } } }
+  ]
+}

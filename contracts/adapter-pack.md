@@ -67,6 +67,18 @@ key **injection**, not just recognition:
    `(target)#(args_hash)` would differ across re-executions and replay would
    fence (KEEL-E031).
 
+**Operation reads (CCR-8).** A `POST` to a host under `googleapis.com`
+(`googleapis.com` itself or any `*.googleapis.com`, compared
+case-insensitively) whose last path segment is a custom method with a verb of
+the form `fetch…Operation` (`:fetchPredictOperation`, `:fetchOperation`, any
+`:fetch*Operation`) is a read of a long-running operation's state. The adapter
+judges it `idempotent = true` without a key: it has no side effect, and
+re-issuing it is exactly what polling does. Injection (rule 1) is skipped for
+such a call — there is nothing to make safe. The submit side of the same
+surface (`:predictLongRunning`, any `:*LongRunning`) is NOT covered and stays
+non-idempotent. Level 0 consequence: these POSTs gain retry (conn/timeout/5xx/
+429) and the per-attempt `timeout` under defaults.
+
 ## Contract tests
 
 Each pack pins the library/framework versions it certifies and runs its seam

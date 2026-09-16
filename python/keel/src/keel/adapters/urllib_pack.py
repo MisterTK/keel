@@ -212,7 +212,7 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
     recorded_key = _http.peek_recorded_idempotency_key(target, hash_)
     header_names = [k for k, _ in req.header_items()] if req is not None else []
     injected = _http.resolve_idempotency_injection(
-        method, header_names, idem_header, recorded_key=recorded_key
+        method, header_names, idem_header, recorded_key=recorded_key, host=host, path=parts.path
     )
     current, pass_data = fullurl, data
     if injected is not None:
@@ -221,7 +221,7 @@ def _judge(fullurl: Any, data: Any) -> tuple[Any, Any, str, str, str, bool, str 
             current, pass_data = req, None
         req.add_header(idem_header, injected)  # type: ignore[arg-type]
         current = req
-    idempotent = injected is not None or _http.is_idempotent(method, header_names, idem_header)
+    idempotent = injected is not None or _http.is_idempotent(method, header_names, idem_header, host=host, path=parts.path)
     return current, pass_data, url, target, op, idempotent, hash_, injected
 
 

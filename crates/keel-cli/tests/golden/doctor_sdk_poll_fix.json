@@ -1,7 +1,7 @@
 {
   "adapters": [
     {
-      "detected": true,
+      "detected": false,
       "lib": "httpx",
       "status": "pinned",
       "target": "host"
@@ -61,7 +61,7 @@
       "target": "tool:<name>"
     },
     {
-      "detected": false,
+      "detected": true,
       "lib": "google-genai",
       "status": "pinned",
       "target": "llm:google-genai"
@@ -159,14 +159,14 @@
   "coverage": {
     "invisible": [],
     "visible_unwrapped": [
-      "us-central1-aiplatform.googleapis.com"
+      "llm:google-genai"
     ],
     "wrapped": []
   },
   "findings": [
     {
       "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
-      "detail": "`us-central1-aiplatform.googleapis.com` is visible in your code but has no observed runtime evidence.",
+      "detail": "`llm:google-genai` is visible in your code but has no observed runtime evidence.",
       "level": "warn",
       "topic": "visible-unwrapped"
     },
@@ -177,10 +177,61 @@
       "topic": "invisible"
     },
     {
-      "action": "Add `COPY keel.toml ./` (before the layer that runs the app). At runtime the policy is read from KEEL_CWD or the working directory; without the file Keel refuses to activate under KEEL_CWD and runs production defaults otherwise.",
-      "detail": "`Dockerfile` has no COPY/ADD directive that reaches keel.toml — the policy in this checkout will not be in the image.",
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. Or apply the attached patch (`git apply`): it adds the route-key `poll` block for this provider — tune `interval`/`deadline` to the job.",
+      "detail": "`wait` (inline.py:6) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
+      "fix": {
+        "changes": [
+          {
+            "after": {
+              "poll": {
+                "deadline": "30m",
+                "interval": "10s",
+                "until": {
+                  "field": "done",
+                  "terminal": [
+                    true
+                  ]
+                }
+              },
+              "timeout": "30s"
+            },
+            "before": null,
+            "path": "target.\"GET generativelanguage.googleapis.com/*/operations/*\""
+          },
+          {
+            "after": {
+              "poll": {
+                "deadline": "30m",
+                "interval": "10s",
+                "until": {
+                  "field": "done",
+                  "terminal": [
+                    true
+                  ]
+                }
+              },
+              "timeout": "30s"
+            },
+            "before": null,
+            "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\""
+          }
+        ],
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces the hand-rolled poll in inline.py:6 (wait)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces the hand-rolled poll in inline.py:6 (wait)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
+      },
       "level": "warn",
-      "topic": "keel-toml-not-in-image"
+      "topic": "hand-rolled-poll"
+    },
+    {
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. The route-key patch for this provider is attached to the first hand-rolled-poll finding above.",
+      "detail": "`wait_guarded` (inline.py:12) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
+      "level": "warn",
+      "topic": "hand-rolled-poll"
+    },
+    {
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. The route-key patch for this provider is attached to the first hand-rolled-poll finding above.",
+      "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
+      "level": "warn",
+      "topic": "hand-rolled-poll"
     }
   ],
   "follow_ups": [
@@ -211,7 +262,7 @@
     "external_processes": [],
     "unreachable": [],
     "wrappable": [
-      "us-central1-aiplatform.googleapis.com"
+      "llm:google-genai"
     ]
   }
 }

@@ -619,6 +619,88 @@ fn doctor_fix_json_matches_golden_and_applies() {
     );
 }
 
+/// Poll v2 (#93/#101): three SDK-shaped poll loops — the bound-result shape
+/// and both inline `client.operations.get(op).done` shapes — each get a
+/// `hand-rolled-poll` finding, and the LRO-sized timeout in the same fixture
+/// pins the rewritten `sdk-client-timeout` text. All three would propose the
+/// SAME two route keys, so exactly ONE carries the patch and the others point
+/// at it. That patch applies with the real `git apply`, and a second run sees
+/// both route keys present and proposes nothing at all.
+#[test]
+fn doctor_sdk_poll_route_key_fix_matches_golden_and_applies() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in ["render.py", "inline.py", "keel.toml"] {
+        std::fs::copy(fixtures().join("py_sdk_poll").join(f), dir.path().join(f)).unwrap();
+    }
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "a poll lead does not flip ok");
+    check_golden("doctor_sdk_poll_fix.json", &json_string(&r.json));
+
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let findings = r.json["findings"].as_array().unwrap();
+    let polls: Vec<_> = findings
+        .iter()
+        .filter(|f| f["topic"] == "hand-rolled-poll")
+        .collect();
+    assert_eq!(polls.len(), 3, "{}", json_string(&r.json));
+    let with_fix: Vec<_> = polls.iter().filter(|f| !f["fix"].is_null()).collect();
+    assert_eq!(
+        with_fix.len(),
+        1,
+        "identical route keys → exactly one applyable patch: {}",
+        json_string(&r.json)
+    );
+    for f in polls.iter().filter(|f| f["fix"].is_null()) {
+        assert!(
+            f["action"]
+                .as_str()
+                .unwrap()
+                .contains("attached to the first hand-rolled-poll finding above"),
+            "{f}"
+        );
+    }
+    let patch = with_fix[0]["fix"]["patch"].as_str().unwrap();
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    assert!(applied.contains("timeout = \"1800s\""), "{applied}");
+    assert!(
+        applied.contains("[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]"),
+        "{applied}"
+    );
+    let again = doctor::run(dir.path());
+    assert_eq!(
+        again.exit,
+        keel_cli::EXIT_OK,
+        "the proposed route keys validate: {}",
+        json_string(&again.json)
+    );
+    for f in again.json["findings"].as_array().unwrap() {
+        if f["topic"] == "hand-rolled-poll" {
+            assert!(
+                f["fix"].is_null(),
+                "both route keys are configured — nothing left to propose: {f}"
+            );
+        }
+    }
+}
+
 // ---- config-above-cwd through the REAL binary (issue #85) ----
 
 /// The built `keel` binary (the `CARGO_BIN_EXE_keel` convention `tests/exec.rs`

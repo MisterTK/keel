@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::ErrorClass;
 use serde::Deserialize;
+use serde_json::Value;
 
 /// A literal that failed to parse; surfaces through serde as the
 /// deserialization error message for the offending field.
@@ -667,21 +668,23 @@ pub struct IdempotencyPolicy {
     pub header: String,
 }
 
-/// `until = { field, terminal }` — the poll's terminal predicate (CCR-3).
-/// Non-emptiness is enforced at deserialize so an unpollable predicate is
+/// `until = { field, terminal }` — the poll's terminal predicate (CCR-3;
+/// CCR-8 widened `terminal` to string | boolean | number, matched by JSON
+/// type and value, and made `field` a dotted path). Non-emptiness and item
+/// types are enforced at deserialize so an unpollable predicate is
 /// KEEL-E001 at configure, never a silent never-terminal loop.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "PollUntilRaw")]
 pub struct PollUntil {
     pub field: String,
-    pub terminal: Vec<String>,
+    pub terminal: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PollUntilRaw {
     field: String,
-    terminal: Vec<String>,
+    terminal: Vec<Value>,
 }
 
 impl TryFrom<PollUntilRaw> for PollUntil {
@@ -694,6 +697,17 @@ impl TryFrom<PollUntilRaw> for PollUntil {
         if raw.terminal.is_empty() {
             return Err(ParseError::new("poll until.terminal", "(empty array)"));
         }
+        if let Some(bad) = raw
+            .terminal
+            .iter()
+            .find(|t| !matches!(t, Value::String(_) | Value::Bool(_) | Value::Number(_)))
+        {
+            return Err(ParseError::with_note(
+                "poll until.terminal",
+                &bad.to_string(),
+                "items must be strings, booleans, or numbers",
+            ));
+        }
         Ok(Self {
             field: raw.field,
             terminal: raw.terminal,
@@ -701,8 +715,38 @@ impl TryFrom<PollUntilRaw> for PollUntil {
     }
 }
 
+impl PollUntil {
+    /// Judge one JSON document (conformance/README.md "Poll", verdict rules —
+    /// parity-critical with both stubs): `None` when `field` — a dotted path
+    /// walked through nested objects — is absent or an intermediate is not an
+    /// object (fail-open: the caller returns the payload as-is), `Some(true)`
+    /// when the value is JSON-equal to a `terminal` item of the same JSON type
+    /// (numbers by value), `Some(false)` when pending.
+    #[must_use]
+    pub fn judge(&self, doc: &serde_json::Map<String, Value>) -> Option<bool> {
+        let mut segments = self.field.split('.');
+        let mut current = doc.get(segments.next()?)?;
+        for seg in segments {
+            current = current.as_object()?.get(seg)?;
+        }
+        Some(self.terminal.iter().any(|t| terminal_eq(current, t)))
+    }
+}
+
+/// Same-JSON-type equality: `"true"` ≠ `true`, `1` ≠ `true`, `100` = `100.0`.
+/// Numbers are compared in the f64 domain — integers beyond 2^53 collapse, by
+/// design, so `100` matches `100.0` and every implementation agrees.
+fn terminal_eq(value: &Value, item: &Value) -> bool {
+    match (value, item) {
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        _ => false,
+    }
+}
+
 /// `poll = { interval, deadline, until }` — poll-until-terminal (CCR-3).
-/// GET/HEAD at Level 0 only; semantics in conformance/README.md ("Poll").
+/// Applies to idempotent requests (CCR-8); semantics in conformance/README.md ("Poll").
 /// `interval` must be nonzero: on a virtual clock a zero interval never
 /// approaches `deadline`, looping forever, so it is rejected at deserialize
 /// (KEEL-E001) rather than left to hang at runtime.
@@ -959,6 +1003,8 @@ impl Policy {
 //
 // Precedence, per `docs/targeting.md` (the cross-language parity contract
 // with the Node twin's `judge.mjs`):
+//   0. Route key on a mapped host — only when tier 1 would claim the host,
+//      and only for pattern keys with a `/path` (CCR-8).
 //   1. LLM host map — exact provider host, or a Vertex regional endpoint via
 //      the `-aiplatform.googleapis.com` suffix rule.
 //   2. Exact bare-host `[target]` key (no method/port/path/`*`).
@@ -1091,37 +1137,20 @@ struct OutboundPattern {
 }
 
 impl Policy {
-    /// The policy target key for one outbound request. See the module-level
-    /// precedence comment above `OUTBOUND_METHODS` for the four tiers.
-    #[must_use]
-    pub fn resolve_target(
+    /// The most specific `[target]` pattern key matching one request, or
+    /// `None`. `route_only` restricts candidates to ROUTE keys — pattern keys
+    /// whose parse yields a `/path` component — which is tier 0's candidate
+    /// set (a route on an LLM host is more specific than Keel's own default
+    /// host classification and beats it; a host-only glob is not).
+    fn most_specific_pattern(
         &self,
         method: &str,
         host: &str,
         scheme: Option<&str>,
         port: Option<u16>,
         path: Option<&str>,
-    ) -> String {
-        // 1. LLM host map (exact host, then the Vertex regional suffix rule).
-        let provider = LLM_HOST_PROVIDERS
-            .iter()
-            .find(|(h, _)| *h == host)
-            .map(|(_, p)| *p)
-            .or_else(|| {
-                host.ends_with(VERTEX_REGIONAL_SUFFIX)
-                    .then_some("google-genai")
-            });
-        if let Some(p) = provider {
-            return format!("llm:{p}");
-        }
-        // 2. Exact bare-host [target] key.
-        if !CLASS_PREFIXES.iter().any(|c| host.starts_with(c))
-            && self.target.contains_key(host)
-            && is_bare_host_key(host)
-        {
-            return host.to_owned();
-        }
-        // 3. Compile the pattern tier and pick the most specific match.
+        route_only: bool,
+    ) -> Option<String> {
         let mut patterns: Vec<OutboundPattern> = Vec::new();
         for key in self.target.keys() {
             if CLASS_PREFIXES.iter().any(|c| key.starts_with(c)) || is_bare_host_key(key) {
@@ -1130,6 +1159,9 @@ impl Policy {
             let Some((m, h, pt, pa)) = parse_outbound_key(key) else {
                 continue;
             };
+            if route_only && pa.is_none() {
+                continue;
+            }
             let wildcards = key.matches('*').count();
             patterns.push(OutboundPattern {
                 key: key.clone(),
@@ -1180,7 +1212,63 @@ impl Policy {
             {
                 continue;
             }
-            return p.key.clone();
+            return Some(p.key.clone());
+        }
+        None
+    }
+
+    /// The policy target key for one outbound request. See the module-level
+    /// precedence comment above `OUTBOUND_METHODS` for the five tiers.
+    #[must_use]
+    pub fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        // 1. LLM host map (exact host, then the Vertex regional suffix rule) —
+        //    unless a ROUTE key matches (tier 0, CCR-8): a user-written
+        //    `[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]`
+        //    is more specific than Keel's default classification of the host.
+        //    Host-only globs are not route keys and never capture LLM traffic.
+        let provider = LLM_HOST_PROVIDERS
+            .iter()
+            .find(|(h, _)| *h == host)
+            .map(|(_, p)| *p)
+            .or_else(|| {
+                host.ends_with(VERTEX_REGIONAL_SUFFIX)
+                    .then_some("google-genai")
+            });
+        if let Some(p) = provider {
+            // Tier 0 is free unless a route key exists: `/` can only appear in
+            // the path component of an outbound key (class-prefixed keys may
+            // carry `/` in a function path, so exclude them). A strict
+            // superset of "parses to Some(path)", so this never skips a key
+            // that could have matched.
+            let has_route_key = self
+                .target
+                .keys()
+                .any(|k| !CLASS_PREFIXES.iter().any(|c| k.starts_with(c)) && k.contains('/'));
+            if has_route_key
+                && let Some(key) =
+                    self.most_specific_pattern(method, host, scheme, port, path, true)
+            {
+                return key;
+            }
+            return format!("llm:{p}");
+        }
+        // 2. Exact bare-host [target] key.
+        if !CLASS_PREFIXES.iter().any(|c| host.starts_with(c))
+            && self.target.contains_key(host)
+            && is_bare_host_key(host)
+        {
+            return host.to_owned();
+        }
+        // 3. Most specific pattern key.
+        if let Some(key) = self.most_specific_pattern(method, host, scheme, port, path, false) {
+            return key;
         }
         // 4. No pattern matched: fall through to the bare host.
         host.to_owned()
@@ -1376,7 +1464,7 @@ mod tests {
     #[test]
     fn breaker_failure_rate_range_is_enforced() {
         // Frozen schema: breaker.failure_rate is exclusiveMinimum 0, maximum 1.
-        let bad = |rate: serde_json::Value| {
+        let bad = |rate: Value| {
             let doc = json!({ "target": { "x": { "breaker": { "failure_rate": rate } } } });
             serde_path_to_error::deserialize::<_, Policy>(&doc)
         };
@@ -1402,7 +1490,7 @@ mod tests {
 
     #[test]
     fn breaker_mode_selection_follows_the_schema() {
-        let breaker = |doc: serde_json::Value| -> BreakerPolicy {
+        let breaker = |doc: Value| -> BreakerPolicy {
             let doc = json!({ "target": { "x": { "breaker": doc } } });
             let policy: Policy = serde_path_to_error::deserialize(&doc).unwrap();
             policy.target["x"].breaker.clone().unwrap()
@@ -1580,7 +1668,123 @@ mod tests {
         assert_eq!(poll.interval.0, 10_000);
         assert_eq!(poll.deadline.0, 90_000);
         assert_eq!(poll.until.field, "status");
-        assert_eq!(poll.until.terminal, vec!["completed", "failed"]);
+        assert_eq!(
+            poll.until.terminal,
+            vec![serde_json::json!("completed"), serde_json::json!("failed")]
+        );
+    }
+
+    #[test]
+    fn poll_terminal_accepts_string_bool_number_and_rejects_others() {
+        let ok = serde_json::json!({ "target": { "x": { "poll": {
+            "interval": "10s", "deadline": "90s",
+            "until": { "field": "response.state", "terminal": ["DONE", true, 100, 1.5] } } } } });
+        let policy: Policy = serde_json::from_value(ok).unwrap();
+        let until = &policy.target["x"].poll.as_ref().unwrap().until;
+        assert_eq!(until.field, "response.state");
+        assert_eq!(until.terminal.len(), 4);
+        for bad in [
+            serde_json::json!([{}]),
+            serde_json::json!([null]),
+            serde_json::json!([[1]]),
+        ] {
+            let doc = serde_json::json!({ "target": { "x": { "poll": {
+                "interval": "10s", "deadline": "90s", "until": { "field": "s", "terminal": bad } } } } });
+            let err = serde_json::from_value::<Policy>(doc)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("items must be strings, booleans, or numbers"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_until_judge_matches_by_json_type_and_walks_dotted_paths() {
+        let until = |field: &str, terminal: Value| PollUntil {
+            field: field.to_owned(),
+            terminal: terminal.as_array().unwrap().clone(),
+        };
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        let done = until("done", serde_json::json!([true]));
+        assert_eq!(
+            done.judge(&obj(serde_json::json!({ "done": true }))),
+            Some(true)
+        );
+        assert_eq!(
+            done.judge(&obj(serde_json::json!({ "done": false }))),
+            Some(false)
+        );
+        assert_eq!(
+            done.judge(&obj(serde_json::json!({ "done": "true" }))),
+            Some(false),
+            "string never matches bool"
+        );
+        assert_eq!(
+            done.judge(&obj(serde_json::json!({ "done": 1 }))),
+            Some(false),
+            "1 never matches true"
+        );
+        assert_eq!(
+            done.judge(&obj(serde_json::json!({ "name": "op" }))),
+            None,
+            "missing → fail-open"
+        );
+        let pct = until("progress", serde_json::json!([100]));
+        assert_eq!(
+            pct.judge(&obj(serde_json::json!({ "progress": 100 }))),
+            Some(true)
+        );
+        assert_eq!(
+            pct.judge(&obj(serde_json::json!({ "progress": 100.0 }))),
+            Some(true),
+            "numbers compare by value"
+        );
+        assert_eq!(
+            pct.judge(&obj(serde_json::json!({ "progress": "100" }))),
+            Some(false)
+        );
+        assert_eq!(
+            pct.judge(&obj(serde_json::json!({ "progress": 99 }))),
+            Some(false)
+        );
+        let nested = until("response.state", serde_json::json!(["SUCCEEDED", "FAILED"]));
+        assert_eq!(
+            nested.judge(&obj(
+                serde_json::json!({ "response": { "state": "SUCCEEDED" } })
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            nested.judge(&obj(
+                serde_json::json!({ "response": { "state": "RUNNING" } })
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            nested.judge(&obj(serde_json::json!({ "metadata": {} }))),
+            None,
+            "missing intermediate"
+        );
+        assert_eq!(
+            nested.judge(&obj(serde_json::json!({ "response": "flat" }))),
+            None,
+            "non-object intermediate"
+        );
+        assert_eq!(
+            nested.judge(&obj(
+                serde_json::json!({ "response": { "state": { "deep": 1 } } })
+            )),
+            Some(false),
+            "object value is pending, not terminal"
+        );
+        let dotted_key = until("a.b", serde_json::json!(["x"]));
+        assert_eq!(
+            dotted_key.judge(&obj(serde_json::json!({ "a.b": "x" }))),
+            None,
+            "literal-dot keys are not addressable"
+        );
     }
 
     #[test]
@@ -1700,6 +1904,23 @@ mod resolve_target_tests {
             p.target.insert((*k).to_owned(), TargetPolicy::default());
         }
         p
+    }
+
+    #[test]
+    fn class_prefixed_slash_key_does_not_enable_tier_zero() {
+        // `py:pkg/mod:fn*` contains `/` but is class-prefixed, so it is not a
+        // route key: tier 0 stays off and the LLM host map still wins.
+        let p = policy(&["py:pkg/mod:fn*", "*.googleapis.com"]);
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "us-central1-aiplatform.googleapis.com",
+                Some("https"),
+                None,
+                Some("/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:generateContent")
+            ),
+            "llm:google-genai"
+        );
     }
 
     #[test]
@@ -1860,5 +2081,93 @@ mod resolve_target_tests {
                 format!("llm:{provider}")
             );
         }
+    }
+
+    const VERTEX_HOST: &str = "us-central1-aiplatform.googleapis.com";
+    const FETCH: &str = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation";
+    const SUBMIT: &str =
+        "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning";
+    const ROUTE: &str = "POST *-aiplatform.googleapis.com/*:fetchPredictOperation";
+
+    #[test]
+    fn route_key_beats_the_llm_host_map_for_its_route_only() {
+        let p = policy(&[ROUTE, "*.googleapis.com"]);
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, Some("https"), None, Some(FETCH)),
+            ROUTE
+        );
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, Some("https"), None, Some(SUBMIT)),
+            "llm:google-genai",
+            "host-only glob never captures an LLM host"
+        );
+        assert_eq!(
+            p.resolve_target("GET", VERTEX_HOST, Some("https"), None, Some(FETCH)),
+            "llm:google-genai",
+            "METHOD prefix must match"
+        );
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/g:generateContent")
+            ),
+            "llm:google-genai"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "storage.googleapis.com", None, None, Some("/b/x")),
+            "*.googleapis.com",
+            "non-LLM host: tier 3 unchanged"
+        );
+    }
+
+    #[test]
+    fn most_specific_route_key_wins_on_an_llm_host() {
+        let p = policy(&[ROUTE, "*-aiplatform.googleapis.com/*"]);
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, None, None, Some(FETCH)),
+            ROUTE
+        );
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, None, None, Some(SUBMIT)),
+            "*-aiplatform.googleapis.com/*"
+        );
+    }
+
+    #[test]
+    fn gemini_operations_get_route_key_resolves() {
+        let key = "GET generativelanguage.googleapis.com/*/operations/*";
+        let p = policy(&[key]);
+        assert_eq!(
+            p.resolve_target(
+                "GET",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/veo/operations/op1")
+            ),
+            key
+        );
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/veo:generateContent")
+            ),
+            "llm:google-genai"
+        );
+    }
+
+    #[test]
+    fn non_llm_host_exact_still_beats_a_route_key() {
+        let p = policy(&["api.example.com", "GET api.example.com/*"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, Some("/v1/x")),
+            "api.example.com"
+        );
     }
 }

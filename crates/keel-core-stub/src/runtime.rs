@@ -368,19 +368,19 @@ fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> Po
     } else {
         obj
     };
-    match doc.get(&poll.until.field) {
+    match poll.until.judge(doc) {
         None => PollVerdict::FailOpen,
-        Some(Value::String(s)) if poll.until.terminal.iter().any(|t| t == s) => {
-            PollVerdict::Terminal
-        }
-        Some(_) => PollVerdict::Pending,
+        Some(true) => PollVerdict::Terminal,
+        Some(false) => PollVerdict::Pending,
     }
 }
 
-/// The poll gate: a resolved poll table applies only to idempotent GET/HEAD
-/// ops (re-issuing a GET is as safe as retrying it — CCR-3).
+/// The poll gate: a resolved poll table applies to any idempotent request
+/// (CCR-8). Idempotency is the property CCR-3's GET/HEAD check approximated;
+/// the front end's judgment (`Request.idempotent`) now carries it alone, so a
+/// POST the adapter judged safe to re-issue (an operation read) polls too.
 fn poll_applies(request: &Request) -> bool {
-    request.idempotent && (request.op.starts_with("GET ") || request.op.starts_with("HEAD "))
+    request.idempotent
 }
 
 impl KeelCoreStub {

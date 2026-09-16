@@ -186,16 +186,46 @@ def streaming_response(content_type: str | None) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
 
 
+def operation_read(host: str | None, path: str | None) -> bool:
+    """True iff (host, path) is a Google long-running-operation READ: a host
+    under ``googleapis.com`` (the apex or any ``*.googleapis.com``, compared
+    case-insensitively) whose last path segment is a custom method with a
+    ``fetch…Operation`` verb (``:fetchPredictOperation``, ``:fetchOperation``,
+    any ``:fetch*Operation``). contracts/adapter-pack.md "Operation reads"
+    (CCR-8): such a POST has no side effect — re-issuing it is exactly what
+    polling does — so it is judged idempotent without a key. The submit side
+    (``:predictLongRunning``) is NOT covered. Twin of judge.mjs
+    ``operationRead``; keep identical (corpus: conformance/operation_read/).
+    Deliberately separate from ``lro_shaped_path`` (cache exemption, which
+    also covers submits): this is the narrower predicate."""
+    if not host or not path:
+        return False
+    h = host.lower()
+    if h != "googleapis.com" and not h.endswith(".googleapis.com"):
+        return False
+    last = path.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return False
+    verb = last.rsplit(":", 1)[-1]
+    return verb.startswith("fetch") and verb.endswith("Operation")
+
+
 def is_idempotent(
     method: str,
     header_names: Iterable[str],
     idempotency_header: str | None = None,
+    *,
+    host: str | None = None,
+    path: str | None = None,
 ) -> bool:
     """Decide retryability. ``header_names`` are the request's header names
     (any case). A POST/PATCH is retryable only when a recognized idempotency
-    header is present; ``idempotency_header`` is the target's configured header
-    (policy ``idempotency.header``), if any, else the default set is used."""
+    header is present — or, for a POST, when ``(host, path)`` is a Google
+    operation read (CCR-8). ``idempotency_header`` is the target's configured
+    header (policy ``idempotency.header``), if any, else the default set."""
     if method in IDEMPOTENT_METHODS:
+        return True
+    if method == "POST" and operation_read(host, path):
         return True
     present = {h.lower() for h in header_names}
     candidates = (
@@ -260,6 +290,8 @@ def resolve_idempotency_injection(
     configured_header: str | None,
     *,
     recorded_key: str | None = None,
+    host: str | None = None,
+    path: str | None = None,
 ) -> str | None:
     """The idempotency key to INJECT for this call, or ``None`` to inject
     nothing (contracts/adapter-pack.md "Idempotency-key injection"):
@@ -279,6 +311,8 @@ def resolve_idempotency_injection(
     function — rule 5 (it would otherwise fence Tier 2 replay)."""
     if configured_header is None or method in IDEMPOTENT_METHODS:
         return None
+    if method == "POST" and operation_read(host, path):
+        return None  # already idempotent by rule — nothing to make safe (CCR-8)
     present = {h.lower() for h in header_names}
     if configured_header.lower() in present:
         return None
@@ -587,6 +621,7 @@ __all__ = [
     "poll_configured",
     "buffer_body_configured",
     "streaming_response",
+    "operation_read",
     "is_idempotent",
     "new_idempotency_key",
     "step_key",

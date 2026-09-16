@@ -55,11 +55,13 @@ scenarios 36–37), each asserting an exact (not subset) match against `expect`:
 
 - `{ "resolve": { "method", "host", "scheme"?, "port"?, "path"? }, "expect": "<key>" }`
   — resolves the request to its `[target]` policy key and asserts it equals
-  `expect` exactly. Selection follows `docs/targeting.md`: the LLM host map
-  (exact host, then the Vertex regional suffix) first, else the `[target]`
-  table's bare-host **exact** key (checked unconditionally, regardless of the
-  request's path), else the most specific matching pattern key
-  (method/host-glob/port/path-glob), else the bare host.
+  `expect` exactly. Selection follows `docs/targeting.md`: a ROUTE key (a
+  pattern key with a `/path`) matching the request wins on a host the LLM
+  host map would claim (tier 0, CCR-8); else the LLM host map (exact host,
+  then the Vertex regional suffix); else the `[target]` table's bare-host
+  **exact** key (checked unconditionally, regardless of the request's path);
+  else the most specific matching pattern key (method/host-glob/port/
+  path-glob); else the bare host. A host-only glob never captures an LLM host.
 - `{ "layer": { "target", "key" }, "expect": <json value> }` — resolves one
   policy layer value for `target`/`key` (an exact `[target]` entry, else
   `defaults.llm` for an `llm:*` target, else `defaults.outbound`, else JSON
@@ -78,9 +80,9 @@ enforcing wall-clock timeouts).
 1. **Resolution.** Per-layer: `target."<id>"` entry, else `defaults.llm` when
    the target starts with `llm:`, else `defaults.outbound`. A layer set at a
    more specific level replaces the whole layer table (no deep merge).
-   Scenarios use exact target ids (glob/pattern resolution is a front-end
-   concern and tested separately — see `docs/targeting.md` for the
-   host/URL-pattern grammar and precedence rules).
+   `call` steps use exact target ids; key resolution (globs, route keys, the
+   LLM host map) is core-and-stub judgment pinned by the `resolve` steps of
+   scenarios 36, 38, and 41 — see `docs/targeting.md`.
 2. **Cache.** When the resolved policy has `cache` with a `ttl` and the
    request carries `args_hash`: a fresh entry returns `from_cache: true`
    with `attempts: 0` and no effect invocation; a successful live call
@@ -139,8 +141,9 @@ enforcing wall-clock timeouts).
      "Schedule algebra" below), overridden upward by the error's
      `retry_after_ms` (`wait = max(schedule, retry_after)`), and try again.
 6. **Poll (poll-until-terminal).** When the resolved policy has a `poll`
-   table AND the request is idempotent AND its `op` starts with `"GET "` or
-   `"HEAD "`, each retry-loop completion that returns `ok` is judged:
+   table AND the request is idempotent (`Request.idempotent` — the method is
+   NOT consulted; CCR-8), each retry-loop completion that returns `ok` is
+   judged:
    - Document: a payload object carrying `body_b64` (or both `status` and
      `headers`) is an adapter HTTP envelope — `body_b64` must be a string
      that base64-decodes and JSON-parses to an object, which becomes the
@@ -153,9 +156,19 @@ enforcing wall-clock timeouts).
      decode under a lenient reading (e.g. `"AB=="`, which some decoders
      silently accept as identical to canonical `"AA=="`) fails open rather
      than being judged, in every implementation (scenario 35).
-   - Verdict: document lacks `until.field` → fail-open; field's value is a
-     JSON string equal to one of `until.terminal` → terminal (returned
-     unchanged); any other value → pending.
+   - Verdict: `until.field` is a dotted path walked through nested objects
+     (`response.state`); a missing segment, a non-object intermediate, or a
+     key that merely contains a dot → fail-open. Lookup is **own-keys only**:
+     a segment naming an inherited property of the host language's object type
+     (JavaScript's `constructor`, `__proto__`, …) is a MISSING key, exactly as
+     it is on a Rust map or a Python dict (scenario 48). The value is
+     **terminal** when it is JSON-equal to an `until.terminal` item of the
+     SAME JSON type — strings by equality, booleans by equality, numbers by
+     numeric value in IEEE-754 double precision (integers beyond 2^53 are not
+     distinguished) (`100` matches `100.0`; `"true"` never matches `true`; `1`
+     never matches `true`) → returned unchanged; any other value → pending. `until.terminal`
+     items are strings, booleans, or numbers; anything else is `KEEL-E001` at
+     configure (scenario 47).
    - Pending at `elapsed` ms since the poll's first attempt: if
      `elapsed + interval > deadline` → terminal `KEEL-E016` with message
      exactly `"{op} poll deadline exceeded: '{field}' not terminal after
