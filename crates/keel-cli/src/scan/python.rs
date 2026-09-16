@@ -425,22 +425,74 @@ def _governs_status_cmp(node):
         for sub in ast.walk(node))
 
 
+def _assigned_name(target):
+    """The bound name of an assignment target, for the narrow shapes an SDK
+    poll result is realistically stored in: a plain name (`op = ...`) or an
+    attribute (`self.op = ...`, keyed by its final attribute). Anything else
+    (tuple/list unpacking, subscript targets) returns None — deliberately
+    not treated as a poll-governing binding."""
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def _sdk_poll_feeds_exit(node, imported_llm_libs):
+    """An SDK "poll the job" call only counts as poll evidence when its
+    RESULT governs whether the loop exits — mirroring the restriction
+    `_governs_status_cmp` already applies to string comparisons, for the
+    same reason: a status-sync loop that iterates DISTINCT jobs and merely
+    calls an SDK poll-shaped method per item (e.g. `for id in ids: b =
+    client.batches.retrieve(id); cache[id] = b; sleep(...)`) is not a poll
+    of one job and must not be flagged. Governance is: the call's result is
+    bound to a name/attribute, and that name is referenced in either the
+    loop's own `while` test, or the test of a nested `if` whose body breaks
+    or returns."""
+    bound = set()
+    for sub in ast.walk(node):
+        if not (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call)
+                and sdk_poll_provider(sub.value, imported_llm_libs) is not None):
+            continue
+        for t in sub.targets:
+            name = _assigned_name(t)
+            if name:
+                bound.add(name)
+    if not bound:
+        return False
+
+    def refs(expr):
+        return any(
+            (isinstance(n, ast.Name) and n.id in bound)
+            or (isinstance(n, ast.Attribute) and n.attr in bound)
+            for n in ast.walk(expr))
+
+    if isinstance(node, ast.While) and refs(node.test):
+        return True
+    return any(
+        isinstance(sub, ast.If)
+        and any(isinstance(s, (ast.Break, ast.Return)) for s in sub.body)
+        and refs(sub.test)
+        for sub in ast.walk(node))
+
+
 def detect_simplifications(fn, aliases, imported_llm_libs):
     """The three WS3 patterns inside one function def, each anchored at the
     construct to delete. Precedence inside a loop: a status-string comparison
     makes it a poll (the stronger, WS5-pairing signal) even if an attempt
-    counter is also present. An SDK "poll the job" call (see
-    `sdk_poll_provider`) is the same strong signal by itself — the adopter's
-    `while not op.done: ... op = client.operations.get(op)` loop has no
-    status-string comparison anywhere in it, but the SDK shape alone says
-    "polling a job" (#95). An except-handler sleep inside an already-matched
-    loop is the same construct, not a second finding."""
+    counter is also present. An SDK "poll the job" call whose result governs
+    the loop's exit (see `_sdk_poll_feeds_exit`) is the same strong signal by
+    itself — the adopter's `while not op.done: ... op =
+    client.operations.get(op)` loop has no status-string comparison anywhere
+    in it, but the SDK shape alone says "polling a job" (#95). An
+    except-handler sleep inside an already-matched loop is the same
+    construct, not a second finding."""
     found = []
     covered = set()
     for node in ast.walk(fn):
         if not isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
             continue
-        has_sleep = has_counter = has_sdk_poll = False
+        has_sleep = has_counter = False
         for sub in ast.walk(node):
             if is_sleep(sub, aliases):
                 has_sleep = True
@@ -453,12 +505,9 @@ def detect_simplifications(fn, aliases, imported_llm_libs):
                     and isinstance(sub.targets[0], ast.Name)
                     and sub.targets[0].id == sub.value.left.id):
                 has_counter = True
-            if (isinstance(sub, ast.Call)
-                    and sdk_poll_provider(sub, imported_llm_libs) is not None):
-                has_sdk_poll = True
         if not has_sleep:
             continue
-        if _governs_status_cmp(node) or has_sdk_poll:
+        if _governs_status_cmp(node) or _sdk_poll_feeds_exit(node, imported_llm_libs):
             kind = "hand-rolled-poll"
         elif has_counter:
             kind = "hand-rolled-retry"
@@ -1872,6 +1921,24 @@ def wait(client, job):
 ",
         )
         .unwrap();
+        // Not a poll: `for batch_id in batch_ids` iterates DISTINCT jobs, and
+        // the sleep is rate-limit pacing, not backoff — `b` is only ever
+        // stored into `cache`, never read back into a loop-exit test. The SDK
+        // poll call shape matches (provider imported, suffix, receiver), but
+        // its result does not govern the loop's continuation, so this must
+        // NOT be flagged (the false-positive class review caught).
+        fs::write(
+            dir.path().join("sync.py"),
+            r"import time, openai
+
+def sync_batch_metadata(client, batch_ids, cache):
+    for batch_id in batch_ids:
+        b = client.batches.retrieve(batch_id)
+        cache[batch_id] = b
+        time.sleep(0.5)
+",
+        )
+        .unwrap();
         let s = scan(dir.path());
         let f = |module: &str, name: &str| {
             s.functions
@@ -1888,6 +1955,13 @@ def wait(client, job):
             std::collections::BTreeSet::from(["llm:openai".to_owned()])
         );
         assert!(f("other", "wait").targets.is_empty());
+        // sync_batch_metadata DOES reach the openai target (the SDK call is
+        // real) but must not be classified as a poll.
+        assert!(
+            f("sync", "sync_batch_metadata")
+                .targets
+                .contains("llm:openai")
+        );
         let polls: Vec<(&str, &str)> = s
             .findings
             .simplifications
@@ -1898,6 +1972,14 @@ def wait(client, job):
         assert_eq!(
             polls,
             vec![("batches.py", "wait"), ("render.py", "poll_video_takes")]
+        );
+        assert!(
+            !s.findings
+                .simplifications
+                .iter()
+                .any(|x| x.file == "sync.py"),
+            "iterating distinct jobs with a rate-limit sleep must not be flagged as a poll: {:?}",
+            s.findings.simplifications
         );
     }
 }
