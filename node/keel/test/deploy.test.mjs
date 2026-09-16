@@ -4,11 +4,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, chmodSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { ephemeralJournalWarning } from "../src/deploy.mjs";
+import { ephemeralJournalWarning, sqliteJournalPath } from "../src/deploy.mjs";
 
 const FLOWS = { flows: { entrypoints: ["py:app:main"] } };
 
@@ -123,6 +123,28 @@ test("file: journal is resolved lexically, not against the filesystem", () => {
     rmSync(d, { recursive: true, force: true });
   }
 });
+
+test(
+  "file: journal path is lexical, not symlink-resolved (#99)",
+  { skip: process.platform === "win32" ? "symlink creation needs SeCreateSymbolicLinkPrivilege on Windows" : false },
+  () => {
+    // #99: create the symlink ourselves so this is a real regression guard
+    // on every platform, not only where /tmp happens to be one.
+    const d = tmp();
+    try {
+      const real = join(d, "real");
+      mkdirSync(real);
+      const link = join(d, "link");
+      symlinkSync(real, link, "dir");
+      const pol = { ...FLOWS, journal: "file:.keel/journal.db" };
+      const got = sqliteJournalPath(pol, link);
+      assert.equal(got, join(link, ".keel", "journal.db"));
+      assert.notEqual(got, join(real, ".keel", "journal.db"), "lexical, not resolved");
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  }
+);
 
 test("cmd: flows count as configured", () => {
   const d = tmp();
