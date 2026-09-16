@@ -293,10 +293,40 @@ def _strict_b64decode(s: str) -> bytes | None:
     return raw if base64.b64encode(raw).decode("ascii") == s else None
 
 
+def _lookup_field(doc: dict[str, Any], field: str) -> tuple[bool, Any]:
+    """Walk a dotted `until.field` through nested objects. `(False, None)`
+    when any segment is missing or an intermediate is not an object — the
+    fail-open case, identical to a missing top-level key. Keys containing a
+    literal `.` are not addressable (CCR-8)."""
+    current: Any = doc
+    for seg in field.split("."):
+        if not isinstance(current, dict) or seg not in current:
+            return False, None
+        current = current[seg]
+    return True, current
+
+
+def _terminal_match(value: Any, terminal: list[Any]) -> bool:
+    """Same-JSON-type equality (CCR-8): "true" != true, 1 != true, 100 == 100.0.
+    `bool` is guarded before numbers because `True == 1` in Python."""
+    for t in terminal:
+        if isinstance(value, bool) or isinstance(t, bool):
+            if isinstance(value, bool) and isinstance(t, bool) and value is t:
+                return True
+            continue
+        if isinstance(value, str) and isinstance(t, str) and value == t:
+            return True
+        if isinstance(value, (int, float)) and isinstance(t, (int, float)) and value == t:
+            return True
+    return False
+
+
 def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
     """Judge one successful iteration's payload: "terminal" | "pending" |
     "fail_open". Parity with keel-core's ``poll_verdict``
-    (conformance/README.md "Poll")."""
+    (conformance/README.md "Poll"). CCR-8: `until.field` is a dotted path
+    walked through nested objects, and `until.terminal` matches by same-JSON-
+    type equality (not string coercion)."""
     if not isinstance(payload, dict):
         return "fail_open"
     doc = payload
@@ -314,13 +344,10 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
         if not isinstance(parsed, dict):
             return "fail_open"
         doc = parsed
-    field = poll["until"]["field"]
-    if field not in doc:
+    found, value = _lookup_field(doc, poll["until"]["field"])
+    if not found:
         return "fail_open"
-    value = doc[field]
-    if isinstance(value, str) and value in poll["until"]["terminal"]:
-        return "terminal"
-    return "pending"
+    return "terminal" if _terminal_match(value, poll["until"]["terminal"]) else "pending"
 
 
 # -- outbound target resolution (mirrors keel._targets + adapters._http) -----
@@ -449,6 +476,31 @@ def _outbound_pattern_matches(
     return path_glob is None or bool(path_glob.match(path))
 
 
+def _most_specific_pattern(
+    patterns: list[_OutboundPattern],
+    method: str,
+    host: str,
+    scheme: str | None,
+    port: int | None,
+    path: str | None,
+    *,
+    route_only: bool = False,
+) -> str | None:
+    """The most specific matching pattern key, or None. `route_only` keeps
+    only ROUTE keys (a pattern with a `/path` component) — tier 0's
+    candidate set on an LLM-mapped host (CCR-8)."""
+    effective_port = port if port is not None else _SCHEME_PORTS.get(scheme or "")
+    host_l = host.lower()
+    path_n = path or "/"
+    method_u = (method or "GET").upper()
+    for p in patterns:
+        if route_only and p[7] is None:
+            continue
+        if _outbound_pattern_matches(p, method_u, host_l, effective_port, path_n):
+            return p[3]  # key
+    return None
+
+
 def _resolve_outbound(
     policy: Any,
     method: str,
@@ -464,15 +516,7 @@ def _resolve_outbound(
     exact, patterns = _compile_outbound_targets(policy)
     if host in exact:
         return host
-    if patterns:
-        effective_port = port if port is not None else _SCHEME_PORTS.get(scheme or "")
-        host_l = host.lower()
-        path_n = path or "/"
-        method_u = (method or "GET").upper()
-        for p in patterns:
-            if _outbound_pattern_matches(p, method_u, host_l, effective_port, path_n):
-                return p[3]  # key
-    return host
+    return _most_specific_pattern(patterns, method, host, scheme, port, path) or host
 
 
 class KeelCoreStub:
@@ -735,9 +779,11 @@ class KeelCoreStub:
             if (
                 not isinstance(terminal, list)
                 or not terminal
-                or not all(isinstance(t, str) for t in terminal)
+                or not all(isinstance(t, (str, bool, int, float)) for t in terminal)
             ):
-                raise cls._invalid(path, "poll.until.terminal must be a non-empty array of strings")
+                raise cls._invalid(
+                    path, "poll.until.terminal must be a non-empty array of strings, booleans, or numbers"
+                )
 
     # -- resolution --------------------------------------------------------
 
@@ -767,19 +813,25 @@ class KeelCoreStub:
         path: str | None = None,
     ) -> str:
         """The policy target key for one outbound request: the LLM host map
-        first (exact host, then the Vertex regional suffix), else the
-        `[target]` table's exact-host/pattern resolution (see
-        `_resolve_outbound`), else the bare host. Core-and-stub judgment as of
-        SP-1 (`docs/targeting.md`): this is an independent, self-contained
-        mirror of `crates/keel-core-api/src/policy.rs`'s
-        `Policy::resolve_target`, proven equivalent by conformance scenarios
-        36-38, NOT a call-through to the front end (which has no matcher of
+        first (exact host, then the Vertex regional suffix) — but a ROUTE
+        key (a pattern with a `/path` component) on that same host beats the
+        host map, tier 0 (CCR-8) — else the `[target]` table's exact-host/
+        pattern resolution (see `_resolve_outbound`), else the bare host.
+        Core-and-stub judgment as of SP-1 (`docs/targeting.md`): this is an
+        independent, self-contained mirror of
+        `crates/keel-core-api/src/policy.rs`'s `Policy::resolve_target`,
+        proven equivalent by conformance scenarios 36-38 (and 41-47 for
+        CCR-8), NOT a call-through to the front end (which has no matcher of
         its own left to call)."""
         provider = _LLM_HOST_PROVIDERS.get(host)
         if provider is None and host.endswith(_VERTEX_REGIONAL_SUFFIX):
             provider = "google-genai"
         if provider:
-            return f"llm:{provider}"
+            # Tier 0 (CCR-8): a ROUTE key on a mapped host beats the host map;
+            # a host-only glob never does.
+            _exact, patterns = _compile_outbound_targets(self._policy)
+            route = _most_specific_pattern(patterns, method, host, scheme, port, path, route_only=True)
+            return route if route is not None else f"llm:{provider}"
         return _resolve_outbound(self._policy, method, host, scheme=scheme, port=port, path=path)
 
     @staticmethod
@@ -959,14 +1011,11 @@ class KeelCoreStub:
                 m["retries"] += 1
             raise AssertionError("loop always returns by the final attempt")
 
-        # poll layer (CCR-3): wraps the retry loop; gate = resolved poll table
-        # + idempotent GET/HEAD op (conformance/README.md "Poll").
+        # poll layer (CCR-3; gate widened by CCR-8): wraps the retry loop;
+        # gate = resolved poll table + an idempotent request. The method is
+        # not consulted — the front end's idempotency judgment carries it.
         poll_cfg = self._layer(target, "poll")
-        poll_active = (
-            isinstance(poll_cfg, dict)
-            and request.get("idempotent", False)
-            and (op.startswith("GET ") or op.startswith("HEAD "))
-        )
+        poll_active = isinstance(poll_cfg, dict) and bool(request.get("idempotent", False))
         poll_started_ms = self._now_ms
         while True:
             status_, value = run_attempts()
