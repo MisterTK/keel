@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -207,7 +208,23 @@ def install_keel(
     # subprocess adapter consults these to decide whether an intercepted
     # `subprocess.run`/`call` maps to a declared durable flow. Stored before
     # `install_adapters()` so the pack's `install()` sees them.
-    set_cmd_flows(extract_cmd_flows(policy))
+    cmd_flows = extract_cmd_flows(policy)
+    set_cmd_flows(cmd_flows)
+
+    # One activation row per process (WS8, #92): the evidence answering "was
+    # Keel on, with which policy?" after a deployment. Spread `_STATE.meta`
+    # (the same provenance the banner/JSON summary report) so this can never
+    # drift from what Keel tells the user; the fields below are the ones
+    # `_STATE.meta` doesn't carry.
+    discovery.record_activation({
+        **_STATE.meta,
+        "ts_ms": int(time.time() * 1000),
+        "pid": os.getpid(),
+        "language": "python",
+        "cwd": str(cwd),
+        "flows_configured": bool(flow_entrypoints) or bool(cmd_flows),
+        "argv0": sys.argv[0] if sys.argv else "",
+    })
 
     # Library adapters (httpx/requests/…) plus framework packs with a real
     # seam of their own (adk_pack, pydantic-ai, …): all armed lazily — each

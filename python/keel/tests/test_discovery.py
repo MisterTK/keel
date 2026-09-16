@@ -18,6 +18,8 @@ from keel._backend import load_backend
 from keel._discovery import (
     SCHEMA_VERSION,
     Discovery,
+    _DAILY_SCHEMA,
+    _DISCOVERY_SCHEMA,
     _migrate,
     _row_from_outcome,
 )
@@ -305,6 +307,60 @@ class DailyBucketsTest(unittest.TestCase):
         days = {row[0] for row in conn.execute("SELECT day FROM discovery_daily")}
         disc.close()
         self.assertIn(5, days, "a same-day re-check must not re-run the DELETE")
+
+
+class ActivationsTest(unittest.TestCase):
+    def _row(self, **over):
+        base = {"ts_ms": 1_000, "pid": 42, "language": "python", "version": "0.5.6", "cwd": "/code",
+                "keel_cwd": "/code", "policy_source": "keel.toml", "policy_path": "/code/keel.toml",
+                "flows_configured": True, "argv0": "app.py"}
+        base.update(over)
+        return base
+
+    def test_schema_version_is_three_and_table_exists_on_fresh_file(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 3)
+        with TemporaryDirectory() as d:
+            disc = Discovery(d)
+            disc.record_activation(self._row())
+            disc.close()
+            conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            rows = conn.execute("SELECT language, policy_path, flows_configured FROM activations").fetchall()
+            self.assertEqual(rows, [("python", "/code/keel.toml", 1)])
+
+    def test_activation_is_written_once_on_first_record_or_close(self) -> None:
+        with TemporaryDirectory() as d:
+            disc = Discovery(d)
+            disc.record_activation(self._row())
+            self.assertFalse(Path(d, ".keel").exists(), "no filesystem touch until a call or exit")
+            disc.record("api.example.com", {"v": 1, "result": "ok", "attempts": 1, "from_cache": False}, 5)
+            disc.close()
+            conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM activations").fetchone()[0], 1)
+
+    def test_v2_file_is_migrated_in_place(self) -> None:
+        with TemporaryDirectory() as d:
+            path = Path(d, ".keel", "discovery.db")
+            path.parent.mkdir()
+            conn = sqlite3.connect(path)
+            conn.executescript(_DISCOVERY_SCHEMA + _DAILY_SCHEMA + "PRAGMA user_version = 2;")
+            conn.commit(); conn.close()
+            disc = Discovery(d)
+            disc.record_activation(self._row(policy_source="defaults", policy_path=None))
+            disc.close()
+            conn = sqlite3.connect(path)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("SELECT policy_source FROM activations").fetchone(), ("defaults",))
+
+    def test_retention_keeps_the_newest_fifty(self) -> None:
+        with TemporaryDirectory() as d:
+            for i in range(55):
+                disc = Discovery(d)
+                disc.record_activation(self._row(ts_ms=1_000 + i, pid=i))
+                disc.close()
+            conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM activations").fetchone()[0], 50)
+            self.assertEqual(conn.execute("SELECT MIN(ts_ms) FROM activations").fetchone()[0], 1_005)
 
 
 if __name__ == "__main__":
