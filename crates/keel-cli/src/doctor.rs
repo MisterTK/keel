@@ -803,15 +803,6 @@ fn excluded_kind_topic(kind: &str) -> &'static str {
     }
 }
 
-/// The WS3 simplification findings: each hand-rolled pattern the scan
-/// sighted inside a target-reaching function becomes one paired finding —
-/// "here is the target; once Keel wraps it, the code at file:line is
-/// redundant". The level pairs with the topology bucket: `warn` when any of
-/// the sighting's targets is already wrappable (deleting the pattern is
-/// actionable now), `info` when wrapping itself is still pending (e.g. a
-/// stdlib-urllib transport before the urllib pack lands). Never affects
-/// `ok`. Interpolates only hosts, file paths, line numbers, and function
-/// names (the no-raw-source hardening rule).
 /// One route-key `poll` block doctor proposes for an SDK poll shape (spec
 /// §3.4 table). `interval`/`deadline` are proposal defaults an operator tunes.
 struct RouteKeyProposal {
@@ -883,33 +874,66 @@ fn render_route_block(p: &RouteKeyProposal, s: &SimplificationSighting) -> Strin
     )
 }
 
-/// The applyable route-key proposal for one `hand-rolled-poll` sighting, or
-/// `None` when no shape is known, every proposed key is already configured,
-/// or the resulting document would not parse.
-fn route_key_fix(s: &SimplificationSighting, policy_text: Option<&str>) -> Option<Proposal> {
-    let existing: toml_edit::DocumentMut = policy_text.unwrap_or("").parse().ok()?;
+/// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
+/// the sorted key set it would append (the dedupe identity — see
+/// [`simplification_findings`]). `None` when no shape is known, every proposed
+/// key is already configured, or the resulting document would not parse.
+fn route_key_fix(
+    s: &SimplificationSighting,
+    policy_text: Option<&str>,
+) -> Option<(Vec<&'static str>, Proposal)> {
+    // `None` = no base document to edit (absent or invalid keel.toml): propose
+    // nothing rather than a patch that would create/clobber the file.
+    let text = policy_text?;
+    let existing: toml_edit::DocumentMut = text.parse().ok()?;
     let has_key = |k: &str| {
         existing
             .get("target")
             .and_then(toml_edit::Item::as_table_like)
             .is_some_and(|t| t.contains_key(k))
     };
-    let ops: Vec<PolicyOp> = s
+    let proposals: Vec<RouteKeyProposal> = s
         .targets
         .iter()
         .flat_map(|t| route_key_proposals(t, &s.sdk_polls))
         .filter(|p| !has_key(p.key))
-        .map(|p| PolicyOp::AppendBlock {
-            text: render_route_block(&p, s),
-        })
         .collect();
-    if ops.is_empty() {
+    if proposals.is_empty() {
         return None;
     }
+    let mut keys: Vec<&'static str> = proposals.iter().map(|p| p.key).collect();
+    keys.sort_unstable();
+    let ops: Vec<PolicyOp> = proposals
+        .iter()
+        .map(|p| PolicyOp::AppendBlock {
+            text: render_route_block(p, s),
+        })
+        .collect();
     let proposal = propose(policy_text, &ops).ok()?;
-    (!proposal.patch.is_empty()).then_some(proposal)
+    (!proposal.patch.is_empty()).then_some((keys, proposal))
 }
 
+/// The WS3 simplification findings: each hand-rolled pattern the scan
+/// sighted inside a target-reaching function becomes one paired finding —
+/// "here is the target; once Keel wraps it, the code at file:line is
+/// redundant". The level pairs with the topology bucket: `warn` when any of
+/// the sighting's targets is already wrappable (deleting the pattern is
+/// actionable now), `info` when wrapping itself is still pending (e.g. a
+/// stdlib-urllib transport before the urllib pack lands). Never affects
+/// `ok`. Interpolates only hosts, file paths, line numbers, and function
+/// names (the no-raw-source hardening rule).
+///
+/// Poll v2: a `hand-rolled-poll` may also carry an applyable route-key `poll`
+/// proposal. Two sightings of the same provider shape would propose the SAME
+/// blocks against the same base file, and only one such patch can apply — so
+/// the proposal is attached to the FIRST sighting (in `scan.simplifications`
+/// order: file, line, kind) for a given key set, and later sightings with that
+/// same key set point at it instead. Dedupe is by key SET, not by target, so a
+/// google-genai loop and an openai loop each still get their own patch.
+///
+/// `policy_text` is the base document a proposal edits; the caller passes
+/// `None` for an invalid `keel.toml` — the removal fix on the policy finding
+/// owns that file until it parses.
 fn simplification_findings(
     scan: &ScanResult,
     topology: &Topology,
@@ -917,6 +941,8 @@ fn simplification_findings(
 ) -> Vec<Finding> {
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
+    // Key sets already proposed in this report (see the dedupe note above).
+    let mut proposed: BTreeSet<Vec<&'static str>> = BTreeSet::new();
     for s in &scan.simplifications {
         let targets = s.targets.join(", ");
         let actionable_now = s.targets.iter().any(|t| wrappable.contains(t.as_str()));
@@ -928,7 +954,20 @@ fn simplification_findings(
         let mut fix = None;
         let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
             "hand-rolled-poll" => {
-                fix = route_key_fix(s, policy_text);
+                // The first sighting for a key set carries the patch; later
+                // ones name it, since only one of two identical patches can
+                // apply against the same base file.
+                let already_proposed = match route_key_fix(s, policy_text) {
+                    Some((keys, proposal)) => {
+                        if proposed.insert(keys) {
+                            fix = Some(proposal);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    None => false,
+                };
                 let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
                      `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
                      POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
@@ -940,6 +979,11 @@ fn simplification_findings(
                     action.push_str(
                         " Or apply the attached patch (`git apply`): it adds the route-key \
                          `poll` block for this provider — tune `interval`/`deadline` to the job.",
+                    );
+                } else if already_proposed {
+                    action.push_str(
+                        " The route-key patch for this provider is attached to the first \
+                         hand-rolled-poll finding above.",
                     );
                 }
                 (
@@ -1575,10 +1619,12 @@ fn build_report(
         });
     }
     findings.extend(topology_findings(&topology));
+    // An invalid keel.toml already carries the removal fix on the policy
+    // finding; a second patch against the same base file could not apply too.
     findings.extend(simplification_findings(
         scan,
         &topology,
-        policy_text.as_deref(),
+        policy.valid.then_some(policy_text.as_deref()).flatten(),
     ));
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
@@ -2710,10 +2756,55 @@ mod tests {
             "{}",
             fix2.patch
         );
+        // A SECOND sighting of the same provider shape proposes the same two
+        // blocks against the same base file, and only one such patch can
+        // apply — so the first carries it and the second names it.
+        scan.simplifications.push(SimplificationSighting {
+            file: "render.py".into(),
+            line: 42,
+            kind: "hand-rolled-poll".into(),
+            function: "poll_again".into(),
+            targets: vec!["llm:google-genai".into()],
+            sdk_polls: vec!["operations.get".into()],
+        });
+        let dedup = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+        );
+        assert!(dedup[0].fix.is_some(), "first sighting carries the patch");
+        assert!(
+            dedup[1].fix.is_none(),
+            "same key set → not proposed twice: {:?}",
+            dedup[1].fix
+        );
+        assert!(
+            dedup[1].action.contains(
+                "The route-key patch for this provider is attached to the first \
+                 hand-rolled-poll finding above."
+            ),
+            "{}",
+            dedup[1].action
+        );
+        assert!(
+            !dedup[1].action.contains("apply the attached patch"),
+            "{}",
+            dedup[1].action
+        );
+        // An invalid (or absent) keel.toml has no base document to edit — the
+        // policy finding's removal fix owns that file until it parses.
+        let invalid = simplification_findings(&scan, &topology, None);
+        assert!(invalid.iter().all(|f| f.fix.is_none()), "{invalid:?}");
+        scan.simplifications.pop();
         // URL-literal poll (no SDK shape) → no fix, action still updated.
         scan.simplifications[0].sdk_polls.clear();
         let f3 = simplification_findings(&scan, &topology, Some(""));
         assert!(f3[0].fix.is_none());
+        assert!(
+            !f3[0].action.contains("attached"),
+            "no patch exists to point at: {}",
+            f3[0].action
+        );
     }
 
     /// WS3: each hand-rolled pattern the scan sighted becomes ONE paired

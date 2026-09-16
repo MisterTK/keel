@@ -222,92 +222,14 @@
       "topic": "hand-rolled-poll"
     },
     {
-      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. Or apply the attached patch (`git apply`): it adds the route-key `poll` block for this provider — tune `interval`/`deadline` to the job.",
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. The route-key patch for this provider is attached to the first hand-rolled-poll finding above.",
       "detail": "`wait_guarded` (inline.py:12) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
-      "fix": {
-        "changes": [
-          {
-            "after": {
-              "poll": {
-                "deadline": "30m",
-                "interval": "10s",
-                "until": {
-                  "field": "done",
-                  "terminal": [
-                    true
-                  ]
-                }
-              },
-              "timeout": "30s"
-            },
-            "before": null,
-            "path": "target.\"GET generativelanguage.googleapis.com/*/operations/*\""
-          },
-          {
-            "after": {
-              "poll": {
-                "deadline": "30m",
-                "interval": "10s",
-                "until": {
-                  "field": "done",
-                  "terminal": [
-                    true
-                  ]
-                }
-              },
-              "timeout": "30s"
-            },
-            "before": null,
-            "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\""
-          }
-        ],
-        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces the hand-rolled poll in inline.py:12 (wait_guarded)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces the hand-rolled poll in inline.py:12 (wait_guarded)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
-      },
       "level": "warn",
       "topic": "hand-rolled-poll"
     },
     {
-      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. Or apply the attached patch (`git apply`): it adds the route-key `poll` block for this provider — tune `interval`/`deadline` to the job.",
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. The route-key patch for this provider is attached to the first hand-rolled-poll finding above.",
       "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
-      "fix": {
-        "changes": [
-          {
-            "after": {
-              "poll": {
-                "deadline": "30m",
-                "interval": "10s",
-                "until": {
-                  "field": "done",
-                  "terminal": [
-                    true
-                  ]
-                }
-              },
-              "timeout": "30s"
-            },
-            "before": null,
-            "path": "target.\"GET generativelanguage.googleapis.com/*/operations/*\""
-          },
-          {
-            "after": {
-              "poll": {
-                "deadline": "30m",
-                "interval": "10s",
-                "until": {
-                  "field": "done",
-                  "terminal": [
-                    true
-                  ]
-                }
-              },
-              "timeout": "30s"
-            },
-            "before": null,
-            "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\""
-          }
-        ],
-        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces the hand-rolled poll in render.py:9 (poll_video_takes)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces the hand-rolled poll in render.py:9 (poll_video_takes)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
-      },
       "level": "warn",
       "topic": "hand-rolled-poll"
     }
