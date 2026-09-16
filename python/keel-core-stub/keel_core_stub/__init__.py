@@ -308,7 +308,9 @@ def _lookup_field(doc: dict[str, Any], field: str) -> tuple[bool, Any]:
 
 def _terminal_match(value: Any, terminal: list[Any]) -> bool:
     """Same-JSON-type equality (CCR-8): "true" != true, 1 != true, 100 == 100.0.
-    `bool` is guarded before numbers because `True == 1` in Python."""
+    `bool` is guarded before numbers because `True == 1` in Python. Numbers are
+    compared in the f64 domain (integers beyond 2^53 collapse, by design) so
+    every implementation agrees."""
     for t in terminal:
         if isinstance(value, bool) or isinstance(t, bool):
             if isinstance(value, bool) and isinstance(t, bool) and value is t:
@@ -316,7 +318,7 @@ def _terminal_match(value: Any, terminal: list[Any]) -> bool:
             continue
         if isinstance(value, str) and isinstance(t, str) and value == t:
             return True
-        if isinstance(value, (int, float)) and isinstance(t, (int, float)) and value == t:
+        if isinstance(value, (int, float)) and isinstance(t, (int, float)) and float(value) == float(t):
             return True
     return False
 
@@ -828,10 +830,26 @@ class KeelCoreStub:
             provider = "google-genai"
         if provider:
             # Tier 0 (CCR-8): a ROUTE key on a mapped host beats the host map;
-            # a host-only glob never does.
-            _exact, patterns = _compile_outbound_targets(self._policy)
-            route = _most_specific_pattern(patterns, method, host, scheme, port, path, route_only=True)
-            return route if route is not None else f"llm:{provider}"
+            # a host-only glob never does. Compiling the pattern tier is only
+            # paid for when a route key actually exists: `/` can only appear in
+            # the path component of an outbound key (class-prefixed keys may
+            # carry `/` in a function path, so exclude them). A strict superset
+            # of "parses to a path", so this never skips a key that could match.
+            targets = self._policy.get("target")
+            # `"/" in k` first: the cheap test that is false for almost every
+            # key, so the tuple-prefix check runs only on real candidates.
+            has_route_key = isinstance(targets, dict) and any(
+                isinstance(k, str) and "/" in k and not k.startswith(_TARGET_CLASS_PREFIXES)
+                for k in targets
+            )
+            if has_route_key:
+                _exact, patterns = _compile_outbound_targets(self._policy)
+                route = _most_specific_pattern(
+                    patterns, method, host, scheme, port, path, route_only=True
+                )
+                if route is not None:
+                    return route
+            return f"llm:{provider}"
         return _resolve_outbound(self._policy, method, host, scheme=scheme, port=port, path=path)
 
     @staticmethod

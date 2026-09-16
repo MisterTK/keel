@@ -183,7 +183,7 @@ function strictBase64Decode(s) {
 function lookupField(doc, field) {
   let current = doc;
   for (const seg of field.split(".")) {
-    if (!isTable(current) || !(seg in current)) return { found: false, value: undefined };
+    if (!isTable(current) || !Object.hasOwn(current, seg)) return { found: false, value: undefined };
     current = current[seg];
   }
   return { found: true, value: current };
@@ -203,7 +203,12 @@ function terminalMatch(value, terminal) {
 function pollVerdict(poll, payload) {
   if (!isTable(payload)) return "fail_open";
   let doc = payload;
-  if ("body_b64" in payload || ("status" in payload && "headers" in payload)) {
+  // Own keys only, matching `lookupField` and Python's `in` on a dict: an
+  // inherited property must never look like an envelope field.
+  if (
+    Object.hasOwn(payload, "body_b64") ||
+    (Object.hasOwn(payload, "status") && Object.hasOwn(payload, "headers"))
+  ) {
     if (typeof payload.body_b64 !== "string") return "fail_open";
     const decoded = strictBase64Decode(payload.body_b64);
     if (decoded === null) return "fail_open";
@@ -610,9 +615,22 @@ export class KeelCoreStub {
       (host.endsWith(VERTEX_REGIONAL_SUFFIX) ? "google-genai" : undefined);
     if (provider) {
       // Tier 0 (CCR-8): a ROUTE key on a mapped host beats the host map.
-      const { patterns } = compileOutboundMatchers(this.#policy);
-      const route = mostSpecificPattern(patterns, { method, host, scheme, port, path }, true);
-      return route ?? `llm:${provider}`;
+      // Compiling the pattern tier is only paid for when a route key exists:
+      // `/` can only appear in the path component of an outbound key
+      // (class-prefixed keys may carry `/` in a function path, so exclude
+      // them). A strict superset of "parses to a path", so this never skips a
+      // key that could have matched.
+      const targets = this.#policy?.target;
+      const hasRouteKey = isTable(targets) &&
+        // `includes("/")` first: the cheap test that is false for almost every
+        // key, so the prefix scan runs only on real candidates.
+        Object.keys(targets).some((k) => k.includes("/") && !CLASS_PREFIXES.some((p) => k.startsWith(p)));
+      if (hasRouteKey) {
+        const { patterns } = compileOutboundMatchers(this.#policy);
+        const route = mostSpecificPattern(patterns, { method, host, scheme, port, path }, true);
+        if (route !== null && route !== undefined) return route;
+      }
+      return `llm:${provider}`;
     }
     return resolveOutbound(this.#policy, { method, host, scheme, port, path });
   }

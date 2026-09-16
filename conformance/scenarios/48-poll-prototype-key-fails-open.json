@@ -1,0 +1,19 @@
+{
+  "name": "poll-prototype-key-fails-open",
+  "description": "CCR-8 dotted-field lookup is own-keys only in every implementation: a field named after an Object.prototype member (constructor) or walking through __proto__ is a MISSING key on a JSON document, so the poll fails open (one attempt, payload returned as-is) — it must never resolve to an inherited property and loop to KEEL-E016.",
+  "policy": { "target": {
+    "proto.example": { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "constructor", "terminal": ["done"] } } },
+    "deep.example":  { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "__proto__.x", "terminal": ["done"] } } }
+  } },
+  "steps": [
+    { "call": { "target": "proto.example",
+        "request": { "op": "GET proto.example/v1/op1", "idempotent": true, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "status": "running" } } ],
+        "expect": { "result": "ok", "payload": { "status": "running" }, "attempts": 1 } } },
+    { "call": { "target": "deep.example",
+        "request": { "op": "GET deep.example/v1/op1", "idempotent": true, "args_hash": "h2" },
+        "effect": [ { "status": "ok", "payload": { "status": "running" } } ],
+        "expect": { "result": "ok", "payload": { "status": "running" }, "attempts": 1 } } },
+    { "report_expect": { "clock_ms": 0, "targets": { "proto.example": { "calls": 1, "attempts": 1 }, "deep.example": { "calls": 1, "attempts": 1 } } } }
+  ]
+}

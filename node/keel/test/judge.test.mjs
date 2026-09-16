@@ -250,4 +250,3 @@ test("injection is skipped for an operation read (CCR-8)", () => {
   assert.equal(resolveIdempotencyInjection("POST", new Headers(), "Idempotency-Key", () => "k", null, vertex, fetch), null);
   assert.equal(resolveIdempotencyInjection("POST", new Headers(), "Idempotency-Key", () => "k", null, vertex, submit), "k");
 });
-

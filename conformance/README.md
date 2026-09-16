@@ -158,11 +158,15 @@ enforcing wall-clock timeouts).
      than being judged, in every implementation (scenario 35).
    - Verdict: `until.field` is a dotted path walked through nested objects
      (`response.state`); a missing segment, a non-object intermediate, or a
-     key that merely contains a dot → fail-open; the value is **terminal**
-     when it is JSON-equal to an `until.terminal` item of the SAME JSON type
-     — strings by equality, booleans by equality, numbers by numeric value
-     (`100` matches `100.0`; `"true"` never matches `true`; `1` never matches
-     `true`) → returned unchanged; any other value → pending. `until.terminal`
+     key that merely contains a dot → fail-open. Lookup is **own-keys only**:
+     a segment naming an inherited property of the host language's object type
+     (JavaScript's `constructor`, `__proto__`, …) is a MISSING key, exactly as
+     it is on a Rust map or a Python dict (scenario 48). The value is
+     **terminal** when it is JSON-equal to an `until.terminal` item of the
+     SAME JSON type — strings by equality, booleans by equality, numbers by
+     numeric value in IEEE-754 double precision (integers beyond 2^53 are not
+     distinguished) (`100` matches `100.0`; `"true"` never matches `true`; `1`
+     never matches `true`) → returned unchanged; any other value → pending. `until.terminal`
      items are strings, booleans, or numbers; anything else is `KEEL-E001` at
      configure (scenario 47).
    - Pending at `elapsed` ms since the poll's first attempt: if

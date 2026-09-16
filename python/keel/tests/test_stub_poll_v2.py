@@ -50,6 +50,14 @@ class RouteKeyTest(unittest.TestCase):
         core.configure({"target": {"api.example.com": {}, "GET api.example.com/*": {}}})
         self.assertEqual(core.resolve_target("GET", "api.example.com", None, None, "/v1/x"), "api.example.com")
 
+    def test_class_prefixed_slash_key_does_not_enable_tier_zero(self) -> None:
+        # `py:pkg/mod:fn*` contains `/` but is class-prefixed, so it is not a
+        # route key: the cheap "any route key?" pre-test stays false and the
+        # LLM host map still wins.
+        core = KeelCoreStub()
+        core.configure({"target": {"py:pkg/mod:fn*": {}, "*.googleapis.com": {}}})
+        self.assertEqual(core.resolve_target("POST", VERTEX, "https", None, FETCH), "llm:google-genai")
+
 
 class TypedTerminalTest(unittest.TestCase):
     def test_boolean_terminal_matches_by_type(self) -> None:
@@ -64,6 +72,23 @@ class TypedTerminalTest(unittest.TestCase):
         core.configure({"target": {"ops.internal": {"poll": _poll({"field": "progress", "terminal": [100]})}}})
         out = _run(core, "GET ops.internal/op", True, [{"progress": 99}, {"progress": "100"}, {"progress": True}, {"progress": 100.0}])
         self.assertEqual(out["attempts"], 4)
+
+    def test_numeric_terminals_are_compared_in_the_f64_domain(self) -> None:
+        # Numbers are compared as f64 in EVERY implementation (JSON has one
+        # number type; Rust/Node have only f64), so two integers that differ
+        # only beyond 2^53 are the same terminal. Documented, not accidental --
+        # Python's exact int comparison is deliberately widened to match.
+        core = KeelCoreStub()
+        core.configure({"target": {"ops.internal": {"poll": _poll({"field": "seq", "terminal": [9007199254740992]})}}})
+        self.assertEqual(_run(core, "GET ops.internal/op", True, [{"seq": 9007199254740993}])["attempts"], 1)
+
+    def test_inherited_attribute_names_are_missing_keys(self) -> None:
+        # Scenario 48's unit twin: a field named after a host-language object
+        # member must fail open, never resolve through a prototype/class.
+        for field in ("constructor", "__proto__.x", "__class__.__name__"):
+            core = KeelCoreStub()
+            core.configure({"target": {"ops.internal": {"poll": _poll({"field": field, "terminal": ["done"]})}}})
+            self.assertEqual(_run(core, "GET ops.internal/op", True, [{"status": "running"}])["attempts"], 1, field)
 
     def test_dotted_field_walks_objects_and_fails_open(self) -> None:
         core = KeelCoreStub()

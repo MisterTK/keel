@@ -734,6 +734,8 @@ impl PollUntil {
 }
 
 /// Same-JSON-type equality: `"true"` ≠ `true`, `1` ≠ `true`, `100` = `100.0`.
+/// Numbers are compared in the f64 domain — integers beyond 2^53 collapse, by
+/// design, so `100` matches `100.0` and every implementation agrees.
 fn terminal_eq(value: &Value, item: &Value) -> bool {
     match (value, item) {
         (Value::String(a), Value::String(b)) => a == b,
@@ -1240,7 +1242,19 @@ impl Policy {
                     .then_some("google-genai")
             });
         if let Some(p) = provider {
-            if let Some(key) = self.most_specific_pattern(method, host, scheme, port, path, true) {
+            // Tier 0 is free unless a route key exists: `/` can only appear in
+            // the path component of an outbound key (class-prefixed keys may
+            // carry `/` in a function path, so exclude them). A strict
+            // superset of "parses to Some(path)", so this never skips a key
+            // that could have matched.
+            let has_route_key = self
+                .target
+                .keys()
+                .any(|k| !CLASS_PREFIXES.iter().any(|c| k.starts_with(c)) && k.contains('/'));
+            if has_route_key
+                && let Some(key) =
+                    self.most_specific_pattern(method, host, scheme, port, path, true)
+            {
                 return key;
             }
             return format!("llm:{p}");
@@ -1890,6 +1904,23 @@ mod resolve_target_tests {
             p.target.insert((*k).to_owned(), TargetPolicy::default());
         }
         p
+    }
+
+    #[test]
+    fn class_prefixed_slash_key_does_not_enable_tier_zero() {
+        // `py:pkg/mod:fn*` contains `/` but is class-prefixed, so it is not a
+        // route key: tier 0 stays off and the LLM host map still wins.
+        let p = policy(&["py:pkg/mod:fn*", "*.googleapis.com"]);
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "us-central1-aiplatform.googleapis.com",
+                Some("https"),
+                None,
+                Some("/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:generateContent")
+            ),
+            "llm:google-genai"
+        );
     }
 
     #[test]

@@ -37,6 +37,35 @@ test("boolean and numeric terminals match by JSON type and value", () => {
   const n = new KeelCoreStub();
   n.configure({ target: { "ops.internal": { poll: poll({ field: "progress", terminal: [100] }) } } });
   assert.equal(run(n, "GET ops.internal/op", true, [{ progress: 99 }, { progress: "100" }, { progress: true }, { progress: 100.0 }]).attempts, 4);
+  // Numbers are compared in the f64 domain in EVERY implementation, so two
+  // integers that differ only beyond 2^53 are the same terminal. Documented,
+  // not accidental: JSON has one number type and Rust/Node have only f64.
+  const big = new KeelCoreStub();
+  big.configure({ target: { "ops.internal": { poll: poll({ field: "seq", terminal: [9007199254740992] }) } } });
+  assert.equal(run(big, "GET ops.internal/op", true, [{ seq: 9007199254740993 }]).attempts, 1);
+});
+
+test("dotted-field lookup is own keys only: inherited properties are missing keys", () => {
+  // `constructor` and `__proto__` exist on every JS object via the prototype
+  // chain; on a JSON document they are MISSING keys, so the poll fails open
+  // after one attempt rather than judging an inherited value (and, for a
+  // never-matching one, looping to KEEL-E016). Scenario 48 is the
+  // cross-implementation pin.
+  const proto = new KeelCoreStub();
+  proto.configure({ target: { "ops.internal": { poll: poll({ field: "constructor", terminal: ["done"] }) } } });
+  assert.equal(run(proto, "GET ops.internal/op", true, [{ status: "running" }]).attempts, 1);
+  const deep = new KeelCoreStub();
+  deep.configure({ target: { "ops.internal": { poll: poll({ field: "__proto__.x", terminal: ["done"] }) } } });
+  assert.equal(run(deep, "GET ops.internal/op", true, [{ status: "running" }]).attempts, 1);
+});
+
+test("tier 0 is skipped when no route key exists, without changing the answer", () => {
+  // `py:pkg/mod:fn*` contains `/` but is class-prefixed, so it is not a route
+  // key: the cheap "any route key?" pre-test stays false and the LLM host map
+  // still wins.
+  const core = new KeelCoreStub();
+  core.configure({ target: { "py:pkg/mod:fn*": {}, "*.googleapis.com": {} } });
+  assert.equal(core.resolveTarget("POST", VERTEX, "https", null, FETCH), "llm:google-genai");
 });
 
 test("dotted field walks objects, fails open, and is printed verbatim in E016", () => {
