@@ -20,6 +20,14 @@ test("dumpsLine sorts objects nested inside arrays too", () => {
   );
 });
 
+test("sortKeys leaves non-plain objects to JSON.stringify (#103)", () => {
+  const d = new Date("2026-09-16T12:00:00.000Z");
+  assert.equal(dumpsLine({ when: d, b: 1, a: 2 }), '{"a":2,"b":1,"when":"2026-09-16T12:00:00.000Z"}\n');
+  assert.equal(dumpsLine({ m: new Map([["k", 1]]) }), '{"m":{}}\n', "a Map has no toJSON; {} is JSON.stringify's own answer, not ours");
+  assert.equal(dumpsLine({ o: Object.create(null, { z: { value: 1, enumerable: true }, a: { value: 2, enumerable: true } }) }), '{"o":{"a":2,"z":1}}\n');
+  assert.equal(dumpsLine({ arr: [{ z: 1, a: 2 }] }), '{"arr":[{"a":2,"z":1}]}\n');
+});
+
 test("only the exact value json switches the log format", () => {
   for (const v of ["json", "JSON", "  json  ", "Json"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), true, v);
   for (const v of ["", "1", "true", "ndjson", "text", "jsonl"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), false, v);
