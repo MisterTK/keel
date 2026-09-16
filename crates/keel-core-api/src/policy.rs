@@ -1001,6 +1001,8 @@ impl Policy {
 //
 // Precedence, per `docs/targeting.md` (the cross-language parity contract
 // with the Node twin's `judge.mjs`):
+//   0. Route key on a mapped host — only when tier 1 would claim the host,
+//      and only for pattern keys with a `/path` (CCR-8).
 //   1. LLM host map — exact provider host, or a Vertex regional endpoint via
 //      the `-aiplatform.googleapis.com` suffix rule.
 //   2. Exact bare-host `[target]` key (no method/port/path/`*`).
@@ -1133,37 +1135,20 @@ struct OutboundPattern {
 }
 
 impl Policy {
-    /// The policy target key for one outbound request. See the module-level
-    /// precedence comment above `OUTBOUND_METHODS` for the four tiers.
-    #[must_use]
-    pub fn resolve_target(
+    /// The most specific `[target]` pattern key matching one request, or
+    /// `None`. `route_only` restricts candidates to ROUTE keys — pattern keys
+    /// whose parse yields a `/path` component — which is tier 0's candidate
+    /// set (a route on an LLM host is more specific than Keel's own default
+    /// host classification and beats it; a host-only glob is not).
+    fn most_specific_pattern(
         &self,
         method: &str,
         host: &str,
         scheme: Option<&str>,
         port: Option<u16>,
         path: Option<&str>,
-    ) -> String {
-        // 1. LLM host map (exact host, then the Vertex regional suffix rule).
-        let provider = LLM_HOST_PROVIDERS
-            .iter()
-            .find(|(h, _)| *h == host)
-            .map(|(_, p)| *p)
-            .or_else(|| {
-                host.ends_with(VERTEX_REGIONAL_SUFFIX)
-                    .then_some("google-genai")
-            });
-        if let Some(p) = provider {
-            return format!("llm:{p}");
-        }
-        // 2. Exact bare-host [target] key.
-        if !CLASS_PREFIXES.iter().any(|c| host.starts_with(c))
-            && self.target.contains_key(host)
-            && is_bare_host_key(host)
-        {
-            return host.to_owned();
-        }
-        // 3. Compile the pattern tier and pick the most specific match.
+        route_only: bool,
+    ) -> Option<String> {
         let mut patterns: Vec<OutboundPattern> = Vec::new();
         for key in self.target.keys() {
             if CLASS_PREFIXES.iter().any(|c| key.starts_with(c)) || is_bare_host_key(key) {
@@ -1172,6 +1157,9 @@ impl Policy {
             let Some((m, h, pt, pa)) = parse_outbound_key(key) else {
                 continue;
             };
+            if route_only && pa.is_none() {
+                continue;
+            }
             let wildcards = key.matches('*').count();
             patterns.push(OutboundPattern {
                 key: key.clone(),
@@ -1222,7 +1210,51 @@ impl Policy {
             {
                 continue;
             }
-            return p.key.clone();
+            return Some(p.key.clone());
+        }
+        None
+    }
+
+    /// The policy target key for one outbound request. See the module-level
+    /// precedence comment above `OUTBOUND_METHODS` for the five tiers.
+    #[must_use]
+    pub fn resolve_target(
+        &self,
+        method: &str,
+        host: &str,
+        scheme: Option<&str>,
+        port: Option<u16>,
+        path: Option<&str>,
+    ) -> String {
+        // 1. LLM host map (exact host, then the Vertex regional suffix rule) —
+        //    unless a ROUTE key matches (tier 0, CCR-8): a user-written
+        //    `[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]`
+        //    is more specific than Keel's default classification of the host.
+        //    Host-only globs are not route keys and never capture LLM traffic.
+        let provider = LLM_HOST_PROVIDERS
+            .iter()
+            .find(|(h, _)| *h == host)
+            .map(|(_, p)| *p)
+            .or_else(|| {
+                host.ends_with(VERTEX_REGIONAL_SUFFIX)
+                    .then_some("google-genai")
+            });
+        if let Some(p) = provider {
+            if let Some(key) = self.most_specific_pattern(method, host, scheme, port, path, true) {
+                return key;
+            }
+            return format!("llm:{p}");
+        }
+        // 2. Exact bare-host [target] key.
+        if !CLASS_PREFIXES.iter().any(|c| host.starts_with(c))
+            && self.target.contains_key(host)
+            && is_bare_host_key(host)
+        {
+            return host.to_owned();
+        }
+        // 3. Most specific pattern key.
+        if let Some(key) = self.most_specific_pattern(method, host, scheme, port, path, false) {
+            return key;
         }
         // 4. No pattern matched: fall through to the bare host.
         host.to_owned()
@@ -2018,5 +2050,93 @@ mod resolve_target_tests {
                 format!("llm:{provider}")
             );
         }
+    }
+
+    const VERTEX_HOST: &str = "us-central1-aiplatform.googleapis.com";
+    const FETCH: &str = "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation";
+    const SUBMIT: &str =
+        "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning";
+    const ROUTE: &str = "POST *-aiplatform.googleapis.com/*:fetchPredictOperation";
+
+    #[test]
+    fn route_key_beats_the_llm_host_map_for_its_route_only() {
+        let p = policy(&[ROUTE, "*.googleapis.com"]);
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, Some("https"), None, Some(FETCH)),
+            ROUTE
+        );
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, Some("https"), None, Some(SUBMIT)),
+            "llm:google-genai",
+            "host-only glob never captures an LLM host"
+        );
+        assert_eq!(
+            p.resolve_target("GET", VERTEX_HOST, Some("https"), None, Some(FETCH)),
+            "llm:google-genai",
+            "METHOD prefix must match"
+        );
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/g:generateContent")
+            ),
+            "llm:google-genai"
+        );
+        assert_eq!(
+            p.resolve_target("GET", "storage.googleapis.com", None, None, Some("/b/x")),
+            "*.googleapis.com",
+            "non-LLM host: tier 3 unchanged"
+        );
+    }
+
+    #[test]
+    fn most_specific_route_key_wins_on_an_llm_host() {
+        let p = policy(&[ROUTE, "*-aiplatform.googleapis.com/*"]);
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, None, None, Some(FETCH)),
+            ROUTE
+        );
+        assert_eq!(
+            p.resolve_target("POST", VERTEX_HOST, None, None, Some(SUBMIT)),
+            "*-aiplatform.googleapis.com/*"
+        );
+    }
+
+    #[test]
+    fn gemini_operations_get_route_key_resolves() {
+        let key = "GET generativelanguage.googleapis.com/*/operations/*";
+        let p = policy(&[key]);
+        assert_eq!(
+            p.resolve_target(
+                "GET",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/veo/operations/op1")
+            ),
+            key
+        );
+        assert_eq!(
+            p.resolve_target(
+                "POST",
+                "generativelanguage.googleapis.com",
+                None,
+                None,
+                Some("/v1beta/models/veo:generateContent")
+            ),
+            "llm:google-genai"
+        );
+    }
+
+    #[test]
+    fn non_llm_host_exact_still_beats_a_route_key() {
+        let p = policy(&["api.example.com", "GET api.example.com/*"]);
+        assert_eq!(
+            p.resolve_target("GET", "api.example.com", None, None, Some("/v1/x")),
+            "api.example.com"
+        );
     }
 }
