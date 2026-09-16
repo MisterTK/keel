@@ -184,7 +184,8 @@ the six phases in order; the static scan is evidence, not the verdict.
    (a route-key `poll` block that beats the LLM host map for that route;
    Vertex `:fetch*Operation` POSTs are judged idempotent since 0.6.0) — apply
    it with `git apply`, then tune `interval`/`deadline`; later findings for
-   the same provider point at it instead.
+   the same provider carry `fix_ref` instead of a `fix` — the `file:line` of
+   the finding that actually holds the patch — rather than repeating it.
    Each is either replaced by policy (note which `keel.toml` key) or explicitly
    out of Keel's reach (say so honestly). Respect dependency-averse files —
    a stdlib-only gate/validator was built that way on purpose; never propose
