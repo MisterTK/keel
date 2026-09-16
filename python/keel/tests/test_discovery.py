@@ -368,6 +368,16 @@ class ActivationsTest(unittest.TestCase):
         # remembered, so a later best-effort failure cannot lose the evidence.
         import keel.bootstrap as bootstrap
 
+        # `_STATE` is a process-global singleton and `uninstall_keel()` never
+        # resets `exit_registered` back to False — an earlier successful
+        # `install_keel()` call ANYWHERE ELSE in the same test process (e.g.
+        # test_auto.py, which sorts before this module) leaves it True
+        # forever, which would make the assertion below pass unconditionally
+        # regardless of this test's own ordering. Force a clean starting
+        # state and restore whatever was there before, so this test's
+        # verdict depends only on what THIS `install_keel()` call does.
+        saved_exit_registered = bootstrap._STATE.exit_registered
+        bootstrap._STATE.exit_registered = False
         try:
             with TemporaryDirectory() as d:
                 Path(d, "keel.toml").write_text("")
@@ -395,6 +405,7 @@ class ActivationsTest(unittest.TestCase):
                     conn.close()
         finally:
             bootstrap.uninstall_keel()
+            bootstrap._STATE.exit_registered = saved_exit_registered
 
 
 if __name__ == "__main__":

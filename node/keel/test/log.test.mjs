@@ -28,6 +28,16 @@ test("sortKeys leaves non-plain objects to JSON.stringify (#103)", () => {
   assert.equal(dumpsLine({ arr: [{ z: 1, a: 2 }] }), '{"arr":[{"a":2,"z":1}]}\n');
 });
 
+test("sortKeys leaves a plain class instance's own key order alone too (#103)", () => {
+  class Point {
+    constructor() {
+      this.z = 1;
+      this.a = 2;
+    }
+  }
+  assert.equal(dumpsLine({ p: new Point() }), '{"p":{"z":1,"a":2}}\n', "no toJSON, no Object.prototype — JSON.stringify's own insertion-order answer, unsorted");
+});
+
 test("only the exact value json switches the log format", () => {
   for (const v of ["json", "JSON", "  json  ", "Json"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), true, v);
   for (const v of ["", "1", "true", "ndjson", "text", "jsonl"]) assert.equal(jsonLogs({ KEEL_LOG_FORMAT: v }), false, v);
