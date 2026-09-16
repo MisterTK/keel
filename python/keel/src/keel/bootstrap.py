@@ -207,7 +207,7 @@ def install_keel(
             f"keel ▸ warning: {target} served {hits} consecutive cache hits for one identical "
             f"call over {span_s}s — if this is a status poll, set cache = "
             '{ mode = "off" } on that target '
-            "(a route-key poll policy arrives in v0.6.0, #93)\n",
+            '— or give the status route its own poll policy (README: Poll)\n',
             {
                 "keel": "warning",
                 "code": "cache-poll-suspect",

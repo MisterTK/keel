@@ -256,10 +256,11 @@ Two tiers, one policy file:
 - **Tier 1 — resilience.** Every intercepted call passes through a fixed
   layer chain: cache → rate limit → circuit breaker → timeout → retry.
   Stateless, works everywhere, needs nothing but the library.
-- **Poll (submit-then-poll, opt-in).** A `poll` table turns a GET/HEAD call
-  into a poll-until-terminal loop, judged on the response body instead of
-  the transport result — the shape behind "submit a job, poll its status
-  field until done":
+- **Poll (submit-then-poll, opt-in).** A `poll` table turns an idempotent
+  status read into a poll-until-terminal loop, judged on the response body
+  instead of the transport result — the shape behind "submit a job, poll its
+  status until done". Terminals are matched by JSON type (`"done"`, `true`,
+  `100`), and `until.field` may be a dotted path (`response.state`):
 
   ```toml
   [target."api.example.com"]
@@ -287,10 +288,26 @@ Two tiers, one policy file:
   least the Keel value for long calls.
 
 `keel doctor` flags LRO-sized timeouts (>600s) with an `sdk-client-timeout`
-follow-up. **`poll` applies to GET/HEAD polls only** in 0.5.x: Vertex
-`:fetchPredictOperation` and other POST-shaped polls cannot use it yet — set
-`cache = { mode = "off" }` on that target and keep your app-level deadline
-(poll v2 tracks POST-shaped polls and boolean terminals).
+follow-up. **POST-shaped operation reads poll too** (0.6.0): a `POST` to
+`*.googleapis.com` ending in `:fetch*Operation` is judged idempotent — it is
+retried under Level 0 defaults and gets the per-attempt `timeout` — and a
+**route key** on the LLM host (a `[target]` key with a path) is consulted
+before Keel's own host map, so the poll can carry its own policy:
+
+```toml
+[target."llm:google-genai"]
+timeout = "120s"                       # chat and generate calls
+
+[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]
+timeout = "30s"                        # one poll attempt
+poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true] } }
+```
+
+The route is an ordinary target (its own breaker, rate limit, and `keel
+status` line, `defaults.outbound` underneath — no LLM budget, fallback, or
+dev cache). A host-only glob such as `*.googleapis.com` never captures LLM
+traffic. `keel doctor` proposes this block as an applyable patch on every
+`hand-rolled-poll` finding it can attribute to an SDK poll call.
 
 ### `keel exec` — durable external commands (CCR-4)
 
