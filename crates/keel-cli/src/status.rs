@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use keel_journal::{DailyStats, MS_PER_DAY, TargetStats};
+use keel_journal::{Activation, DailyStats, MS_PER_DAY, TargetStats};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
@@ -68,10 +68,28 @@ pub struct WeekSummary {
     pub unwrapped_calls: i64,
 }
 
+/// The last recorded activation, plus how many are on record — the "did
+/// Keel actually run, and with which policy" evidence (#92). `count` is the
+/// total number of activation rows ever recorded; `last` is the newest one.
+#[derive(Debug, Serialize)]
+pub struct ActivationSummary {
+    pub count: usize,
+    pub last: Option<Activation>,
+}
+
+/// Fold recorded activation rows (newest-first, as the store returns them)
+/// into a summary.
+fn summarize_activations(mut rows: Vec<Activation>) -> ActivationSummary {
+    let count = rows.len();
+    let last = rows.drain(..).next();
+    ActivationSummary { count, last }
+}
+
 /// The whole status report — one struct, so the human screen and the `--json`
 /// twin cannot drift (every human fact has a JSON counterpart).
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
+    pub activation: ActivationSummary,
     pub breaker_opens: i64,
     pub cache_hit_rate: f64,
     pub cache_hits: i64,
@@ -99,6 +117,7 @@ pub struct StatusReport {
 pub fn report(project: &Path, now_ms: i64) -> Result<StatusReport, String> {
     let discovery = evidence::read_discovery(project)?;
     let daily = evidence::read_discovery_daily(project)?;
+    let activation = summarize_activations(evidence::read_activations(project)?);
     let discovery_present = evidence::discovery_db(project).exists();
     // Honor the policy's `journal` key (file: locations), like the engine does.
     let journal_path = evidence::resolved_journal(project).path;
@@ -117,6 +136,7 @@ pub fn report(project: &Path, now_ms: i64) -> Result<StatusReport, String> {
         discovery_present,
         journal_present,
         now_ms,
+        activation,
     ))
 }
 
@@ -141,8 +161,10 @@ fn aggregate(
     discovery_present: bool,
     journal_present: bool,
     now_ms: i64,
+    activation: ActivationSummary,
 ) -> StatusReport {
     let mut r = StatusReport {
+        activation,
         breaker_opens: 0,
         cache_hit_rate: 0.0,
         cache_hits: 0,
@@ -284,16 +306,27 @@ fn human(r: &StatusReport) -> String {
             "  breaker events:   {}\n  throttled:        {}\n",
             r.breaker_opens, r.throttled,
         ),
-        format!(
-            "  flows:            {} total ({} completed, {} running, {} failed, {} dead)\n  resumable:        {}\n",
-            r.flows.total,
-            r.flows.completed,
-            r.flows.running,
-            r.flows.failed,
-            r.flows.dead,
-            r.flows.resumable,
-        ),
     ];
+    if let Some(a) = &r.activation.last {
+        let policy = match (&a.policy_source[..], &a.policy_path) {
+            ("defaults", _) => format!("production defaults (no keel.toml in {})", a.cwd),
+            (_, Some(p)) => format!("policy {p}"),
+            (_, None) => "policy keel.toml".to_owned(),
+        };
+        lines.push(format!(
+            "  last activation:  {} {} \u{b7} {} \u{b7} pid {}\n",
+            a.language, a.version, policy, a.pid,
+        ));
+    }
+    lines.push(format!(
+        "  flows:            {} total ({} completed, {} running, {} failed, {} dead)\n  resumable:        {}\n",
+        r.flows.total,
+        r.flows.completed,
+        r.flows.running,
+        r.flows.failed,
+        r.flows.dead,
+        r.flows.resumable,
+    ));
     if r.unwrapped_calls > 0 {
         lines.push(format!(
             "  coverage gap:     {} call(s) observed on targets with no policy entry — run `keel init` to add them.\n",
@@ -346,6 +379,58 @@ mod tests {
     use super::*;
 
     const T0: i64 = 1_783_728_000_000; // an arbitrary but fixed UTC instant
+
+    #[test]
+    fn activation_summary_reports_count_and_newest() {
+        let a = |ts: i64| Activation {
+            ts_ms: ts,
+            pid: 1,
+            language: "python".into(),
+            version: "0.5.6".into(),
+            cwd: "/code".into(),
+            keel_cwd: None,
+            policy_source: "keel.toml".into(),
+            policy_path: Some("/code/keel.toml".into()),
+            flows_configured: false,
+            argv0: "app.py".into(),
+        };
+        let s = summarize_activations(vec![a(20), a(10)]);
+        assert_eq!(s.count, 2);
+        assert_eq!(s.last.as_ref().map(|x| x.ts_ms), Some(20));
+        assert_eq!(summarize_activations(vec![]).count, 0);
+    }
+
+    #[test]
+    fn human_status_prints_the_last_activation_line() {
+        // Build a StatusReport via `aggregate` with one activation; assert the line.
+        let r = aggregate(
+            vec![],
+            &[],
+            FlowSummary::default(),
+            true,
+            false,
+            T0,
+            summarize_activations(vec![Activation {
+                ts_ms: 1,
+                pid: 4242,
+                language: "python".into(),
+                version: "0.5.6".into(),
+                cwd: "/code".into(),
+                keel_cwd: Some("/code".into()),
+                policy_source: "defaults".into(),
+                policy_path: None,
+                flows_configured: false,
+                argv0: String::new(),
+            }]),
+        );
+        assert!(
+            human(&r).contains(
+                "  last activation:  python 0.5.6 \u{b7} production defaults (no keel.toml in /code) \u{b7} pid 4242\n"
+            ),
+            "{}",
+            human(&r)
+        );
+    }
 
     #[test]
     fn empty_project_nudges_to_run() {

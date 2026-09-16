@@ -418,6 +418,12 @@ impl ScanVisitor<'_> {
             launcher: launcher.to_owned(),
             command,
             argv: None,
+            // Runtime/env-inheritance classification is Python-walker only
+            // as of this build (issue #91) — this scanner extracts no argv
+            // to classify against, so `child_runtime` is always unknown and
+            // never contributes an `inherits_activation` verdict.
+            child_runtime: None,
+            env_inheritance: "unknown".to_owned(),
         });
     }
 

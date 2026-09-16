@@ -43,6 +43,16 @@ OTHER_LIBS = {"psycopg", "boto3"}
 # and must record nothing.
 AGENT_LIBS = {"pydantic_ai", "crewai", "langgraph", "agents", "mcp"}
 KNOWN = HTTP_LIBS | LLM_LIBS | OTHER_LIBS | AGENT_LIBS | {"google.adk"}
+# SDK "poll the job" calls, per provider, as attribute-chain suffixes. A
+# function that contains one of these while its module imports that provider
+# reaches the provider's target even when the client handle is untracked
+# (built by a factory, imported from elsewhere) — the shape that made the
+# 2026-09-15 field report's poll loop invisible (#95).
+SDK_POLL_METHODS = {
+    "google.genai": {("operations", "get")},
+    "openai": {("batches", "retrieve"), ("videos", "retrieve"), ("fine_tuning", "jobs", "retrieve")},
+    "anthropic": {("batches", "retrieve")},
+}
 # Known Python resilience libraries — a `keel doctor` signal that a target may
 # already have its own retry/backoff, separate from KNOWN (which is about
 # libraries Keel *adapts*; these are libraries Keel never adapts, so mixing
@@ -281,6 +291,75 @@ def argv_list(call):
     return None
 
 
+PY_LAUNCHERS = {"python", "python3", "uv", "uvx", "pipx", "poetry", "pdm", "hatch"}
+NODE_LAUNCHERS = {"node", "npx", "tsx", "npm", "pnpm", "yarn", "bun", "deno"}
+
+
+def _first_argv(call):
+    """The first argv element as a literal string, or the sentinel
+    "sys.executable" when it is that expression, else None."""
+    if not call.args:
+        return None
+    a = call.args[0]
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        parts = a.value.split()
+        return parts[0] if parts else None
+    if isinstance(a, (ast.List, ast.Tuple)) and a.elts:
+        e = a.elts[0]
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return e.value
+        if (isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name)
+                and e.value.id == "sys" and e.attr == "executable"):
+            return "sys.executable"
+    return None
+
+
+def child_runtime(call):
+    """"python" / "node" when the launched program is recognizably one of
+    those runtimes (a bare interpreter name, a versioned `python3.12`, a
+    Python/Node package runner, or `sys.executable`), else None (WS7)."""
+    first = _first_argv(call)
+    if first is None:
+        return None
+    if first == "sys.executable":
+        return "python"
+    base = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if base.endswith(".exe"):
+        base = base[:-4]
+    if base in PY_LAUNCHERS or base.startswith("python3.") or base.startswith("python2."):
+        return "python"
+    if base in NODE_LAUNCHERS:
+        return "node"
+    return None
+
+
+def _is_os_environ(node):
+    return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "os" and node.attr == "environ")
+
+
+def env_mode(call):
+    """How the child's environment relates to ours: "inherited" (no `env=`,
+    `env=os.environ`, `{**os.environ, …}`, `dict(os.environ, …)`),
+    "replaced" (a dict literal that does not spread os.environ), or
+    "unknown" (any other expression). Decides whether KEEL_ENABLE reaches
+    the child (WS7)."""
+    for kw in call.keywords:
+        if kw.arg != "env":
+            continue
+        v = kw.value
+        if _is_os_environ(v):
+            return "inherited"
+        if isinstance(v, ast.Dict):
+            spreads = any(k is None and _is_os_environ(val) for k, val in zip(v.keys, v.values))
+            return "inherited" if spreads else "replaced"
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "dict"
+                and v.args and _is_os_environ(v.args[0])):
+            return "inherited"
+        return "unknown"
+    return "inherited"
+
+
 def is_sleep(node, aliases):
     """Known conservative miss: `from time import sleep as pause` binds
     `pause` to the "time" MODULE in `aliases` (`import_entries` only tracks
@@ -346,12 +425,68 @@ def _governs_status_cmp(node):
         for sub in ast.walk(node))
 
 
-def detect_simplifications(fn, aliases):
+def _assigned_name(target):
+    """The bound name of an assignment target, for the narrow shapes an SDK
+    poll result is realistically stored in: a plain name (`op = ...`) or an
+    attribute (`self.op = ...`, keyed by its final attribute). Anything else
+    (tuple/list unpacking, subscript targets) returns None — deliberately
+    not treated as a poll-governing binding."""
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def _sdk_poll_feeds_exit(node, imported_llm_libs):
+    """An SDK "poll the job" call only counts as poll evidence when its
+    RESULT governs whether the loop exits — mirroring the restriction
+    `_governs_status_cmp` already applies to string comparisons, for the
+    same reason: a status-sync loop that iterates DISTINCT jobs and merely
+    calls an SDK poll-shaped method per item (e.g. `for id in ids: b =
+    client.batches.retrieve(id); cache[id] = b; sleep(...)`) is not a poll
+    of one job and must not be flagged. Governance is: the call's result is
+    bound to a name/attribute, and that name is referenced in either the
+    loop's own `while` test, or the test of a nested `if` whose body breaks
+    or returns."""
+    bound = set()
+    for sub in ast.walk(node):
+        if not (isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Call)
+                and sdk_poll_provider(sub.value, imported_llm_libs) is not None):
+            continue
+        for t in sub.targets:
+            name = _assigned_name(t)
+            if name:
+                bound.add(name)
+    if not bound:
+        return False
+
+    def refs(expr):
+        return any(
+            (isinstance(n, ast.Name) and n.id in bound)
+            or (isinstance(n, ast.Attribute) and n.attr in bound)
+            for n in ast.walk(expr))
+
+    if isinstance(node, ast.While) and refs(node.test):
+        return True
+    return any(
+        isinstance(sub, ast.If)
+        and any(isinstance(s, (ast.Break, ast.Return)) for s in sub.body)
+        and refs(sub.test)
+        for sub in ast.walk(node))
+
+
+def detect_simplifications(fn, aliases, imported_llm_libs):
     """The three WS3 patterns inside one function def, each anchored at the
     construct to delete. Precedence inside a loop: a status-string comparison
     makes it a poll (the stronger, WS5-pairing signal) even if an attempt
-    counter is also present. An except-handler sleep inside an
-    already-matched loop is the same construct, not a second finding."""
+    counter is also present. An SDK "poll the job" call whose result governs
+    the loop's exit (see `_sdk_poll_feeds_exit`) is the same strong signal by
+    itself — the adopter's `while not op.done: ... op =
+    client.operations.get(op)` loop has no status-string comparison anywhere
+    in it, but the SDK shape alone says "polling a job" (#95). An
+    except-handler sleep inside an already-matched loop is the same
+    construct, not a second finding."""
     found = []
     covered = set()
     for node in ast.walk(fn):
@@ -372,7 +507,7 @@ def detect_simplifications(fn, aliases):
                 has_counter = True
         if not has_sleep:
             continue
-        if _governs_status_cmp(node):
+        if _governs_status_cmp(node) or _sdk_poll_feeds_exit(node, imported_llm_libs):
             kind = "hand-rolled-poll"
         elif has_counter:
             kind = "hand-rolled-retry"
@@ -400,7 +535,31 @@ def detect_simplifications(fn, aliases):
     return found
 
 
-def fn_facts(fn, rel, mod, aliases, url_consts):
+def attr_chain(node):
+    """`a.b.c(...)` -> ("a", "b", "c"); None for anything that is not a plain
+    Name/Attribute chain."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return tuple(reversed(parts))
+
+
+def sdk_poll_provider(call, imported_llm_libs):
+    chain = attr_chain(call.func)
+    if chain is None:
+        return None
+    for lib in imported_llm_libs:
+        for suffix in SDK_POLL_METHODS.get(lib, ()):
+            if len(chain) > len(suffix) and chain[-len(suffix):] == suffix:
+                return lib
+    return None
+
+
+def fn_facts(fn, rel, mod, aliases, url_consts, imported_llm_libs):
     effects = unsafe_idem = t_reads = r_reads = 0
     targets = set()
     reasons = []
@@ -413,6 +572,9 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
                 targets.add(h)
         if not isinstance(node, ast.Call):
             continue
+        provider = sdk_poll_provider(node, imported_llm_libs)
+        if provider is not None:
+            targets.add("llm:" + provider.replace(".", "-"))
         lib = aliases.get(call_root(node.func))
         if lib is None:
             continue
@@ -425,7 +587,7 @@ def fn_facts(fn, rel, mod, aliases, url_consts):
             if name in {"post", "patch"}:
                 unsafe_idem += 1
             if lib in LLM_LIBS:
-                targets.add("llm:" + lib)
+                targets.add("llm:" + lib.replace(".", "-"))
         elif lib == "time" and name in TIME_NAMES:
             t_reads += 1
         elif lib == "datetime" and name in DT_NAMES:
@@ -509,23 +671,28 @@ for dirpath, dirnames, filenames in os.walk(root):
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "subprocess." + name,
                                      "command": argv_text(node),
-                                     "argv": argv_list(node)})
+                                     "argv": argv_list(node),
+                                     "child_runtime": child_runtime(node),
+                                     "env": env_mode(node)})
             elif lib == "os" and name in ("system", "popen"):
                 subprocesses.append({"file": rel, "line": node.lineno,
                                      "launcher": "os." + name,
                                      "command": argv_text(node),
-                                     "argv": None})
+                                     "argv": None,
+                                     "child_runtime": child_runtime(node),
+                                     "env": env_mode(node)})
         consts = url_consts_of(tree)
+        imported_llm_libs = {lib for lib in set(aliases.values()) if lib in LLM_LIBS}
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                facts = fn_facts(node, rel, mod, aliases, consts)
+                facts = fn_facts(node, rel, mod, aliases, consts, imported_llm_libs)
                 functions.append(facts)
                 # Conservative emission gate (WS3 spec): only functions that
                 # also reach a Keel-relevant target get simplification
                 # sightings — a sleep loop around purely local work is none
                 # of Keel's business.
                 if facts["targets"]:
-                    for hit in detect_simplifications(node, aliases):
+                    for hit in detect_simplifications(node, aliases, imported_llm_libs):
                         simplifications.append({
                             "file": rel, "function": node.name,
                             "kind": hit["kind"], "line": hit["line"],
@@ -620,6 +787,12 @@ struct WalkerSubprocess {
     /// condition than `command`'s "statically extractable at all".
     #[serde(default)]
     argv: Option<Vec<String>>,
+    /// `"python"` / `"node"` / `None` — see [`SubprocessSighting::child_runtime`].
+    #[serde(default)]
+    child_runtime: Option<String>,
+    /// `"inherited"` / `"replaced"` / `"unknown"` — see
+    /// [`SubprocessSighting::env_inheritance`].
+    env: String,
 }
 
 /// One simplification sighting from the walker (see
@@ -730,6 +903,8 @@ pub fn scan(project: &Path) -> PyScan {
             launcher: sub.launcher,
             command: sub.command,
             argv: sub.argv,
+            child_runtime: sub.child_runtime,
+            env_inheritance: sub.env,
         });
     }
     for s in output.simplifications {
@@ -1298,6 +1473,51 @@ def go(cmd):
     }
 
     #[test]
+    fn subprocess_sightings_carry_child_runtime_and_env_inheritance() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("launch.py"),
+            r#"import os, subprocess, sys
+subprocess.run([sys.executable, "-m", "amh_media.render"], env={**os.environ, "KEEL_ENABLE": "1"})
+subprocess.run(["python3.12", "worker.py"])
+subprocess.run(["uv", "run", "job.py"], env={"PATH": "/usr/bin"})
+subprocess.run(["node", "svc.mjs"], env=os.environ)
+subprocess.run(["ffmpeg", "-i", "in.mp4"])
+subprocess.run(["python", "x.py"], env=make_env())
+"#,
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let got: Vec<(u32, Option<&str>, &str)> = s
+            .findings
+            .subprocesses
+            .iter()
+            .map(|p| {
+                (
+                    p.line,
+                    p.child_runtime.as_deref(),
+                    p.env_inheritance.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, Some("python"), "inherited"), // sys.executable + {**os.environ, …}
+                (3, Some("python"), "inherited"), // python3.12, no env kwarg
+                (4, Some("python"), "replaced"),  // uv, env dict without os.environ
+                (5, Some("node"), "inherited"),   // env=os.environ
+                (6, None, "inherited"),           // ffmpeg
+                (7, Some("python"), "unknown"),   // env=make_env()
+            ]
+        );
+    }
+
+    #[test]
     fn hand_rolled_retry_poll_and_swallow_are_detected() {
         if !python3_present() {
             eprintln!("skip: python3 not available");
@@ -1646,5 +1866,120 @@ def retryer():
         let scan = scan(dir.path());
         assert_eq!(scan.files_scanned, 1, "only the parseable file counts");
         assert!(scan.findings.http_in_use);
+    }
+
+    #[test]
+    fn sdk_poll_calls_attribute_the_provider_target_without_a_url_literal() {
+        if !python3_present() {
+            eprintln!("skip: python3 not available");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        // The ai-marketing-hub loop, verbatim shape: the client comes from a
+        // factory in another module, so no alias binding exists here.
+        fs::write(
+            dir.path().join("render.py"),
+            r#"import time
+from google import genai
+from .clients import get_client
+
+def poll_video_takes(op, model_id, timeout_s=900):
+    client = get_client()
+    deadline = time.monotonic() + timeout_s
+    while not op.done:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Video render timed out ({model_id})")
+        time.sleep(10)
+        op = client.operations.get(op)
+    return op.result
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("batches.py"),
+            r#"import time
+import openai
+
+def wait(client, batch_id):
+    while True:
+        b = client.batches.retrieve(batch_id)
+        if b.status in ("completed", "failed"):
+            return b
+        time.sleep(5)
+"#,
+        )
+        .unwrap();
+        // Same loop shape, but no provider import in the module: no attribution.
+        fs::write(
+            dir.path().join("other.py"),
+            r"import time
+
+def wait(client, job):
+    while not job.done:
+        time.sleep(1)
+        job = client.operations.get(job)
+",
+        )
+        .unwrap();
+        // Not a poll: `for batch_id in batch_ids` iterates DISTINCT jobs, and
+        // the sleep is rate-limit pacing, not backoff — `b` is only ever
+        // stored into `cache`, never read back into a loop-exit test. The SDK
+        // poll call shape matches (provider imported, suffix, receiver), but
+        // its result does not govern the loop's continuation, so this must
+        // NOT be flagged (the false-positive class review caught).
+        fs::write(
+            dir.path().join("sync.py"),
+            r"import time, openai
+
+def sync_batch_metadata(client, batch_ids, cache):
+    for batch_id in batch_ids:
+        b = client.batches.retrieve(batch_id)
+        cache[batch_id] = b
+        time.sleep(0.5)
+",
+        )
+        .unwrap();
+        let s = scan(dir.path());
+        let f = |module: &str, name: &str| {
+            s.functions
+                .iter()
+                .find(|f| f.entrypoint == format!("py:{module}:{name}"))
+                .unwrap_or_else(|| panic!("{module}:{name} attributed"))
+        };
+        assert_eq!(
+            f("render", "poll_video_takes").targets,
+            std::collections::BTreeSet::from(["llm:google-genai".to_owned()])
+        );
+        assert_eq!(
+            f("batches", "wait").targets,
+            std::collections::BTreeSet::from(["llm:openai".to_owned()])
+        );
+        assert!(f("other", "wait").targets.is_empty());
+        // sync_batch_metadata DOES reach the openai target (the SDK call is
+        // real) but must not be classified as a poll.
+        assert!(
+            f("sync", "sync_batch_metadata")
+                .targets
+                .contains("llm:openai")
+        );
+        let polls: Vec<(&str, &str)> = s
+            .findings
+            .simplifications
+            .iter()
+            .filter(|x| x.kind == "hand-rolled-poll")
+            .map(|x| (x.file.as_str(), x.function.as_str()))
+            .collect();
+        assert_eq!(
+            polls,
+            vec![("batches.py", "wait"), ("render.py", "poll_video_takes")]
+        );
+        assert!(
+            !s.findings
+                .simplifications
+                .iter()
+                .any(|x| x.file == "sync.py"),
+            "iterating distinct jobs with a rate-limit sleep must not be flagged as a poll: {:?}",
+            s.findings.simplifications
+        );
     }
 }

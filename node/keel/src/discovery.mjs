@@ -37,9 +37,16 @@
  * Migration: a file written by the previous (v1, `user_version = 0`) schema is
  * upgraded in place at flush — the two counter columns are appended
  * (`ALTER TABLE … ADD COLUMN`), the daily table is created, and
- * `user_version` is stamped to 2. Mirrors
+ * `user_version` is stamped to 2. A v2 file gains the `activations` table
+ * (one row per process, WS8/#92) and is stamped to 3. Mirrors
  * `keel_journal::discovery::migrate` exactly, so either writer can open a file
  * the other created.
+ *
+ * `recordActivation(row)` only remembers the row; it is written once, lazily,
+ * at the next `flushSync()` (Node's only write path — aggregates are buffered
+ * in memory and written once too), so an activated-but-idle process still
+ * leaves exactly one row of evidence at exit. Retention keeps the newest 50
+ * rows (by `ts_ms` then `rowid`), mirroring the crate and the Python twin.
  */
 
 import { createRequire } from "node:module";
@@ -47,7 +54,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /** Current discovery schema version, stamped in `PRAGMA user_version`. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** How many trailing UTC days of `discovery_daily` buckets are kept. */
 export const RETENTION_DAYS = 30;
@@ -57,26 +64,45 @@ export const MS_PER_DAY = 86_400_000;
 
 export function createDiscovery(
   cwd = process.cwd(),
-  { now = Date.now, knownTargets = new Set(), summary = null } = {}
+  { now = Date.now, knownTargets = new Set(), summary = null, cachepoll = null } = {}
 ) {
   const dbPath = join(cwd, ".keel", "discovery.db");
   const aggregates = new Map(); // target -> Aggregate
+  let activation = null;
+  let activationWritten = false;
 
   return {
     dbPath,
 
     /**
+     * Remember this process's activation (WS8/#92). Written lazily, at the
+     * next `flushSync()` — so an idle-but-activated process still leaves
+     * exactly one row of evidence at exit, and a never-activated process
+     * never touches the filesystem.
+     */
+    recordActivation(row) {
+      activation = { ...row };
+    },
+
+    /**
      * Hot-path: fold one intercepted call's Outcome envelope into its target's
      * aggregate. `latencyMs` is the call's end-to-end time (0 if unknown).
+     * `argsHash` (WS9, #78) feeds the runtime cache-poll detector — absent
+     * for call shapes with no args-hash concept.
      */
-    observe(target, outcome, latencyMs = 0) {
+    observe(target, outcome, latencyMs = 0, argsHash = null) {
       if (!target || outcome == null) return;
       // The exit-time console summary (src/summary.mjs) is fed here because
       // this is the one place that knows whether the target was wrapped.
       try {
-        summary?.observe(outcome, knownTargets.has(target));
+        summary?.observe(outcome, knownTargets.has(target), target);
       } catch {
         /* the summary never breaks a call */
+      }
+      try {
+        if (cachepoll?.observe(target, argsHash, outcome)) summary?.noteCachePollSuspect();
+      } catch {
+        /* a detector bug must never break a call */
       }
       let a = aggregates.get(target);
       if (!a) aggregates.set(target, (a = newAggregate()));
@@ -115,7 +141,7 @@ export function createDiscovery(
      * daily bucket), migrating a legacy file in place first. Never throws.
      */
     flushSync() {
-      if (aggregates.size === 0) return false;
+      if (aggregates.size === 0 && (activation === null || activationWritten)) return false;
       try {
         const require = createRequire(import.meta.url);
         const { DatabaseSync } = require("node:sqlite");
@@ -124,6 +150,15 @@ export function createDiscovery(
         try {
           db.exec(CONNECTION_PRAGMAS);
           migrate(db);
+          if (activation !== null && !activationWritten) {
+            db.prepare(ACTIVATION_INSERT).run(
+              Number(activation.ts_ms), Number(activation.pid), String(activation.language), String(activation.version),
+              String(activation.cwd), activation.keel_cwd ?? null, String(activation.policy_source),
+              activation.policy_path ?? null, activation.flows_configured ? 1 : 0, String(activation.argv0 ?? ""),
+            );
+            db.prepare(ACTIVATION_PRUNE).run();
+            activationWritten = true;
+          }
           const upsert = db.prepare(UPSERT);
           const dailyUpsert = db.prepare(DAILY_UPSERT);
           let day = null;
@@ -213,30 +248,33 @@ function prune(db, day) {
 function migrate(db) {
   const version = db.prepare("PRAGMA user_version").get().user_version;
   if (version >= SCHEMA_VERSION) return;
-  const hasTable = Boolean(
-    db
-      .prepare(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery') AS x"
-      )
-      .get().x
-  );
-  if (hasTable) {
-    const hasColumn = Boolean(
+  if (version < 2) {
+    const hasTable = Boolean(
       db
         .prepare(
-          "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') WHERE name = 'not_retried') AS x"
+          "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery') AS x"
         )
         .get().x
     );
-    if (!hasColumn) {
-      // Appended, so a migrated file's column order matches a fresh v2 one.
-      db.exec("ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0;");
-      db.exec("ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0;");
+    if (hasTable) {
+      const hasColumn = Boolean(
+        db
+          .prepare(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') WHERE name = 'not_retried') AS x"
+          )
+          .get().x
+      );
+      if (!hasColumn) {
+        // Appended, so a migrated file's column order matches a fresh v2 one.
+        db.exec("ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0;");
+        db.exec("ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0;");
+      }
+    } else {
+      db.exec(DISCOVERY_SCHEMA);
     }
-  } else {
-    db.exec(DISCOVERY_SCHEMA);
+    db.exec(DAILY_SCHEMA);
   }
-  db.exec(DAILY_SCHEMA);
+  if (version < 3) db.exec(ACTIVATIONS_SCHEMA);
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
 }
 
@@ -247,7 +285,8 @@ PRAGMA synchronous = NORMAL;
 `;
 
 // Canonical schema — MUST match crates/keel-journal/src/discovery.rs verbatim.
-const DISCOVERY_SCHEMA = `
+// Exported for tests that need to seed a legacy (pre-activations) v2 file.
+export const DISCOVERY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS discovery (
   target            TEXT PRIMARY KEY,
   calls             INTEGER NOT NULL DEFAULT 0,
@@ -270,7 +309,7 @@ CREATE TABLE IF NOT EXISTS discovery (
 `;
 
 // Canonical daily-bucket schema — MUST match discovery.rs's DAILY_SCHEMA.
-const DAILY_SCHEMA = `
+export const DAILY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS discovery_daily (
   target          TEXT NOT NULL,
   day             INTEGER NOT NULL,
@@ -336,4 +375,32 @@ ON CONFLICT(target, day) DO UPDATE SET
   breaker_opens   = breaker_opens + excluded.breaker_opens,
   not_retried     = not_retried + excluded.not_retried,
   unwrapped_calls = unwrapped_calls + excluded.unwrapped_calls
+`;
+
+// Canonical activations schema — MUST match crates/keel-journal/src/discovery.rs
+// and python/keel/src/keel/_discovery.py verbatim. One row per process (WS8/#92).
+const ACTIVATIONS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS activations (
+    ts_ms            INTEGER NOT NULL,
+    pid              INTEGER NOT NULL,
+    language         TEXT    NOT NULL,
+    version          TEXT    NOT NULL,
+    cwd              TEXT    NOT NULL,
+    keel_cwd         TEXT,
+    policy_source    TEXT    NOT NULL,
+    policy_path      TEXT,
+    flows_configured INTEGER NOT NULL DEFAULT 0,
+    argv0            TEXT    NOT NULL DEFAULT ''
+);
+`;
+
+const ACTIVATION_INSERT = `
+INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source,
+  policy_path, flows_configured, argv0) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+// Retention: keep the newest 50 rows, mirroring the crate and the Python twin.
+const ACTIVATION_PRUNE = `
+DELETE FROM activations WHERE rowid NOT IN
+  (SELECT rowid FROM activations ORDER BY ts_ms DESC, rowid DESC LIMIT 50)
 `;

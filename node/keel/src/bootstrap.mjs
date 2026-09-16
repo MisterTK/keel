@@ -23,10 +23,12 @@ import {
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
+import { createCachePollDetector } from "./cachepoll.mjs";
 import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
+import { ephemeralJournalWarning } from "./deploy.mjs";
 import { devCacheOffReason, resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
 import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
@@ -173,6 +175,12 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
     env
   );
   backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
+  // Issue #90: durable flows on a SQLite journal that will not survive an
+  // instance replacement — doctor can see this from a deploy artifact in the
+  // repo, but only the runtime can see the environment (serverless markers,
+  // /.dockerenv, a read-only cwd). Python twin: `bootstrap.py`.
+  const journalWarning = ephemeralJournalWarning(policy, env, cwd);
+  if (journalWarning !== null) emit(env, ...journalWarning);
 
   // `keel sim <plan>`: adapter-level fault injection driven by a declarative
   // plan (docs/sim-format.md), wired BEFORE the recording tee below so a run
@@ -205,7 +213,26 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // exactly as it silences the banner.
   const consoleEnabled = policy.telemetry?.console !== false && !isTruthy(env.KEEL_QUIET);
   const summary = consoleEnabled ? createSummary() : null;
-  const discovery = createDiscovery(cwd, { knownTargets, summary });
+  const cachepoll = createCachePollDetector({
+    onSuspect: (target, hits, spanS) => {
+      emit(
+        env,
+        `keel ▸ warning: ${target} served ${hits} consecutive cache hits for one identical ` +
+          `call over ${spanS}s — if this is a status poll, set cache = ` +
+          `{ mode = "off" } on that target ` +
+          `(a route-key poll policy arrives in v0.6.0, #93)\n`,
+        {
+          keel: "warning",
+          code: "cache-poll-suspect",
+          target,
+          hits,
+          span_s: spanS,
+          version: VERSION,
+        }
+      );
+    },
+  });
+  const discovery = createDiscovery(cwd, { knownTargets, summary, cachepoll });
   setRuntime({ enabled: true, backend: effectiveBackend, discovery });
 
   // Outbound host/URL-pattern targets (docs/targeting.md) are resolved by the
@@ -250,6 +277,15 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // module (see `src/flow.mjs`'s module docs for why this must happen here,
   // before the normal ESM entry runs).
   const flowEntrypoints = extractFlowEntrypoints(policy);
+  discovery.recordActivation({
+    ...meta,
+    ts_ms: Date.now(),
+    pid: process.pid,
+    language: "node",
+    cwd,
+    flows_configured: flowEntrypoints.length > 0 || Object.keys(cmdFlows ?? {}).length > 0,
+    argv0: process.argv[1] ?? "",
+  });
   if (wrappable.length > 0 || eveDetection.matched) {
     register("./loader.mjs", import.meta.url, {
       data: {
@@ -333,13 +369,16 @@ export function installExitFlush(
     // never cost a discovery write.
     try {
       if (summary) {
+        const byTarget = summary.unprotectedByTarget();
         if (jsonLogs(env)) {
           // Unconditional, unlike the text form: a zero line proves Keel was
           // live and intercepted nothing, which is exactly what the outage
           // post-mortem had no way to establish.
-          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}));
+          proc.stderr.write(
+            formatSummaryJson(summary.counts(), meta ?? {}, byTarget, summary.cachePollSuspects())
+          );
         } else {
-          const text = formatSummary(summary.counts(), keelOnPath());
+          const text = formatSummary(summary.counts(), keelOnPath(), byTarget);
           if (text) proc.stderr.write(text);
         }
       }

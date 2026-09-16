@@ -30,6 +30,7 @@ from . import FIXTURES, child_env
 
 APP = str(FIXTURES / "lro_poll_app.py")
 GENERATE_APP = str(FIXTURES / "generate_cache_app.py")
+CACHEPOLL_APP = str(FIXTURES / "cachepoll_app.py")
 
 
 class _FakeVertex(BaseHTTPRequestHandler):
@@ -188,3 +189,39 @@ class Slice1AcceptanceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         objs = self._objs(proc)
         self.assertEqual(objs[-1]["cache_hits"], 1, proc.stderr)
+
+    def test_f_a_status_poll_shaped_cache_replay_is_named_at_runtime(self) -> None:
+        # #78: six identical `:generateContent` POSTs, ~4.5s apart (a status-
+        # poll cadence, not a burst) — `:generateContent` is a shape the dev
+        # cache still hashes (unlike the LRO submit/poll shapes #83 exempts),
+        # so this genuinely reproduces five consecutive cache hits rather than
+        # proving nothing. KEEL_CACHEPOLL_MIN_SPAN_S is an UNSTABLE, test-only
+        # knob (read once at detector construction) that shrinks the ~18s
+        # span this cadence produces below the threshold without changing the
+        # production default (20s), so the whole run finishes in ~25s.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import keel._auto; import runpy; runpy.run_path(%r, run_name='__main__')"
+                % CACHEPOLL_APP,
+            ],
+            env=child_env(
+                KEEL_ENABLE="1",
+                KEEL_CWD=str(self.empty_root),
+                KEEL_POLICY="optional",
+                LRO_LOCAL=self.local_authority,
+                KEEL_LOG_FORMAT="json",
+                KEEL_CACHEPOLL_MIN_SPAN_S="15",
+            ),
+            cwd=str(self.empty_root),
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        objs = self._objs(proc)
+        suspects = [o for o in objs if o.get("code") == "cache-poll-suspect"]
+        self.assertEqual(len(suspects), 1, proc.stderr)
+        self.assertEqual(suspects[0]["hits"], 5)
+        self.assertEqual(objs[-1]["keel"], "summary")
+        self.assertEqual(objs[-1]["cache_poll_suspects"], 1)

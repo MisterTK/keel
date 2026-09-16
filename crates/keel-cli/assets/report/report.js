@@ -71,6 +71,11 @@
       { label: "unprotected calls", value: s.unwrapped_calls || 0, flag: (s.unwrapped_calls || 0) > 0 },
       { label: "not retried", value: s.not_retried || 0, flag: (s.not_retried || 0) > 0 }
     ];
+    var act = s.activation && s.activation.last;
+    headline.push(act
+      ? { label: "last activation", value: act.policy_source === "defaults" ? "defaults" : "policy",
+          sub: act.policy_path || act.cwd || "", flag: act.policy_source === "defaults" }
+      : { label: "last activation", value: "none", sub: "", flag: true });
     var rows = (s.targets || []).map(function (t) {
       return {
         key: t.target,

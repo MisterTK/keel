@@ -319,7 +319,7 @@ def _run(pool: Any, do_call: Callable[[], Any], method: str, url: str, headers: 
     outcome = backend.execute(env, effect)
     latency_ms = round((time.perf_counter() - started) * 1000)
     if discovery is not None:
-        discovery.record(target, outcome, latency_ms)
+        discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
     action, value = _http.deliver(
         outcome,

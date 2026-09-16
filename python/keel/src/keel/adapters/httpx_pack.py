@@ -458,7 +458,7 @@ def _run_sync(call_with: Callable[[Any], Any], request: Any) -> Any:
         outcome = _http.call_execute(backend, env, effect, injected)
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
-            discovery.record(target, outcome, latency_ms)
+            discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
         if outcome.get("result") == "ok":
             if track_usage and not outcome.get("from_cache"):
@@ -602,7 +602,7 @@ async def _run_async(call_with: Callable[[Any], Any], request: Any) -> Any:
             )
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
-            discovery.record(target, outcome, latency_ms)
+            discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
         if outcome.get("result") == "ok":
             if track_usage and not outcome.get("from_cache"):

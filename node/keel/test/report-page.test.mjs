@@ -46,6 +46,32 @@ test("headline carries the value numbers and flags what is unprotected", () => {
   assert.equal(byLabel["not retried"].flag, true);
 });
 
+test("last activation tile reflects the activation summary", () => {
+  const withPolicy = {
+    ...state,
+    status: {
+      ...state.status,
+      activation: { count: 1, last: { policy_source: "keel.toml", policy_path: "/code/keel.toml", cwd: "/code" } },
+    },
+  };
+  const byLabelPolicy = Object.fromEntries(viewModel(withPolicy).headline.map((h) => [h.label, h]));
+  assert.deepEqual(byLabelPolicy["last activation"], { label: "last activation", value: "policy", sub: "/code/keel.toml", flag: false });
+
+  const withDefaults = {
+    ...state,
+    status: {
+      ...state.status,
+      activation: { count: 1, last: { policy_source: "defaults", policy_path: null, cwd: "/code" } },
+    },
+  };
+  const byLabelDefaults = Object.fromEntries(viewModel(withDefaults).headline.map((h) => [h.label, h]));
+  assert.deepEqual(byLabelDefaults["last activation"], { label: "last activation", value: "defaults", sub: "/code", flag: true });
+
+  const withoutActivation = { ...state, status: { ...state.status, activation: { count: 0, last: null } } };
+  const byLabelNone = Object.fromEntries(viewModel(withoutActivation).headline.map((h) => [h.label, h]));
+  assert.deepEqual(byLabelNone["last activation"], { label: "last activation", value: "none", sub: "", flag: true });
+});
+
 test("rows are keyed by target with flagged cells", () => {
   const vm = viewModel(state);
   assert.deepEqual(vm.rows.map((r) => r.key), ["api.example.com", "llm:openai"]);

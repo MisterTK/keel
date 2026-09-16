@@ -96,6 +96,18 @@ pub struct SubprocessSighting {
     /// means "never a `[flows.match."cmd:*"]` match candidate", independent
     /// of what `command`'s text happens to look like.
     pub argv: Option<Vec<String>>,
+    /// `"python"` or `"node"` when the launched program is recognizably one
+    /// of those runtimes (bare interpreter, versioned `python3.12`, a
+    /// package runner, or `sys.executable`), else `None`. Python-walker
+    /// only as of this build — Node's scanner sights no launchers yet
+    /// (issue #91).
+    pub child_runtime: Option<String>,
+    /// How the child's environment relates to ours: `"inherited"` (no
+    /// `env=` kwarg, `env=os.environ`, a dict spreading `os.environ`, or
+    /// `dict(os.environ, …)`), `"replaced"` (a dict literal that does not
+    /// spread `os.environ`), or `"unknown"` (any other expression).
+    /// Decides whether `KEEL_ENABLE` reaches the child (issue #91).
+    pub env_inheritance: String,
 }
 
 /// One hand-rolled resilience pattern sighted inside a function that also

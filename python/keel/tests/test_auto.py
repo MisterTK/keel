@@ -315,6 +315,19 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertIn(b"OK", proc.stdout)
         self.assertEqual(len(self._keel_lines(proc)), 1, proc.stderr)
 
+    def test_activation_row_names_policy_source_and_root(self) -> None:
+        (self.root / "keel.toml").write_text("")
+        proc = _run("import keel._auto", env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        import sqlite3 as _sq
+        conn = _sq.connect(self.root / ".keel" / "discovery.db")
+        row = conn.execute("SELECT language, policy_source, policy_path, keel_cwd, cwd FROM activations").fetchone()
+        self.assertEqual(row, ("python", "keel.toml", str(self.root / "keel.toml"), str(self.root), str(self.root)))
+
+    def test_refused_activation_writes_no_row(self) -> None:
+        proc = _run("import keel._auto", env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
+        self.assertFalse((self.root / ".keel").exists())
+
     def test_the_latch_does_not_answer_a_later_call_about_a_different_root(self) -> None:
         """The refusal latch is a PRINT-once latch, not a process-wide verdict.
 

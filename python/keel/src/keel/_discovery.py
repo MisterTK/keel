@@ -61,9 +61,19 @@ accumulate correctly without a transaction (WAL, `busy_timeout`).
 Migration: a file written by the previous (v1, `user_version = 0`) schema is
 upgraded in place on first open — the two counter columns are appended
 (`ALTER TABLE … ADD COLUMN`, so column order matches a fresh v2 file), the
-daily table is created, and `user_version` is stamped to 2. Mirrors
-`crates/keel-journal/src/discovery.rs::migrate` exactly, so either writer can
-open a file the other created.
+daily table is created, and `user_version` is stamped to 2. A v2 file gains
+the `activations` table (one row per process, WS8/#92) and is stamped to 3.
+Mirrors `crates/keel-journal/src/discovery.rs::migrate` exactly, so either
+writer can open a file the other created.
+
+`activations` records one row per process's lazily-remembered call to
+`record_activation` (ts_ms/pid/language/version/cwd/keel_cwd/policy_source/
+policy_path/flows_configured/argv0), written on the first successful
+`_connect()` (i.e. the first recorded call) or at `close()` if no call ever
+happened — whichever comes first, and exactly once — so an activated-but-idle
+process still leaves exactly one row of evidence at exit, and a process that
+never activates never touches the filesystem. Retention keeps the newest 50
+rows (by `ts_ms` then `rowid`), mirroring the crate.
 
 Discovery is best-effort: it must never throw into, slow, or add output to
 the user's program (DX invariant 4). Every public method swallows its own
@@ -79,11 +89,12 @@ from time import time as _wall_clock  # captured at import: immune to in-flow
 from typing import TYPE_CHECKING, Any  # time virtualization (keel's own clock is never journaled)
 
 if TYPE_CHECKING:
+    from ._cachepoll import CachePollDetector
     from ._summary import Summary
 
 #: Current discovery schema version, stamped in `PRAGMA user_version`.
 #: Mirrors `keel_journal::discovery::DISCOVERY_SCHEMA_VERSION`.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: How many trailing UTC days of `discovery_daily` buckets are kept. Mirrors
 #: `keel_journal::discovery::RETENTION_DAYS`.
@@ -177,6 +188,29 @@ ON CONFLICT(target, day) DO UPDATE SET
     not_retried     = not_retried + excluded.not_retried,
     unwrapped_calls = unwrapped_calls + excluded.unwrapped_calls"""
 
+_ACTIVATIONS_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS activations (
+    ts_ms            INTEGER NOT NULL,
+    pid              INTEGER NOT NULL,
+    language         TEXT    NOT NULL,
+    version          TEXT    NOT NULL,
+    cwd              TEXT    NOT NULL,
+    keel_cwd         TEXT,
+    policy_source    TEXT    NOT NULL,
+    policy_path      TEXT,
+    flows_configured INTEGER NOT NULL DEFAULT 0,
+    argv0            TEXT    NOT NULL DEFAULT ''
+);"""
+
+_ACTIVATION_INSERT = (
+    "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source, "
+    "policy_path, flows_configured, argv0) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_ACTIVATION_PRUNE = (
+    "DELETE FROM activations WHERE rowid NOT IN "
+    "(SELECT rowid FROM activations ORDER BY ts_ms DESC, rowid DESC LIMIT 50)"
+)
+
 
 class Discovery:
     """A per-target traffic ledger over its own WAL-mode SQLite file. One
@@ -196,15 +230,22 @@ class Discovery:
         cwd: str | Path | None = None,
         known_targets: frozenset[str] | None = None,
         summary: "Summary | None" = None,
+        cachepoll: "CachePollDetector | None" = None,
     ) -> None:
         self.db_path = Path(cwd or Path.cwd()) / ".keel" / "discovery.db"
         self._known_targets = known_targets or frozenset()
         # The exit-time console summary (`_summary.Summary`), fed from
         # `record()` because this is the one place that knows `wrapped`.
         self._summary = summary
+        # The runtime cache-poll detector (WS9, #78), fed from `record()`
+        # because this is the one place every intercepted call passes
+        # through with both `target` and (when the caller has one) `args_hash`.
+        self._cachepoll = cachepoll
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._last_prune_day: int | None = None
+        self._activation: dict[str, Any] | None = None
+        self._activation_written = False
 
     def _connect(self) -> sqlite3.Connection | None:
         """Open (once) the connection, lazily so a disabled/never-recording
@@ -224,15 +265,27 @@ class Discovery:
         self._conn = conn
         return conn
 
-    def record(self, target: str, outcome: dict[str, Any], latency_ms: int) -> None:
+    def record(
+        self,
+        target: str,
+        outcome: dict[str, Any],
+        latency_ms: int,
+        args_hash: str | None = None,
+    ) -> None:
         """Fold one intercepted call's outcome envelope into its target's
         aggregates (lifetime row plus the clock-day bucket). Best-effort:
         never raises."""
         wrapped = target in self._known_targets
         if self._summary is not None:
             try:
-                self._summary.observe(outcome, wrapped)
+                self._summary.observe(outcome, wrapped, target=target)
             except Exception:  # noqa: BLE001 — the summary never breaks a call
+                pass
+        if self._cachepoll is not None:
+            try:
+                if self._cachepoll.observe(target, args_hash, outcome) and self._summary is not None:
+                    self._summary.note_cache_poll_suspect()
+            except Exception:  # noqa: BLE001 — a detector bug must never break a call
                 pass
         row = _row_from_outcome(target, outcome, latency_ms, wrapped)
         now_ms = row[12]  # last_seen_ms, per _row_from_outcome's column order
@@ -242,6 +295,7 @@ class Discovery:
                 conn = self._connect()
                 if conn is None:
                     return
+                self._write_activation(conn)
                 conn.execute(_UPSERT, row)
                 conn.execute(_DAILY_UPSERT, _daily_row(row, day))
                 self._prune(conn, day)
@@ -260,8 +314,33 @@ class Discovery:
             (day - (RETENTION_DAYS - 1),),
         )
 
+    def record_activation(self, row: dict[str, Any]) -> None:
+        """Remember this process's activation (WS8). Written lazily — with the
+        first recorded call, or at close() — so an idle activation touches the
+        filesystem exactly once, at exit."""
+        self._activation = dict(row)
+
+    def _write_activation(self, conn: sqlite3.Connection) -> None:
+        if self._activation is None or self._activation_written:
+            return
+        a = self._activation
+        conn.execute(_ACTIVATION_INSERT, (
+            int(a["ts_ms"]), int(a["pid"]), a["language"], a["version"], a["cwd"], a.get("keel_cwd"),
+            a["policy_source"], a.get("policy_path"), int(bool(a.get("flows_configured"))), a.get("argv0") or "",
+        ))
+        conn.execute(_ACTIVATION_PRUNE)
+        self._activation_written = True
+
     def close(self) -> None:
         with self._lock:
+            if self._activation is not None and not self._activation_written:
+                try:
+                    conn = self._connect()
+                    if conn is not None:
+                        self._write_activation(conn)
+                        conn.commit()
+                except sqlite3.Error:
+                    pass
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -277,25 +356,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
     (version,) = conn.execute("PRAGMA user_version").fetchone()
     if version >= SCHEMA_VERSION:
         return
-    has_table = conn.execute(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery')"
-    ).fetchone()[0]
-    if has_table:
-        has_column = conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') "
-            "WHERE name = 'not_retried')"
+    if version < 2:
+        has_table = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery')"
         ).fetchone()[0]
-        if not has_column:
-            # Appended, so a migrated file's column order matches a fresh v2 one.
-            conn.execute(
-                "ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0"
-            )
-            conn.execute(
-                "ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0"
-            )
-    else:
-        conn.executescript(_DISCOVERY_SCHEMA)
-    conn.executescript(_DAILY_SCHEMA)
+        if has_table:
+            has_column = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery') "
+                "WHERE name = 'not_retried')"
+            ).fetchone()[0]
+            if not has_column:
+                # Appended, so a migrated file's column order matches a fresh v2 one.
+                conn.execute(
+                    "ALTER TABLE discovery ADD COLUMN not_retried INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    "ALTER TABLE discovery ADD COLUMN unwrapped_calls INTEGER NOT NULL DEFAULT 0"
+                )
+        else:
+            conn.executescript(_DISCOVERY_SCHEMA)
+        conn.executescript(_DAILY_SCHEMA)
+    if version < 3:
+        conn.executescript(_ACTIVATIONS_SCHEMA)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 

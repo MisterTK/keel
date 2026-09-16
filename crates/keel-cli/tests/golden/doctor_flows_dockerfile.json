@@ -1,7 +1,7 @@
 {
   "adapters": [
     {
-      "detected": false,
+      "detected": true,
       "lib": "httpx",
       "status": "pinned",
       "target": "host"
@@ -97,7 +97,7 @@
       "target": "mcp:<server>"
     },
     {
-      "detected": true,
+      "detected": false,
       "lib": "fetch",
       "status": "pinned",
       "target": "host"
@@ -175,6 +175,12 @@
       "detail": "`api.example.com` — RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real.",
       "level": "info",
       "topic": "reserved-name-excluded"
+    },
+    {
+      "action": "Mount a persistent volume at `.keel/` (or point `journal` at a `file:` path on one), or use a Postgres journal. Until then a redeploy or scale-to-zero discards every resumable flow.",
+      "detail": "`[flows]` is configured and the journal is SQLite at `.keel/journal.db` — this project ships as a container/serverless artifact (Dockerfile), whose filesystem does not survive an instance replacement.",
+      "level": "warn",
+      "topic": "journal-ephemeral-storage"
     }
   ],
   "follow_ups": [

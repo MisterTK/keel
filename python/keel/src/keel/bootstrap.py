@@ -16,12 +16,15 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
 from ._backend import load_backend
+from ._cachepoll import CachePollDetector
 from ._defaults import apply_pack_defaults
+from ._deploy import ephemeral_journal_warning
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._log import emit, json_logs
@@ -180,6 +183,13 @@ def install_keel(
     )
     policy = apply_journal_env_override(policy, env)
     backend.configure(policy)  # raises KEEL-E001/KEEL-E005 on invalid/unsupported policy
+    # Issue #90: durable flows on a SQLite journal that will not survive an
+    # instance replacement — doctor can see this from a deploy artifact in the
+    # repo, but only the runtime can see the environment (serverless markers,
+    # /.dockerenv, a read-only cwd).
+    warning = ephemeral_journal_warning(policy, env, cwd)
+    if warning is not None:
+        emit(env, *warning)
 
     # The explicit `[target."…"]` keys of the SAME effective policy the core
     # just configured — discovery's "wrapped" classification (dx-spec §2's
@@ -190,7 +200,26 @@ def install_keel(
     # `_policy.extract_cmd_flows` does for `on_busy`). KEEL_QUIET silences it
     # exactly as it silences the banner.
     summary = Summary() if _console_enabled(policy, env) else None
-    discovery = Discovery(cwd, known_targets, summary=summary)
+
+    def _cache_poll_suspect(target: str, hits: int, span_s: int) -> None:
+        emit(
+            env,
+            f"keel ▸ warning: {target} served {hits} consecutive cache hits for one identical "
+            f"call over {span_s}s — if this is a status poll, set cache = "
+            '{ mode = "off" } on that target '
+            "(a route-key poll policy arrives in v0.6.0, #93)\n",
+            {
+                "keel": "warning",
+                "code": "cache-poll-suspect",
+                "target": target,
+                "hits": hits,
+                "span_s": span_s,
+                "version": __version__,
+            },
+        )
+
+    cachepoll = CachePollDetector(on_suspect=_cache_poll_suspect)
+    discovery = Discovery(cwd, known_targets, summary=summary, cachepoll=cachepoll)
     _STATE.discovery = discovery
     _STATE.summary = summary
     set_runtime(backend, discovery)
@@ -207,7 +236,23 @@ def install_keel(
     # subprocess adapter consults these to decide whether an intercepted
     # `subprocess.run`/`call` maps to a declared durable flow. Stored before
     # `install_adapters()` so the pack's `install()` sees them.
-    set_cmd_flows(extract_cmd_flows(policy))
+    cmd_flows = extract_cmd_flows(policy)
+    set_cmd_flows(cmd_flows)
+
+    # One activation row per process (WS8, #92): the evidence answering "was
+    # Keel on, with which policy?" after a deployment. Spread `_STATE.meta`
+    # (the same provenance the banner/JSON summary report) so this can never
+    # drift from what Keel tells the user; the fields below are the ones
+    # `_STATE.meta` doesn't carry.
+    discovery.record_activation({
+        **_STATE.meta,
+        "ts_ms": int(time.time() * 1000),
+        "pid": os.getpid(),
+        "language": "python",
+        "cwd": str(cwd),
+        "flows_configured": bool(flow_entrypoints) or bool(cmd_flows),
+        "argv0": sys.argv[0] if sys.argv else "",
+    })
 
     # Library adapters (httpx/requests/…) plus framework packs with a real
     # seam of their own (adk_pack, pydantic-ai, …): all armed lazily — each
@@ -299,13 +344,21 @@ def _register_exit_flush() -> None:
         if _STATE.summary is not None:
             try:
                 counts = _STATE.summary.counts()
+                by_target = _STATE.summary.unprotected_by_target()
                 if json_logs(_STATE.env if _STATE.env is not None else os.environ):
                     # Unconditional, unlike the text form: a zero line proves
                     # Keel was live and intercepted nothing, which is exactly
                     # what the outage post-mortem had no way to establish.
-                    sys.stderr.write(format_summary_json(counts, _STATE.meta or {}))
+                    sys.stderr.write(
+                        format_summary_json(
+                            counts,
+                            _STATE.meta or {},
+                            by_target,
+                            _STATE.summary.cache_poll_suspects(),
+                        )
+                    )
                 else:
-                    text = format_summary(counts, keel_on_path())
+                    text = format_summary(counts, keel_on_path(), by_target)
                     if text:
                         sys.stderr.write(text)
             except Exception:  # noqa: BLE001 — observability never fails the process

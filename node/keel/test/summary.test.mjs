@@ -56,8 +56,18 @@ test("every corpus case formats byte-identically", () => {
   assert.ok(files.length >= 5, "corpus present");
   for (const file of files) {
     const c = JSON.parse(readFileSync(new URL(file, corpusDir), "utf8"));
-    assert.equal(formatSummary(c.counts, c.keel_on_path), c.expected, c.name);
+    assert.equal(formatSummary(c.counts, c.keel_on_path, c.unprotected_by_target), c.expected, c.name);
   }
+});
+
+test("createSummary tracks unprotected per target", () => {
+  const s = createSummary();
+  s.observe(outcome(), false, "a.example");
+  s.observe(outcome(), false, "a.example");
+  s.observe(outcome(), false, "b.example");
+  s.observe(outcome(), true, "c.example");
+  assert.deepEqual(s.unprotectedByTarget(), { "a.example": 2, "b.example": 1 });
+  assert.equal(s.counts().unprotected, 3);
 });
 
 // `KEEL_LOG_FORMAT=json` (F10): a second shared corpus, read by the Python
@@ -68,7 +78,7 @@ test("every json corpus case formats byte-identically", () => {
   assert.ok(files.length >= 3, "json corpus present");
   for (const file of files) {
     const c = JSON.parse(readFileSync(new URL(file, jsonCorpusDir), "utf8"));
-    assert.equal(formatSummaryJson(c.counts, c.meta), c.expected, c.name);
+    assert.equal(formatSummaryJson(c.counts, c.meta, c.unprotected_by_target), c.expected, c.name);
   }
 });
 
@@ -115,10 +125,10 @@ test("summary prints on stderr after one wrapped call; stdout untouched", () => 
   assert.ok(r.stderr.indexOf("wrapped") < r.stderr.indexOf("report --open"), "banner before summary");
 });
 
-test("a call on a target with no policy entry is reported unprotected", () => {
+test("a call on a target with no policy entry is reported unprotected, attributed to that target", () => {
   const r = runFixture(null);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stderr, /keel ▸ 1 call · 1 call unprotected\n/);
+  assert.match(r.stderr, /keel ▸ 1 call · 1 call unprotected \(127\.0\.0\.1 1\)\n/);
 });
 
 test("telemetry.console = false silences the summary but not the banner", () => {

@@ -23,10 +23,17 @@ const KEYS = ["calls", "throttled", "retries_succeeded", "breaker_trips", "cache
 
 export function createSummary() {
   const c = Object.fromEntries(KEYS.map((k) => [k, 0]));
+  const byTarget = new Map();
+  // JSON-summary-only (WS9, #78) — never printed in the text form, so it is
+  // not one of KEYS.
+  let cachePollSuspects = 0;
   return {
     /** Fold one call's outcome in. Mirrors discovery.mjs's classification,
-     *  except `retries_succeeded` (success-only, narrower than `retries`). */
-    observe(outcome, wrapped) {
+     *  except `retries_succeeded` (success-only, narrower than `retries`).
+     *  `target` is optional and, alongside an unwrapped call, feeds
+     *  `unprotectedByTarget()` — the attribution behind the exit summary's
+     *  "N calls unprotected (…)" breakdown (#96). */
+    observe(outcome, wrapped, target = null) {
       if (outcome == null) return;
       const attempts = Number.isFinite(outcome.attempts) ? outcome.attempts : 0;
       const ok = outcome.result === "ok";
@@ -38,10 +45,23 @@ export function createSummary() {
       if (code === "KEEL-E012") c.breaker_trips += 1; // breaker fast-fail (and LLM budget block, by design)
       if (ok && fromCache) c.cache_hits += 1;
       if (code === "KEEL-E014") c.not_retried += 1; // observed, not retried
-      if (!wrapped) c.unprotected += 1;
+      if (!wrapped) {
+        c.unprotected += 1;
+        if (target) byTarget.set(target, (byTarget.get(target) ?? 0) + 1);
+      }
     },
     counts() {
       return { ...c };
+    },
+    unprotectedByTarget() {
+      return Object.fromEntries(byTarget);
+    },
+    /** Called once per fired detector key (WS9, #78) — JSON summary only. */
+    noteCachePollSuspect() {
+      cachePollSuspects += 1;
+    },
+    cachePollSuspects() {
+      return cachePollSuspects;
     },
   };
 }
@@ -50,8 +70,25 @@ function n(count, singular, plural) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+/**
+ * The `unprotected` segment: a bare count, or — when a per-target breakdown
+ * is supplied — the count plus a parenthetical naming the top three targets
+ * (count desc, then name asc), with a `+{k} others` tail when more than
+ * three targets contributed (#96).
+ */
+function unprotectedSegment(count, byTarget) {
+  const seg = `${n(count, "call", "calls")} unprotected`;
+  const entries = byTarget ? Object.entries(byTarget) : [];
+  if (entries.length === 0) return seg;
+  const ranked = entries.sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  let top = ranked.slice(0, 3).map(([t, c]) => `${t} ${c}`).join(", ");
+  const rest = ranked.length - 3;
+  if (rest > 0) top += `, +${n(rest, "other", "others")}`;
+  return `${seg} (${top})`;
+}
+
 /** The two lines (with trailing newlines), or "" when nothing was intercepted. */
-export function formatSummary(counts, keelOnPath) {
+export function formatSummary(counts, keelOnPath, byTarget = null) {
   const calls = counts.calls ?? 0;
   if (calls === 0) return "";
   const segments = [n(calls, "call", "calls")];
@@ -60,7 +97,7 @@ export function formatSummary(counts, keelOnPath) {
   if (counts.breaker_trips) segments.push(n(counts.breaker_trips, "breaker trip", "breaker trips"));
   if (counts.cache_hits) segments.push(`${counts.cache_hits} served from cache`);
   if (counts.not_retried) segments.push(`${n(counts.not_retried, "failure", "failures")} not retried`);
-  if (counts.unprotected) segments.push(`${n(counts.unprotected, "call", "calls")} unprotected`);
+  if (counts.unprotected) segments.push(unprotectedSegment(counts.unprotected, byTarget));
   const command = keelOnPath ? "keel report --open" : "uvx --from keelrun-cli keel report --open";
   return `${PREFIX}${segments.join(" · ")}\n${INDENT}${command} for the full picture\n`;
 }
@@ -71,10 +108,16 @@ export function formatSummary(counts, keelOnPath) {
  * container "Keel activated and intercepted nothing" is itself the evidence
  * the outage post-mortem needed. Pinned by conformance/console_summary_json/,
  * which the Python front end reads too (identical bytes, both languages).
+ * `unprotected_by_target` carries the FULL map (every target, sorted keys,
+ * `{}` when none) — the text line only ever names the top three (#96).
+ * `cache_poll_suspects` (WS9, #78) is JSON-summary-only — never printed in
+ * the text form, so it is not one of KEYS.
  */
-export function formatSummaryJson(counts, meta) {
+export function formatSummaryJson(counts, meta, byTarget = null, cachePollSuspects = 0) {
   const obj = {};
   for (const k of KEYS) obj[k] = Number(counts?.[k] ?? 0);
+  obj.unprotected_by_target = { ...(byTarget ?? {}) };
+  obj.cache_poll_suspects = Number(cachePollSuspects ?? 0);
   return dumpsLine({ ...obj, keel: "summary", ...meta });
 }
 

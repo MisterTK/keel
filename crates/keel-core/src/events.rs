@@ -16,7 +16,8 @@
 //! - `KEEL_EVENTS` set to anything else (`1`, `true`, …) — force **on**
 //!   (creates `./.keel/events/` on demand).
 //! - unset — **on** exactly when `./.keel` already exists (a Keel-initialized
-//!   project directory), **off** otherwise.
+//!   project directory), **off** otherwise. `./.keel` is rooted at `KEEL_CWD`
+//!   when set, else the process working directory.
 //!
 //! Off is a zero-cost no-op: the engine holds no sink and every emit site is
 //! one `Option` discriminant check (the overhead bench's `a_empty` /
@@ -260,8 +261,8 @@ impl FromStr for TraceRef {
 pub struct EventsEnv {
     /// The value of `KEEL_EVENTS`, if set.
     pub keel_events: Option<String>,
-    /// The directory whose `.keel/` marks a Keel-initialized project (the
-    /// process working directory in production).
+    /// The directory whose `.keel/` marks a Keel-initialized project
+    /// (`KEEL_CWD` when set, else the process working directory).
     pub base_dir: PathBuf,
 }
 
@@ -269,9 +270,27 @@ impl EventsEnv {
     /// Snapshot the real process environment.
     #[must_use]
     pub fn capture() -> Self {
+        Self::capture_from(
+            |k| std::env::var(k).ok(),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    /// The testable core of [`capture`](Self::capture): `KEEL_CWD` (set,
+    /// non-blank, a directory) is the config root discovery and the journal
+    /// already use, so the event feed keys on it too — a `KEEL_CWD`-relocated
+    /// process must not end up with discovery on and events off (WS8 probe,
+    /// #92).
+    pub fn capture_from(var: impl Fn(&str) -> Option<String>, cwd: PathBuf) -> Self {
+        let base_dir = var("KEEL_CWD")
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or(cwd);
         Self {
-            keel_events: std::env::var("KEEL_EVENTS").ok(),
-            base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            keel_events: var("KEEL_EVENTS"),
+            base_dir,
         }
     }
 }
@@ -550,6 +569,31 @@ mod tests {
             keel_events: keel_events.map(str::to_owned),
             base_dir: base_dir.to_owned(),
         }
+    }
+
+    #[test]
+    fn capture_prefers_keel_cwd_when_it_is_a_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keel_cwd = dir.path().to_string_lossy().into_owned();
+        let env = |k: &str| (k == "KEEL_CWD").then(|| keel_cwd.clone());
+        let got = EventsEnv::capture_from(env, PathBuf::from("/elsewhere"));
+        assert_eq!(got.base_dir, dir.path());
+        // blank or non-directory values fall back to cwd
+        let blank = |k: &str| (k == "KEEL_CWD").then(|| "  ".to_owned());
+        assert_eq!(
+            EventsEnv::capture_from(blank, PathBuf::from("/elsewhere")).base_dir,
+            PathBuf::from("/elsewhere")
+        );
+        let missing = |k: &str| (k == "KEEL_CWD").then(|| "/definitely/not/a/dir/keel".to_owned());
+        assert_eq!(
+            EventsEnv::capture_from(missing, PathBuf::from("/elsewhere")).base_dir,
+            PathBuf::from("/elsewhere")
+        );
+        let none = |_: &str| None;
+        assert_eq!(
+            EventsEnv::capture_from(none, PathBuf::from("/elsewhere")).base_dir,
+            PathBuf::from("/elsewhere")
+        );
     }
 
     #[test]
