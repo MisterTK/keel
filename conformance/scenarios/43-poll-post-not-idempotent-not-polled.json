@@ -1,0 +1,19 @@
+{
+  "name": "poll-post-not-idempotent-not-polled",
+  "description": "CCR-8 mirror of 42: the same POST submitted with idempotent:false (the submit side of an LRO surface, or any bare POST) never polls even with a pending-shaped payload and a poll table resolved — returned as-is after one attempt, no retry, no KEEL-E016, clock untouched.",
+  "policy": { "target": {
+    "api.jobs.example": {
+      "retry": { "attempts": 3, "schedule": "fixed(200ms)", "on": ["conn", "timeout", "429", "5xx"] },
+      "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed"] } }
+    }
+  } },
+  "steps": [
+    { "call": {
+        "target": "api.jobs.example",
+        "request": { "op": "POST api.jobs.example/jobs:submit", "idempotent": false, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "status": "running" } } ],
+        "expect": { "result": "ok", "payload": { "status": "running" }, "attempts": 1, "waits_ms": [] }
+    } },
+    { "report_expect": { "clock_ms": 0, "targets": { "api.jobs.example": { "calls": 1, "attempts": 1, "retries": 0, "successes": 1, "failures": 0 } } } }
+  ]
+}

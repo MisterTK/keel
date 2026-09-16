@@ -1,0 +1,21 @@
+{
+  "name": "poll-numeric-terminal",
+  "description": "CCR-8: until.terminal accepts numbers, matched by JSON type and numeric VALUE — 99 pending, the string \"100\" pending, true pending, 100 terminal; and 100.0 is terminal for [100] (numbers compare by value across integer/float spellings).",
+  "policy": { "target": {
+    "jobs.example": { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "progress", "terminal": [100] } } }
+  } },
+  "steps": [
+    { "call": { "target": "jobs.example",
+        "request": { "op": "GET jobs.example/v1/j1", "idempotent": true, "args_hash": "h1" },
+        "effect": [ { "status": "ok", "payload": { "progress": 99 } },
+                    { "status": "ok", "payload": { "progress": "100" } },
+                    { "status": "ok", "payload": { "progress": true } },
+                    { "status": "ok", "payload": { "progress": 100 } } ],
+        "expect": { "result": "ok", "payload": { "progress": 100 }, "attempts": 4 } } },
+    { "call": { "target": "jobs.example",
+        "request": { "op": "GET jobs.example/v1/j2", "idempotent": true, "args_hash": "h2" },
+        "effect": [ { "status": "ok", "payload": { "progress": 100.0 } } ],
+        "expect": { "result": "ok", "attempts": 1 } } },
+    { "report_expect": { "clock_ms": 30000, "targets": { "jobs.example": { "calls": 2, "attempts": 5, "successes": 2 } } } }
+  ]
+}

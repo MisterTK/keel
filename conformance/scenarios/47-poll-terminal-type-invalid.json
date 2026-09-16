@@ -1,0 +1,9 @@
+{
+  "name": "poll-terminal-type-invalid",
+  "description": "CCR-8: until.terminal items must be strings, booleans, or numbers — an object item is KEEL-E001 at configure in every implementation (and fails contracts/policy.schema.json, so check_schema.py sees it as invalid-as-designed).",
+  "policy": { "target": {
+    "jobs.example": { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": [ { "state": "done" } ] } } }
+  } },
+  "expect_configure_error": "KEEL-E001",
+  "steps": []
+}

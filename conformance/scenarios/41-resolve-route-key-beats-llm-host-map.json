@@ -1,0 +1,21 @@
+{
+  "name": "resolve-route-key-beats-llm-host-map",
+  "description": "Tier 0 (CCR-8, docs/targeting.md §1.2): a ROUTE key — a pattern key with a /path — on a host the LLM host map would claim beats the map for the requests it matches (method, host glob, path glob); a host-only glob never captures an LLM host; among route keys the most specific wins; non-LLM hosts keep the four existing tiers, including exact-beats-pattern (scenario 36 step 3 re-pinned).",
+  "policy": { "target": {
+    "POST *-aiplatform.googleapis.com/*:fetchPredictOperation": {},
+    "*-aiplatform.googleapis.com/*": {},
+    "GET generativelanguage.googleapis.com/*/operations/*": {},
+    "*.googleapis.com": {},
+    "api.example.com": {}, "GET api.example.com/*": {}
+  } },
+  "steps": [
+    { "resolve": { "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "scheme": "https", "path": "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation" }, "expect": "POST *-aiplatform.googleapis.com/*:fetchPredictOperation" },
+    { "resolve": { "method": "POST", "host": "us-central1-aiplatform.googleapis.com", "scheme": "https", "path": "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:predictLongRunning" }, "expect": "*-aiplatform.googleapis.com/*" },
+    { "resolve": { "method": "GET", "host": "us-central1-aiplatform.googleapis.com", "scheme": "https", "path": "/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation" }, "expect": "*-aiplatform.googleapis.com/*" },
+    { "resolve": { "method": "POST", "host": "generativelanguage.googleapis.com", "path": "/v1beta/models/gemini-2.5-pro:generateContent" }, "expect": "llm:google-genai" },
+    { "resolve": { "method": "GET", "host": "generativelanguage.googleapis.com", "path": "/v1beta/models/veo-3.1/operations/op1" }, "expect": "GET generativelanguage.googleapis.com/*/operations/*" },
+    { "resolve": { "method": "POST", "host": "api.openai.com", "path": "/v1/chat/completions" }, "expect": "llm:openai" },
+    { "resolve": { "method": "GET", "host": "storage.googleapis.com", "path": "/b/x/o/y" }, "expect": "*.googleapis.com" },
+    { "resolve": { "method": "GET", "host": "api.example.com", "path": "/v1/x" }, "expect": "api.example.com" }
+  ]
+}

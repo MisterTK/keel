@@ -1,0 +1,23 @@
+{
+  "name": "poll-post-idempotent",
+  "description": "CCR-8: the poll gate is idempotency, not method. An idempotent POST (an operation read the front end judged safe) to a route-key target polls: two pending then terminal → 3 attempts, one call, intervals on the clock, waits_ms retry-only.",
+  "policy": { "target": {
+    "POST *-aiplatform.googleapis.com/*:fetchPredictOperation": {
+      "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["completed", "failed"] } }
+    }
+  } },
+  "steps": [
+    { "call": {
+        "target": "POST *-aiplatform.googleapis.com/*:fetchPredictOperation",
+        "request": { "op": "POST us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/veo-3.1:fetchPredictOperation", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "running" } },
+          { "status": "ok", "payload": { "status": "completed", "result": 42 } }
+        ],
+        "expect": { "result": "ok", "payload": { "status": "completed", "result": 42 }, "attempts": 3, "from_cache": false, "waits_ms": [], "throttled": false }
+    } },
+    { "report_expect": { "clock_ms": 20000, "targets": {
+        "POST *-aiplatform.googleapis.com/*:fetchPredictOperation": { "calls": 1, "attempts": 3, "retries": 0, "successes": 1, "failures": 0 } } } }
+  ]
+}
