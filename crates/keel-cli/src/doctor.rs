@@ -918,8 +918,10 @@ impl RouteCadence {
 ///
 /// `interval`/`deadline` come from [`RouteCadence`], i.e. the slowest values
 /// observed across every loop on this route, defaulting to `10s` / `30m` per
-/// column. The comment says so whenever more than one loop is involved, so it
-/// never reads as "these are that one named loop's numbers".
+/// column. Whenever more than one loop is involved the comment says which is
+/// which, PER COLUMN: a defaulted column was not observed anywhere, and
+/// claiming it was "the slowest of them" would be a false statement sitting
+/// right beside the number.
 fn render_route_block(
     p: &RouteKeyProposal,
     s: &SimplificationSighting,
@@ -932,10 +934,26 @@ fn render_route_block(
         .deadline_s
         .map_or_else(|| "30m".to_owned(), |v| format!("{v}s"));
     let provenance = if cadence.sightings > 1 {
+        // Only claim "slowest observed" for a column actually derived from the
+        // loops; a defaulted column says so, and says why.
+        let source = match (cadence.interval_s, cadence.deadline_s) {
+            (Some(_), Some(_)) => "interval and deadline are the slowest of them",
+            (Some(_), None) => {
+                "interval is the slowest of them, deadline is Keel's default \
+                 (a loop on this route declares none)"
+            }
+            (None, Some(_)) => {
+                "deadline is the slowest of them, interval is Keel's default \
+                 (a loop on this route declares none)"
+            }
+            (None, None) => {
+                "interval and deadline are Keel's defaults \
+                 (a loop on this route declares neither)"
+            }
+        };
         format!(
-            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}); \
-             interval/deadline are the slowest of them",
-            cadence.sightings, s.file, s.line, s.function
+            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}); {}",
+            cadence.sightings, s.file, s.line, s.function, source
         )
     } else {
         format!(
@@ -3082,10 +3100,40 @@ mod tests {
             "{partial}"
         );
         // Provenance: a multi-loop patch must not name one loop as if the
-        // numbers were its own.
+        // numbers were its own, and must claim "slowest of them" ONLY for a
+        // column it actually derived — `partial`'s `interval = "10s"` is the
+        // default, and saying it was observed would be a false statement
+        // beside the number.
         assert!(
-            both.contains("replaces 2 hand-rolled polls on this route"),
+            both.contains("replaces 2 hand-rolled polls on this route")
+                && both.contains("interval and deadline are the slowest of them"),
             "{both}"
+        );
+        assert!(
+            partial.contains(
+                "deadline is the slowest of them, interval is Keel's default \
+                 (a loop on this route declares none)"
+            ),
+            "{partial}"
+        );
+        let neither = patch_for(vec![sighting(8, None, None), sighting(40, Some(3), None)]);
+        assert!(
+            neither.contains(
+                "interval and deadline are Keel's defaults \
+                 (a loop on this route declares neither)"
+            ),
+            "{neither}"
+        );
+        let interval_only = patch_for(vec![
+            sighting(8, Some(3), None),
+            sighting(40, Some(9), None),
+        ]);
+        assert!(
+            interval_only.contains(
+                "interval is the slowest of them, deadline is Keel's default \
+                 (a loop on this route declares none)"
+            ),
+            "{interval_only}"
         );
         assert!(
             !patch_for(vec![sighting(8, Some(3), Some(600))])
