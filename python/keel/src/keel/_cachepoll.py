@@ -9,8 +9,19 @@ twin; `keel explain` content lands with poll v2 (#93)."""
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any, Callable
+
+#: Cap on tracked `(target, args_hash)` runs and on the fired-key set, in
+#: BOTH languages (Node twin: `node/keel/src/cachepoll.mjs`'s `MAX_RUNS`/
+#: `MAX_FIRED`) — this detector lives inside other people's long-running
+#: server processes, and a server making many DISTINCT cached calls (an LLM
+#: app with varying prompts is precisely our audience) must not accumulate
+#: one entry per distinct call for the life of the process. Named constants,
+#: not magic numbers.
+MAX_RUNS = 1024
+MAX_FIRED = 1024
 
 
 class CachePollDetector:
@@ -20,7 +31,17 @@ class CachePollDetector:
     process when `hits >= min_hits` AND the run's span (`last - first`) is
     at least `min_span_s` — the span rule is what tells a status poll (hits
     spaced seconds apart) apart from a test suite replaying one prompt in a
-    burst. Never fires when `args_hash` is `None`/falsy."""
+    burst. Never fires when `args_hash` is `None`/falsy.
+
+    Thread-safe: the sync HTTP packs (`requests_pack`, `urllib3_pack`,
+    `httpx_pack._run_sync`, `urllib_pack`) genuinely run on multiple OS
+    threads in a threaded WSGI/worker-pool host, and `discovery.record()`
+    calls `observe()` OUTSIDE `Discovery._lock`'s scope (that lock only
+    wraps the SQLite write) — so this class owns its own lock rather than
+    reusing `Discovery._lock` (which must not widen to cover this, and this
+    must stay independently usable). `on_suspect` is invoked AFTER the lock
+    is released — decide-and-mark happens under the lock, emitting to
+    stderr while holding it is how you get a deadlock later."""
 
     def __init__(
         self,
@@ -38,26 +59,54 @@ class CachePollDetector:
         env_span = os.environ.get("KEEL_CACHEPOLL_MIN_SPAN_S")
         self._min_span = float(min_span_s if min_span_s is not None else (env_span or 20.0))
         self._on_suspect = on_suspect
+        self._lock = threading.Lock()
         self._runs: dict[tuple[str, str], list[float]] = {}  # key -> [hits, first, last]
-        self._fired: set[tuple[str, str]] = set()
+        # A dict used as an insertion-ordered set (Python 3.7+ dicts preserve
+        # insertion order) so eviction can drop the oldest-fired key cheaply.
+        self._fired: dict[tuple[str, str], None] = {}
 
     def observe(self, target: str, args_hash: str | None, outcome: dict[str, Any]) -> bool:
         if not args_hash:
             return False
         key = (target, args_hash)
-        if not outcome.get("from_cache"):
-            self._runs.pop(key, None)
-            return False
-        now = self._clock()
-        run = self._runs.get(key)
-        if run is None:
-            self._runs[key] = [1, now, now]
-            return False
-        run[0] += 1
-        run[2] = now
-        if key in self._fired or run[0] < self._min_hits or (run[2] - run[1]) < self._min_span:
-            return False
-        self._fired.add(key)
-        if self._on_suspect is not None:
-            self._on_suspect(target, int(run[0]), int(run[2] - run[1]))
-        return True
+        suspect: tuple[str, int, int] | None = None
+        with self._lock:
+            if not outcome.get("from_cache"):
+                self._runs.pop(key, None)
+                return False
+            now = self._clock()
+            run = self._runs.get(key)
+            if run is None:
+                if len(self._runs) >= MAX_RUNS:
+                    self._evict_oldest_run_locked()
+                self._runs[key] = [1, now, now]
+                return False
+            run[0] += 1
+            run[2] = now
+            if key in self._fired or run[0] < self._min_hits or (run[2] - run[1]) < self._min_span:
+                return False
+            self._mark_fired_locked(key)
+            suspect = (target, int(run[0]), int(run[2] - run[1]))
+        # Outside the lock: on_suspect (bootstrap's `emit`, which writes to
+        # stderr) must never run while this lock is held.
+        if suspect is not None and self._on_suspect is not None:
+            self._on_suspect(*suspect)
+        return suspect is not None
+
+    def _evict_oldest_run_locked(self) -> None:
+        """Drop the tracked run with the OLDEST `last` timestamp. A key that
+        has not been touched recently is by definition not a live poll run,
+        so evicting it cannot lose a detection in progress. Caller holds
+        `self._lock`."""
+        oldest_key = min(self._runs, key=lambda k: self._runs[k][2])
+        del self._runs[oldest_key]
+
+    def _mark_fired_locked(self, key: tuple[str, str]) -> None:
+        """Simple insertion-order eviction once the fired set is full.
+        Re-firing a key after it has been evicted from a full fired set is
+        acceptable, and strictly better than unbounded growth. Caller holds
+        `self._lock`."""
+        if len(self._fired) >= MAX_FIRED:
+            oldest = next(iter(self._fired))
+            del self._fired[oldest]
+        self._fired[key] = None

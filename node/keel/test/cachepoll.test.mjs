@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createCachePollDetector } from "../src/cachepoll.mjs";
+import { createCachePollDetector, MAX_FIRED, MAX_RUNS } from "../src/cachepoll.mjs";
 
 const HIT = { v: 1, result: "ok", attempts: 0, from_cache: true };
 const MISS = { v: 1, result: "ok", attempts: 1, from_cache: false };
@@ -61,4 +61,32 @@ test("keys are independent and null is ignored", () => {
     state.t += 10.0;
   }
   assert.deepEqual(fired, []);
+});
+
+test("eviction caps runs at MAX_RUNS and an active run near the cap still fires", () => {
+  const { state, now } = fakeClock();
+  const fired = [];
+  const d = createCachePollDetector({ now, onSuspect: (t, h, s) => fired.push([t, h, s]) });
+  for (let i = 0; i < MAX_RUNS + 50; i++) {
+    d.observe("llm:openai", `h${i}`, HIT);
+    state.t += 0.001;
+  }
+  assert.ok(d._debugSizes().runs <= MAX_RUNS);
+  // An active run, touched most recently (so never the oldest-`last`
+  // eviction candidate), must survive the churn above and still fire.
+  for (let i = 0; i < 5; i++) {
+    d.observe("llm:google-genai", "active", HIT);
+    state.t += 10.0;
+  }
+  assert.deepEqual(fired, [["llm:google-genai", 5, 40]]);
+});
+
+test("fired set eviction caps growth", () => {
+  const { state, now } = fakeClock();
+  const d = createCachePollDetector({ now, minHits: 1, minSpanS: 0 });
+  for (let i = 0; i < MAX_FIRED + 50; i++) {
+    d.observe("llm:openai", `f${i}`, HIT);
+    d.observe("llm:openai", `f${i}`, HIT); // second hit fires (minHits=1, span=0)
+  }
+  assert.ok(d._debugSizes().fired <= MAX_FIRED);
 });
