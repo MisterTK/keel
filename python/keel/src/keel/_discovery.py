@@ -89,6 +89,7 @@ from time import time as _wall_clock  # captured at import: immune to in-flow
 from typing import TYPE_CHECKING, Any  # time virtualization (keel's own clock is never journaled)
 
 if TYPE_CHECKING:
+    from ._cachepoll import CachePollDetector
     from ._summary import Summary
 
 #: Current discovery schema version, stamped in `PRAGMA user_version`.
@@ -229,12 +230,17 @@ class Discovery:
         cwd: str | Path | None = None,
         known_targets: frozenset[str] | None = None,
         summary: "Summary | None" = None,
+        cachepoll: "CachePollDetector | None" = None,
     ) -> None:
         self.db_path = Path(cwd or Path.cwd()) / ".keel" / "discovery.db"
         self._known_targets = known_targets or frozenset()
         # The exit-time console summary (`_summary.Summary`), fed from
         # `record()` because this is the one place that knows `wrapped`.
         self._summary = summary
+        # The runtime cache-poll detector (WS9, #78), fed from `record()`
+        # because this is the one place every intercepted call passes
+        # through with both `target` and (when the caller has one) `args_hash`.
+        self._cachepoll = cachepoll
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._last_prune_day: int | None = None
@@ -259,7 +265,13 @@ class Discovery:
         self._conn = conn
         return conn
 
-    def record(self, target: str, outcome: dict[str, Any], latency_ms: int) -> None:
+    def record(
+        self,
+        target: str,
+        outcome: dict[str, Any],
+        latency_ms: int,
+        args_hash: str | None = None,
+    ) -> None:
         """Fold one intercepted call's outcome envelope into its target's
         aggregates (lifetime row plus the clock-day bucket). Best-effort:
         never raises."""
@@ -268,6 +280,12 @@ class Discovery:
             try:
                 self._summary.observe(outcome, wrapped, target=target)
             except Exception:  # noqa: BLE001 — the summary never breaks a call
+                pass
+        if self._cachepoll is not None:
+            try:
+                if self._cachepoll.observe(target, args_hash, outcome) and self._summary is not None:
+                    self._summary.note_cache_poll_suspect()
+            except Exception:  # noqa: BLE001 — a detector bug must never break a call
                 pass
         row = _row_from_outcome(target, outcome, latency_ms, wrapped)
         now_ms = row[12]  # last_seen_ms, per _row_from_outcome's column order

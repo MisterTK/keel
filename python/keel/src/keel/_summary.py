@@ -41,6 +41,9 @@ class Summary:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {k: 0 for k in COUNT_KEYS}
         self._by_target: dict[str, int] = {}
+        # JSON-summary-only (WS9, #78) — never printed in the text form, so it
+        # is not one of COUNT_KEYS.
+        self._cache_poll_suspects = 0
 
     def observe(self, outcome: dict[str, Any], wrapped: bool, target: str | None = None) -> None:
         """Fold one call's outcome envelope in. Classification mirrors
@@ -80,6 +83,15 @@ class Summary:
     def unprotected_by_target(self) -> dict[str, int]:
         with self._lock:
             return dict(self._by_target)
+
+    def note_cache_poll_suspect(self) -> None:
+        """Called once per fired detector key (WS9, #78) — JSON summary only."""
+        with self._lock:
+            self._cache_poll_suspects += 1
+
+    def cache_poll_suspects(self) -> int:
+        with self._lock:
+            return self._cache_poll_suspects
 
 
 def _n(count: int, singular: str, plural: str) -> str:
@@ -134,7 +146,10 @@ def format_summary(
 
 
 def format_summary_json(
-    counts: dict[str, int], meta: dict[str, Any], by_target: dict[str, int] | None = None
+    counts: dict[str, int],
+    meta: dict[str, Any],
+    by_target: dict[str, int] | None = None,
+    cache_poll_suspects: int = 0,
 ) -> str:
     """The `KEEL_LOG_FORMAT=json` twin of `format_summary`: one line, sorted
     keys, no spaces. Unlike the text form it prints even at zero calls — in a
@@ -142,11 +157,14 @@ def format_summary_json(
     the outage post-mortem needed. Pinned by conformance/console_summary_json/,
     which the Node front end reads too (identical bytes, both languages).
     `unprotected_by_target` carries the FULL map (every target, sorted keys,
-    `{}` when none) — the text line only ever names the top three (#96)."""
+    `{}` when none) — the text line only ever names the top three (#96).
+    `cache_poll_suspects` (WS9, #78) is JSON-summary-only — never printed in
+    the text form, so it is not one of COUNT_KEYS."""
     from ._log import dumps_line
 
     obj: dict[str, Any] = {k: int(counts.get(k, 0)) for k in COUNT_KEYS}
     obj["unprotected_by_target"] = dict(sorted((by_target or {}).items()))
+    obj["cache_poll_suspects"] = int(cache_poll_suspects)
     obj.update({"keel": "summary", **meta})
     return dumps_line(obj)
 

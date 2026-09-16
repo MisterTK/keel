@@ -64,7 +64,7 @@ export const MS_PER_DAY = 86_400_000;
 
 export function createDiscovery(
   cwd = process.cwd(),
-  { now = Date.now, knownTargets = new Set(), summary = null } = {}
+  { now = Date.now, knownTargets = new Set(), summary = null, cachepoll = null } = {}
 ) {
   const dbPath = join(cwd, ".keel", "discovery.db");
   const aggregates = new Map(); // target -> Aggregate
@@ -87,8 +87,10 @@ export function createDiscovery(
     /**
      * Hot-path: fold one intercepted call's Outcome envelope into its target's
      * aggregate. `latencyMs` is the call's end-to-end time (0 if unknown).
+     * `argsHash` (WS9, #78) feeds the runtime cache-poll detector — absent
+     * for call shapes with no args-hash concept.
      */
-    observe(target, outcome, latencyMs = 0) {
+    observe(target, outcome, latencyMs = 0, argsHash = null) {
       if (!target || outcome == null) return;
       // The exit-time console summary (src/summary.mjs) is fed here because
       // this is the one place that knows whether the target was wrapped.
@@ -96,6 +98,11 @@ export function createDiscovery(
         summary?.observe(outcome, knownTargets.has(target), target);
       } catch {
         /* the summary never breaks a call */
+      }
+      try {
+        if (cachepoll?.observe(target, argsHash, outcome)) summary?.noteCachePollSuspect();
+      } catch {
+        /* a detector bug must never break a call */
       }
       let a = aggregates.get(target);
       if (!a) aggregates.set(target, (a = newAggregate()));

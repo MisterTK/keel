@@ -397,7 +397,7 @@ def _run_send(
         outcome = _http.call_execute(backend, env, effect, injected)
         latency_ms = round((time.perf_counter() - started) * 1000)
         if discovery is not None:
-            discovery.record(target, outcome, latency_ms)
+            discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
         if outcome.get("result") == "ok":
             if track_usage and not outcome.get("from_cache"):

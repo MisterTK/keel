@@ -438,7 +438,7 @@ async def _run(self: Any, orig: Callable[..., Any], method: str, str_or_url: Any
         outcome = await loop.run_in_executor(None, lambda: backend.execute(env, effect))
     latency_ms = round((time.perf_counter() - started) * 1000)
     if discovery is not None:
-        discovery.record(target, outcome, latency_ms)
+        discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
     action, value = _http.deliver(
         outcome,

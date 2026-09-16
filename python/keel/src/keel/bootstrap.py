@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 from . import __version__
 from ._backend import load_backend
+from ._cachepoll import CachePollDetector
 from ._defaults import apply_pack_defaults
 from ._deploy import ephemeral_journal_warning
 from ._discovery import Discovery
@@ -199,7 +200,26 @@ def install_keel(
     # `_policy.extract_cmd_flows` does for `on_busy`). KEEL_QUIET silences it
     # exactly as it silences the banner.
     summary = Summary() if _console_enabled(policy, env) else None
-    discovery = Discovery(cwd, known_targets, summary=summary)
+
+    def _cache_poll_suspect(target: str, hits: int, span_s: int) -> None:
+        emit(
+            env,
+            f"keel ▸ warning: {target} served {hits} consecutive cache hits for one identical "
+            f"call over {span_s}s — if this is a status poll, set cache = "
+            '{ mode = "off" } on that target '
+            "(a route-key poll policy arrives in v0.6.0, #93)\n",
+            {
+                "keel": "warning",
+                "code": "cache-poll-suspect",
+                "target": target,
+                "hits": hits,
+                "span_s": span_s,
+                "version": __version__,
+            },
+        )
+
+    cachepoll = CachePollDetector(on_suspect=_cache_poll_suspect)
+    discovery = Discovery(cwd, known_targets, summary=summary, cachepoll=cachepoll)
     _STATE.discovery = discovery
     _STATE.summary = summary
     set_runtime(backend, discovery)
@@ -329,7 +349,14 @@ def _register_exit_flush() -> None:
                     # Unconditional, unlike the text form: a zero line proves
                     # Keel was live and intercepted nothing, which is exactly
                     # what the outage post-mortem had no way to establish.
-                    sys.stderr.write(format_summary_json(counts, _STATE.meta or {}, by_target))
+                    sys.stderr.write(
+                        format_summary_json(
+                            counts,
+                            _STATE.meta or {},
+                            by_target,
+                            _STATE.summary.cache_poll_suspects(),
+                        )
+                    )
                 else:
                     text = format_summary(counts, keel_on_path(), by_target)
                     if text:

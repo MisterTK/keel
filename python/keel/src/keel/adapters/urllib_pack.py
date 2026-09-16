@@ -393,7 +393,7 @@ def _run_open(orig: Callable[..., Any], self: Any, fullurl: Any, data: Any, time
     outcome = _http.call_execute(backend, env, effect, injected)
     latency_ms = round((time.perf_counter() - started) * 1000)
     if discovery is not None:
-        discovery.record(target, outcome, latency_ms)
+        discovery.record(target, outcome, latency_ms, args_hash=hash_)
 
     action, value = _http.deliver(
         outcome,

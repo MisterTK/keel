@@ -24,6 +24,9 @@ const KEYS = ["calls", "throttled", "retries_succeeded", "breaker_trips", "cache
 export function createSummary() {
   const c = Object.fromEntries(KEYS.map((k) => [k, 0]));
   const byTarget = new Map();
+  // JSON-summary-only (WS9, #78) — never printed in the text form, so it is
+  // not one of KEYS.
+  let cachePollSuspects = 0;
   return {
     /** Fold one call's outcome in. Mirrors discovery.mjs's classification,
      *  except `retries_succeeded` (success-only, narrower than `retries`).
@@ -52,6 +55,13 @@ export function createSummary() {
     },
     unprotectedByTarget() {
       return Object.fromEntries(byTarget);
+    },
+    /** Called once per fired detector key (WS9, #78) — JSON summary only. */
+    noteCachePollSuspect() {
+      cachePollSuspects += 1;
+    },
+    cachePollSuspects() {
+      return cachePollSuspects;
     },
   };
 }
@@ -100,11 +110,14 @@ export function formatSummary(counts, keelOnPath, byTarget = null) {
  * which the Python front end reads too (identical bytes, both languages).
  * `unprotected_by_target` carries the FULL map (every target, sorted keys,
  * `{}` when none) — the text line only ever names the top three (#96).
+ * `cache_poll_suspects` (WS9, #78) is JSON-summary-only — never printed in
+ * the text form, so it is not one of KEYS.
  */
-export function formatSummaryJson(counts, meta, byTarget = null) {
+export function formatSummaryJson(counts, meta, byTarget = null, cachePollSuspects = 0) {
   const obj = {};
   for (const k of KEYS) obj[k] = Number(counts?.[k] ?? 0);
   obj.unprotected_by_target = { ...(byTarget ?? {}) };
+  obj.cache_poll_suspects = Number(cachePollSuspects ?? 0);
   return dumpsLine({ ...obj, keel: "summary", ...meta });
 }
 

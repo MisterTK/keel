@@ -23,6 +23,7 @@ import {
 import { loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
+import { createCachePollDetector } from "./cachepoll.mjs";
 import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
@@ -212,7 +213,26 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // exactly as it silences the banner.
   const consoleEnabled = policy.telemetry?.console !== false && !isTruthy(env.KEEL_QUIET);
   const summary = consoleEnabled ? createSummary() : null;
-  const discovery = createDiscovery(cwd, { knownTargets, summary });
+  const cachepoll = createCachePollDetector({
+    onSuspect: (target, hits, spanS) => {
+      emit(
+        env,
+        `keel ▸ warning: ${target} served ${hits} consecutive cache hits for one identical ` +
+          `call over ${spanS}s — if this is a status poll, set cache = ` +
+          `{ mode = "off" } on that target ` +
+          `(a route-key poll policy arrives in v0.6.0, #93)\n`,
+        {
+          keel: "warning",
+          code: "cache-poll-suspect",
+          target,
+          hits,
+          span_s: spanS,
+          version: VERSION,
+        }
+      );
+    },
+  });
+  const discovery = createDiscovery(cwd, { knownTargets, summary, cachepoll });
   setRuntime({ enabled: true, backend: effectiveBackend, discovery });
 
   // Outbound host/URL-pattern targets (docs/targeting.md) are resolved by the
@@ -354,7 +374,9 @@ export function installExitFlush(
           // Unconditional, unlike the text form: a zero line proves Keel was
           // live and intercepted nothing, which is exactly what the outage
           // post-mortem had no way to establish.
-          proc.stderr.write(formatSummaryJson(summary.counts(), meta ?? {}, byTarget));
+          proc.stderr.write(
+            formatSummaryJson(summary.counts(), meta ?? {}, byTarget, summary.cachePollSuspects())
+          );
         } else {
           const text = formatSummary(summary.counts(), keelOnPath(), byTarget);
           if (text) proc.stderr.write(text);

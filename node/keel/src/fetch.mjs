@@ -252,7 +252,7 @@ export function installFetch(
         }
       }, injectedKey);
 
-      discovery?.observe(target, outcome, performance.now() - started);
+      discovery?.observe(target, outcome, performance.now() - started, hash);
 
       if (outcome.result === "ok") {
         if (trackUsage && !outcome.from_cache) recordLlmSpend(target, hopUrl, hopBody, outcome.payload);
