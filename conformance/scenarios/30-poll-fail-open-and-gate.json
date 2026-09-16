@@ -1,6 +1,6 @@
 {
   "name": "poll-fail-open-and-gate",
-  "description": "Poll (CCR-3) fail-open + gate: a JSON object without until.field, an HTTP envelope with a non-JSON body, and a non-object payload are all returned as-is with one attempt; a POST op never polls even with a pending-shaped payload.",
+  "description": "Poll (CCR-3) fail-open + gate: a JSON object without until.field, an HTTP envelope with a non-JSON body, and a non-object payload are all returned as-is with one attempt; a NON-IDEMPOTENT op never polls even with a pending-shaped payload (CCR-8: the gate is idempotency, not method).",
   "policy": {
     "target": {
       "api.jobs.example": {
@@ -36,7 +36,7 @@
     {
       "call": {
         "target": "api.jobs.example",
-        "request": { "op": "POST api.jobs.example/submit", "idempotent": true, "args_hash": "h4" },
+        "request": { "op": "POST api.jobs.example/submit", "idempotent": false, "args_hash": "h4" },
         "effect": [ { "status": "ok", "payload": { "status": "running" } } ],
         "expect": { "result": "ok", "payload": { "status": "running" }, "attempts": 1 }
       }
