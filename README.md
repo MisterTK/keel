@@ -306,8 +306,10 @@ poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal 
 The route is an ordinary target (its own breaker, rate limit, and `keel
 status` line, `defaults.outbound` underneath — no LLM budget, fallback, or
 dev cache). A host-only glob such as `*.googleapis.com` never captures LLM
-traffic. `keel doctor` proposes this block as an applyable patch on every
-`hand-rolled-poll` finding it can attribute to an SDK poll call.
+traffic. When a valid `keel.toml` is present, `keel doctor` attaches this
+block as an applyable patch to the first `hand-rolled-poll` finding it can
+attribute to an SDK poll call (one patch per provider; later findings for
+the same provider point at it).
 
 ### `keel exec` — durable external commands (CCR-4)
 
