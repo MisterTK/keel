@@ -18,6 +18,7 @@ counter these tests assert on) needs.
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -32,26 +33,46 @@ APP = str(FIXTURES / "lro_poll_app.py")
 GENERATE_APP = str(FIXTURES / "generate_cache_app.py")
 CACHEPOLL_APP = str(FIXTURES / "cachepoll_app.py")
 
+ROUTE_KEY = "POST *-aiplatform.googleapis.com/*:fetchPredictOperation"
+ROUTE_TOML = (
+    '[target."llm:google-genai"]\n'
+    'timeout = "60s"\n'
+    '\n'
+    f'[target."{ROUTE_KEY}"]\n'
+    'timeout = "30s"\n'
+)
+POLL_LINE = 'poll = { interval = "100ms", deadline = "30s", until = { field = "done", terminal = [true] } }\n'
+RETRY_LINE = 'retry = { attempts = 3, schedule = "fixed(50ms)", on = ["conn", "timeout", "429", "5xx"] }\n'
+
 
 class _FakeVertex(BaseHTTPRequestHandler):
     """POST :predictLongRunning → an operation; POST :fetchPredictOperation →
     pending twice, then done. Byte-identical poll bodies, like Vertex."""
 
     polls = 0
+    #: HTTP statuses to answer the next poll requests with BEFORE the normal
+    #: transcript resumes (e2: a scripted 503 the retry layer must absorb).
+    #: A scripted error does not count as a poll.
+    poll_script: list[int] = []
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("content-length", "0"))
         self.rfile.read(length)
         if self.path.endswith(":predictLongRunning"):
             body = {"name": "projects/p/locations/us-central1/operations/op1"}
+            status = 200
+        elif type(self).poll_script:
+            status = type(self).poll_script.pop(0)
+            body = {"error": {"code": status, "status": "UNAVAILABLE"}}
         else:
             type(self).polls += 1
+            status = 200
             body = {
                 "name": "projects/p/locations/us-central1/operations/op1",
                 "done": type(self).polls >= 3,
             }
         data = json.dumps(body).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
@@ -64,6 +85,7 @@ class _FakeVertex(BaseHTTPRequestHandler):
 class Slice1AcceptanceTest(unittest.TestCase):
     def setUp(self) -> None:
         _FakeVertex.polls = 0
+        _FakeVertex.poll_script = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeVertex)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -107,6 +129,14 @@ class Slice1AcceptanceTest(unittest.TestCase):
             for line in proc.stderr.decode().splitlines()
             if line.strip().startswith("{")
         ]
+
+    def _discovery_rows(self) -> dict[str, sqlite3.Row]:
+        conn = sqlite3.connect(self.empty_root / ".keel" / "discovery.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            return {r["target"]: r for r in conn.execute("SELECT * FROM discovery")}
+        finally:
+            conn.close()
 
     def test_a_strict_refusal_runs_keel_free_and_the_render_completes(self) -> None:
         proc = self._run()
@@ -225,3 +255,40 @@ class Slice1AcceptanceTest(unittest.TestCase):
         self.assertEqual(suspects[0]["hits"], 5)
         self.assertEqual(objs[-1]["keel"], "summary")
         self.assertEqual(objs[-1]["cache_poll_suspects"], 1)
+
+    def test_e_a_route_key_poll_policy_drives_the_vertex_poll_loop(self) -> None:
+        # Poll v2 (#93): the adopter's configuration. The route key beats the
+        # LLM host map for the operation read, the operation read is judged
+        # idempotent, and `poll` with a BOOLEAN terminal runs the loop inside
+        # Keel — the app's own first poll call already returns done.
+        (self.empty_root / "keel.toml").write_text(ROUTE_TOML + POLL_LINE)
+        proc = self._run()  # keel.toml is at KEEL_CWD: strict activation, no KEEL_POLICY needed
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"POLLS=1 DONE=True", proc.stdout, proc.stdout)
+        self.assertEqual(_FakeVertex.polls, 3, "Keel re-issued the poll twice inside one call")
+        objs = self._objs(proc)
+        self.assertEqual(objs[0]["policy_source"], "keel.toml")
+        self.assertEqual(objs[-1]["keel"], "summary")
+        self.assertEqual(objs[-1]["calls"], 2, "one submit + ONE poll call")
+        self.assertEqual(objs[-1]["cache_hits"], 0)
+        rows = self._discovery_rows()
+        self.assertEqual((rows[ROUTE_KEY]["calls"], rows[ROUTE_KEY]["attempts"]), (1, 3))
+        self.assertEqual(rows["llm:google-genai"]["calls"], 1, "only the submit lands on the provider target")
+
+    def test_e2_without_poll_the_operation_read_is_retried_through_a_503(self) -> None:
+        # The Level 0 consequence CCR-8 states plainly: an operation-read POST
+        # is now idempotent, so a 503 on a status check is retried instead of
+        # surfacing to the app. Without the rule the app would see the 503
+        # body (no `done`), loop once more, and the route row would carry
+        # not_retried = 1 — that is the mutation this test catches.
+        _FakeVertex.poll_script = [503]
+        (self.empty_root / "keel.toml").write_text(ROUTE_TOML + RETRY_LINE)
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"POLLS=3 DONE=True", proc.stdout, proc.stdout)
+        self.assertEqual(_FakeVertex.polls, 3)
+        rows = self._discovery_rows()
+        route = rows[ROUTE_KEY]
+        self.assertEqual((route["calls"], route["attempts"], route["retries"]), (3, 4, 1))
+        self.assertEqual(route["not_retried"], 0)
+        self.assertEqual(self._objs(proc)[-1]["not_retried"], 0)
