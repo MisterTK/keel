@@ -1,0 +1,221 @@
+{
+  "adapters": [
+    {
+      "detected": true,
+      "lib": "httpx",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "requests",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "aiohttp",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib3",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib.request",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "openai",
+      "status": "pinned",
+      "target": "llm:openai"
+    },
+    {
+      "detected": false,
+      "lib": "anthropic",
+      "status": "pinned",
+      "target": "llm:anthropic"
+    },
+    {
+      "detected": false,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": false,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
+      "detected": false,
+      "lib": "fetch",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "undici",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "http",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "ai-sdk",
+      "status": "pinned",
+      "target": "llm:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
+    }
+  ],
+  "boundaries": {
+    "governance_files": [],
+    "parsed_files": [
+      "dockerfile (COPY/ADD directives only)"
+    ],
+    "parsed_languages": [
+      "python",
+      "js-ts"
+    ],
+    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's six phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, activation reaching the I/O process, durable evidence). Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
+    "unparsed": [
+      "shell",
+      "makefile",
+      "ci-workflow",
+      "governance-prose"
+    ]
+  },
+  "coverage": {
+    "invisible": [],
+    "visible_unwrapped": [
+      "api.example.com"
+    ],
+    "wrapped": []
+  },
+  "findings": [
+    {
+      "action": "If a dependency makes calls Keel never reports, file an adapter request.",
+      "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
+      "level": "info",
+      "topic": "invisible"
+    },
+    {
+      "action": "Nothing to do — a reserved/documentation name is a fixture by definition.",
+      "detail": "`api.example.com` — RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real.",
+      "level": "info",
+      "topic": "reserved-name-excluded"
+    },
+    {
+      "action": "Mount a persistent volume at `.keel/` (or point `journal` at a `file:` path on one), or use a Postgres journal. Until then a redeploy or scale-to-zero discards every resumable flow.",
+      "detail": "`[flows]` is configured and the journal is SQLite at `.keel/journal.db` — this project ships as a container/serverless artifact (Dockerfile), whose filesystem does not survive an instance replacement.",
+      "level": "warn",
+      "topic": "journal-ephemeral-storage"
+    }
+  ],
+  "follow_ups": [
+    {
+      "code": "reserved-name-excluded",
+      "detail": "`api.example.com` was excluded from proposed policy — RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real. Confirm the exclusion is intended.",
+      "rank": 4,
+      "subject": "api.example.com"
+    }
+  ],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
+  "ok": true,
+  "policy": {
+    "field": null,
+    "message": null,
+    "path": "keel.toml",
+    "present": true,
+    "valid": true
+  },
+  "runtime_activation": "unverified",
+  "topology": {
+    "excluded": [
+      {
+        "host": "api.example.com",
+        "kind": "reserved-name",
+        "reason": "RFC 2606/5737 reserved or documentation name — a fixture, not a dependency; add it to keel.toml explicitly if it is real"
+      }
+    ],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": []
+  }
+}

@@ -449,6 +449,10 @@ struct PolicyValidation {
     /// `defaults.llm`, then `policy.target`'s `BTreeMap` iteration order).
     lro_timeouts: Vec<(String, u64)>,
     fix: Option<Proposal>,
+    /// `[flows] entrypoints` non-empty or `[flows.match]` non-empty (issue
+    /// #90) — whether this project has anything durable for an ephemeral
+    /// journal to lose. `false` when `keel.toml` is absent or invalid.
+    flows_configured: bool,
 }
 
 /// A one-line advisory for `keel run`'s pre-exec preflight step (dx-spec's
@@ -502,6 +506,7 @@ pub fn run(project: &Path) -> Rendered {
     let config_above_cwd_finding = config_above_cwd_finding(project);
     let boundaries = boundaries(project);
     let build_files = crate::dockerfile::analyze(project);
+    let artifacts = deploy_artifacts(project, &build_files);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
     let runtime_activation_value = runtime_activation(project, policy.check.present, &activations);
     let report = build_report(
@@ -513,6 +518,7 @@ pub fn run(project: &Path) -> Rendered {
         config_above_cwd_finding,
         boundaries,
         &build_files,
+        &artifacts,
         &stale_flows,
         runtime_activation_value,
     );
@@ -1121,6 +1127,53 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
     })
 }
 
+/// Deployment artifacts at the project root that mean "this runs in a
+/// container or on a serverless platform": the parsed build files plus the
+/// common platform manifests. Root only, like the Dockerfile scan (WS4).
+fn deploy_artifacts(project: &Path, build_files: &[crate::dockerfile::BuildFile]) -> Vec<String> {
+    let mut out: Vec<String> = build_files.iter().map(|b| b.file.clone()).collect();
+    for name in ["app.yaml", "fly.toml", "serverless.yaml", "serverless.yml"] {
+        if project.join(name).is_file() {
+            out.push(name.to_owned());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A durable-flow journal on SQLite at a deployment artifact's project root
+/// (issue #90): the redeploy/scale-to-zero pattern that discards it is common
+/// enough on container/serverless platforms that this is worth a warning
+/// without any runtime evidence — doctor can see the artifact in the repo,
+/// the runtime half of this check (below) sees the environment instead.
+fn journal_ephemeral_finding(
+    journal: &JournalReport,
+    flows_configured: bool,
+    artifacts: &[String],
+) -> Option<Finding> {
+    if journal.backend != "sqlite" || !flows_configured || artifacts.is_empty() {
+        return None;
+    }
+    Some(Finding {
+        action:
+            "Mount a persistent volume at `.keel/` (or point `journal` at a `file:` path on one), \
+                 or use a Postgres journal. Until then a redeploy or scale-to-zero discards every \
+                 resumable flow."
+                .to_owned(),
+        detail: format!(
+            "`[flows]` is configured and the journal is SQLite at `{}` — this project ships as a \
+             container/serverless artifact ({}), whose filesystem does not survive an instance \
+             replacement.",
+            journal.location,
+            artifacts.join(", ")
+        ),
+        fix: None,
+        level: "warn",
+        topic: "journal-ephemeral-storage",
+    })
+}
+
 /// Canonicalize both sides before comparing, falling back to the raw
 /// (non-canonicalized) form when a path does not exist on disk — a recorded
 /// activation may point at a path that no longer exists, and a project under
@@ -1165,9 +1218,9 @@ fn runtime_activation(project: &Path, policy_present: bool, rows: &[Activation])
 #[allow(clippy::too_many_lines)]
 // straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
-#[allow(clippy::too_many_arguments)] // ten already-resolved evidence inputs (see doc
+#[allow(clippy::too_many_arguments)] // eleven already-resolved evidence inputs (see doc
 // comment above); issue #85 added config_above_cwd_finding, WS3 added build_files,
-// #92 added runtime_activation.
+// #92 added runtime_activation, issue #90 added artifacts.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1177,6 +1230,7 @@ fn build_report(
     config_above_cwd_finding: Option<Finding>,
     boundaries: Boundaries,
     build_files: &[crate::dockerfile::BuildFile],
+    artifacts: &[String],
     stale_flows: &[crate::flows::StaleFlow],
     runtime_activation: &'static str,
 ) -> DoctorReport {
@@ -1185,6 +1239,7 @@ fn build_report(
         cmd_match,
         lro_timeouts,
         fix,
+        flows_configured,
     } = policy;
     let registry_libs = registry_libs();
 
@@ -1331,6 +1386,11 @@ fn build_report(
     );
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
+    findings.extend(journal_ephemeral_finding(
+        &journal,
+        flows_configured,
+        artifacts,
+    ));
     findings.extend(agents_cli_finding);
     // WS3: only meaningful when there IS a policy file to ship — with no
     // keel.toml in the checkout there is nothing for the image to be missing.
@@ -1644,6 +1704,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         };
     }
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -1686,6 +1747,11 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                     lro_timeouts.push((format!("target.\"{name}\""), t.0));
                 }
             }
+            // Issue #90: computed BEFORE `policy.flows` moves into `cmd_match`
+            // below.
+            let flows_configured = policy.flows.as_ref().is_some_and(|f| {
+                !f.entrypoints.is_empty() || f.match_.as_ref().is_some_and(|m| !m.is_empty())
+            });
             PolicyValidation {
                 check: PolicyCheck {
                     field: None,
@@ -1697,6 +1763,7 @@ fn validate_policy(path: &Path) -> PolicyValidation {
                 cmd_match: policy.flows.and_then(|f| f.match_).unwrap_or_default(),
                 lro_timeouts,
                 fix: None,
+                flows_configured,
             }
         }
         Err(e) => {
@@ -1719,6 +1786,7 @@ fn invalid(field: Option<String>, message: &str, fix: Option<Proposal>) -> Polic
         cmd_match: BTreeMap::new(),
         lro_timeouts: Vec::new(),
         fix,
+        flows_configured: false,
     }
 }
 
@@ -1893,6 +1961,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn journal_ephemeral_finding_needs_sqlite_flows_and_an_artifact() {
+        let sqlite = default_journal();
+        let bf = vec![crate::dockerfile::BuildFile {
+            file: "Dockerfile".into(),
+            reach: crate::dockerfile::Reach::Reached,
+            directive: None,
+            reached_in_final_stage: true,
+        }];
+        assert!(journal_ephemeral_finding(&sqlite, true, &["Dockerfile".to_owned()]).is_some());
+        assert!(
+            journal_ephemeral_finding(&sqlite, false, &["Dockerfile".to_owned()]).is_none(),
+            "no flows → nothing durable to lose"
+        );
+        assert!(
+            journal_ephemeral_finding(&sqlite, true, &[]).is_none(),
+            "no artifact → not a deployment we can see"
+        );
+        let pg = JournalReport {
+            backend: "postgres",
+            location: "postgres://\u{2026}".into(),
+            source: "keel.toml",
+            supported: false,
+        };
+        assert!(journal_ephemeral_finding(&pg, true, &["Dockerfile".to_owned()]).is_none());
+        let f = journal_ephemeral_finding(
+            &sqlite,
+            true,
+            &["Dockerfile".to_owned(), "fly.toml".to_owned()],
+        )
+        .unwrap();
+        assert_eq!((f.topic, f.level), ("journal-ephemeral-storage", "warn"));
+        assert!(f.detail.contains("Dockerfile, fly.toml"), "{}", f.detail);
+        let _ = bf;
+    }
+
+    #[test]
+    fn deploy_artifacts_lists_root_files_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("fly.toml"), "").unwrap();
+        std::fs::write(dir.path().join("serverless.yml"), "").unwrap();
+        std::fs::create_dir(dir.path().join("deploy")).unwrap();
+        std::fs::write(dir.path().join("deploy/app.yaml"), "").unwrap();
+        let bf = crate::dockerfile::analyze(dir.path());
+        assert_eq!(
+            deploy_artifacts(dir.path(), &bf),
+            vec!["fly.toml".to_owned(), "serverless.yml".to_owned()]
+        );
+    }
+
     fn scan_with(target: &str, class: TargetClass, libs: &[&str]) -> ScanResult {
         let mut s = ScanResult {
             files_scanned: 1,
@@ -1979,6 +2097,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         };
         let r = build_report(
             &scan,
@@ -1988,6 +2107,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2008,6 +2128,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // straight-line fixture setup, one bucket per
+    // scan.targets insert; the extra build_report artifacts arg pushed this over 100.
     fn topology_buckets_classify_hosts_honestly() {
         use crate::scan::{DepAverseFile, SubprocessSighting, TransportClass};
         let mut scan = ScanResult {
@@ -2080,6 +2202,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2161,6 +2284,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2247,6 +2371,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(
@@ -2324,6 +2449,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2435,6 +2561,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
 
@@ -2484,6 +2611,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2547,6 +2675,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
@@ -2569,6 +2698,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2660,6 +2790,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
 
@@ -2739,6 +2870,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(
@@ -2809,6 +2941,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2904,6 +3037,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         };
         let r = build_report(
             &scan,
@@ -2913,6 +3047,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -2983,6 +3118,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         let mcp = r
@@ -3014,6 +3150,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         }
     }
 
@@ -3034,6 +3171,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3073,6 +3211,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         let finding = r
@@ -3105,6 +3244,7 @@ mod tests {
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(
@@ -3125,6 +3265,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3151,6 +3292,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         };
         let r = build_report(
             &scan,
@@ -3160,6 +3302,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3190,6 +3333,7 @@ mod tests {
             cmd_match: BTreeMap::new(),
             lro_timeouts: Vec::new(),
             fix: None,
+            flows_configured: false,
         };
         let journal = JournalReport {
             backend: "postgres",
@@ -3205,6 +3349,7 @@ mod tests {
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3726,6 +3871,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
@@ -3783,6 +3929,7 @@ def caller():
             boundaries(dir.path()),
             &[],
             &[],
+            &[],
             "unverified",
         );
         let text = human(&r);
@@ -3822,6 +3969,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3865,6 +4013,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         let f = r
@@ -3887,6 +4036,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3915,6 +4065,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -3954,6 +4105,7 @@ def caller():
                 None,
                 None,
                 empty_boundaries(),
+                &[],
                 &[],
                 &[],
                 "unverified",
@@ -4020,6 +4172,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         let e = r
@@ -4049,6 +4202,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
@@ -4068,6 +4222,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -4110,6 +4265,7 @@ def caller():
             empty_boundaries(),
             &[],
             &[],
+            &[],
             "unverified",
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
@@ -4129,6 +4285,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",
@@ -4173,6 +4330,7 @@ def caller():
             None,
             None,
             empty_boundaries(),
+            &[],
             &[],
             &[],
             "unverified",

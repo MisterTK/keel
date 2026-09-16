@@ -27,6 +27,7 @@ import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./s
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
 import { applyPackDefaults } from "./defaults.mjs";
+import { ephemeralJournalWarning } from "./deploy.mjs";
 import { devCacheOffReason, resolveDevCache, serverlessMarker } from "./packs/llm.mjs";
 import { installChildProcessPack } from "./packs/child-process.mjs";
 import { installMcpPack } from "./packs/mcp.mjs";
@@ -173,6 +174,12 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
     env
   );
   backend.configure(policy); // throws KEEL-E001/KEEL-E005 on invalid/unsupported policy
+  // Issue #90: durable flows on a SQLite journal that will not survive an
+  // instance replacement — doctor can see this from a deploy artifact in the
+  // repo, but only the runtime can see the environment (serverless markers,
+  // /.dockerenv, a read-only cwd). Python twin: `bootstrap.py`.
+  const journalWarning = ephemeralJournalWarning(policy, env, cwd);
+  if (journalWarning !== null) emit(env, ...journalWarning);
 
   // `keel sim <plan>`: adapter-level fault injection driven by a declarative
   // plan (docs/sim-format.md), wired BEFORE the recording tee below so a run

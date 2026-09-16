@@ -23,6 +23,7 @@ from typing import Any, Mapping
 from . import __version__
 from ._backend import load_backend
 from ._defaults import apply_pack_defaults
+from ._deploy import ephemeral_journal_warning
 from ._discovery import Discovery
 from ._hook import KeelFinder, install_import_hook, remove_import_hook
 from ._log import emit, json_logs
@@ -181,6 +182,13 @@ def install_keel(
     )
     policy = apply_journal_env_override(policy, env)
     backend.configure(policy)  # raises KEEL-E001/KEEL-E005 on invalid/unsupported policy
+    # Issue #90: durable flows on a SQLite journal that will not survive an
+    # instance replacement — doctor can see this from a deploy artifact in the
+    # repo, but only the runtime can see the environment (serverless markers,
+    # /.dockerenv, a read-only cwd).
+    warning = ephemeral_journal_warning(policy, env, cwd)
+    if warning is not None:
+        emit(env, *warning)
 
     # The explicit `[target."…"]` keys of the SAME effective policy the core
     # just configured — discovery's "wrapped" classification (dx-spec §2's

@@ -722,6 +722,44 @@ fn doctor_json_matches_golden_for_dockerfile_without_keel_toml() {
     check_golden("doctor_dockerfile_no_copy.json", &json_string(&r.json));
 }
 
+/// A project with `[flows]` configured, a default SQLite journal, and a root
+/// Dockerfile that DOES ship keel.toml (`COPY . /code`) — the exact case
+/// `keel-toml-not-in-image` does NOT catch, since the artifact fully ships
+/// the policy. Issue #90: durable-flow state on that same container's
+/// filesystem does not survive an instance replacement either.
+#[test]
+fn doctor_json_matches_golden_for_flows_dockerfile() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in ["app.py", "keel.toml", "Dockerfile"] {
+        std::fs::copy(
+            fixtures().join("py_flows_dockerfile").join(f),
+            dir.path().join(f),
+        )
+        .unwrap();
+    }
+    let r = doctor::run(dir.path());
+    assert_eq!(
+        r.exit,
+        keel_cli::EXIT_OK,
+        "a packaging warning does not flip ok"
+    );
+    assert!(
+        has_topic(&r.json, "journal-ephemeral-storage"),
+        "{}",
+        json_string(&r.json)
+    );
+    assert!(
+        !has_topic(&r.json, "keel-toml-not-in-image"),
+        "the Dockerfile ships keel.toml — should not ALSO warn about that: {}",
+        json_string(&r.json)
+    );
+    check_golden("doctor_flows_dockerfile.json", &json_string(&r.json));
+}
+
 /// An agents-cli project root with `agent_directory: app`, `app/` present, and
 /// a `keel.toml` written at `<root>/<toml_at>`. Returns the root TempDir.
 fn agents_cli_tree(toml_at: &str) -> tempfile::TempDir {
