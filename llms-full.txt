@@ -198,10 +198,12 @@ Silence on success is a DX invariant, not a lack of evidence:
   with `--watch` or `--serve`.
 - **`KEEL_LOG_FORMAT=json`** — five deployment-evidence lines become one JSON
   object per line, byte-identical between Python and Node: the startup
-  (activation) line, the exit summary, the activation refusal, the
+  (activation) line, the exit summary, BOTH activation refusals
+  (`policy-missing-at-keel-cwd`, and `activation-failed` for any other
+  bootstrap failure — including a `keel.toml` an older Keel cannot parse), the
   ephemeral-journal warning, and the `cache-poll-suspect` warning. Every one
   of them carries a `severity` (`INFO` on the activation and summary,
-  `WARNING` on the two warnings, `ERROR` on the refusal) — Cloud Logging and
+  `WARNING` on the two warnings, `ERROR` on both refusals) — Cloud Logging and
   CloudWatch fill an entry's severity only from that field, so without it a
   refusal to activate is indistinguishable from a healthy start in any
   `severity>=ERROR` view. Nothing else converts: other `keel ▸ …` prose stays
@@ -298,7 +300,7 @@ cargo build -p keelrun-cli                      # the `keel` binary
 
 ## Conformance
 
-57 scenarios in `conformance/scenarios/` (44 Tier 1, 13 Tier 2), run by the
+58 scenarios in `conformance/scenarios/` (45 Tier 1, 13 Tier 2), run by the
 real Rust core (all of them — Tier 2 additionally against a real Postgres
 journal backend), the Rust/Python/Node stubs (every Tier 1 scenario; Tier 2
 skipped by design — no journal), and the native front ends.

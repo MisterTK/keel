@@ -103,10 +103,11 @@ human-facing "what happened" check these first:
   `uvx` equivalent). A no-op run stays silent. `console = false` under
   `[telemetry]`, or `KEEL_QUIET=1`, turns it off. In a container stderr is
   the surface that survives — a parent that captures a child's stderr
-  silently swallows it — and `KEEL_LOG_FORMAT=json` makes five lines one JSON
-  object each: that summary, the startup line, an activation error, and the
-  two runtime warnings (`journal-ephemeral-storage`, `cache-poll-suspect`).
-  All five carry a `severity` — `INFO`, `WARNING`, `ERROR` — which is the only
+  silently swallows it — and `KEEL_LOG_FORMAT=json` makes six lines one JSON
+  object each: that summary, the startup line, both activation refusals
+  (`policy-missing-at-keel-cwd`, `activation-failed`), and the two runtime
+  warnings (`journal-ephemeral-storage`, `cache-poll-suspect`).
+  All six carry a `severity` — `INFO`, `WARNING`, `ERROR` — which is the only
   thing Cloud Logging and CloudWatch read to rank an entry, so a
   `severity>=ERROR` view now shows a refusal to activate instead of hiding it
   among healthy starts.

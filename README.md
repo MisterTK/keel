@@ -207,12 +207,13 @@ dashboard — pick whichever fits the moment:
 
    In a container, stderr is the surface that survives — though a parent
    that captures a child's stderr silently swallows it. Set
-   `KEEL_LOG_FORMAT=json` and five lines each become one JSON object: this
-   summary, the startup line, an activation error, and both warnings above —
-   so `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are
+   `KEEL_LOG_FORMAT=json` and six lines each become one JSON object: this
+   summary, the startup line, both activation refusals
+   (`policy-missing-at-keel-cwd` and `activation-failed`), and both warnings
+   above — so `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are
    queryable fields in Cloud Logging or CloudWatch rather than prose. Every
-   one of the five carries a `severity` (`INFO` on the startup line and the
-   summary, `WARNING` on the two warnings, `ERROR` on the activation error):
+   one of the six carries a `severity` (`INFO` on the startup line and the
+   summary, `WARNING` on the two warnings, `ERROR` on both refusals):
    those platforms fill an entry's severity only from that field, so without
    it a refusal to activate reads as a healthy start in any `severity>=ERROR`
    view. The summary's `backend` field names which backend actually ran —

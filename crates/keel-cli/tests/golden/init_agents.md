@@ -36,8 +36,12 @@ absent or, worse, running on defaults):
 At startup Keel prints exactly one `keel ▸ wrapped …` line to **stderr**
 naming the policy it loaded (`with policy /code/keel.toml`) or the directory
 it searched (`with production defaults — no keel.toml in /code`). In container
-logs, that line is the activation evidence; `KEEL_LOG_FORMAT=json` makes it
-and the exit summary one JSON object per line.
+logs, that line is the activation evidence; `KEEL_LOG_FORMAT=json` replaces
+every one of Keel's console lines with a single JSON object carrying a
+`severity`. Six kinds: the activation line and the exit summary (`INFO`), both
+activation refusals (`ERROR` — Keel is off and the app is serving unprotected),
+and the ephemeral-journal and cache-poll-suspect warnings (`WARNING`). Filter on
+`severity` to separate "Keel is working" from "Keel is not running at all".
 
 Do not hand-write retry loops or backoff around calls Keel already wraps; edit
 `keel.toml` instead. Uninstalling Keel removes the behavior and nothing else —
