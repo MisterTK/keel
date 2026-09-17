@@ -761,7 +761,7 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
             conn.execute_batch("ALTER TABLE activations ADD COLUMN backend TEXT;")?;
         }
     }
-    conn.execute_batch("PRAGMA user_version = 4")?;
+    conn.execute_batch(&format!("PRAGMA user_version = {DISCOVERY_SCHEMA_VERSION}"))?;
     Ok(())
 }
 
