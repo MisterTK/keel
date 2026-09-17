@@ -149,7 +149,11 @@ enforcing wall-clock timeouts).
      that base64-decodes and JSON-parses to an object, which becomes the
      document; any other payload object is the document itself; anything
      else (non-object payload, undecodable/non-object body) is **fail-open**:
-     the payload is returned as-is. The decode is **canonical/strict**
+     the payload is returned as-is. This step runs BEFORE the verdict below,
+     so `until.absent` is **not consulted** for any of it — `absent` answers
+     "the document parsed and the field is not in it", never "the document
+     could not be read" (scenario 51 pins a bodyless envelope failing open
+     under `absent = "pending"`). The decode is **canonical/strict**
      (RFC 4648 §4 alphabet only, correct padding, and zero discarded
      padding bits — matching Rust's `base64::engine::general_purpose::
      STANDARD.decode`, not a lenient decoder): a `body_b64` that would only

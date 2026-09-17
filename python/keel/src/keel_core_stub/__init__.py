@@ -337,10 +337,17 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
     "fail_open". Parity with keel-core's ``poll_verdict``
     (conformance/README.md "Poll"). CCR-8: `until.field` is a dotted path
     walked through nested objects, and `until.terminal` matches by same-JSON-
-    type equality (not string coercion). CCR-11: a document that does not
-    carry the field at all is judged by `until.absent` — "fail_open" by
+    type equality (not string coercion). CCR-11: a PARSED JSON OBJECT that
+    does not carry the field is judged by `until.absent` — "fail_open" by
     default, "pending" when the operator declared absence the pending signal
-    (a running google.longrunning.Operation omits `done` entirely)."""
+    (a running google.longrunning.Operation omits `done` entirely).
+
+    `absent` governs absence, not unreadability. Every "fail_open" return
+    below the envelope branch happens BEFORE `until.absent` is consulted and
+    is unaffected by it: a non-dict payload, an envelope with no string
+    `body_b64`, a body that will not strictly base64-decode, a body that is
+    not JSON, and a body that is JSON but not an object all fail open even
+    under `absent = "pending"`."""
     if not isinstance(payload, dict):
         return "fail_open"
     doc = payload

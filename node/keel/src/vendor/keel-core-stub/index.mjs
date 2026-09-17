@@ -199,10 +199,17 @@ function terminalMatch(value, terminal) {
 /** Judge one successful poll iteration's payload: "terminal" | "pending" |
  *  "fail_open". Parity with keel-core's `poll_verdict`
  *  (conformance/README.md "Poll"; CCR-8 widened the gate and the field/
- *  terminal semantics; CCR-11 made a document that does not carry the field
- *  at all answer to `until.absent` — "fail_open" by default, "pending" when
- *  the operator declared absence the pending signal, as every running
- *  google.longrunning.Operation needs). */
+ *  terminal semantics; CCR-11 made a PARSED JSON OBJECT that does not carry
+ *  the field answer to `until.absent` — "fail_open" by default, "pending"
+ *  when the operator declared absence the pending signal, as every running
+ *  google.longrunning.Operation needs).
+ *
+ *  `absent` governs absence, not unreadability. Every "fail_open" return
+ *  before the `lookupField` call happens BEFORE `until.absent` is consulted
+ *  and is unaffected by it: a non-table payload, an envelope with no string
+ *  `body_b64`, a body that will not strictly base64-decode, a body that is
+ *  not JSON, and a body that is JSON but not a table all fail open even
+ *  under `absent = "pending"`. */
 function pollVerdict(poll, payload) {
   if (!isTable(payload)) return "fail_open";
   let doc = payload;

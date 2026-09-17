@@ -668,12 +668,21 @@ pub struct IdempotencyPolicy {
     pub header: String,
 }
 
-/// What a response that does not carry `until.field` at all means (CCR-11).
-/// `FailOpen` is the default and the pre-CCR-11 behavior: return the response
-/// as-is and end the poll. `Pending` reads the absence as the pending signal
-/// and keeps polling — the shape every `google.longrunning.Operation` needs,
-/// since proto3 JSON omits a false bool and a running operation's body is
-/// just `{"name": "..."}`.
+/// What a PARSED JSON OBJECT that does not carry `until.field` means
+/// (CCR-11). `FailOpen` is the default and the pre-CCR-11 behavior: return
+/// the response as-is and end the poll. `Pending` reads the absence as the
+/// pending signal and keeps polling — the shape every
+/// `google.longrunning.Operation` needs, since proto3 JSON omits a false bool
+/// and a running operation's body is just `{"name": "..."}`.
+///
+/// This governs ABSENCE, not unreadability. A response the core cannot parse
+/// into a JSON object — a non-object payload, an envelope with no `body_b64`,
+/// a body that will not strictly base64-decode, a body that is not JSON, or a
+/// body that is JSON but not an object — fails open *before* `absent` is
+/// consulted, in every implementation (`poll_verdict` in
+/// `keel-core`/`keel-core-stub` and its Python/Node twins). That predates
+/// CCR-11 and is unchanged by it: a predicate cannot be applied to a document
+/// that was never parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PollAbsent {
