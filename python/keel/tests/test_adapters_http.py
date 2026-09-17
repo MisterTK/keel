@@ -365,5 +365,27 @@ class OperationReadCorpusTest(unittest.TestCase):
         self.assertTrue(_http.is_idempotent("GET", []))
 
 
+class CustomMethodVerbTest(unittest.TestCase):
+    """The one shared parser (#107.3) both `operation_read` and
+    `lro_shaped_path` sit on top of: the last path segment's text after its
+    last `:`, or None when that segment carries no colon. Twin of judge.mjs
+    `customMethodVerb`."""
+
+    def test_returns_the_verb(self) -> None:
+        for path, verb in [
+            ("/v1/models/veo:fetchOperation", "fetchOperation"),
+            ("/v1/models/veo:predictLongRunning", "predictLongRunning"),
+            ("models/veo:a:b", "b"),  # last colon wins
+            (":fetchOperation", "fetchOperation"),
+        ]:
+            with self.subTest(path):
+                self.assertEqual(_http._custom_method_verb(path), verb)
+
+    def test_none_without_a_colon_in_the_last_segment(self) -> None:
+        for path in ["/v1/operations/abc", "", "/a:b/c", "/"]:
+            with self.subTest(path):
+                self.assertIsNone(_http._custom_method_verb(path))
+
+
 if __name__ == "__main__":
     unittest.main()

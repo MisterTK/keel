@@ -51,6 +51,19 @@ export function normalizeRequest(input, init) {
 }
 
 /**
+ * The Google custom-method verb a URL path names, or null when the last path
+ * segment carries no `:`. One parser, two predicates: both `operationRead`
+ * (CCR-8 idempotency) and `lroShapedPath` (the cache exemption) read the verb
+ * through this, then apply their OWN — deliberately different — test to it.
+ * Twin of Python's `_http._custom_method_verb`.
+ */
+export function customMethodVerb(pathname) {
+  const last = String(pathname ?? "").split("/").pop() ?? "";
+  const colon = last.lastIndexOf(":");
+  return colon < 0 ? null : last.slice(colon + 1);
+}
+
+/**
  * True iff (hostname, pathname) is a Google long-running-operation READ:
  * a host under `googleapis.com` (apex or any `*.googleapis.com`, case-
  * insensitive) whose last path segment carries a `fetch…Operation` custom
@@ -62,11 +75,8 @@ export function operationRead(hostname, pathname) {
   if (!hostname || !pathname) return false;
   const h = String(hostname).toLowerCase();
   if (h !== "googleapis.com" && !h.endsWith(".googleapis.com")) return false;
-  const last = String(pathname).split("/").pop() ?? "";
-  const colon = last.lastIndexOf(":");
-  if (colon < 0) return false;
-  const verb = last.slice(colon + 1);
-  return verb.startsWith("fetch") && verb.endsWith("Operation");
+  const verb = customMethodVerb(pathname);
+  return verb !== null && verb.startsWith("fetch") && verb.endsWith("Operation");
 }
 
 /**
@@ -201,10 +211,8 @@ function canonicalBody(body) {
  * `_http.lro_shaped_path`; keep identical.
  */
 export function lroShapedPath(pathname) {
-  const last = String(pathname ?? "").split("/").pop() ?? "";
-  const colon = last.lastIndexOf(":");
-  if (colon < 0) return false;
-  const verb = last.slice(colon + 1);
+  const verb = customMethodVerb(pathname);
+  if (verb === null) return false;
   return verb.endsWith("LongRunning") || (verb.startsWith("fetch") && verb.endsWith("Operation"));
 }
 

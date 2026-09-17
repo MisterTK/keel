@@ -239,6 +239,16 @@ def install_keel(
     cmd_flows = extract_cmd_flows(policy)
     set_cmd_flows(cmd_flows)
 
+    # #104: register the exit-flush hook BEFORE the row below is remembered.
+    # `record_activation` only queues the row in memory (written lazily on
+    # the first outcome or at close) — the atexit hook below is what
+    # guarantees a well-behaved process flushes it at all, so it must exist
+    # before a later best-effort failure (e.g. install_adapters raising)
+    # could otherwise leave the row queued forever with no hook to flush it.
+    # `_register_exit_flush` only reads `_STATE` lazily inside `_flush`, so
+    # it has no dependency on anything constructed after this point.
+    _register_exit_flush()
+
     # One activation row per process (WS8, #92): the evidence answering "was
     # Keel on, with which policy?" after a deployment. Spread `_STATE.meta`
     # (the same provenance the banner/JSON summary report) so this can never
@@ -267,7 +277,6 @@ def install_keel(
     mcp = install_mcp_pack()
     _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
 
-    _register_exit_flush()
     _banner(env, source, [t.key for t in targets], adapters, mcp, cwd, cwd_source)
 
     state = {

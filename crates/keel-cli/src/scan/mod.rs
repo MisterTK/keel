@@ -127,6 +127,21 @@ pub struct SimplificationSighting {
     /// SDK poll shapes seen in the loop, e.g. `operations.get`; empty for
     /// URL-literal polls and non-poll kinds.
     pub sdk_polls: Vec<String>,
+    /// The loop's own sleep interval in whole seconds, when the source states
+    /// it as one unambiguous integer literal (#107). `None` whenever it is not
+    /// statically certain — a computed backoff, a fractional sleep, two
+    /// disagreeing sleeps, or a non-loop kind. Never a guess: a consumer
+    /// falls back to its own documented default on `None`.
+    pub interval_s: Option<u32>,
+    /// A whole-second deadline the sighting's enclosing FUNCTION declares —
+    /// the default of a timeout-named parameter (`timeout_s: int = 900`), and
+    /// only when the function declares exactly one. It is a property of the
+    /// function, not of this loop: it is computed once per function and
+    /// stamped on every loop sighting inside it. `None` under the same
+    /// never-guess rule as [`Self::interval_s`]; a literal in a comparison
+    /// (`waited > 60`) is deliberately not a source, since such a literal is
+    /// usually an iteration count rather than seconds.
+    pub deadline_s: Option<u32>,
 }
 
 /// One hand-rolled orchestration construct sighted in a file the language

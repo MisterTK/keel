@@ -254,12 +254,21 @@ struct PolicyCheck {
 /// One actionable finding. Where the finding implies a policy edit, `fix`
 /// carries the applyable form (dx-spec §5, diffs as the lingua franca): a
 /// unified `patch` for `git apply` plus structured `changes`.
+///
+/// `fix_ref` is the structured half of "this finding's fix lives elsewhere":
+/// the `file:line` of the sighting whose finding holds the patch, for the case
+/// where two findings would propose the SAME edit and only one patch can apply
+/// (#107). Absent — and omitted from the JSON entirely — on every finding that
+/// either carries its own `fix` or needs none, so existing consumers see the
+/// exact bytes they saw before.
 #[derive(Debug, Serialize)]
 struct Finding {
     action: String,
     detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fix: Option<Proposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix_ref: Option<String>,
     level: &'static str,
     topic: &'static str,
 }
@@ -614,6 +623,7 @@ fn resilience_finding(scan: &ScanResult, registry_libs: &BTreeSet<&str>) -> Opti
             if libs.len() == 1 { "it" } else { "they" }
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "preexisting-resilience",
     })
@@ -639,6 +649,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 .to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "url-no-transport",
         });
@@ -674,6 +685,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "subprocess-blind-spot",
         });
@@ -695,6 +707,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -712,6 +725,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -746,6 +760,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
                 cmds.join(", ")
             ),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: "subprocess-blind-spot",
         });
@@ -773,6 +788,7 @@ fn topology_findings(topology: &Topology) -> Vec<Finding> {
             action: action.to_owned(),
             detail: format!("`{}` — {}.", entry.host, entry.reason),
             fix: None,
+            fix_ref: None,
             level: "info",
             topic: excluded_kind_topic(entry.kind),
         });
@@ -862,30 +878,107 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
     out
 }
 
-/// The TOML block for one proposal, carrying its own evidence comment (the
-/// loop it replaces) — the no-raw-source rule holds: only the file, line and
-/// function name are interpolated.
-fn render_route_block(p: &RouteKeyProposal, s: &SimplificationSighting) -> String {
+/// The cadence ONE route-key patch proposes, folded over every sighting that
+/// shares that key set (#107). One patch governs a route all of those loops
+/// travel, so each column is the most conservative value across them — the
+/// MAXIMUM — and drops to the block's documented default the moment any one
+/// member's value is unknown. Speeding a loop up is the failure mode that
+/// matters here (an LRO poll storm); slowing one down is not.
+#[derive(Debug, Clone, Copy, Default)]
+struct RouteCadence {
+    /// Max `interval_s` across the set, or `None` if any member has none.
+    interval_s: Option<u32>,
+    /// Max `deadline_s` across the set, or `None` if any member has none.
+    deadline_s: Option<u32>,
+    /// How many sightings share this key set (>= 1), for the provenance
+    /// comment.
+    sightings: usize,
+}
+
+impl RouteCadence {
+    fn of(s: &SimplificationSighting) -> Self {
+        Self {
+            interval_s: s.interval_s,
+            deadline_s: s.deadline_s,
+            sightings: 1,
+        }
+    }
+
+    fn fold(&mut self, s: &SimplificationSighting) {
+        // `zip` is the whole rule: `None` on either side erases the column.
+        self.interval_s = self.interval_s.zip(s.interval_s).map(|(a, b)| a.max(b));
+        self.deadline_s = self.deadline_s.zip(s.deadline_s).map(|(a, b)| a.max(b));
+        self.sightings += 1;
+    }
+}
+
+/// The TOML block for one proposal, carrying its own evidence comment — the
+/// no-raw-source rule holds: only the file, line, function name and a count
+/// are interpolated.
+///
+/// `interval`/`deadline` come from [`RouteCadence`], i.e. the slowest values
+/// observed across every loop on this route, defaulting to `10s` / `30m` per
+/// column. Whenever more than one loop is involved the comment says which is
+/// which, PER COLUMN: a defaulted column was not observed anywhere, and
+/// claiming it was "the slowest of them" would be a false statement sitting
+/// right beside the number.
+fn render_route_block(
+    p: &RouteKeyProposal,
+    s: &SimplificationSighting,
+    cadence: RouteCadence,
+) -> String {
+    let interval = cadence
+        .interval_s
+        .map_or_else(|| "10s".to_owned(), |v| format!("{v}s"));
+    let deadline = cadence
+        .deadline_s
+        .map_or_else(|| "30m".to_owned(), |v| format!("{v}s"));
+    let provenance = if cadence.sightings > 1 {
+        // Only claim "slowest observed" for a column actually derived from the
+        // loops; a defaulted column says so, and says why.
+        let source = match (cadence.interval_s, cadence.deadline_s) {
+            (Some(_), Some(_)) => "interval and deadline are the slowest of them",
+            (Some(_), None) => {
+                "interval is the slowest of them, deadline is Keel's default \
+                 (a loop on this route declares none)"
+            }
+            (None, Some(_)) => {
+                "deadline is the slowest of them, interval is Keel's default \
+                 (a loop on this route declares none)"
+            }
+            (None, None) => {
+                "interval and deadline are Keel's defaults \
+                 (a loop on this route declares neither)"
+            }
+        };
+        format!(
+            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}); {}",
+            cadence.sightings, s.file, s.line, s.function, source
+        )
+    } else {
+        format!(
+            "replaces the hand-rolled poll in {}:{} ({})",
+            s.file, s.line, s.function
+        )
+    };
     format!(
-        "[target.\"{}\"]   # keel doctor: {} — replaces the hand-rolled poll in {}:{} ({})\n\
+        "[target.\"{}\"]   # keel doctor: {} — {}\n\
          timeout = \"30s\"\n\
-         poll    = {{ interval = \"10s\", deadline = \"30m\", until = {{ field = \"{}\", terminal = {} }} }}\n",
-        p.key, p.note, s.file, s.line, s.function, p.field, p.terminal
+         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {{ field = \"{}\", terminal = {} }} }}\n",
+        p.key, p.note, provenance, interval, deadline, p.field, p.terminal
     )
 }
 
-/// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
-/// the sorted key set it would append (the dedupe identity — see
-/// [`simplification_findings`]). `None` when no shape is known, every proposed
-/// key is already configured, or the resulting document would not parse.
-fn route_key_fix(
+/// The route keys one `hand-rolled-poll` sighting would append to
+/// `policy_text`, already filtered against what that document configures.
+/// `None` when there is no base document to edit (absent or invalid
+/// `keel.toml`: propose nothing rather than a patch that would create/clobber
+/// the file), or when the sighting names no proposable route.
+fn route_key_candidates(
     s: &SimplificationSighting,
     policy_text: Option<&str>,
-) -> Option<(Vec<&'static str>, Proposal)> {
-    // `None` = no base document to edit (absent or invalid keel.toml): propose
-    // nothing rather than a patch that would create/clobber the file.
-    let text = policy_text?;
-    let existing: toml_edit::DocumentMut = text.parse().ok()?;
+) -> Option<Vec<RouteKeyProposal>> {
+    let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
     let has_key = |k: &str| {
         existing
             .get("target")
@@ -898,19 +991,59 @@ fn route_key_fix(
         .flat_map(|t| route_key_proposals(t, &s.sdk_polls))
         .filter(|p| !has_key(p.key))
         .collect();
-    if proposals.is_empty() {
-        return None;
-    }
+    (!proposals.is_empty()).then_some(proposals)
+}
+
+/// The sorted key set a sighting's candidates form — the dedupe identity and
+/// the [`RouteCadence`] fold key (see [`simplification_findings`]).
+fn route_key_set(proposals: &[RouteKeyProposal]) -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = proposals.iter().map(|p| p.key).collect();
     keys.sort_unstable();
+    keys
+}
+
+/// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
+/// the key set it would append. `None` when no shape is known, every proposed
+/// key is already configured, or the resulting document would not parse. The
+/// cadence is looked up by key set, NOT read off `s` — see [`RouteCadence`].
+fn route_key_fix(
+    s: &SimplificationSighting,
+    policy_text: Option<&str>,
+    cadences: &BTreeMap<Vec<&'static str>, RouteCadence>,
+) -> Option<(Vec<&'static str>, Proposal)> {
+    let proposals = route_key_candidates(s, policy_text)?;
+    let keys = route_key_set(&proposals);
+    let cadence = cadences.get(&keys).copied().unwrap_or_default();
     let ops: Vec<PolicyOp> = proposals
         .iter()
         .map(|p| PolicyOp::AppendBlock {
-            text: render_route_block(p, s),
+            text: render_route_block(p, s, cadence),
         })
         .collect();
     let proposal = propose(policy_text, &ops).ok()?;
     (!proposal.patch.is_empty()).then_some((keys, proposal))
+}
+
+/// Fold every `hand-rolled-poll` sighting into the cadence of the route-key
+/// set it would propose, BEFORE any finding is rendered — the patch the first
+/// sighting carries has to speak for all of them.
+fn route_cadences(
+    scan: &ScanResult,
+    policy_text: Option<&str>,
+) -> BTreeMap<Vec<&'static str>, RouteCadence> {
+    let mut out: BTreeMap<Vec<&'static str>, RouteCadence> = BTreeMap::new();
+    for s in &scan.simplifications {
+        if s.kind != "hand-rolled-poll" {
+            continue;
+        }
+        let Some(proposals) = route_key_candidates(s, policy_text) else {
+            continue;
+        };
+        out.entry(route_key_set(&proposals))
+            .and_modify(|c| c.fold(s))
+            .or_insert_with(|| RouteCadence::of(s));
+    }
+    out
 }
 
 /// The WS3 simplification findings: each hand-rolled pattern the scan
@@ -928,8 +1061,10 @@ fn route_key_fix(
 /// blocks against the same base file, and only one such patch can apply — so
 /// the proposal is attached to the FIRST sighting (in `scan.simplifications`
 /// order: file, line, kind) for a given key set, and later sightings with that
-/// same key set point at it instead. Dedupe is by key SET, not by target, so a
-/// google-genai loop and an openai loop each still get their own patch.
+/// same key set point at it through `fix_ref` — the holder's `file:line`, a
+/// structured reference rather than prose about report order (#107). Dedupe is
+/// by key SET, not by target, so a google-genai loop and an openai loop each
+/// still get their own patch.
 ///
 /// `policy_text` is the base document a proposal edits; the caller passes
 /// `None` for an invalid `keel.toml` — the removal fix on the policy finding
@@ -941,9 +1076,13 @@ fn simplification_findings(
 ) -> Vec<Finding> {
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
-    // Key sets already proposed in this report (see the dedupe note above).
-    let mut proposed: BTreeSet<Vec<&'static str>> = BTreeSet::new();
+    // Key sets already proposed in this report -> the `file:line` of the
+    // sighting whose finding carries that patch (the `fix_ref` a later
+    // duplicate points at, so the pointer survives reordering/filtering).
+    let mut proposed: BTreeMap<Vec<&'static str>, String> = BTreeMap::new();
+    let cadences = route_cadences(scan, policy_text);
     for s in &scan.simplifications {
+        let mut fix_ref = None;
         let targets = s.targets.join(", ");
         let actionable_now = s.targets.iter().any(|t| wrappable.contains(t.as_str()));
         let (level, when) = if actionable_now {
@@ -957,17 +1096,14 @@ fn simplification_findings(
                 // The first sighting for a key set carries the patch; later
                 // ones name it, since only one of two identical patches can
                 // apply against the same base file.
-                let already_proposed = match route_key_fix(s, policy_text) {
-                    Some((keys, proposal)) => {
-                        if proposed.insert(keys) {
-                            fix = Some(proposal);
-                            false
-                        } else {
-                            true
-                        }
+                if let Some((keys, proposal)) = route_key_fix(s, policy_text, &cadences) {
+                    if let Some(holder) = proposed.get(&keys) {
+                        fix_ref = Some(holder.clone());
+                    } else {
+                        proposed.insert(keys, format!("{}:{}", s.file, s.line));
+                        fix = Some(proposal);
                     }
-                    None => false,
-                };
+                }
                 let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
                      `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
                      POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
@@ -980,10 +1116,11 @@ fn simplification_findings(
                         " Or apply the attached patch (`git apply`): it adds the route-key \
                          `poll` block for this provider — tune `interval`/`deadline` to the job.",
                     );
-                } else if already_proposed {
-                    action.push_str(
-                        " The route-key patch for this provider is attached to the first \
-                         hand-rolled-poll finding above.",
+                } else if let Some(holder) = &fix_ref {
+                    let _ = write!(
+                        action,
+                        " The route-key patch for this provider is attached to the \
+                         `hand-rolled-poll` finding for {holder} (`fix_ref`)."
                     );
                 }
                 (
@@ -1031,6 +1168,7 @@ fn simplification_findings(
             action,
             detail: format!("{what}."),
             fix,
+            fix_ref,
             level,
             topic,
         });
@@ -1125,11 +1263,14 @@ fn build_follow_ups(
     let (inheriting, uncovered): (Vec<&ExternalProcess>, Vec<&ExternalProcess>) = unmatched
         .into_iter()
         .partition(|p| p.inherits_activation == Some("python-pth"));
-    if !uncovered.is_empty() {
-        let cmds: Vec<String> = uncovered
-            .iter()
-            .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
-            .collect();
+    // Issue #102: even when every sighting self-activates (no uncovered blind
+    // spot at all), the inheriting count must still be reachable from
+    // `follow_ups`, not only from the lower-priority `info` finding — a
+    // project whose children ALL self-activate previously never saw this
+    // follow-up. The detail branches on whether there is anything left to
+    // chase; the subject/suffix formatting for the already-working uncovered
+    // case is unchanged.
+    if !uncovered.is_empty() || !inheriting.is_empty() {
         let mut extra = Vec::new();
         if !in_tests.is_empty() {
             extra.push(format!("+{} in test files", in_tests.len()));
@@ -1150,13 +1291,32 @@ fn build_follow_ups(
         } else {
             format!(" ({})", extra.join(", "))
         };
-        ups.push(FollowUp {
-            code: "subprocess-blind-spot",
-            detail: format!(
+        let detail = if uncovered.is_empty() {
+            let (noun, verb) = if inheriting.len() == 1 {
+                ("child", "self-activates")
+            } else {
+                ("children", "self-activate")
+            };
+            format!(
+                "No externally-launched process here is a blind spot — the {} Python {noun} \
+                 that {verb} when it inherits KEEL_ENABLE. There is no blind spot to chase, \
+                 only to confirm the self-activation covers what you expect.",
+                inheriting.len()
+            )
+        } else {
+            let cmds: Vec<String> = uncovered
+                .iter()
+                .map(|p| format!("`{}` ({}:{})", p.command, p.file, p.line))
+                .collect();
+            format!(
                 "Keel cannot see traffic inside externally-launched processes; confirm none of \
                  these carry traffic you care about: {}.",
                 cmds.join(", ")
-            ),
+            )
+        };
+        ups.push(FollowUp {
+            code: "subprocess-blind-spot",
+            detail,
             rank: follow_up_rank("subprocess-blind-spot"),
             subject: format!(
                 "{} externally-launched process(es){suffix}",
@@ -1275,6 +1435,7 @@ fn agents_cli_placement_finding(project: &Path) -> Option<Finding> {
              keel.toml at the project root never ships to the container."
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "agents-cli-config-placement",
     })
@@ -1326,6 +1487,7 @@ fn config_above_cwd_finding(project: &Path) -> Option<Finding> {
                     here.display()
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "config-above-cwd",
             });
@@ -1384,6 +1546,7 @@ fn journal_finding(journal: &JournalReport) -> Option<Finding> {
             journal.backend, journal.backend
         ),
         fix: None,
+        fix_ref: None,
         level: "error",
         topic: "journal",
     })
@@ -1431,6 +1594,7 @@ fn journal_ephemeral_finding(
             artifacts.join(", ")
         ),
         fix: None,
+        fix_ref: None,
         level: "warn",
         topic: "journal-ephemeral-storage",
     })
@@ -1563,6 +1727,7 @@ fn build_report(
                 "`{target}` is visible in your code but has no observed runtime evidence."
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "visible-unwrapped",
         });
@@ -1572,6 +1737,7 @@ fn build_report(
             action: format!("No adapter for `{lib}` yet — its calls are invisible to Keel. Track adapter support or wrap manually."),
             detail: format!("`{lib}` is imported but has no adapter in the registry."),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "invisible",
         });
@@ -1581,6 +1747,7 @@ fn build_report(
         action: "If a dependency makes calls Keel never reports, file an adapter request.".to_owned(),
         detail: "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.".to_owned(),
         fix: None,
+        fix_ref: None,
         level: "info",
         topic: "invisible",
     });
@@ -1614,6 +1781,7 @@ fn build_report(
                  at-most-once-dispatch signature in: {list}."
             ),
             fix: None,
+            fix_ref: None,
             level: "warn",
             topic: "orchestration-blind-spot",
         });
@@ -1641,6 +1809,7 @@ fn build_report(
                 policy.message.clone().unwrap_or_default()
             ),
             fix,
+            fix_ref: None,
             level: "error",
             topic: "policy",
         });
@@ -1712,6 +1881,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.file
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "keel-toml-not-in-image",
             }),
@@ -1726,6 +1896,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.file
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "warn",
                 topic: "keel-toml-not-in-image",
             }),
@@ -1740,6 +1911,7 @@ fn packaging_findings(build_files: &[crate::dockerfile::BuildFile]) -> Vec<Findi
                     bf.directive.as_deref().unwrap_or_default()
                 ),
                 fix: None,
+                fix_ref: None,
                 level: "info",
                 topic: "keel-toml-image-indeterminate",
             }),
@@ -2697,6 +2869,8 @@ mod tests {
             function: "poll_video_takes".into(),
             targets: vec!["llm:google-genai".into()],
             sdk_polls: vec!["operations.get".into()],
+            interval_s: None,
+            deadline_s: None,
         });
         let topology = Topology {
             excluded: vec![],
@@ -2766,6 +2940,8 @@ mod tests {
             function: "poll_again".into(),
             targets: vec!["llm:google-genai".into()],
             sdk_polls: vec!["operations.get".into()],
+            interval_s: None,
+            deadline_s: None,
         });
         let dedup = simplification_findings(
             &scan,
@@ -2778,10 +2954,14 @@ mod tests {
             "same key set → not proposed twice: {:?}",
             dedup[1].fix
         );
+        // #107.3: the pointer is structured (`fix_ref`) and the prose names
+        // the holder by file:line instead of relying on report ORDER.
+        assert_eq!(dedup[0].fix_ref, None, "the holder points at nobody");
+        assert_eq!(dedup[1].fix_ref.as_deref(), Some("render.py:8"));
         assert!(
             dedup[1].action.contains(
-                "The route-key patch for this provider is attached to the first \
-                 hand-rolled-poll finding above."
+                "The route-key patch for this provider is attached to the `hand-rolled-poll` \
+                 finding for render.py:8 (`fix_ref`)."
             ),
             "{}",
             dedup[1].action
@@ -2804,6 +2984,160 @@ mod tests {
             !f3[0].action.contains("attached"),
             "no patch exists to point at: {}",
             f3[0].action
+        );
+    }
+
+    /// #107.2: the proposed `poll` block states the loop's OWN cadence when
+    /// the scanner could read it, and falls back to the documented defaults
+    /// (`10s` / `30m`) when it could not — a sighting that knows nothing must
+    /// not have a number invented for it.
+    #[test]
+    fn route_key_proposal_uses_the_loops_own_interval_and_deadline() {
+        use crate::scan::SimplificationSighting;
+        let sighting = |interval_s, deadline_s| SimplificationSighting {
+            file: "render.py".into(),
+            line: 8,
+            kind: "hand-rolled-poll".into(),
+            function: "poll_video_takes".into(),
+            targets: vec!["llm:openai".into()],
+            sdk_polls: vec!["batches.retrieve".into()],
+            interval_s,
+            deadline_s,
+        };
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:openai".to_owned()],
+        };
+        let patch_for = |s: SimplificationSighting| {
+            let mut scan = ScanResult::default();
+            scan.simplifications.push(s);
+            simplification_findings(&scan, &topology, Some("[flows]\n"))[0]
+                .fix
+                .as_ref()
+                .expect("route-key proposal attached")
+                .patch
+                .clone()
+        };
+        let own = patch_for(sighting(Some(20), Some(900)));
+        assert!(
+            own.contains("interval = \"20s\", deadline = \"900s\""),
+            "{own}"
+        );
+        // Partially known: the half Keel read is used, the half it did not
+        // falls back — the two are independent.
+        let half = patch_for(sighting(Some(20), None));
+        assert!(
+            half.contains("interval = \"20s\", deadline = \"30m\""),
+            "{half}"
+        );
+        let neither = patch_for(sighting(None, None));
+        assert!(
+            neither.contains("interval = \"10s\", deadline = \"30m\""),
+            "{neither}"
+        );
+    }
+
+    /// #107.2, multi-sighting: ONE patch governs a route key that ALL the
+    /// loops sharing it travel, so its cadence must be the most conservative
+    /// of them — the MAXIMUM interval and the MAXIMUM deadline — never one
+    /// member's numbers imposed on the rest. A single `None` in either column
+    /// drops that column to its documented default; the two are independent.
+    #[test]
+    fn route_key_cadence_is_the_most_conservative_across_the_key_set() {
+        use crate::scan::SimplificationSighting;
+        let sighting = |line, interval_s, deadline_s| SimplificationSighting {
+            file: "render.py".into(),
+            line,
+            kind: "hand-rolled-poll".into(),
+            function: "poll".into(),
+            targets: vec!["llm:openai".into()],
+            sdk_polls: vec!["batches.retrieve".into()],
+            interval_s,
+            deadline_s,
+        };
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:openai".to_owned()],
+        };
+        let patch_for = |sightings: Vec<SimplificationSighting>| {
+            let scan = ScanResult {
+                simplifications: sightings,
+                ..ScanResult::default()
+            };
+            let findings = simplification_findings(&scan, &topology, Some("[flows]\n"));
+            findings
+                .iter()
+                .find_map(|f| f.fix.as_ref())
+                .expect("route-key proposal attached")
+                .patch
+                .clone()
+        };
+        // Two loops on one route: the slower cadence wins both columns, so
+        // the patch never speeds up the 3s loop to the 1s loop's pace.
+        let both = patch_for(vec![
+            sighting(8, Some(1), Some(120)),
+            sighting(40, Some(3), Some(600)),
+        ]);
+        assert!(
+            both.contains("interval = \"3s\", deadline = \"600s\""),
+            "{both}"
+        );
+        // A third loop whose interval Keel could not read: the interval falls
+        // back to the default while the deadline stays the maximum — the two
+        // reasons are visibly distinct in one patch.
+        let partial = patch_for(vec![
+            sighting(8, Some(1), Some(120)),
+            sighting(40, Some(3), Some(600)),
+            sighting(70, None, Some(300)),
+        ]);
+        assert!(
+            partial.contains("interval = \"10s\", deadline = \"600s\""),
+            "{partial}"
+        );
+        // Provenance: a multi-loop patch must not name one loop as if the
+        // numbers were its own, and must claim "slowest of them" ONLY for a
+        // column it actually derived — `partial`'s `interval = "10s"` is the
+        // default, and saying it was observed would be a false statement
+        // beside the number.
+        assert!(
+            both.contains("replaces 2 hand-rolled polls on this route")
+                && both.contains("interval and deadline are the slowest of them"),
+            "{both}"
+        );
+        assert!(
+            partial.contains(
+                "deadline is the slowest of them, interval is Keel's default \
+                 (a loop on this route declares none)"
+            ),
+            "{partial}"
+        );
+        let neither = patch_for(vec![sighting(8, None, None), sighting(40, Some(3), None)]);
+        assert!(
+            neither.contains(
+                "interval and deadline are Keel's defaults \
+                 (a loop on this route declares neither)"
+            ),
+            "{neither}"
+        );
+        let interval_only = patch_for(vec![
+            sighting(8, Some(3), None),
+            sighting(40, Some(9), None),
+        ]);
+        assert!(
+            interval_only.contains(
+                "interval is the slowest of them, deadline is Keel's default \
+                 (a loop on this route declares none)"
+            ),
+            "{interval_only}"
+        );
+        assert!(
+            !patch_for(vec![sighting(8, Some(3), Some(600))])
+                .contains("hand-rolled polls on this route"),
+            "a single sighting keeps the singular provenance"
         );
     }
 
@@ -2842,6 +3176,8 @@ mod tests {
             function: "caller".into(),
             targets: vec!["api.ok.com".into()],
             sdk_polls: vec![],
+            interval_s: None,
+            deadline_s: None,
         });
         // Unreachable target (stdlib urllib) with a hand-rolled poll — the
         // claude-trader shape until WS4 flips urllib to tracked.
@@ -2866,6 +3202,8 @@ mod tests {
             function: "_poll_research".into(),
             targets: vec!["api.tavily.com".into()],
             sdk_polls: vec![],
+            interval_s: None,
+            deadline_s: None,
         });
         let r = build_report(
             &scan,
@@ -4899,5 +5237,54 @@ def caller():
             })
             .expect("an info finding for the inheriting child");
         assert!(info.detail.contains("self-activates"), "{}", info.detail);
+    }
+
+    #[test]
+    fn inheriting_children_alone_still_produce_a_follow_up() {
+        use crate::scan::SubprocessSighting;
+        let mut scan = ScanResult {
+            files_scanned: 1,
+            python_available: true,
+            ..ScanResult::default()
+        };
+        scan.subprocesses = vec![SubprocessSighting {
+            file: "agent.py".into(),
+            line: 10,
+            launcher: "subprocess.run".into(),
+            command: "<dynamic>".into(),
+            argv: None,
+            child_runtime: Some("python".into()),
+            env_inheritance: "inherited".into(),
+        }];
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+            &[],
+            "unverified",
+        );
+        let fu = r
+            .follow_ups
+            .iter()
+            .find(|f| f.code == "subprocess-blind-spot")
+            .expect(
+                "#102: the count must be reachable from follow_ups, not only from the info finding",
+            );
+        assert!(
+            fu.subject.contains("1 Python child that self-activates"),
+            "{}",
+            fu.subject
+        );
+        assert!(
+            fu.detail.contains("no blind spot to chase"),
+            "{}",
+            fu.detail
+        );
     }
 }

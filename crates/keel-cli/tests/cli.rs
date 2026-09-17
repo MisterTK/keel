@@ -657,15 +657,23 @@ fn doctor_sdk_poll_route_key_fix_matches_golden_and_applies() {
         "identical route keys → exactly one applyable patch: {}",
         json_string(&r.json)
     );
+    // #107: the duplicates point at the holder by `file:line`, in a
+    // structured field as well as in the prose — not by report position.
     for f in polls.iter().filter(|f| f["fix"].is_null()) {
+        let r = f["fix_ref"].as_str().expect("structured fix_ref");
+        assert_eq!(r, "inline.py:6", "{f}");
         assert!(
-            f["action"]
-                .as_str()
-                .unwrap()
-                .contains("attached to the first hand-rolled-poll finding above"),
+            f["action"].as_str().unwrap().contains(&format!(
+                "attached to the `hand-rolled-poll` finding for {r} (`fix_ref`)"
+            )),
             "{f}"
         );
     }
+    assert!(
+        with_fix[0]["fix_ref"].is_null(),
+        "the holder points at nobody: {}",
+        with_fix[0]
+    );
     let patch = with_fix[0]["fix"]["patch"].as_str().unwrap();
     std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
     let out = Command::new("git")

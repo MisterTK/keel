@@ -13,6 +13,7 @@ import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from keel._backend import load_backend
 from keel._discovery import (
@@ -361,6 +362,50 @@ class ActivationsTest(unittest.TestCase):
             conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM activations").fetchone()[0], 50)
             self.assertEqual(conn.execute("SELECT MIN(ts_ms) FROM activations").fetchone()[0], 1_005)
+
+    def test_activation_survives_a_raise_after_record_activation(self) -> None:
+        # #104: the exit hook must already be registered when the row is
+        # remembered, so a later best-effort failure cannot lose the evidence.
+        import keel.bootstrap as bootstrap
+
+        # `_STATE` is a process-global singleton and `uninstall_keel()` never
+        # resets `exit_registered` back to False — an earlier successful
+        # `install_keel()` call ANYWHERE ELSE in the same test process (e.g.
+        # test_auto.py, which sorts before this module) leaves it True
+        # forever, which would make the assertion below pass unconditionally
+        # regardless of this test's own ordering. Force a clean starting
+        # state and restore whatever was there before, so this test's
+        # verdict depends only on what THIS `install_keel()` call does.
+        saved_exit_registered = bootstrap._STATE.exit_registered
+        bootstrap._STATE.exit_registered = False
+        try:
+            with TemporaryDirectory() as d:
+                Path(d, "keel.toml").write_text("")
+                with mock.patch.object(bootstrap, "install_adapters", side_effect=RuntimeError("boom")):
+                    with self.assertRaises(RuntimeError):
+                        bootstrap.install_keel(cwd=d, env={"KEEL_QUIET": "1"})
+                # #104: the exit hook (which is what would flush this row on a
+                # real, non-test process exit) must already be registered by
+                # the time install_adapters raises — install_adapters runs
+                # AFTER record_activation but BEFORE the old
+                # _register_exit_flush() call site, so this is the ordering
+                # the bug actually depended on.
+                self.assertTrue(
+                    bootstrap._STATE.exit_registered,
+                    "the atexit flush hook must be registered before a later "
+                    "best-effort failure, or the row is never auto-flushed",
+                )
+                # atexit has not fired yet in-process; close the store directly to
+                # prove the row was remembered AND is flushable.
+                bootstrap._STATE.discovery.close()
+                conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
+                try:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM activations").fetchone()[0], 1)
+                finally:
+                    conn.close()
+        finally:
+            bootstrap.uninstall_keel()
+            bootstrap._STATE.exit_registered = saved_exit_registered
 
 
 if __name__ == "__main__":

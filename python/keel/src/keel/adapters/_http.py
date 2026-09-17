@@ -186,6 +186,18 @@ def streaming_response(content_type: str | None) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
 
 
+def _custom_method_verb(path: str | None) -> str | None:
+    """The Google custom-method verb a URL path names, or ``None`` when the
+    last path segment carries no ``:``. One parser, two predicates: both
+    ``operation_read`` (CCR-8 idempotency) and ``lro_shaped_path`` (the cache
+    exemption) read the verb through this, then apply their OWN — deliberately
+    different — test to it. Twin of judge.mjs ``customMethodVerb``."""
+    last = str(path or "").rsplit("/", 1)[-1]
+    if ":" not in last:
+        return None
+    return last.rsplit(":", 1)[-1]
+
+
 def operation_read(host: str | None, path: str | None) -> bool:
     """True iff (host, path) is a Google long-running-operation READ: a host
     under ``googleapis.com`` (the apex or any ``*.googleapis.com``, compared
@@ -203,11 +215,8 @@ def operation_read(host: str | None, path: str | None) -> bool:
     h = host.lower()
     if h != "googleapis.com" and not h.endswith(".googleapis.com"):
         return False
-    last = path.rsplit("/", 1)[-1]
-    if ":" not in last:
-        return False
-    verb = last.rsplit(":", 1)[-1]
-    return verb.startswith("fetch") and verb.endswith("Operation")
+    verb = _custom_method_verb(path)
+    return verb is not None and verb.startswith("fetch") and verb.endswith("Operation")
 
 
 def is_idempotent(
@@ -369,10 +378,9 @@ def lro_shaped_path(path: str) -> bool:
     verb SHAPE, not an enumerated list, so a new Vertex surface with the same
     grammar is covered without a release. Twin of Node's
     ``judge.mjs::lroShapedPath``; keep identical."""
-    last = path.rsplit("/", 1)[-1]
-    if ":" not in last:
+    verb = _custom_method_verb(path)
+    if verb is None:
         return False
-    verb = last.rsplit(":", 1)[-1]
     return verb.endswith("LongRunning") or (
         verb.startswith("fetch") and verb.endswith("Operation")
     )

@@ -13,9 +13,11 @@
 //!   port yet, not core-level features).
 //! * Idempotency follows the RFC 9110 safe/idempotent method set
 //!   (GET/HEAD/OPTIONS/PUT/DELETE/TRACE) plus a default
-//!   `(x-)idempotency-key` header, with no per-target `idempotency.header`
-//!   policy override (that needs a *resolved-policy* read-back from the
-//!   engine — a clean seam for a follow-up).
+//!   `(x-)idempotency-key` header, plus the CCR-8 operation-read exception
+//!   (a POST that is a Google long-running-operation read — see
+//!   `operation_read` — is idempotent without a key), with no per-target
+//!   `idempotency.header` policy override (that needs a *resolved-policy*
+//!   read-back from the engine — a clean seam for a follow-up).
 //! * Caching is always disabled (`args_hash: None`) since a stable cache
 //!   key would need to buffer and hash the request body, which this v1
 //!   does not do. Retry, the circuit breaker, the rate limiter, and
@@ -240,7 +242,12 @@ impl Middleware for KeelMiddleware {
         let method = req.method().clone();
         let host = req.url().host_str().unwrap_or("unknown").to_owned();
         let op = format!("{method} {host}{}", req.url().path());
-        let idempotent = is_idempotent(method.as_str(), req.headers());
+        let idempotent = is_idempotent(
+            method.as_str(),
+            req.headers(),
+            req.url().host_str(),
+            Some(req.url().path()),
+        );
         let core_req = CoreRequest {
             v: ENVELOPE_VERSION,
             target: host,
@@ -263,8 +270,41 @@ impl Middleware for KeelMiddleware {
     }
 }
 
-fn is_idempotent(method: &str, headers: &reqwest::header::HeaderMap) -> bool {
+/// True iff `(host, path)` is a Google long-running-operation READ: a host
+/// under `googleapis.com` (the apex or any `*.googleapis.com`, compared
+/// case-insensitively) whose last path segment is a custom method with a
+/// `fetch…Operation` verb. `contracts/adapter-pack.md` "Operation reads"
+/// (CCR-8): such a POST has no side effect, and re-issuing it is exactly
+/// what polling does, so it is judged idempotent without a key. The submit
+/// side (`:predictLongRunning`) is NOT covered. Twin of Python's
+/// `_http.operation_read` and Node's `operationRead`; the shared corpus
+/// `conformance/operation_read/cases.json` is the referee.
+fn operation_read(host: Option<&str>, path: Option<&str>) -> bool {
+    let (Some(host), Some(path)) = (host, path) else {
+        return false;
+    };
+    let h = host.to_ascii_lowercase();
+    if h != "googleapis.com" && !h.ends_with(".googleapis.com") {
+        return false;
+    }
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let Some((_, verb)) = last.rsplit_once(':') else {
+        return false;
+    };
+    verb.starts_with("fetch") && verb.ends_with("Operation")
+}
+
+fn is_idempotent(
+    method: &str,
+    headers: &reqwest::header::HeaderMap,
+    host: Option<&str>,
+    path: Option<&str>,
+) -> bool {
     if IDEMPOTENT_METHODS.contains(&method) {
+        return true;
+    }
+    // CCR-8: a POST operation read is safe to re-issue without a key.
+    if method == "POST" && operation_read(host, path) {
         return true;
     }
     headers
@@ -302,17 +342,30 @@ mod tests {
     #[test]
     fn idempotent_methods() {
         for m in ["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"] {
-            assert!(is_idempotent(m, &reqwest::header::HeaderMap::new()), "{m}");
+            assert!(
+                is_idempotent(m, &reqwest::header::HeaderMap::new(), None, None),
+                "{m}"
+            );
         }
-        assert!(!is_idempotent("POST", &reqwest::header::HeaderMap::new()));
-        assert!(!is_idempotent("PATCH", &reqwest::header::HeaderMap::new()));
+        assert!(!is_idempotent(
+            "POST",
+            &reqwest::header::HeaderMap::new(),
+            None,
+            None
+        ));
+        assert!(!is_idempotent(
+            "PATCH",
+            &reqwest::header::HeaderMap::new(),
+            None,
+            None
+        ));
     }
 
     #[test]
     fn post_with_idempotency_key_header_is_idempotent() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("idempotency-key", "abc".parse().unwrap());
-        assert!(is_idempotent("POST", &headers));
+        assert!(is_idempotent("POST", &headers, None, None));
     }
 
     #[test]
@@ -340,5 +393,53 @@ mod tests {
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(parse_retry_after_ms(&headers), None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OperationReadCase {
+        name: String,
+        method: String,
+        host: String,
+        path: Option<String>,
+        headers: Vec<String>,
+        operation_read: bool,
+        idempotent: bool,
+    }
+
+    /// The shared corpus is the referee for all three front ends (CCR-8,
+    /// issue #105): Python's `_http.operation_read`, Node's `operationRead`,
+    /// and this middleware must agree row for row.
+    #[test]
+    fn operation_read_corpus_matches_row_for_row() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../conformance/operation_read/cases.json"),
+        )
+        .expect("corpus readable");
+        let cases: Vec<OperationReadCase> = serde_json::from_str(&text).expect("corpus parses");
+        assert!(cases.len() >= 16, "corpus present");
+        for c in &cases {
+            let host = Some(c.host.as_str());
+            let path = c.path.as_deref();
+            assert_eq!(
+                operation_read(host, path),
+                c.operation_read,
+                "operation_read: {}",
+                c.name
+            );
+            let mut headers = reqwest::header::HeaderMap::new();
+            for h in &c.headers {
+                headers.insert(
+                    reqwest::header::HeaderName::from_bytes(h.to_lowercase().as_bytes()).unwrap(),
+                    "v".parse().unwrap(),
+                );
+            }
+            assert_eq!(
+                is_idempotent(&c.method, &headers, host, path),
+                c.idempotent,
+                "is_idempotent: {}",
+                c.name
+            );
+        }
     }
 }

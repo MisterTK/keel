@@ -811,3 +811,111 @@ test("LLM fallback: an unrecognized request shape stops the chain and delivers t
   assert.equal(resp.status, 503);
   assert.equal(hits, 1, "fallback could not rewrite the request, so it never re-dispatched");
 });
+
+// --- per-hop idempotency/timeout re-judgment (issue #106) -------------------
+
+/** Wrap a real `AsyncEngine` (the same backend `withKeel`/the LLM fallback
+ *  tests above already drive fetch through) so each `execute()` call's
+ *  request envelope is captured before being forwarded — realistic
+ *  retry/outcome semantics, with visibility into what fetch.mjs built per
+ *  hop. Not a second harness: same `AsyncEngine`, just observed. */
+function recordingBackend(policy = {}) {
+  const backend = new AsyncEngine(virtualClock());
+  backend.configure(policy);
+  const seen = [];
+  const originalExecute = backend.execute.bind(backend);
+  backend.execute = (request, effect, injectedKey) => {
+    seen.push(request);
+    return originalExecute(request, effect, injectedKey);
+  };
+  return { backend, seen };
+}
+
+test("a fallback hop re-judges idempotency and timeout from its own host (#106)", async () => {
+  // Hop 0 is a Vertex operation read: idempotent by CCR-8 (`operationRead`
+  // in judge.mjs), no key. The REAL `rewriteModel` (llm-policy.mjs) can only
+  // ever rewrite the model NAME portion of a URL/body — never the host, and
+  // never the verb after a path segment's last colon (its documented v0.1
+  // limitation) — so no fallback hop reachable through the real fallback
+  // chain can currently land on a different (hostname, pathname) SHAPE than
+  // hop 0 (verified empirically: both hops keep `idempotent: true` no
+  // matter which of `rewriteModel`'s two rewrite branches fires).
+  // `installFetch`'s `__keelTestRewriteFallback` seam (test-only, NOT a
+  // supported option — see its declaration comment) substitutes a rewriter
+  // that lands hop 1 on a plain, non-Google POST, so this test can exercise
+  // the per-hop re-judgment this fix adds without that real-world
+  // limitation standing in the way.
+  //
+  // The target carries a configured `timeout`, so the two hops' `timeoutMs`
+  // genuinely differ once `idempotent` is judged per hop (the plan's
+  // decision-1 behavior change): hop 0 (idempotent) gets a real KEEL-
+  // injected per-attempt AbortSignal; hop 1 (not idempotent) must get NONE
+  // — injecting one into a non-idempotent success path is the exact
+  // invariant `withTimeout`'s call site is guarding. Before this fix,
+  // `timeoutMs` was frozen from hop 0's `idempotent` and would have wrongly
+  // carried a real timeout into hop 1's attempt.
+  resetLlmBudgets();
+  const { backend, seen } = recordingBackend({
+    target: { "llm:google-genai": { retry: { attempts: 1 }, fallback: ["next"], timeout: "5s" } },
+  });
+  let hits = 0;
+  const signals = [];
+  const globalObj = {
+    fetch: async (_url, init) => {
+      signals.push(init?.signal);
+      hits++;
+      if (hits === 1) return new Response("down", { status: 500 });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  };
+  installFetch(backend, null, {
+    globalObj,
+    __keelTestRewriteFallback: (_url, body) => ({ url: "https://api.example-llm.com/v1/messages", body }),
+  });
+
+  const resp = await globalObj.fetch("https://us-central1-aiplatform.googleapis.com/v1/x:fetchPredictOperation", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+
+  assert.equal(resp.status, 200);
+  assert.equal(hits, 2, "hop 0 failed terminally, the fallback hop dispatched");
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].idempotent, true, "hop 0 is a Google operation read");
+  assert.equal(seen[1].idempotent, false, "the fallback hop is a plain POST elsewhere");
+  assert.ok(
+    signals[0] instanceof AbortSignal,
+    "hop 0 is idempotent with a configured timeout: a real KEEL timeout signal is attached",
+  );
+  assert.equal(
+    signals[1],
+    undefined,
+    "hop 1 is not idempotent: timeoutMs must be null, so no KEEL timeout signal is attached",
+  );
+});
+
+test("a non-fallback call is unchanged by per-hop judgment", async () => {
+  // Single-hop case: byte-identical to the pre-fix hop-0-only derivation,
+  // since there is nothing to re-judge.
+  const { backend, seen } = recordingBackend({ target: { "127.0.0.1": { retry: { attempts: 2 } } } });
+  const server = await startServer((_req, res, hit) => {
+    if (hit === 1) {
+      res.writeHead(503);
+      res.end("down");
+    } else {
+      res.writeHead(200);
+      res.end("ok");
+    }
+  });
+  const uninstall = installFetch(backend, null);
+  try {
+    const resp = await fetch(server.url());
+    assert.equal(resp.status, 200);
+    assert.equal(seen.length, 1, "a single hop dispatches exactly one request envelope");
+    assert.equal(seen[0].idempotent, true, "GET is idempotent — same value the hop-0-only derivation gave");
+  } finally {
+    uninstall();
+    await server.close();
+  }
+});

@@ -23,6 +23,12 @@ export function jsonLogs(env = process.env) {
   return String(env?.KEEL_LOG_FORMAT ?? "").trim().toLowerCase() === "json";
 }
 
+function isPlainObject(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
 /**
  * Recursively sort plain-object keys; arrays keep their order, primitives
  * pass through unchanged. Python's `json.dumps(sort_keys=True)` already
@@ -32,12 +38,13 @@ export function jsonLogs(env = process.env) {
  */
 function sortKeys(value) {
   if (Array.isArray(value)) return value.map(sortKeys);
-  if (value !== null && typeof value === "object") {
-    const sorted = {};
-    for (const k of Object.keys(value).sort()) sorted[k] = sortKeys(value[k]);
-    return sorted;
-  }
-  return value;
+  // A Date, Map, or class instance is NOT ours to rebuild — rebuilding it
+  // would drop its toJSON and serialise its own enumerable keys instead
+  // (#103). Only plain objects get key-sorted.
+  if (!isPlainObject(value)) return value;
+  const out = {};
+  for (const k of Object.keys(value).sort()) out[k] = sortKeys(value[k]);
+  return out;
 }
 
 /** Sorted keys, no spaces — byte-identical to Python's

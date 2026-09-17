@@ -1,9 +1,10 @@
 import os
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from keel._deploy import ephemeral_journal_warning
+from keel._deploy import ephemeral_journal_warning, sqlite_journal_path
 
 FLOWS = {"flows": {"entrypoints": ["py:app:main"]}}
 
@@ -64,3 +65,15 @@ class EphemeralJournalWarningTest(unittest.TestCase):
             pol_abs = {**FLOWS, "journal": "file:/var/data/../other/journal.db"}
             _, obj_abs = ephemeral_journal_warning(pol_abs, {"K_SERVICE": "x"}, Path(d), dockerenv=Path(d, "nope"))
             self.assertEqual(obj_abs["journal"], "/var/other/journal.db")
+
+    @unittest.skipIf(sys.platform == "win32", "symlink creation needs SeCreateSymbolicLinkPrivilege on Windows")
+    def test_file_journal_path_is_lexical_not_symlink_resolved(self) -> None:
+        # #99: create the symlink ourselves so this is a real regression guard
+        # on every platform, not only where /tmp happens to be one.
+        with TemporaryDirectory() as d:
+            real = Path(d, "real"); real.mkdir()
+            link = Path(d, "link"); link.symlink_to(real, target_is_directory=True)
+            policy = {**FLOWS, "journal": "file:.keel/journal.db"}
+            got = sqlite_journal_path(policy, link)
+            self.assertEqual(got, link / ".keel" / "journal.db")
+            self.assertNotEqual(got, real / ".keel" / "journal.db", "lexical, not resolved")

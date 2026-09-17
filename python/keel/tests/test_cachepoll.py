@@ -54,6 +54,46 @@ class CachePollDetectorTest(unittest.TestCase):
             self.clock.t += 10.0
         self.assertEqual(self.fired, [])
 
+    def test_eviction_caps_runs_and_an_active_run_near_the_cap_still_fires(self) -> None:
+        clock = FakeClock()
+        fired = []
+        d = CachePollDetector(clock=clock, on_suspect=lambda t, h, s: fired.append((t, h, s)))
+        for i in range(MAX_RUNS + 50):
+            d.observe("llm:openai", f"h{i}", HIT)
+            clock.t += 0.001
+        self.assertLessEqual(len(d._runs), MAX_RUNS)
+        # An active run, touched most recently (so never the oldest-`last`
+        # eviction candidate), must survive the churn above and still fire.
+        for _ in range(5):
+            d.observe("llm:google-genai", "active", HIT)
+            clock.t += 10.0
+        self.assertEqual(fired, [("llm:google-genai", 5, 40)])
+
+    def test_fired_set_eviction_caps_growth(self) -> None:
+        clock = FakeClock()
+        d = CachePollDetector(clock=clock, min_hits=1, min_span_s=0.0)
+        for i in range(MAX_FIRED + 50):
+            d.observe("llm:openai", f"f{i}", HIT)
+            d.observe("llm:openai", f"f{i}", HIT)  # second hit fires (min_hits=1, span=0)
+        self.assertLessEqual(len(d._fired), MAX_FIRED)
+
+
+class CachePollConcurrencyTest(unittest.TestCase):
+    """Pins the documented once-per-key / no-lost-hits invariant under
+    concurrent access from several OS threads.
+
+    NOT a lock-regression guard: it passes with the lock removed, because
+    CPython's default switch interval (5ms) makes the window vanishingly
+    narrow at this scale. An earlier session reported reproducing lost hits
+    in 1 of 20 unlocked runs with a lowered switch interval
+    (`sys.setswitchinterval(1e-6)`); a later attempt to reproduce that —
+    scaled up to 512 threads and millions of operations, both with and
+    without the lock — saw 0 of 20 losses either way. The race remains
+    theoretically real (the read-modify-write on `run[0]` is unguarded
+    without the lock) but is unreproduced here; this is not a claim that the
+    race does not exist. Do not read a pass here as proof the lock is still
+    needed (#100)."""
+
     def test_concurrent_hits_on_one_key_fire_exactly_once_and_lose_no_hits(self) -> None:
         # Real threads, the real clock, min_span_s=0 so firing depends only
         # on hit count (not on real wall-clock spacing) — isolates the race
@@ -79,29 +119,6 @@ class CachePollDetectorTest(unittest.TestCase):
         total_hits = n_threads * hits_per_thread
         run = d._runs[("llm:google-genai", "h1")]
         self.assertEqual(run[0], total_hits, "no hit lost to the read-modify-write race")
-
-    def test_eviction_caps_runs_and_an_active_run_near_the_cap_still_fires(self) -> None:
-        clock = FakeClock()
-        fired = []
-        d = CachePollDetector(clock=clock, on_suspect=lambda t, h, s: fired.append((t, h, s)))
-        for i in range(MAX_RUNS + 50):
-            d.observe("llm:openai", f"h{i}", HIT)
-            clock.t += 0.001
-        self.assertLessEqual(len(d._runs), MAX_RUNS)
-        # An active run, touched most recently (so never the oldest-`last`
-        # eviction candidate), must survive the churn above and still fire.
-        for _ in range(5):
-            d.observe("llm:google-genai", "active", HIT)
-            clock.t += 10.0
-        self.assertEqual(fired, [("llm:google-genai", 5, 40)])
-
-    def test_fired_set_eviction_caps_growth(self) -> None:
-        clock = FakeClock()
-        d = CachePollDetector(clock=clock, min_hits=1, min_span_s=0.0)
-        for i in range(MAX_FIRED + 50):
-            d.observe("llm:openai", f"f{i}", HIT)
-            d.observe("llm:openai", f"f{i}", HIT)  # second hit fires (min_hits=1, span=0)
-        self.assertLessEqual(len(d._fired), MAX_FIRED)
 
 
 if __name__ == "__main__":

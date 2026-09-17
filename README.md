@@ -290,7 +290,8 @@ Two tiers, one policy file:
 `keel doctor` flags LRO-sized timeouts (>600s) with an `sdk-client-timeout`
 follow-up. **POST-shaped operation reads poll too** (0.6.0): a `POST` to
 `*.googleapis.com` ending in `:fetch*Operation` is judged idempotent — it is
-retried under Level 0 defaults and gets the per-attempt `timeout` — and a
+retried under Level 0 defaults and gets the per-attempt `timeout` — identically
+across all three front ends (Python, Node, and Rust) — and a
 **route key** on the LLM host (a `[target]` key with a path) is consulted
 before Keel's own host map, so the poll can carry its own policy:
 
