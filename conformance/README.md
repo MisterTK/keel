@@ -158,7 +158,14 @@ enforcing wall-clock timeouts).
      than being judged, in every implementation (scenario 35).
    - Verdict: `until.field` is a dotted path walked through nested objects
      (`response.state`); a missing segment, a non-object intermediate, or a
-     key that merely contains a dot → fail-open. Lookup is **own-keys only**:
+     key that merely contains a dot means the field is **absent**, and
+     `until.absent` says what that means: `"fail_open"` (the default, and the
+     pre-CCR-11 rule) returns the payload as-is and ends the poll, while
+     `"pending"` treats the absence as the pending signal and keeps polling
+     (CCR-11, scenario 49 — which pins both halves, because a running
+     `google.longrunning.Operation` omits `done` entirely: proto3 JSON drops
+     a false bool). `until.absent` is optional; any value other than those
+     two words is `KEEL-E001` at configure. Lookup is **own-keys only**:
      a segment naming an inherited property of the host language's object type
      (JavaScript's `constructor`, `__proto__`, …) is a MISSING key, exactly as
      it is on a Rust map or a Python dict (scenario 48). The value is

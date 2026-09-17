@@ -274,6 +274,20 @@ Two tiers, one policy file:
   `KEEL-E016`; a response whose body isn't JSON (or lacks `until.field`)
   fails OPEN and is returned unchanged on the first attempt — polling never
   turns an ordinary response into an error.
+
+  Some APIs omit the field entirely while the job runs: a running
+  `google.longrunning.Operation` body is just `{"name": "..."}`, because
+  proto3 JSON drops a false bool, and `done` only appears on completion.
+  Fail-open would end such a poll on attempt one, so say that absence is the
+  pending signal:
+
+  ```toml
+  [target."POST *-aiplatform.googleapis.com/**:fetchPredictOperation"]
+  poll = { interval = "10s", deadline = "10m", until = { field = "done", terminal = [true], absent = "pending" } }
+  ```
+
+  `absent` defaults to `"fail_open"`, so every policy written without it
+  behaves exactly as before.
 - **Tier 2 — durable flows (opt-in).** Designate an entrypoint in `[flows]`
   and its steps are journaled to a local SQLite file (or Postgres, for
   fleet deployments) as they run. A crash — or a deliberate restart —

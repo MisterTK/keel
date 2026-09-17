@@ -433,6 +433,12 @@ fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> Po
         obj
     };
     match poll.until.judge(doc) {
+        // CCR-11: a response that does not carry the field at all means
+        // whatever `until.absent` says — fail-open unless the operator
+        // declared that absence IS the pending signal.
+        None if poll.until.absent == keel_core_api::policy::PollAbsent::Pending => {
+            PollVerdict::Pending
+        }
         None => PollVerdict::FailOpen,
         Some(true) => PollVerdict::Terminal,
         Some(false) => PollVerdict::Pending,

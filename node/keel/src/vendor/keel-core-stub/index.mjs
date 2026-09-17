@@ -199,7 +199,10 @@ function terminalMatch(value, terminal) {
 /** Judge one successful poll iteration's payload: "terminal" | "pending" |
  *  "fail_open". Parity with keel-core's `poll_verdict`
  *  (conformance/README.md "Poll"; CCR-8 widened the gate and the field/
- *  terminal semantics). */
+ *  terminal semantics; CCR-11 made a document that does not carry the field
+ *  at all answer to `until.absent` — "fail_open" by default, "pending" when
+ *  the operator declared absence the pending signal, as every running
+ *  google.longrunning.Operation needs). */
 function pollVerdict(poll, payload) {
   if (!isTable(payload)) return "fail_open";
   let doc = payload;
@@ -222,7 +225,7 @@ function pollVerdict(poll, payload) {
     doc = parsed;
   }
   const { found, value } = lookupField(doc, poll.until.field);
-  if (!found) return "fail_open";
+  if (!found) return poll.until.absent === "pending" ? "pending" : "fail_open";
   return terminalMatch(value, poll.until.terminal) ? "terminal" : "pending";
 }
 
@@ -346,13 +349,22 @@ function validateTargetPolicy(path, v) {
     if (parseDuration(v.poll.interval) === 0)
       throw invalid(path, "poll.interval must be a nonzero duration");
     if (!isTable(v.poll.until)) throw invalid(path, "poll.until must be a table");
-    rejectUnknownKeys(`${path}.poll.until`, v.poll.until, ["field", "terminal"]);
+    rejectUnknownKeys(`${path}.poll.until`, v.poll.until, ["field", "terminal", "absent"]);
     if (typeof v.poll.until.field !== "string" || v.poll.until.field.length === 0)
       throw invalid(path, "poll.until.field must be a non-empty string");
     const terminal = v.poll.until.terminal;
     const okItem = (t) => typeof t === "string" || typeof t === "boolean" || typeof t === "number";
     if (!Array.isArray(terminal) || terminal.length === 0 || !terminal.every(okItem))
       throw invalid(path, "poll.until.terminal must be a non-empty array of strings, booleans, or numbers");
+    // CCR-11: optional, defaults to "fail_open" (the pre-CCR-11 rule).
+    // Presence is `Object.hasOwn`, not `!== undefined`, matching Python's
+    // `in`: an explicit null is a value the enum does not admit.
+    if (
+      Object.hasOwn(v.poll.until, "absent") &&
+      v.poll.until.absent !== "fail_open" &&
+      v.poll.until.absent !== "pending"
+    )
+      throw invalid(path, 'poll.until.absent must be "fail_open" or "pending"');
   }
 }
 

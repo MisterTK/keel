@@ -98,3 +98,44 @@ test("validator: terminal items are strings, booleans, or numbers", () => {
     );
   }
 });
+
+// --- CCR-11 (#128): a running google.longrunning.Operation omits `done`
+// entirely — proto3 JSON drops a false bool — so `absent = "pending"` says
+// that absence IS the pending signal. The default stays fail-open.
+const RUNNING = { name: "projects/p/operations/op1" };
+const DONE = { name: "projects/p/operations/op1", done: true, response: { videos: 1 } };
+
+test("until.absent = pending keeps polling a body that lacks the field", () => {
+  const core = new KeelCoreStub();
+  core.configure({ target: { "ops.internal": { poll: poll({ field: "done", terminal: [true], absent: "pending" }) } } });
+  const out = run(core, "POST ops.internal/op:fetchPredictOperation", true, [RUNNING, RUNNING, DONE]);
+  assert.equal(out.attempts, 3);
+  assert.deepEqual(out.payload, DONE);
+});
+
+test("until.absent defaults to fail_open on the same bodies", () => {
+  const core = new KeelCoreStub();
+  core.configure({ target: { "ops.internal": { poll: poll({ field: "done", terminal: [true] }) } } });
+  const out = run(core, "POST ops.internal/op:fetchPredictOperation", true, [RUNNING]);
+  assert.equal(out.attempts, 1);
+  assert.deepEqual(out.payload, RUNNING);
+});
+
+test("until.absent = pending still honors the deadline", () => {
+  const core = new KeelCoreStub();
+  core.configure({ target: { "ops.internal": { poll: { interval: "10s", deadline: "25s", until: { field: "done", terminal: [true], absent: "pending" } } } } });
+  const out = run(core, "GET ops.internal/op", true, [RUNNING, RUNNING, RUNNING]);
+  assert.equal(out.error.code, "KEEL-E016");
+});
+
+test("validator: until.absent accepts only the two words", () => {
+  for (const good of ["fail_open", "pending"])
+    new KeelCoreStub().configure({ target: { x: { poll: poll({ field: "f", terminal: [true], absent: good }) } } });
+  for (const bad of ["maybe", "", true, null, 1]) {
+    assert.throws(
+      () => new KeelCoreStub().configure({ target: { x: { poll: poll({ field: "f", terminal: [true], absent: bad }) } } }),
+      (e) => e instanceof KeelError && e.code === "KEEL-E001",
+      JSON.stringify(bad),
+    );
+  }
+});

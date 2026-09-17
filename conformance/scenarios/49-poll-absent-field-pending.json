@@ -1,0 +1,70 @@
+{
+  "name": "poll-absent-field-pending",
+  "description": "CCR-11 (#128): a running google.longrunning.Operation body is {\"name\": \"...\"} — proto3 JSON omits a false bool, so `done` is ABSENT while running and appears only on completion. `until.absent = \"pending\"` makes that absence the pending signal, so the poll continues to the terminal body. The DEFAULT is unchanged: the same bodies under a poll table with no `absent` key still fail open on attempt one, returning the running body as-is. Both halves are pinned here because every pre-CCR-11 poll scenario uses `done: false` while running — the case that never occurs on the wire. The default half declares exactly ONE effect: the runner requires the effect script to be fully consumed, so a second poll iteration there would fail the scenario outright.",
+  "policy": {
+    "target": {
+      "lro.example": {
+        "poll": {
+          "interval": "10s",
+          "deadline": "90s",
+          "until": { "field": "done", "terminal": [true], "absent": "pending" }
+        }
+      },
+      "lro-default.example": {
+        "poll": {
+          "interval": "10s",
+          "deadline": "90s",
+          "until": { "field": "done", "terminal": [true] }
+        }
+      }
+    }
+  },
+  "steps": [
+    {
+      "call": {
+        "target": "lro.example",
+        "request": { "op": "POST lro.example/v1/projects/p/operations/op1:fetchPredictOperation", "idempotent": true, "args_hash": "h1" },
+        "effect": [
+          { "status": "ok", "payload": { "name": "projects/p/operations/op1" } },
+          { "status": "ok", "payload": { "name": "projects/p/operations/op1" } },
+          { "status": "ok", "payload": { "name": "projects/p/operations/op1" } },
+          { "status": "ok", "payload": { "name": "projects/p/operations/op1", "done": true, "response": { "videos": 1 } } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "name": "projects/p/operations/op1", "done": true, "response": { "videos": 1 } },
+          "attempts": 4,
+          "from_cache": false,
+          "waits_ms": [],
+          "throttled": false
+        }
+      }
+    },
+    {
+      "call": {
+        "target": "lro-default.example",
+        "request": { "op": "POST lro-default.example/v1/projects/p/operations/op1:fetchPredictOperation", "idempotent": true, "args_hash": "h2" },
+        "effect": [
+          { "status": "ok", "payload": { "name": "projects/p/operations/op1" } }
+        ],
+        "expect": {
+          "result": "ok",
+          "payload": { "name": "projects/p/operations/op1" },
+          "attempts": 1,
+          "from_cache": false,
+          "waits_ms": [],
+          "throttled": false
+        }
+      }
+    },
+    {
+      "report_expect": {
+        "clock_ms": 30000,
+        "targets": {
+          "lro.example": { "calls": 1, "attempts": 4, "retries": 0, "successes": 1, "failures": 0 },
+          "lro-default.example": { "calls": 1, "attempts": 1, "retries": 0, "successes": 1, "failures": 0 }
+        }
+      }
+    }
+  ]
+}

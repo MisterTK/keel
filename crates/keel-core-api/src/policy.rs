@@ -668,16 +668,32 @@ pub struct IdempotencyPolicy {
     pub header: String,
 }
 
-/// `until = { field, terminal }` — the poll's terminal predicate (CCR-3;
-/// CCR-8 widened `terminal` to string | boolean | number, matched by JSON
-/// type and value, and made `field` a dotted path). Non-emptiness and item
-/// types are enforced at deserialize so an unpollable predicate is
-/// KEEL-E001 at configure, never a silent never-terminal loop.
+/// What a response that does not carry `until.field` at all means (CCR-11).
+/// `FailOpen` is the default and the pre-CCR-11 behavior: return the response
+/// as-is and end the poll. `Pending` reads the absence as the pending signal
+/// and keeps polling — the shape every `google.longrunning.Operation` needs,
+/// since proto3 JSON omits a false bool and a running operation's body is
+/// just `{"name": "..."}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollAbsent {
+    #[default]
+    FailOpen,
+    Pending,
+}
+
+/// `until = { field, terminal, absent? }` — the poll's terminal predicate
+/// (CCR-3; CCR-8 widened `terminal` to string | boolean | number, matched by
+/// JSON type and value, and made `field` a dotted path; CCR-11 added
+/// `absent`). Non-emptiness and item types are enforced at deserialize so an
+/// unpollable predicate is KEEL-E001 at configure, never a silent
+/// never-terminal loop.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "PollUntilRaw")]
 pub struct PollUntil {
     pub field: String,
     pub terminal: Vec<Value>,
+    pub absent: PollAbsent,
 }
 
 #[derive(Deserialize)]
@@ -685,6 +701,8 @@ pub struct PollUntil {
 struct PollUntilRaw {
     field: String,
     terminal: Vec<Value>,
+    #[serde(default)]
+    absent: PollAbsent,
 }
 
 impl TryFrom<PollUntilRaw> for PollUntil {
@@ -711,6 +729,7 @@ impl TryFrom<PollUntilRaw> for PollUntil {
         Ok(Self {
             field: raw.field,
             terminal: raw.terminal,
+            absent: raw.absent,
         })
     }
 }
@@ -719,7 +738,8 @@ impl PollUntil {
     /// Judge one JSON document (conformance/README.md "Poll", verdict rules —
     /// parity-critical with both stubs): `None` when `field` — a dotted path
     /// walked through nested objects — is absent or an intermediate is not an
-    /// object (fail-open: the caller returns the payload as-is), `Some(true)`
+    /// object (the caller maps that through `absent`: fail-open by default,
+    /// pending under CCR-11's `absent = "pending"`), `Some(true)`
     /// when the value is JSON-equal to a `terminal` item of the same JSON type
     /// (numbers by value), `Some(false)` when pending.
     #[must_use]
@@ -1674,6 +1694,41 @@ mod tests {
         );
     }
 
+    /// CCR-11: `until.absent` is optional and defaults to the pre-CCR-11
+    /// rule, so every policy written before it keeps failing open.
+    #[test]
+    fn poll_until_absent_defaults_to_fail_open_and_rejects_other_words() {
+        let poll = |until: Value| {
+            serde_json::json!({ "target": { "x": { "poll": {
+                "interval": "10s", "deadline": "90s", "until": until } } } })
+        };
+        let default: Policy = serde_json::from_value(poll(
+            serde_json::json!({ "field": "done", "terminal": [true] }),
+        ))
+        .unwrap();
+        assert_eq!(
+            default.target["x"].poll.as_ref().unwrap().until.absent,
+            PollAbsent::FailOpen
+        );
+        let explicit: Policy = serde_json::from_value(poll(
+            serde_json::json!({ "field": "done", "terminal": [true], "absent": "pending" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            explicit.target["x"].poll.as_ref().unwrap().until.absent,
+            PollAbsent::Pending
+        );
+        let err = serde_json::from_value::<Policy>(poll(
+            serde_json::json!({ "field": "done", "terminal": [true], "absent": "maybe" }),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown variant `maybe`") && err.contains("fail_open"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn poll_terminal_accepts_string_bool_number_and_rejects_others() {
         let ok = serde_json::json!({ "target": { "x": { "poll": {
@@ -1705,6 +1760,7 @@ mod tests {
         let until = |field: &str, terminal: Value| PollUntil {
             field: field.to_owned(),
             terminal: terminal.as_array().unwrap().clone(),
+            absent: PollAbsent::default(),
         };
         let obj = |v: Value| v.as_object().unwrap().clone();
         let done = until("done", serde_json::json!([true]));
