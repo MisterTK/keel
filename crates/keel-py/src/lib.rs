@@ -193,9 +193,13 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// step of the same open flow may be holding — before concluding that it is
 /// nested inside that step on another thread. The thread-local `IN_EFFECT`
 /// guard catches same-thread nesting for free; this catches the cross-thread
-/// case, which it structurally cannot see (issue #117). Since #116 this only
-/// ever applies INSIDE a flow: outside one there is no handle-wide lock left
-/// to contend, so a cross-thread nested effect simply runs. Generous enough that a merely SLOW outer effect is never
+/// case, which it structurally cannot see (issue #117). In production (a
+/// `Shared` runtime) this only ever applies INSIDE a flow: outside one there
+/// is no handle-wide lock left to contend, so a cross-thread nested effect
+/// simply runs. On a `paused=true` harness handle the runtime `Mutex`
+/// survives and is still taken with the unbounded [`lock_recover`], so that
+/// case can still block — the harness is single-threaded by construction and
+/// never nests. Generous enough that a merely SLOW outer effect is never
 /// mistaken for a deadlocked one: the detection mechanism (`try_lock` still
 /// failing) is IDENTICAL for "the outer effect dispatched to me" and "the
 /// outer effect is just slow" — this value is the only thing separating a
@@ -241,8 +245,15 @@ const NESTED_FLOW_EFFECT_MESSAGE: &str = concat!(
 /// `None` on expiry, which the caller reports as KEEL-E017. `tokio::sync::Mutex`
 /// offers no blocking timed acquire, so this polls `try_lock`; it costs nothing
 /// in the uncontended case (first `try_lock` succeeds) and only ever spins on a
-/// path that would otherwise deadlock forever. Same non-FIFO/barging and
-/// up-to-5ms handoff-latency caveat as [`lock_recover_timeout`] above.
+/// path that would otherwise deadlock forever.
+///
+/// Not FIFO: a later-arriving thread's `try_lock` can win a race against one
+/// that has been polling longer (no queue, no ordering guarantee), and
+/// detection of a just-freed lock lags by up to the 5ms poll interval below.
+/// Under SUSTAINED contention (not this function's target case — that's a
+/// single outer holder, not a queue of waiters) this is a second, narrower
+/// route to a spurious KEEL-E017 for a caller that never actually deadlocked,
+/// just lost every race — another reason the bound stays generous.
 fn blocking_lock_timeout<T>(
     m: &AsyncMutex<T>,
     deadline: std::time::Instant,
@@ -494,6 +505,24 @@ impl RuntimeHandle {
     }
 }
 
+/// Worker threads for the `Shared` (production) runtime.
+///
+/// Deliberately small, and NOT tokio's default of
+/// `available_parallelism()`. Two facts make the default pure cost here:
+/// nothing in the engine or the journal ever calls `tokio::spawn` (every
+/// background worker — the lease heartbeat, the events sink, the discovery
+/// writer — is a `std::thread`), and `Runtime::block_on` drives its future on
+/// the *calling* thread, so the concurrency this split exists for does not
+/// come from the pool at all. An uncapped pool would therefore spawn one OS
+/// thread per core per `KeelCore` and park all of them (measured: 1 → 17
+/// threads on a 16-core box). It is also actively wrong for Keel's audience:
+/// `available_parallelism()` does not read cgroup CPU quota, so a
+/// memory-capped Cloud Run container — the deployment in the field report
+/// this program answers — would size the pool from the host, not its limit.
+/// Two, rather than one, only so a future `spawn` that waits on another
+/// spawned task cannot self-starve.
+const SHARED_WORKER_THREADS: usize = 2;
+
 /// Build the runtime, with only the time driver enabled (the engine uses the
 /// timer wheel, never IO). `paused` turns on tokio's virtual clock (the
 /// conformance harness's model of time) — which only the current-thread flavor
@@ -507,6 +536,7 @@ fn build_runtime(paused: bool) -> std::io::Result<RuntimeHandle> {
     }
     let mut builder = Builder::new_multi_thread();
     builder.enable_time();
+    builder.worker_threads(SHARED_WORKER_THREADS);
     Ok(RuntimeHandle::Shared(Arc::new(builder.build()?)))
 }
 
@@ -961,8 +991,14 @@ impl KeelCore {
             holder,
             config,
         );
-        // Enter inside the runtime so the lease heartbeat can spawn (it no-ops
-        // outside a runtime); the enter itself is synchronous journal work.
+        // `FlowManager::enter_flow` is plain synchronous journal work; it runs
+        // under `block_on` only so any `tokio::time` read on this path resolves
+        // against this handle's (possibly paused) clock, the same reason
+        // `report()` does. It does NOT need a runtime for the lease heartbeat:
+        // that is a `std::thread` looping on `mpsc::recv_timeout`
+        // (`keel_core::flow::spawn_heartbeat`), renewing on real wall-clock time
+        // whether or not any runtime is being driven. An older version of this
+        // comment claimed otherwise.
         let handle = self
             .runtime
             .block_on(async { manager.enter_flow(&desc) })

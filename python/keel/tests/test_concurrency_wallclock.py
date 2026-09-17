@@ -241,15 +241,90 @@ class NestedEffectTest(unittest.TestCase):
 
     @unittest.skipUnless(_native_available(), "native core not built")
     def test_native_nested_effect_does_not_hang(self) -> None:
-        # Outside a flow this must SUCCEED once #116 lands. Until then it
-        # raises KEEL-E017 (this test's actual assertion), and this test
-        # fails on a clean assertion rather than wedging the suite.
+        # OUTSIDE a flow this SUCCEEDS since #116: the handle-wide
+        # `Mutex<Runtime>` is gone and `active_flow` is unheld, so there is
+        # nothing left for the inner call to contend and it simply runs.
+        # (Before #116 it raised KEEL-E017, and before #117 it hung forever.)
+        # The in-flow case, where `active_flow` IS held and KEEL-E017 is still
+        # the correct answer, is `InFlowNestedEffectTest` below.
         got = self._result(
             "native",
             extra_env={"KEEL_NESTED_EFFECT_WAIT_MS": str(self.NATIVE_WAIT_OVERRIDE_MS)},
         )
         self.assertNotIn("hung", got, "nested sync effect hung — #117")
         self.assertEqual(got.get("body"), "ok", got)
+
+
+class InFlowNestedEffectTest(unittest.TestCase):
+    """KEEL-E017 (CCR-9) still fires where it is still the right answer.
+
+    #116 deleted the handle-wide `Mutex<Runtime>`, which was one of the two
+    locks that could expire `execute`'s bounded acquire — and with it the only
+    way `NestedEffectTest` above could reach KEEL-E017, since that
+    reproduction runs OUTSIDE a flow and now legitimately succeeds. A contract
+    code nothing can raise is indistinguishable from a dead one, so this is
+    the in-flow companion: `active_flow` is genuinely held for a step's whole
+    duration (that IS Tier 2's admission rule, see `FlowOrderingTest`), so a
+    second synchronous effect on another thread that cannot get it inside the
+    bound is exactly the condition the code describes.
+
+    The reproduction is contention on that lock rather than a literal nested
+    dispatch, which is the mechanism itself: `try_lock` still failing is the
+    ONLY signal available, and it cannot distinguish "the outer step
+    dispatched to me" from "the outer step is merely slow" — which is why the
+    production bound is 30s and why the message is worded as a possibility.
+    Here `KEEL_NESTED_EFFECT_WAIT_MS` shrinks the bound below the outer step's
+    duration so the expiry happens in ~0.5s instead of ~30s.
+    """
+
+    WAIT_OVERRIDE_MS = 500
+    OUTER_SECONDS = 2.0
+
+    PROG = """
+    import threading, time, json
+    def slow():
+        time.sleep(%s)
+        return "outer"
+    def inner():
+        return "inner"
+    out = {}
+    def race():
+        # Let `slow` claim the flow's lock first; it holds it for the whole
+        # step, i.e. well past this thread's shortened bound.
+        time.sleep(0.3)
+        try:
+            out["inner"] = inner()
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+    def main():
+        t = threading.Thread(target=race)
+        t.start()
+        slow()
+        t.join(timeout=30)
+        print(json.dumps(out or {"hung": True}))
+    if __name__ == "__main__":
+        main()
+    """ % (OUTER_SECONDS,)
+    POLICY = """
+    [flows]
+    entrypoints = ["py:prog:main"]
+
+    [target."py:prog.slow"]
+
+    [target."py:prog.inner"]
+    """
+
+    @unittest.skipUnless(_native_available(), "native core not built")
+    def test_native_in_flow_contended_effect_raises_e017(self) -> None:
+        r = _run(
+            self.PROG, self.POLICY, "native", timeout=75,
+            extra_env={"KEEL_NESTED_EFFECT_WAIT_MS": str(self.WAIT_OVERRIDE_MS)},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        got = json.loads(r.stdout.decode().strip().splitlines()[-1])
+        self.assertNotIn("hung", got, "in-flow contended effect hung — the bound did not apply")
+        self.assertIn("error", got, f"expected KEEL-E017, got {got}")
+        self.assertIn("KEEL-E017", got["error"], got)
 
 
 class FlowOrderingTest(unittest.TestCase):
