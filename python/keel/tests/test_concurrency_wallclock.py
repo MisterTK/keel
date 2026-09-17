@@ -636,14 +636,20 @@ class StubRealClockTest(unittest.TestCase):
 
 
 class InEffectGuardTest(unittest.TestCase):
-    """#120: `report()`/`enter_flow()`/`exit_flow()` refuse with `KEEL-E005`,
-    and `recorded_idempotency_key()` degrades to `None`, when called from
-    inside a synchronous effect — instead of the native core's undocumented
-    `PanicException` (a `tokio::sync::Mutex::blocking_lock`/`Runtime::block_on`
-    panic from within an already-running runtime context).
+    """#120: `enter_flow()`/`exit_flow()` refuse with `KEEL-E005`, `report()`
+    returns its REAL report, and `recorded_idempotency_key()` degrades to
+    `None`, when called from inside a synchronous effect — instead of the
+    native core's undocumented `PanicException` (a
+    `tokio::sync::Mutex::blocking_lock`/`Runtime::block_on` panic from within
+    an already-running runtime context).
     `journal_time`/`journal_random` already had this `in_effect()` guard
     (the model this fix follows for `recorded_idempotency_key`);
     `report`/`enter_flow` had none at all — see `crates/keel-py/src/lib.rs`.
+    `report` needs no degradation: `Engine::report` is synchronous and this
+    thread is already inside the runtime's `block_on`, so it just skips the
+    (now redundant, and panicking) second `block_on` and returns the full
+    current report — pinned below against the same report read OUTSIDE the
+    effect, so a future silent downgrade to a stub/partial value fails here.
     `exit_flow`'s guard is defensive (its own docstring notes no known call
     site reaches it in this state today, transitively protected by
     `enter_flow`'s guard) rather than a reachable-today bug like the other
@@ -672,15 +678,14 @@ class InEffectGuardTest(unittest.TestCase):
         backend = get_backend()
         out = {}
         try:
-            backend.report()
-            out["report"] = "no_error"
+            out["report"] = backend.report()
         except Exception as e:
-            out["report"] = getattr(e, "code", type(e).__name__)
+            out["report"] = f"raised:{getattr(e, 'code', type(e).__name__)}"
         try:
             backend.enter_flow("py:prog:probe", "h")
             out["enter_flow"] = "no_error"
         except Exception as e:
-            out["enter_flow"] = getattr(e, "code", type(e).__name__)
+            out["enter_flow"] = [getattr(e, "code", type(e).__name__), str(e)]
         try:
             out["recorded_idempotency_key"] = backend.recorded_idempotency_key("t#-")
         except Exception as e:
@@ -689,11 +694,16 @@ class InEffectGuardTest(unittest.TestCase):
             backend.exit_flow("completed")
             out["exit_flow"] = "no_error"
         except Exception as e:
-            out["exit_flow"] = getattr(e, "code", type(e).__name__)
+            out["exit_flow"] = [getattr(e, "code", type(e).__name__), str(e)]
         return out
 
     def main():
-        print(json.dumps(probe()))
+        from keel._runtime import get_backend
+        out = probe()
+        # The same report read OUTSIDE any effect, for the in-effect one to be
+        # compared against (`main` is a flow entrypoint, not a wrapped target).
+        out["report_outside"] = get_backend().report()
+        print(json.dumps(out))
 
     if __name__ == "__main__":
         main()
@@ -710,7 +720,23 @@ class InEffectGuardTest(unittest.TestCase):
         r = _run(self.PROG, self.POLICY, "native")
         self.assertEqual(r.returncode, 0, r.stderr.decode())
         got = json.loads(r.stdout.decode().strip().splitlines()[-1])
-        self.assertEqual(got["report"], "KEEL-E005", got)
-        self.assertEqual(got["enter_flow"], "KEEL-E005", got)
+        # `report()` is NOT degraded in-effect: same shape, same keys, as the
+        # report read outside the effect moments later.
+        self.assertIsInstance(got["report"], dict, got)
+        self.assertEqual(got["report"]["v"], 1, got)
+        self.assertEqual(
+            sorted(got["report"]), sorted(got["report_outside"]), got
+        )
+        self.assertEqual(
+            sorted(got["report"]["targets"]),
+            sorted(got["report_outside"]["targets"]),
+            "the in-effect report saw a different target set than the real one",
+        )
         self.assertIsNone(got["recorded_idempotency_key"], got)
-        self.assertEqual(got["exit_flow"], "KEEL-E005", got)
+        # Assert the MESSAGE, not just the code: a missing journal and an
+        # already-open flow both raise KEEL-E005 from `enter_flow` too, so the
+        # code alone does not prove the `in_effect()` guard is what fired.
+        for name in ("enter_flow", "exit_flow"):
+            code, message = got[name]
+            self.assertEqual(code, "KEEL-E005", got)
+            self.assertIn("inside a synchronous effect", message, got)

@@ -914,25 +914,21 @@ impl KeelCore {
     /// The deterministic per-target metrics/discovery report (dict). Read inside
     /// the runtime so `clock_ms` reflects this handle's (possibly paused) clock.
     ///
-    /// Raises `KEEL-E005` when called from inside a synchronous effect (issue
-    /// #120): unlike `journal_time`/`journal_random`/`recorded_idempotency_key`,
-    /// there is no meaningful degraded value to hand back for "the whole
-    /// discovery report, right now" — a stale/partial report would be a
-    /// `dev_cache_off: null`-shaped lie, not a safe passthrough. `self.runtime`
-    /// is already inside `block_on` for the outer call whose effect is
-    /// running, so a second `block_on` here would panic; refusing with a typed
-    /// error is the same shape chunk-8 used for a nested `execute()` (Node).
+    /// Safe from inside a synchronous effect (issue #120), and NOT degraded
+    /// there. [`Engine::report`] is a plain synchronous fn; the `block_on`
+    /// below awaits nothing and exists solely so the `tokio::time` reads
+    /// inside it resolve against this handle's clock. When [`in_effect`] is
+    /// true this thread is ALREADY inside that same runtime's `block_on` (the
+    /// [`InEffectGuard`] is entered inside the `block_on` closure in
+    /// [`Self::execute`]), so runtime context is present and a direct call
+    /// returns the full, current report — while a second `block_on` would
+    /// panic. So: same value, one less `block_on`.
     fn report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if in_effect() {
-            return Err(keel_error(
-                py,
-                "KEEL-E005",
-                "report() cannot run from inside a synchronous effect (a nested call from \
-                 within another wrapped call's own effect body); call it outside any \
-                 intercepted call.",
-            ));
-        }
-        let value = self.runtime.block_on(async { self.engine.report() });
+        let value = if in_effect() {
+            self.engine.report()
+        } else {
+            self.runtime.block_on(async { self.engine.report() })
+        };
         pythonize(py, &value)
             .map(Bound::unbind)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("report not encodable: {e}")))
@@ -1010,9 +1006,9 @@ impl KeelCore {
             return Err(keel_error(
                 py,
                 "KEEL-E005",
-                "enter_flow() cannot open a nested flow from inside a synchronous effect (a \
-                 `cmd:` rule or flow entrypoint invoked from within another wrapped call's own \
-                 effect body); this build supports only one open flow at a time.",
+                "enter_flow() cannot open a flow from inside a synchronous effect (a `cmd:` rule \
+                 or flow entrypoint invoked from within another wrapped call's own effect \
+                 body); call it outside that nested effect.",
             ));
         }
         // Read the journal LIVE from the engine: a `configure` whose policy

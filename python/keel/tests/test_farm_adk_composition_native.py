@@ -321,6 +321,12 @@ class RealAdkNativeFlowEndToEndTest(_NativeAdkCompositionTestBase):
             "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
         self.assertLess(
+            effects[0]["seq"],
+            randoms[0]["seq"],
+            "identity is written before correlation (adk_pack writes the "
+            "session_identity step on flow entry, ahead of the invocation_id draw)",
+        )
+        self.assertLess(
             randoms[0]["seq"], effects[1]["seq"], "the tool effects admit after correlation"
         )
         self.assertLess(effects[1]["seq"], effects[2]["seq"])
