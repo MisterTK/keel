@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
-from ._backend import backend_name, load_backend
+from ._backend import _stub_paused, backend_name, load_backend
 from ._cachepoll import CachePollDetector
 from ._defaults import apply_pack_defaults
 from ._deploy import ephemeral_journal_warning
@@ -506,9 +506,21 @@ def _banner(
     # "production defaults" and the em-dash (breaking the adjacency the
     # KEEL_CWD/KEEL_POLICY tests assert) and stack a second parenthetical onto
     # the serverless "(dev cache off: …)" one.
-    backend_note = (
-        "" if backend_name == "native" else " (pure-Python backend: no durable flows, no cross-run cache)"
-    )
+    if backend_name == "native":
+        backend_note = ""
+    elif _stub_paused(env):
+        # #121: KEEL_STUB_PAUSED reinstates the entire #119 defect (every
+        # duration silently reinterpreted, no backoff/throttling/pacing) —
+        # an unstable, test-only seam that must never be silent if it ever
+        # escapes into a real process. Appended to the SAME clause rather
+        # than a new one, so the native line stays untouched either way.
+        backend_note = (
+            " (pure-Python backend: no durable flows, no cross-run cache; "
+            "KEEL_STUB_PAUSED is set — no pacing: retry backoff, rate limiting "
+            "and poll intervals are not real)"
+        )
+    else:
+        backend_note = " (pure-Python backend: no durable flows, no cross-run cache)"
     body = head if note is None else f"{head} — {note}"
     text = f"{body}{backend_note}\n"
     obj: dict[str, Any] = {

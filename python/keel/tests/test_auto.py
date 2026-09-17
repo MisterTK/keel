@@ -515,6 +515,25 @@ class StrictKeelCwdTest(unittest.TestCase):
             "pure-Python backend: no durable flows, no cross-run cache", text_proc.stderr.decode()
         )
 
+    def test_paused_stub_seam_is_named_end_to_end(self) -> None:
+        # #121: `KEEL_STUB_PAUSED` reinstates the entire #119 defect (no
+        # backoff/throttling/pacing) with zero evidence anywhere else in the
+        # output — a real, wired-up process that somehow inherits it must say
+        # so, not just the `_banner` unit tests. `child_env` normally strips
+        # this var (it is `**extra`, applied AFTER the strip), so this is the
+        # one place in the suite that deliberately lets it through.
+        (self.root / "keel.toml").write_text("")
+        text_proc = _run(
+            "import keel._auto",
+            env=child_env(
+                KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub", KEEL_STUB_PAUSED="1"
+            ),
+            cwd=str(self.root),
+        )
+        out = text_proc.stderr.decode()
+        self.assertIn("pure-Python backend: no durable flows, no cross-run cache", out)
+        self.assertIn("KEEL_STUB_PAUSED is set — no pacing", out)
+
     def test_json_log_format_refusal_is_an_error_object(self) -> None:
         import json as _json
         proc = _run(
