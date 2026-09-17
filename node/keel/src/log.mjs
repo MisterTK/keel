@@ -1,6 +1,7 @@
 /**
- * `KEEL_LOG_FORMAT=json`: Keel's five deployment-evidence lines — the
- * activation banner, the exit summary, the activation refusal, the
+ * `KEEL_LOG_FORMAT=json`: Keel's six deployment-evidence lines — the
+ * activation banner, the exit summary, BOTH activation refusals
+ * (`policy-missing-at-keel-cwd` and `activation-failed`), the
  * ephemeral-journal warning (`journal-ephemeral-storage`), and the
  * cache-poll warning (`cache-poll-suspect`) — each become one JSON object
  * (sorted keys, no spaces) so container log pipelines index their fields
@@ -10,12 +11,16 @@
  * is no auto-detect (byte-identity tests and `keel run` piping depend on the
  * text form).
  *
- * Severity coverage is UNIVERSAL across all five, not a subset (#130):
- * `INFO` on the activation and summary, `ERROR` on the refusal, `WARNING` on
- * both warning kinds — Cloud Run fills an entry's severity only from a
+ * Severity coverage is UNIVERSAL across all six, not a subset (#130):
+ * `INFO` on the activation and summary, `ERROR` on both refusals, `WARNING`
+ * on both warning kinds — Cloud Run fills an entry's severity only from a
  * `severity` field in the payload, so any kind left out is indistinguishable
- * from a healthy line in a severity-filtered view. A sixth kind introduced
- * later must carry one too, or this docstring is lying again.
+ * from a healthy line in a severity-filtered view. That count was FIVE when
+ * #130 shipped, and it was wrong: `activation-failed` (`register.mjs`)
+ * already existed as unstructured prose, which is the single most
+ * consequential line Keel writes — Keel is off and the host is serving
+ * unprotected. A seventh kind introduced later must carry one too, and must
+ * be counted here, or this docstring is lying again.
  *
  * The Python front end's `keel/_log.py` is the byte-for-byte twin: same
  * recognized value, same separators, same key ordering. Keep every emitted

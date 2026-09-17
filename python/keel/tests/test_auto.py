@@ -646,6 +646,60 @@ class StrictKeelCwdTest(unittest.TestCase):
         # indistinguishable from a healthy activation in a severity>=ERROR view.
         self.assertEqual(objs[0]["severity"], "ERROR", proc.stderr)
 
+    def test_json_log_format_activation_failure_is_an_error_object(self) -> None:
+        """#130's second refusal: ANY bootstrap exception also puts Keel fully
+        off while the host keeps serving, so it must be structured and ERROR
+        too — it was prose at the platform's default severity, which is
+        exactly the invisibility #130 was filed about.
+
+        The failure used here is the forward-compatibility shape CCR-11 makes
+        likely: a `keel.toml` carrying a `poll.until` key this Keel does not
+        know is KEEL-E001 at configure, and under `.pth` auto-activation that
+        lands the whole process unprotected. (An older Keel reads
+        `absent = "pending"` exactly this way; a placeholder key reproduces it
+        against the current one.)
+        """
+        import json as _json
+
+        (self.root / "keel.toml").write_text(
+            '[target."api.example.com"]\n'
+            'poll = { interval = "10s", deadline = "90s", '
+            'until = { field = "done", terminal = [true], futurekey = "pending" } }\n'
+        )
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1, proc.stderr)
+        self.assertEqual(objs[0]["keel"], "error")
+        self.assertEqual(objs[0]["code"], "activation-failed")
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root))
+        self.assertEqual(objs[0]["severity"], "ERROR", proc.stderr)
+        self.assertIn("KEEL-E001", objs[0]["message"], objs[0])
+        # No prose escaped alongside the object: KEEL_LOG_FORMAT=json REPLACES
+        # the text line, it does not accompany it.
+        self.assertNotIn("keel ▸", proc.stderr.decode(), proc.stderr)
+        # ...and the host survived, which is the whole point of the fail-open
+        # contract this line reports on.
+        self.assertIn(b"INSTALLED False", proc.stdout, proc.stdout)
+
+    def test_activation_failure_text_form_is_unchanged(self) -> None:
+        """The default (text) form of the same failure must be byte-identical
+        to what it has always been — `keel run` piping and three existing test
+        modules assert on this exact prose."""
+        (self.root / "keel.toml").write_text("not [valid toml\n")
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)),
+            cwd=str(self.root),
+        )
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertTrue(lines[0].startswith("keel ▸ auto-activation failed ("), lines[0])
+        self.assertTrue(lines[0].endswith("); continuing without keel"), lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()
