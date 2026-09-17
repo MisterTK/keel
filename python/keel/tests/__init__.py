@@ -24,13 +24,23 @@ for _p in (PKG_SRC, STUB, FIXTURES):
     if s not in sys.path:
         sys.path.insert(0, s)
 
+# The pure-Python backend honors real durations since #119. In-process tests
+# that go through `load_backend()` assert SEMANTICS, not pacing, so they would
+# otherwise sleep out Level-0 default retry/poll schedules — ~200s of pure wall
+# clock across the suite, and sleeping tests are timing-sensitive tests. Ask for
+# the virtual clock instead (unstable, test-only; see `keel._backend`). Tests
+# that DO measure real time either construct `KeelCoreStub()` themselves or run
+# in a child built by `child_env()`, which strips this.
+os.environ.setdefault("KEEL_STUB_PAUSED", "1")
+
 
 def child_env(**extra: str) -> dict[str, str]:
     """A clean environment for spawned `python -m keel run` children: Keel
-    toggles removed, `PYTHONPATH` pointed at the package src + the stub so the
-    child resolves `keel`/`keel_core_stub` without an install."""
+    toggles removed (including the suite-wide `KEEL_STUB_PAUSED`, so a child
+    always runs the real clock), `PYTHONPATH` pointed at the package src + the
+    stub so the child resolves `keel`/`keel_core_stub` without an install."""
     env = dict(os.environ)
-    for k in ("KEEL_DISABLE", "KEEL_BACKEND", "KEEL_QUIET"):
+    for k in ("KEEL_DISABLE", "KEEL_BACKEND", "KEEL_QUIET", "KEEL_STUB_PAUSED"):
         env.pop(k, None)
     parts = [str(PKG_SRC), str(STUB), str(FIXTURES)]
     if env.get("PYTHONPATH"):

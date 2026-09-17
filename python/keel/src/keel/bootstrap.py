@@ -460,11 +460,6 @@ def _banner(
         marker = serverless_marker(env)
         if marker is not None:
             desc = f"{desc} (dev cache off: {marker} detected)"
-    # #119: the pure-Python stub differs from the native core in Tier 2
-    # support and cache persistence — say so, but ONLY off the common path.
-    # The native line must stay byte-identical (golden tests pin it).
-    if backend_name != "native":
-        desc = f"{desc} (pure-Python backend: no durable flows, no cross-run cache)"
     # One line, dx-spec format (§ "wrapped N call sites (…) with … — keel init"),
     # listing function call sites and armed adapters together. At Level 0 there
     # are no function targets, so we show the adapters rather than "0 call sites".
@@ -504,7 +499,18 @@ def _banner(
             note = f"no keel.toml in {root}; `keel init` to customize"
         else:
             note = "`keel init` to customize"
-    text = f"{head}\n" if note is None else f"{head} — {note}\n"
+    # #119: the pure-Python stub differs from the native core in Tier 2 support
+    # and cache persistence — say so, but ONLY off the common path. The native
+    # line must stay byte-identical (golden tests pin it). This is its own
+    # TRAILING segment, not part of `desc`: inside `desc` it would land between
+    # "production defaults" and the em-dash (breaking the adjacency the
+    # KEEL_CWD/KEEL_POLICY tests assert) and stack a second parenthetical onto
+    # the serverless "(dev cache off: …)" one.
+    backend_note = (
+        "" if backend_name == "native" else " (pure-Python backend: no durable flows, no cross-run cache)"
+    )
+    body = head if note is None else f"{head} — {note}"
+    text = f"{body}{backend_note}\n"
     obj: dict[str, Any] = {
         "dev_cache_off": dev_cache_off,
         "keel": "activation",

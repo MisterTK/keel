@@ -219,11 +219,21 @@ const NESTED_EFFECT_WAIT: Duration = Duration::from_secs(30);
 /// earlier version of this fix made — see CCR-9's history). Same convention as
 /// `KEEL_CACHEPOLL_MIN_SPAN_S` (`node/keel/src/cachepoll.mjs`,
 /// `python/keel/src/keel/_cachepoll.py`).
+///
+/// Clamped to a floor of one second. A production process inherits its
+/// environment, so a stray `KEEL_NESTED_EFFECT_WAIT_MS=0` would make EVERY
+/// contended in-flow effect fail instantly with KEEL-E017 — the exact false
+/// accusation the generous default exists to prevent. One second is still far
+/// below any useful test bound, so the knob keeps working.
+const NESTED_EFFECT_WAIT_FLOOR: Duration = Duration::from_secs(1);
+
 fn nested_effect_wait() -> Duration {
     std::env::var("KEEL_NESTED_EFFECT_WAIT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map_or(NESTED_EFFECT_WAIT, Duration::from_millis)
+        .map_or(NESTED_EFFECT_WAIT, |ms| {
+            Duration::from_millis(ms).max(NESTED_EFFECT_WAIT_FLOOR)
+        })
 }
 
 /// The KEEL-E017 message raised when `execute`'s bounded wait for
@@ -232,13 +242,21 @@ fn nested_effect_wait() -> Duration {
 /// There used to be a second message for a handle-wide `runtime` mutex that
 /// `execute` also had to acquire. Issue #116 removed that mutex outside the
 /// paused-clock harness, so `active_flow` is now the only lock a synchronous
-/// effect can be blocked on — and it is only ever held while a flow is open,
-/// which makes this diagnosis specific rather than a guess: if the lock is
-/// held, an outer step of THIS flow holds it, on another thread.
+/// effect can be blocked on, and it is only ever held while a flow is open.
+///
+/// The message says "most likely" and stops there ON PURPOSE. The mechanism
+/// observes exactly one bit — the lock was still held 30s later — and that bit
+/// does not identify the holder: it may be an `execute_async` step of the same
+/// flow (which takes the same `active_flow`), in which case "a synchronous
+/// effect from inside another synchronous effect" is simply false, and it may
+/// be a genuinely slow outer step rather than one waiting on this call. Naming
+/// a cause we cannot establish would be the `dev_cache_off: null` defect class
+/// again, so the text names the evidence first and the likely cause second.
 const NESTED_FLOW_EFFECT_MESSAGE: &str = concat!(
-    "a synchronous effect was started from inside another synchronous effect running on a ",
-    "different thread, both belonging to the same open flow; the inner call cannot proceed ",
-    "until the outer one returns, and the outer one is waiting for it"
+    "a synchronous effect could not acquire the flow's step lock before the nested-effect ",
+    "deadline (30s by default); the most likely ",
+    "cause is that it was started from inside another effect of the same open flow running on ",
+    "a different thread, which cannot return until this call does"
 );
 
 /// Acquire `m` for a synchronous caller, giving up at `deadline`. Returns

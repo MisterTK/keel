@@ -9,6 +9,11 @@ Three drifts the whole-branch review flagged, now closed on the pure-Python stub
     unicode digits, "3 / s", "xinf", "x1_0" — Node and the core reject them).
 
 Valid policies (including the front end's own Level 0 output) must still pass.
+
+`paused=True` throughout: these assert Tier 1 SEMANTICS, not pacing.
+Since #119 the stub honors real durations, so an unpaused core here would
+sleep out every retry/poll schedule the cases declare — minutes of wall
+clock, and a deterministic surface turned into a timing-sensitive one.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from keel_core_stub import KeelCoreStub, KeelError
 class UnknownKeyRejectionTest(unittest.TestCase):
     def _rejects(self, policy: dict) -> str:
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure(policy)
+            KeelCoreStub(paused=True).configure(policy)
         self.assertEqual(ctx.exception.code, "KEEL-E001")
         return ctx.exception.message
 
@@ -45,7 +50,7 @@ class UnknownKeyRejectionTest(unittest.TestCase):
 class CacheEnumStrictnessTest(unittest.TestCase):
     def _rejects(self, cache: dict) -> None:
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure({"target": {"x": {"cache": cache}}})
+            KeelCoreStub(paused=True).configure({"target": {"x": {"cache": cache}}})
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
     def test_bad_scope(self) -> None:
@@ -58,7 +63,7 @@ class CacheEnumStrictnessTest(unittest.TestCase):
         self._rejects({"ttl": "10m", "key": "body"})
 
     def test_valid_enums_accepted(self) -> None:
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {"target": {"x": {"cache": {"ttl": "10m", "scope": "persistent", "mode": "dev", "key": "url"}}}}
         )
 
@@ -66,7 +71,7 @@ class CacheEnumStrictnessTest(unittest.TestCase):
 class NumericLiteralParityTest(unittest.TestCase):
     def _rejects(self, tp: dict) -> None:
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure({"target": {"x": tp}})
+            KeelCoreStub(paused=True).configure({"target": {"x": tp}})
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
     def test_rate_with_internal_whitespace(self) -> None:
@@ -80,7 +85,7 @@ class NumericLiteralParityTest(unittest.TestCase):
             self._rejects({"retry": {"schedule": f"exp(1s, {factor})"}})
 
     def test_well_formed_values_accepted(self) -> None:
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {"target": {"x": {"rate": "3/s", "timeout": "30s", "retry": {"schedule": "exp(200ms, x2, max 30s)"}}}}
         )
 
@@ -94,7 +99,7 @@ class BreakerRateModeValidationTest(unittest.TestCase):
 
     def _rejects(self, breaker: dict) -> None:
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure({"target": {"x": {"breaker": breaker}}})
+            KeelCoreStub(paused=True).configure({"target": {"x": {"breaker": breaker}}})
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
     def test_window_alone_is_half_configured(self) -> None:
@@ -114,21 +119,21 @@ class BreakerRateModeValidationTest(unittest.TestCase):
         self._rejects({"window": "30s", "failure_rate": 0.5, "min_calls": 0})
 
     def test_both_rate_knobs_selects_rate_mode(self) -> None:
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {"target": {"x": {"breaker": {"window": "30s", "failure_rate": 0.5, "min_calls": 4}}}}
         )
 
     def test_failures_alongside_rate_knobs_is_still_valid_count_mode(self) -> None:
         # Frozen schema precedence: "Setting `failures` selects count mode" —
         # the rate knobs are inert, not rejected.
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {"target": {"x": {"breaker": {"failures": 3, "window": "30s", "failure_rate": 0.5}}}}
         )
 
 
 class ValidTopLevelSectionsTest(unittest.TestCase):
     def test_flows_journal_telemetry_and_idempotency_accepted(self) -> None:
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {
                 "flows": {"entrypoints": ["py:m:f"], "on_nondeterminism": "warn"},
                 "journal": "file:.keel/journal.db",
@@ -140,13 +145,13 @@ class ValidTopLevelSectionsTest(unittest.TestCase):
     def test_bad_journal_and_flows_enum_rejected(self) -> None:
         for bad in ({"journal": "sqlite:x"}, {"flows": {"on_nondeterminism": "explode"}}):
             with self.assertRaises(KeelError) as ctx:
-                KeelCoreStub().configure(bad)
+                KeelCoreStub(paused=True).configure(bad)
             self.assertEqual(ctx.exception.code, "KEEL-E001")
 
     def test_scenario15_still_rejected(self) -> None:
         # Conformance scenario 15 (value error, not an unknown key) stays E001.
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure({"target": {"api.example.com": {"retry": {"attempts": 0}}}})
+            KeelCoreStub(paused=True).configure({"target": {"api.example.com": {"retry": {"attempts": 0}}}})
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
 
@@ -156,11 +161,11 @@ class ScheduleCompositionTest(unittest.TestCase):
 
     def _rejects(self, schedule: str) -> None:
         with self.assertRaises(KeelError) as ctx:
-            KeelCoreStub().configure({"target": {"x": {"retry": {"schedule": schedule}}}})
+            KeelCoreStub(paused=True).configure({"target": {"x": {"retry": {"schedule": schedule}}}})
         self.assertEqual(ctx.exception.code, "KEEL-E001")
 
     def _waits(self, schedule: str, attempts: int) -> list[int]:
-        core = KeelCoreStub()
+        core = KeelCoreStub(paused=True)
         core.configure(
             {
                 "target": {
@@ -176,7 +181,7 @@ class ScheduleCompositionTest(unittest.TestCase):
         return out["waits_ms"]
 
     def test_spec_example_parses(self) -> None:
-        KeelCoreStub().configure(
+        KeelCoreStub(paused=True).configure(
             {"target": {"x": {"retry": {"schedule": "exp(1s, x2, max 5m) upTo 10m andThen fixed(1m)"}}}}
         )
 

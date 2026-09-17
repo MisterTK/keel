@@ -9,7 +9,6 @@ against rather than assuming the ambient one.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -17,6 +16,10 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from keel_core_stub import KeelCoreStub
+
+from . import child_env
 
 NATIVE = None
 
@@ -38,7 +41,14 @@ def _run(script: str, policy: str, backend: str, timeout: int = 90, extra_env: d
     with TemporaryDirectory() as d:
         Path(d, "keel.toml").write_text(textwrap.dedent(policy))
         Path(d, "prog.py").write_text(textwrap.dedent(script))
-        env = {**os.environ, "KEEL_BACKEND": backend, "KEEL_QUIET": "1", **(extra_env or {})}
+        # `child_env` (NOT a raw `os.environ` copy): it is what injects
+        # PYTHONPATH=<src>:<stub>:<fixtures>, without which the child cannot
+        # `import keel` under the documented, PYTHONPATH-less command
+        # (`cd python/keel && python3 -m unittest discover`) — i.e. under CI.
+        # It also DROPS `KEEL_STUB_PAUSED`, which `tests/__init__` sets for the
+        # in-process suite: these tests measure real time, so their children
+        # must run the stub's real clock.
+        env = child_env(KEEL_BACKEND=backend, KEEL_QUIET="1", **(extra_env or {}))
         return subprocess.run(
             [sys.executable, "-m", "keel", "run", "prog.py"],
             cwd=d, env=env, capture_output=True, timeout=timeout,
@@ -274,10 +284,13 @@ class InFlowNestedEffectTest(unittest.TestCase):
     dispatched to me" from "the outer step is merely slow" — which is why the
     production bound is 30s and why the message is worded as a possibility.
     Here `KEEL_NESTED_EFFECT_WAIT_MS` shrinks the bound below the outer step's
-    duration so the expiry happens in ~0.5s instead of ~30s.
+    duration so the expiry happens in ~1s instead of ~30s. 1000ms is the floor
+    the override clamps to (a stray `=0` inherited by a production process
+    would fail every contended in-flow effect instantly), so asking for less
+    would silently get this anyway.
     """
 
-    WAIT_OVERRIDE_MS = 500
+    WAIT_OVERRIDE_MS = 1000
     OUTER_SECONDS = 2.0
 
     PROG = """
@@ -457,7 +470,7 @@ class FlowOrderingTest(unittest.TestCase):
             dp = Path(d.name)
             dp.joinpath("keel.toml").write_text(textwrap.dedent(self.POLICY))
             dp.joinpath("prog.py").write_text(textwrap.dedent(self.PROG))
-            env = {**os.environ, "KEEL_BACKEND": "native", "KEEL_QUIET": "1"}
+            env = child_env(KEEL_BACKEND="native", KEEL_QUIET="1")
             r = subprocess.run(
                 [sys.executable, "-m", "keel", "run", "prog.py"],
                 cwd=str(dp), env=env, capture_output=True, timeout=60,
@@ -503,3 +516,110 @@ class FlowOrderingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StubRealClockTest(unittest.TestCase):
+    """#119, second half: the unpaused stub needs a real CLOCK, not just real
+    sleeps.
+
+    The first pass gave `_wait` a `time.sleep` but left `_now_ms` a counter
+    that only `_wait`/`advance_clock` moved. Every layer that expires by
+    comparing against `_now_ms` therefore could not expire on its own:
+
+      * an OPEN BREAKER never closes — while open, calls fast-fail, a
+        fast-fail performs no wait, no wait means no clock movement, so
+        `_now_ms < open_until` stays true forever. A permanent,
+        self-sustaining outage for that target, in a backend `KEEL_BACKEND=auto`
+        silently selects in production.
+      * a CACHE ENTRY's ttl never expires (same comparison).
+
+    These run in-process against a directly constructed, explicitly UNPAUSED
+    stub — the production configuration — with sub-second durations, so they
+    cost ~1s of wall clock, not a schedule.
+    """
+
+    #: Long enough that a same-millisecond read can't pass by luck, short
+    #: enough to keep the test near a second.
+    COOLDOWN_MS = 400
+
+    @staticmethod
+    def _boom(_attempt: int) -> dict:
+        return {"status": "error", "class": "server", "message": "boom"}
+
+    @staticmethod
+    def _fine(_attempt: int) -> dict:
+        return {"status": "ok", "payload": {"v": 1}}
+
+    @staticmethod
+    def _req(**extra) -> dict:
+        return {"v": 1, "target": "api.example.com", **extra}
+
+    def test_open_breaker_closes_after_a_real_cooldown(self) -> None:
+        core = KeelCoreStub(paused=False)
+        core.configure(
+            {
+                "target": {
+                    "api.example.com": {
+                        "breaker": {"failures": 1, "cooldown": f"{self.COOLDOWN_MS}ms"},
+                        "retry": {"attempts": 1},
+                    }
+                }
+            }
+        )
+        first = core.execute(self._req(), self._boom)
+        self.assertEqual(first["result"], "error", first)
+        self.assertEqual(core.report()["targets"]["api.example.com"]["breaker_state"], "open")
+
+        # Still open immediately: this pins that the clock isn't simply racing
+        # ahead, i.e. the close below is the cooldown elapsing, not a no-op.
+        blocked = core.execute(self._req(), self._fine)
+        self.assertEqual(blocked["breaker"], "open", blocked)
+
+        time.sleep(self.COOLDOWN_MS / 1000.0 + 0.2)
+        # Pre-fix this hangs open forever: fast-failing calls never `_wait`, so
+        # the counter that `open_until` is compared against never moves.
+        self.assertEqual(
+            core.report()["targets"]["api.example.com"]["breaker_state"],
+            "closed",
+            "an open breaker never closed on the unpaused stub — the clock is not real",
+        )
+        recovered = core.execute(self._req(), self._fine)
+        self.assertEqual(recovered["result"], "ok", recovered)
+
+    def test_cache_ttl_expires_on_real_time(self) -> None:
+        core = KeelCoreStub(paused=False)
+        core.configure({"target": {"api.example.com": {"cache": {"ttl": "400ms"}}}})
+        req = self._req(args_hash="h1")
+        self.assertFalse(core.execute(req, self._fine)["from_cache"])
+        self.assertTrue(core.execute(req, self._fine)["from_cache"], "expected a cache hit")
+        time.sleep(0.6)
+        self.assertFalse(
+            core.execute(req, self._fine)["from_cache"],
+            "a cache entry outlived its ttl — the clock is not real",
+        )
+
+    def test_advance_clock_still_composes_when_unpaused(self) -> None:
+        """`advance_clock` is an OFFSET on the real clock, not the clock
+        itself: the paused harness still owns time, and an unpaused core can
+        still be pushed forward without the two mechanisms fighting."""
+        core = KeelCoreStub(paused=False)
+        core.configure({"target": {"api.example.com": {"cache": {"ttl": "1h"}}}})
+        req = self._req(args_hash="h2")
+        core.execute(req, self._fine)
+        self.assertTrue(core.execute(req, self._fine)["from_cache"])
+        core.advance_clock(2 * 60 * 60 * 1000)
+        self.assertFalse(core.execute(req, self._fine)["from_cache"])
+
+    def test_paused_clock_is_unchanged(self) -> None:
+        """The conformance contract: paused, time moves only on `_wait` and
+        `advance_clock`, and starts at 0."""
+        core = KeelCoreStub(paused=True)
+        core.configure({"target": {"api.example.com": {"cache": {"ttl": "1s"}}}})
+        self.assertEqual(core.report()["clock_ms"], 0)
+        req = self._req(args_hash="h3")
+        core.execute(req, self._fine)
+        time.sleep(0.05)
+        self.assertEqual(core.report()["clock_ms"], 0, "a paused clock moved with real time")
+        self.assertTrue(core.execute(req, self._fine)["from_cache"])
+        core.advance_clock(2000)
+        self.assertFalse(core.execute(req, self._fine)["from_cache"])

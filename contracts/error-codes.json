@@ -76,8 +76,8 @@
     },
     "KEEL-E017": {
       "name": "nested-sync-effect",
-      "what": "A synchronous effect was started from inside another synchronous effect running on a different thread.",
-      "why": "Keel's synchronous path serializes an effect against the flow it belongs to. When the nested call runs on a different OS thread than the outer one, the thread-local re-entrancy guard cannot see the nesting, and the inner call would otherwise wait forever on a lock the outer call will not release until the inner one returns.",
+      "what": "A synchronous effect inside an open flow could not acquire the flow's step lock before the nested-effect deadline (30s by default).",
+      "why": "Keel's synchronous path serializes an effect against the flow it belongs to, and only a flow-scoped step can hold that lock. The most likely cause is a nested call: an outer effect of the same flow, running on a different OS thread, cannot return until this inner one does, and the thread-local re-entrancy guard cannot see nesting that crosses threads. Keel observes only that the lock stayed held, not who held it, so a merely slow outer step is the other explanation.",
       "next": "Make the inner call from the same thread as the outer one, use the async path (which composes nesting), or move the nested call outside the wrapped effect. A FastAPI/Starlette TestClient suite hits this because the ASGI app runs in a portal thread inside the client's own intercepted request."
     },
     "KEEL-E020": {
