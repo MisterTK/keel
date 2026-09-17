@@ -188,12 +188,21 @@ def main() -> int:
     stamp = re.search(r"^Status \(([^)]*)", llms, re.M)
     if not stamp:
         fail(problems, "llms.txt: no 'Status (...)' line found")
-    elif version not in stamp.group(1):
-        fail(
-            problems,
-            f"llms.txt's status line does not mention {version} (the workspace version): "
-            f"{stamp.group(1)!r} — bump-version.sh does not sweep this, so it must be edited by hand",
-        )
+    else:
+        # The HEADLINE version — the first one named — must be the workspace
+        # version, not merely mentioned somewhere in the stamp. Checking only
+        # for presence is too weak: right after a bump, a stamp reading
+        # "v0.6.5 is the newest release; main carries unreleased 0.7.0 work"
+        # contains the new version while asserting the opposite of the truth.
+        first = re.search(r"v?(\d+\.\d+\.\d+)", stamp.group(1))
+        if not first:
+            fail(problems, f"llms.txt's status line names no version: {stamp.group(1)!r}")
+        elif first.group(1) != version:
+            fail(
+                problems,
+                f"llms.txt's status line leads with {first.group(1)}, but the workspace version is "
+                f"{version} — bump-version.sh does not sweep this, so it must be edited by hand",
+            )
 
     if problems:
         for p in problems:

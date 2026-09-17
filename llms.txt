@@ -10,9 +10,7 @@ Keel intercepts a program's outbound calls (httpx/requests/fetch, LLM SDKs,
 it is `keel run app.py` / `keel run app.mjs` — no imports, no context objects, no
 base classes. Uninstalling the package removes the behavior and nothing else.
 
-Status (v0.6.5 is the newest release, 2026-09-17; `main` carries unreleased
-0.7.0 work — `until.absent`, `severity` on JSON log lines, `activation_backend`,
-`KEEL_EVENTS=stderr`): Tier 1 and Tier 2 (including async flows) work
+Status (v0.7.0, 2026-09-17): Tier 1 and Tier 2 (including async flows) work
 end-to-end in both Python and Node on the real Rust core, with `kill -9`
 resume, a Postgres journal backend for fleet durability, `keel
 record`/`keel sim`, and a scoped Rust front end (`#[keel::wrap]` +
