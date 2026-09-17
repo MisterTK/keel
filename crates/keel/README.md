@@ -75,6 +75,16 @@ inference. `KeelMiddleware`'s v1 scope: exact-host targets only (no
 `host:`/URL-pattern globs), no response caching, add it last in the
 `ClientBuilder` chain. Both documented in full in each type's own rustdoc.
 
+Idempotency follows the same rule as the Python and Node front ends: the
+idempotent methods are retryable, a `POST`/`PATCH` is not unless it carries an
+idempotency header, and — the one exemption
+([`contracts/adapter-pack.md`](https://github.com/MisterTK/keel/blob/main/contracts/adapter-pack.md),
+CCR-8) — a `POST` to a host under `googleapis.com` whose last path segment is a
+`:fetch…Operation` custom method is a long-running-operation read, judged
+idempotent with no key. The shared corpus
+`conformance/operation_read/cases.json` is the referee for all three front
+ends, row for row.
+
 ## Learn more
 
 - [Root README](https://github.com/MisterTK/keel#readme) — what Keel is,

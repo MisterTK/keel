@@ -58,7 +58,7 @@ Crash it mid-run (`kill -9`), re-run the same command, and it resumes from where
 it stopped. `keel flows` shows resumable/completed flows; `keel trace <flow>`
 shows the step ledger.
 
-### v0.1 limitations (precise, never silent)
+### Durability limits (precise, never silent)
 
 Durability is a promise; a silent downgrade would be a Level 0 surprise. So this
 is a hard, actionable error rather than a quiet fallback:
