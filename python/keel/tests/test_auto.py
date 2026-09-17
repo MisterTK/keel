@@ -10,6 +10,7 @@ site's `.pth` processing itself.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -514,6 +515,72 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertIn(
             "pure-Python backend: no durable flows, no cross-run cache", text_proc.stderr.decode()
         )
+
+    def test_paused_stub_seam_is_named_end_to_end(self) -> None:
+        # #121: `KEEL_STUB_PAUSED` reinstates the entire #119 defect (no
+        # backoff/throttling/pacing) with zero evidence anywhere else in the
+        # output — a real, wired-up process that somehow inherits it must say
+        # so, not just the `_banner` unit tests. `child_env` normally strips
+        # this var (it is `**extra`, applied AFTER the strip), so this is the
+        # one place in the suite that deliberately lets it through.
+        (self.root / "keel.toml").write_text("")
+        text_proc = _run(
+            "import keel._auto",
+            env=child_env(
+                KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub", KEEL_STUB_PAUSED="1"
+            ),
+            cwd=str(self.root),
+        )
+        out = text_proc.stderr.decode()
+        self.assertIn("pure-Python backend: no durable flows, no cross-run cache", out)
+        self.assertIn("KEEL_STUB_PAUSED is set — no pacing", out)
+
+        # …and under KEEL_LOG_FORMAT=json, where `emit` writes the OBJECT
+        # INSTEAD of that text: the deployed, structured-logging process is
+        # the one this warning exists for, so both backend facts have to be
+        # indexable FIELDS or they vanish exactly where they matter (F10, the
+        # same reason `dev_cache_off` is a field).
+        import json as _json
+
+        json_proc = _run(
+            "import keel._auto",
+            env=child_env(
+                KEEL_ENABLE="1",
+                KEEL_CWD=str(self.root),
+                KEEL_BACKEND="stub",
+                KEEL_STUB_PAUSED="1",
+                KEEL_LOG_FORMAT="json",
+            ),
+            cwd=str(self.root),
+        )
+        act = _json.loads(json_proc.stderr.decode().splitlines()[0])
+        self.assertEqual(act["keel"], "activation", json_proc.stderr)
+        self.assertEqual(act["backend"], "stub", act)
+        self.assertIs(act["stub_paused"], True, act)
+        self.assertNotIn("keel ▸", json_proc.stderr.decode())
+
+        # The native backend makes a stray KEEL_STUB_PAUSED inert, so the
+        # field must be ABSENT there rather than reporting a seam that is not
+        # in force — the `dev_cache_off: null`-shaped lie, in miniature.
+        # (`KEEL_BACKEND=native` is a hard failure without the module, so this
+        # half only runs where the native core is actually built — and the
+        # `importlib` probe, not the child's exit code, decides, so a child
+        # that failed for some OTHER reason cannot silently skip the check.)
+        if importlib.util.find_spec("keel_core") is not None:
+            native_proc = _run(
+                "import keel._auto",
+                env=child_env(
+                    KEEL_ENABLE="1",
+                    KEEL_CWD=str(self.root),
+                    KEEL_BACKEND="native",
+                    KEEL_STUB_PAUSED="1",
+                    KEEL_LOG_FORMAT="json",
+                ),
+                cwd=str(self.root),
+            )
+            native_act = _json.loads(native_proc.stderr.decode().splitlines()[0])
+            self.assertEqual(native_act["backend"], "native", native_act)
+            self.assertNotIn("stub_paused", native_act, native_act)
 
     def test_json_log_format_refusal_is_an_error_object(self) -> None:
         import json as _json

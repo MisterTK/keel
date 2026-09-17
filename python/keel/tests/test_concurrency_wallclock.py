@@ -288,10 +288,20 @@ class InFlowNestedEffectTest(unittest.TestCase):
     the override clamps to (a stray `=0` inherited by a production process
     would fail every contended in-flow effect instantly), so asking for less
     would silently get this anyway.
+
+    Margin: the race thread's contended `inner()` attempt starts at 0.3s and
+    the (floored) 1000ms bound expires it at ~1.3s; `OUTER_SECONDS` must clear
+    that with real headroom on a loaded CI runner, which has never run this
+    test. 3.0s gives ~1.7s of slack (vs. the original 2.0s's bare 0.7s) —
+    comfortably larger without making the test slow. Removing the
+    `KEEL_NESTED_EFFECT_WAIT_MS` override (production bound 30s) must still
+    make this test fail: the outer step then releases the lock at 3.0s, well
+    inside the 30s bound, so `inner()` succeeds instead of raising KEEL-E017 —
+    proving this pins the expiry, not a constant.
     """
 
     WAIT_OVERRIDE_MS = 1000
-    OUTER_SECONDS = 2.0
+    OUTER_SECONDS = 3.0
 
     PROG = """
     import threading, time, json
@@ -623,3 +633,110 @@ class StubRealClockTest(unittest.TestCase):
         self.assertTrue(core.execute(req, self._fine)["from_cache"])
         core.advance_clock(2000)
         self.assertFalse(core.execute(req, self._fine)["from_cache"])
+
+
+class InEffectGuardTest(unittest.TestCase):
+    """#120: `enter_flow()`/`exit_flow()` refuse with `KEEL-E005`, `report()`
+    returns its REAL report, and `recorded_idempotency_key()` degrades to
+    `None`, when called from inside a synchronous effect — instead of the
+    native core's undocumented `PanicException` (a
+    `tokio::sync::Mutex::blocking_lock`/`Runtime::block_on` panic from within
+    an already-running runtime context).
+    `journal_time`/`journal_random` already had this `in_effect()` guard
+    (the model this fix follows for `recorded_idempotency_key`);
+    `report`/`enter_flow` had none at all — see `crates/keel-py/src/lib.rs`.
+    `report` needs no degradation: `Engine::report` is synchronous and this
+    thread is already inside the runtime's `block_on`, so it just skips the
+    (now redundant, and panicking) second `block_on` and returns the full
+    current report — pinned below against the same report read OUTSIDE the
+    effect, so a future silent downgrade to a stub/partial value fails here.
+    `exit_flow`'s guard is defensive (its own docstring notes no known call
+    site reaches it in this state today, transitively protected by
+    `enter_flow`'s guard) rather than a reachable-today bug like the other
+    two, but the mechanism is identical and this test exercises it the same
+    way for the same reason: a documented landmine is still a landmine.
+
+    The reproduction is a REAL nested effect, not a direct unit-test call
+    against a bare `KeelCore`: `probe` is a `py:` function target, so by the
+    time its body runs, the native core's `IN_EFFECT` thread-local is set
+    (inside `invoke_sync_effect`, itself called from the effect closure
+    `execute()` built for the `probe()` call) — calling `KeelCore` methods
+    directly from inside that body is exactly the "wrapped `py:`/`tool:`
+    effect" case issue #120 names, reached without needing a real `cmd:` rule
+    or ADK Runner flow. `probe` is called from `main`, a `[flows]`
+    entrypoint — needed only so `keel run` imports the script as a real
+    module named `prog` (triggering the `py:` import hook, which wraps
+    module-level functions only AFTER `exec_module` runs — `_hook.py`'s
+    docstring), not because the flow itself matters to this test.
+    """
+
+    PROG = """
+    import json
+
+    def probe():
+        from keel._runtime import get_backend
+        backend = get_backend()
+        out = {}
+        try:
+            out["report"] = backend.report()
+        except Exception as e:
+            out["report"] = f"raised:{getattr(e, 'code', type(e).__name__)}"
+        try:
+            backend.enter_flow("py:prog:probe", "h")
+            out["enter_flow"] = "no_error"
+        except Exception as e:
+            out["enter_flow"] = [getattr(e, "code", type(e).__name__), str(e)]
+        try:
+            out["recorded_idempotency_key"] = backend.recorded_idempotency_key("t#-")
+        except Exception as e:
+            out["recorded_idempotency_key"] = f"raised:{getattr(e, 'code', type(e).__name__)}"
+        try:
+            backend.exit_flow("completed")
+            out["exit_flow"] = "no_error"
+        except Exception as e:
+            out["exit_flow"] = [getattr(e, "code", type(e).__name__), str(e)]
+        return out
+
+    def main():
+        from keel._runtime import get_backend
+        out = probe()
+        # The same report read OUTSIDE any effect, for the in-effect one to be
+        # compared against (`main` is a flow entrypoint, not a wrapped target).
+        out["report_outside"] = get_backend().report()
+        print(json.dumps(out))
+
+    if __name__ == "__main__":
+        main()
+    """
+    POLICY = """
+    [flows]
+    entrypoints = ["py:prog:main"]
+
+    [target."py:prog.probe"]
+    """
+
+    @unittest.skipUnless(_native_available(), "native core not built")
+    def test_native_in_effect_calls_do_not_panic(self) -> None:
+        r = _run(self.PROG, self.POLICY, "native")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        got = json.loads(r.stdout.decode().strip().splitlines()[-1])
+        # `report()` is NOT degraded in-effect: same shape, same keys, as the
+        # report read outside the effect moments later.
+        self.assertIsInstance(got["report"], dict, got)
+        self.assertEqual(got["report"]["v"], 1, got)
+        self.assertEqual(
+            sorted(got["report"]), sorted(got["report_outside"]), got
+        )
+        self.assertEqual(
+            sorted(got["report"]["targets"]),
+            sorted(got["report_outside"]["targets"]),
+            "the in-effect report saw a different target set than the real one",
+        )
+        self.assertIsNone(got["recorded_idempotency_key"], got)
+        # Assert the MESSAGE, not just the code: a missing journal and an
+        # already-open flow both raise KEEL-E005 from `enter_flow` too, so the
+        # code alone does not prove the `in_effect()` guard is what fired.
+        for name in ("enter_flow", "exit_flow"):
+            code, message = got[name]
+            self.assertEqual(code, "KEEL-E005", got)
+            self.assertIn("inside a synchronous effect", message, got)

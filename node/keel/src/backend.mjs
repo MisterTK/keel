@@ -161,6 +161,17 @@ function resolveJournalPath(cwd, env) {
 }
 
 /**
+ * Report `"native"` for the napi addon, `"stub"` for the in-repo pure-JS
+ * engine — the vocabulary Python's `backend_name` and the JSON summary corpus
+ * already use, so the activation object reads the same in both languages.
+ * (`AsyncEngine.kind` is the more specific `"node-stub"`; that stays as-is for
+ * in-process diagnostics.)
+ */
+export function backendName(backend) {
+  return backend?.kind === "native" ? "native" : "stub";
+}
+
+/**
  * Resolve the runtime backend. Returns an object exposing async
  * `execute(request, effect)`, `configure(policy)`, `layer(target, key)`,
  * `report()`, and `persistent`.

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
-from ._backend import backend_name, load_backend
+from ._backend import _stub_paused, backend_name, load_backend
 from ._cachepoll import CachePollDetector
 from ._defaults import apply_pack_defaults
 from ._deploy import ephemeral_journal_warning
@@ -506,12 +506,33 @@ def _banner(
     # "production defaults" and the em-dash (breaking the adjacency the
     # KEEL_CWD/KEEL_POLICY tests assert) and stack a second parenthetical onto
     # the serverless "(dev cache off: …)" one.
-    backend_note = (
-        "" if backend_name == "native" else " (pure-Python backend: no durable flows, no cross-run cache)"
-    )
+    if backend_name == "native":
+        backend_note = ""
+    elif _stub_paused(env):
+        # #121: KEEL_STUB_PAUSED reinstates the entire #119 defect (every
+        # duration silently reinterpreted, no backoff/throttling/pacing) —
+        # an unstable, test-only seam that must never be silent if it ever
+        # escapes into a real process. Appended to the SAME clause rather
+        # than a new one, so the native line stays untouched either way.
+        backend_note = (
+            " (pure-Python backend: no durable flows, no cross-run cache; "
+            "KEEL_STUB_PAUSED is set — no pacing: retry backoff, rate limiting "
+            "and poll intervals are not real)"
+        )
+    else:
+        backend_note = " (pure-Python backend: no durable flows, no cross-run cache)"
     body = head if note is None else f"{head} — {note}"
     text = f"{body}{backend_note}\n"
+    # `emit` writes the object INSTEAD of the text under KEEL_LOG_FORMAT=json,
+    # so anything the text alone says is invisible to a log pipeline — the same
+    # reason `dev_cache_off` is a field (F10, above). Both backend facts have to
+    # be named here or the #119/#121 warnings vanish in exactly the deployed,
+    # structured-logging process they were written for. `stub_paused` is present
+    # only when the seam is actually in force (stub backend AND the env var): on
+    # the native backend the variable is inert, and a field claiming otherwise
+    # would be the `dev_cache_off: null`-shaped lie F10 warns about.
     obj: dict[str, Any] = {
+        "backend": backend_name,
         "dev_cache_off": dev_cache_off,
         "keel": "activation",
         "policy_path": str(root / "keel.toml") if source != "defaults" and root is not None else None,
@@ -523,4 +544,6 @@ def _banner(
     }
     if note is not None:
         obj["note"] = note
+    if backend_name != "native" and _stub_paused(env):
+        obj["stub_paused"] = True
     emit(env, text, obj)

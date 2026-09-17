@@ -427,6 +427,32 @@ class BannerTest(unittest.TestCase):
             out = self._banner("defaults", [], [], cwd=Path(tmp), backend_name="native")
         self.assertNotIn("backend", out)
 
+    def test_banner_names_a_paused_stub_backend(self) -> None:
+        # #121: KEEL_STUB_PAUSED reinstates the entire #119 defect (every
+        # duration silently reinterpreted, no backoff/throttling/pacing) with
+        # no evidence anywhere else in the output — the banner must say so.
+        with TemporaryDirectory() as tmp:
+            out = self._banner(
+                "defaults", [], [], env={"KEEL_STUB_PAUSED": "1"}, cwd=Path(tmp), backend_name="stub"
+            )
+        self.assertIn("pure-Python backend: no durable flows, no cross-run cache", out)
+        self.assertIn("KEEL_STUB_PAUSED is set — no pacing", out)
+
+    def test_banner_native_backend_ignores_stub_paused_seam(self) -> None:
+        # The seam is read from `_backend.py`'s own env mapping and only ever
+        # matters for the stub — a native backend must stay byte-identical
+        # regardless of a stray KEEL_STUB_PAUSED in the environment.
+        with TemporaryDirectory() as tmp:
+            out = self._banner(
+                "defaults", [], [], env={"KEEL_STUB_PAUSED": "1"}, cwd=Path(tmp), backend_name="native"
+            )
+        self.assertNotIn("backend", out)
+
+    def test_banner_unpaused_stub_says_nothing_about_the_seam(self) -> None:
+        with TemporaryDirectory() as tmp:
+            out = self._banner("defaults", [], [], cwd=Path(tmp), backend_name="stub")
+        self.assertNotIn("KEEL_STUB_PAUSED", out)
+
 
 class BackendNameTest(unittest.TestCase):
     """#119 transparency: `backend_name` is the single seam the banner and

@@ -20,7 +20,7 @@ import {
   extractFlowEntrypoints,
   extractCmdFlows,
 } from "./policy.mjs";
-import { loadBackend } from "./backend.mjs";
+import { backendName, loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
 import { createCachePollDetector } from "./cachepoll.mjs";
@@ -298,7 +298,9 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   }
 
   installExitFlush(discovery, { backend: effectiveBackend, summary, meta, env });
-  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource);
+  banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource, {
+    backendName: backendName(backend),
+  });
   return {
     enabled: true,
     backend: effectiveBackend,
@@ -438,7 +440,17 @@ function policyAboveCwd(cwd, maxLevels = 8) {
   return null;
 }
 
-function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd") {
+function banner(
+  env,
+  source,
+  fnCount,
+  packs,
+  eve,
+  aiSdk,
+  cwd,
+  cwdSource = "cwd",
+  { backendName: bname = "native" } = {}
+) {
   if (isTruthy(env.KEEL_QUIET)) return;
   const seams = ["global fetch"];
   if (fnCount > 0) seams.push(`${fnCount} function target${fnCount === 1 ? "" : "s"}`);
@@ -483,7 +495,14 @@ function banner(env, source, fnCount, packs, eve, aiSdk, cwd, cwdSource = "cwd")
     }
   }
   const text = note === null ? `${head}\n` : `${head} — ${note}\n`;
+  // `emit` writes the object INSTEAD of the text under KEEL_LOG_FORMAT=json,
+  // so which backend resolved has to be a FIELD to survive into a structured
+  // log — the same reason `dev_cache_off` is one (F10, above). Python's twin
+  // carries the identical key with the identical vocabulary. (Node's banner
+  // text says nothing about the backend; only the JSON form names it, which is
+  // why this is a field-only addition here.)
   const obj = {
+    backend: bname,
     dev_cache_off: devCacheOff,
     keel: "activation",
     policy_path: source === "defaults" ? null : join(cwd, "keel.toml"),

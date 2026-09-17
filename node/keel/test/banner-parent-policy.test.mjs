@@ -277,6 +277,17 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
     assert.equal(objs[0].root_source, "cwd");
     assert.ok(!("note" in objs[0]), `a loaded policy has no em-dash tail — no note key: ${objs[0].note}`);
     assert.equal(objs[0].dev_cache_off, null, "no serverless marker here — the dev cache stayed on");
+    // Which backend resolved has to be a FIELD, not just prose: `emit` writes
+    // the object INSTEAD of the text in json mode, so a structured-logging
+    // deployment can only index what the object names (F10, the same reason
+    // `dev_cache_off` is a field). Python's twin carries the identical key
+    // with the identical "native"/"stub" vocabulary.
+    // Forced to the in-repo engine so the expected value is exact rather than
+    // "whichever of the two this machine happened to load".
+    const stubObjs = keelJsonLines(
+      run(root, { KEEL_LOG_FORMAT: "json", KEEL_BACKEND: "stub" }).stderr
+    );
+    assert.equal(stubObjs[0].backend, "stub", JSON.stringify(stubObjs[0]));
     assert.equal(objs[1].calls, 0);
     assert.equal(objs[1].policy_source, "keel.toml");
 
