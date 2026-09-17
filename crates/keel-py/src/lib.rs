@@ -913,7 +913,25 @@ impl KeelCore {
 
     /// The deterministic per-target metrics/discovery report (dict). Read inside
     /// the runtime so `clock_ms` reflects this handle's (possibly paused) clock.
+    ///
+    /// Raises `KEEL-E005` when called from inside a synchronous effect (issue
+    /// #120): unlike `journal_time`/`journal_random`/`recorded_idempotency_key`,
+    /// there is no meaningful degraded value to hand back for "the whole
+    /// discovery report, right now" — a stale/partial report would be a
+    /// `dev_cache_off: null`-shaped lie, not a safe passthrough. `self.runtime`
+    /// is already inside `block_on` for the outer call whose effect is
+    /// running, so a second `block_on` here would panic; refusing with a typed
+    /// error is the same shape chunk-8 used for a nested `execute()` (Node).
     fn report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if in_effect() {
+            return Err(keel_error(
+                py,
+                "KEEL-E005",
+                "report() cannot run from inside a synchronous effect (a nested call from \
+                 within another wrapped call's own effect body); call it outside any \
+                 intercepted call.",
+            ));
+        }
         let value = self.runtime.block_on(async { self.engine.report() });
         pythonize(py, &value)
             .map(Bound::unbind)
@@ -978,6 +996,25 @@ impl KeelCore {
         explicit_key: Option<String>,
         lease_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
+        // Guard first (issue #120): a nested flow is not a capability this
+        // build provides from inside a synchronous effect — `self.runtime`
+        // is already inside `block_on` for the outer call whose effect is
+        // running, so the `block_on` below would panic, and
+        // `self.active_flow.blocking_lock()` below that would panic too (or,
+        // on the harness's current-thread runtime, self-deadlock). There is
+        // no degraded value to hand back for "open a new flow" the way
+        // `journal_time`/`journal_random` hand back the live clock/RNG value —
+        // opening one is the whole point of the call. Same KEEL-E005 shape
+        // chunk-8 used for Node's nested synchronous `execute()` refusal.
+        if in_effect() {
+            return Err(keel_error(
+                py,
+                "KEEL-E005",
+                "enter_flow() cannot open a nested flow from inside a synchronous effect (a \
+                 `cmd:` rule or flow entrypoint invoked from within another wrapped call's own \
+                 effect body); this build supports only one open flow at a time.",
+            ));
+        }
         // Read the journal LIVE from the engine: a `configure` whose policy
         // carries a `journal` location replaces the construction attachment,
         // and Tier 2 steps must land in the same store the engine caches
@@ -1073,12 +1110,20 @@ impl KeelCore {
     ///
     /// `None` (never raises): no flow is open, nothing is recorded at that key,
     /// or the recorded step is already terminal (a terminal step is
-    /// substituted, never re-sent, so no key is due). Detached like
-    /// `journal_time`/`journal_random` to avoid a GIL-held deadlock against an
-    /// in-flight `execute_async` step that needs the GIL to invoke its Python
-    /// effect before releasing this same lock (module docs' "async flow
-    /// bridge" section).
+    /// substituted, never re-sent, so no key is due). Also `None` from inside
+    /// a synchronous effect (issue #120) — same convention as
+    /// `journal_time`/`journal_random`: the caller (`_http.
+    /// peek_recorded_idempotency_key`) treats "nothing recorded" and "can't
+    /// peek right now" identically, minting a fresh key either way, so this is
+    /// a safe passthrough rather than a capability gap needing KEEL-E005.
+    /// Detached like `journal_time`/`journal_random` to avoid a GIL-held
+    /// deadlock against an in-flight `execute_async` step that needs the GIL
+    /// to invoke its Python effect before releasing this same lock (module
+    /// docs' "async flow bridge" section).
     fn recorded_idempotency_key(&self, py: Python<'_>, step_key: &str) -> Option<String> {
+        if in_effect() {
+            return None;
+        }
         py.detach(|| {
             self.active_flow
                 .blocking_lock()

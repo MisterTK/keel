@@ -623,3 +623,73 @@ class StubRealClockTest(unittest.TestCase):
         self.assertTrue(core.execute(req, self._fine)["from_cache"])
         core.advance_clock(2000)
         self.assertFalse(core.execute(req, self._fine)["from_cache"])
+
+
+class InEffectGuardTest(unittest.TestCase):
+    """#120: `report()`/`enter_flow()` refuse with `KEEL-E005`, and
+    `recorded_idempotency_key()` degrades to `None`, when called from inside
+    a synchronous effect — instead of the native core's undocumented
+    `PanicException` (a `tokio::sync::Mutex::blocking_lock`/`Runtime::block_on`
+    panic from within an already-running runtime context).
+    `journal_time`/`journal_random` already had this `in_effect()` guard
+    (the model this fix follows for `recorded_idempotency_key`);
+    `report`/`enter_flow` had none at all — see `crates/keel-py/src/lib.rs`.
+
+    The reproduction is a REAL nested effect, not a direct unit-test call
+    against a bare `KeelCore`: `probe` is a `py:` function target, so by the
+    time its body runs, the native core's `IN_EFFECT` thread-local is set
+    (inside `invoke_sync_effect`, itself called from the effect closure
+    `execute()` built for the `probe()` call) — calling `KeelCore` methods
+    directly from inside that body is exactly the "wrapped `py:`/`tool:`
+    effect" case issue #120 names, reached without needing a real `cmd:` rule
+    or ADK Runner flow. `probe` is called from `main`, a `[flows]`
+    entrypoint — needed only so `keel run` imports the script as a real
+    module named `prog` (triggering the `py:` import hook, which wraps
+    module-level functions only AFTER `exec_module` runs — `_hook.py`'s
+    docstring), not because the flow itself matters to this test.
+    """
+
+    PROG = """
+    import json
+
+    def probe():
+        from keel._runtime import get_backend
+        backend = get_backend()
+        out = {}
+        try:
+            backend.report()
+            out["report"] = "no_error"
+        except Exception as e:
+            out["report"] = getattr(e, "code", type(e).__name__)
+        try:
+            backend.enter_flow("py:prog:probe", "h")
+            out["enter_flow"] = "no_error"
+        except Exception as e:
+            out["enter_flow"] = getattr(e, "code", type(e).__name__)
+        try:
+            out["recorded_idempotency_key"] = backend.recorded_idempotency_key("t#-")
+        except Exception as e:
+            out["recorded_idempotency_key"] = f"raised:{getattr(e, 'code', type(e).__name__)}"
+        return out
+
+    def main():
+        print(json.dumps(probe()))
+
+    if __name__ == "__main__":
+        main()
+    """
+    POLICY = """
+    [flows]
+    entrypoints = ["py:prog:main"]
+
+    [target."py:prog.probe"]
+    """
+
+    @unittest.skipUnless(_native_available(), "native core not built")
+    def test_native_in_effect_calls_do_not_panic(self) -> None:
+        r = _run(self.PROG, self.POLICY, "native")
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        got = json.loads(r.stdout.decode().strip().splitlines()[-1])
+        self.assertEqual(got["report"], "KEEL-E005", got)
+        self.assertEqual(got["enter_flow"], "KEEL-E005", got)
+        self.assertIsNone(got["recorded_idempotency_key"], got)
