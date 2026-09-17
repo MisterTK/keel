@@ -110,3 +110,13 @@ def load_backend(
     from keel_core_stub import KeelCoreStub
 
     return KeelCoreStub()
+
+
+def backend_name(backend: Backend) -> str:
+    """"native" for the PyO3 `keel_core` module, "stub" for the in-repo
+    pure-Python core (#119 transparency) — the banner and JSON summary use
+    this so a user can tell which one they got without inspecting
+    `sys.modules` themselves. Checked by module name rather than an
+    `isinstance` against `KeelCoreStub` so this never forces an eager import
+    of the stub package on the native path."""
+    return "stub" if type(backend).__module__.partition(".")[0] == "keel_core_stub" else "native"

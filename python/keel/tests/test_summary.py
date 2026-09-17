@@ -124,6 +124,18 @@ class JsonSummaryCorpusTest(unittest.TestCase):
                 )
 
 
+class JsonSummaryBackendTest(unittest.TestCase):
+    """#119 transparency: the `backend` field is just another `meta` key,
+    passed through unconditionally like `version`/`policy_source` — pinned
+    directly (not only via the corpus) so the contract is obvious here."""
+
+    def test_json_summary_carries_the_backend(self) -> None:
+        from keel._summary import format_summary_json
+
+        obj = json.loads(format_summary_json({"calls": 1}, {"backend": "stub"}))
+        self.assertEqual(obj["backend"], "stub")
+
+
 class JsonLogsTest(unittest.TestCase):
     def test_only_the_exact_value_json_switches_format(self) -> None:
         from keel._log import json_logs
