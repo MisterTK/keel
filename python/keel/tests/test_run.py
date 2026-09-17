@@ -289,6 +289,7 @@ class BannerTest(unittest.TestCase):
         env: dict | None = None,
         cwd: str | Path | None = None,
         cwd_source: str = "cwd",
+        backend_name: str = "native",
     ) -> str:
         import contextlib
         import io
@@ -297,7 +298,16 @@ class BannerTest(unittest.TestCase):
 
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
-            _banner(env if env is not None else {}, source, target_keys, adapters, None, cwd, cwd_source)
+            _banner(
+                env if env is not None else {},
+                source,
+                target_keys,
+                adapters,
+                None,
+                cwd,
+                cwd_source,
+                backend_name=backend_name,
+            )
         return buf.getvalue()
 
     def test_level0_banner_lists_adapters_not_zero_call_sites(self) -> None:
@@ -403,6 +413,45 @@ class BannerTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = self._banner("defaults", [], [], env={"K_SERVICE": "x", "KEEL_ENV": "prod"}, cwd=Path(tmp))
         self.assertNotIn("dev cache off", out)
+
+    def test_banner_names_a_non_native_backend(self) -> None:
+        # #119: the stub differs from the native core in Tier 2 support and
+        # cache persistence — a user must be able to tell which one they got.
+        with TemporaryDirectory() as tmp:
+            out = self._banner("defaults", [], [], cwd=Path(tmp), backend_name="stub")
+        self.assertIn("pure-Python backend: no durable flows, no cross-run cache", out)
+
+    def test_banner_stays_silent_about_the_native_backend(self) -> None:
+        # The common case must not grow noise — no golden may move.
+        with TemporaryDirectory() as tmp:
+            out = self._banner("defaults", [], [], cwd=Path(tmp), backend_name="native")
+        self.assertNotIn("backend", out)
+
+
+class BackendNameTest(unittest.TestCase):
+    """#119 transparency: `backend_name` is the single seam the banner and
+    JSON summary both read to say which core actually resolved."""
+
+    def test_stub_backend_reports_stub(self) -> None:
+        from keel._backend import backend_name
+        from keel_core_stub import KeelCoreStub
+
+        self.assertEqual(backend_name(KeelCoreStub()), "stub")
+
+    def test_anything_else_reports_native(self) -> None:
+        from keel._backend import backend_name
+
+        class FakeNativeCore:
+            def configure(self, policy):
+                pass
+
+            def execute(self, request, effect):
+                return {}
+
+            def report(self):
+                return {}
+
+        self.assertEqual(backend_name(FakeNativeCore()), "native")
 
 
 if __name__ == "__main__":

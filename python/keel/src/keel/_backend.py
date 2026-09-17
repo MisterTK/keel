@@ -109,4 +109,31 @@ def load_backend(
 
     from keel_core_stub import KeelCoreStub
 
-    return KeelCoreStub()
+    return KeelCoreStub(paused=_stub_paused(environ))
+
+
+def _stub_paused(env: Mapping[str, str]) -> bool:
+    """`KEEL_STUB_PAUSED` — UNSTABLE, test-only: build the pure-Python backend
+    on a virtual clock (`KeelCoreStub(paused=True)`) so a unit test that asserts
+    *semantics* does not have to sleep out a real Level-0 retry schedule to get
+    there. Never set it in production: a paused backend reinterprets every
+    duration in the policy, which is the #119 defect this branch just fixed.
+    Same unstable-knob convention as `KEEL_CACHEPOLL_MIN_SPAN_S`
+    (`python/keel/src/keel/_cachepoll.py`, `node/keel/src/cachepoll.mjs`) and
+    `KEEL_NESTED_EFFECT_WAIT_MS` (`crates/keel-py/src/lib.rs`).
+
+    `python/keel/tests/__init__.py` sets it for the in-process suite; the
+    house `child_env()` helper strips it, so subprocess tests — including
+    `test_concurrency_wallclock`, whose whole point is measuring real time —
+    get the real clock."""
+    return env.get("KEEL_STUB_PAUSED", "").strip().lower() in ("1", "true", "yes")
+
+
+def backend_name(backend: Backend) -> str:
+    """Report "native" for the PyO3 `keel_core` module, "stub" for the in-repo
+    pure-Python core (#119 transparency) — the banner and JSON summary use
+    this so a user can tell which one they got without inspecting
+    `sys.modules` themselves. Checked by module name rather than an
+    `isinstance` against `KeelCoreStub` so this never forces an eager import
+    of the stub package on the native path."""
+    return "stub" if type(backend).__module__.partition(".")[0] == "keel_core_stub" else "native"

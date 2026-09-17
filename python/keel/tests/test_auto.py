@@ -484,6 +484,37 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertNotIn("note", objs[0], "a loaded policy has no em-dash tail — no note key")
         self.assertEqual(objs[1]["keel_cwd"], str(self.root))
 
+    def test_backend_is_named_end_to_end_under_the_stub(self) -> None:
+        # #119 transparency: KEEL_BACKEND=auto (the default) falls back to the
+        # stub silently on a failed native import — the stub has no durable
+        # flows and no cross-run cache persistence, so a user must be able to
+        # tell which backend they got from the real, wired-up output (not
+        # just the `_banner`/`format_summary_json` unit tests).
+        (self.root / "keel.toml").write_text("")
+        proc = _run(
+            "import keel._auto; import sample_targets; sample_targets.enrich_a(1)",
+            env=child_env(
+                KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub", KEEL_LOG_FORMAT="json"
+            ),
+            cwd=str(self.root),
+        )
+        import json as _json
+
+        lines = [l for l in proc.stderr.decode().splitlines() if l.strip()]
+        objs = [_json.loads(l) for l in lines]
+        kinds = [o["keel"] for o in objs]
+        self.assertEqual(kinds, ["activation", "summary"], proc.stderr)
+        self.assertEqual(objs[1]["backend"], "stub")
+
+        text_proc = _run(
+            "import keel._auto",
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub"),
+            cwd=str(self.root),
+        )
+        self.assertIn(
+            "pure-Python backend: no durable flows, no cross-run cache", text_proc.stderr.decode()
+        )
+
     def test_json_log_format_refusal_is_an_error_object(self) -> None:
         import json as _json
         proc = _run(

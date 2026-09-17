@@ -28,6 +28,7 @@ import base64
 import json
 import math
 import re
+import time
 from typing import Any, Callable
 
 ENVELOPE_VERSION = 1
@@ -530,14 +531,49 @@ def _resolve_outbound(
 
 
 class KeelCoreStub:
-    def __init__(self) -> None:
+    def __init__(self, paused: bool = False) -> None:
+        # `paused=True` is the conformance harness's virtual clock: waits advance
+        # a counter instead of sleeping, and `advance_clock` drives time. The
+        # DEFAULT is a real clock, because `_backend.resolve` selects this class
+        # in production whenever the native module is missing, and a backend that
+        # reinterprets every duration in the policy is not a backend (#119).
+        self._paused = paused
         self._policy: dict[str, Any] = {}
-        self._now_ms = 0
+        # The clock is an OFFSET, not a stored "now": under `paused=True` it is
+        # the whole clock (starts at 0, moved only by `_wait`/`advance_clock` —
+        # byte-for-byte the historical behavior); unpaused it is an adjustment
+        # on top of `time.monotonic()`, so `advance_clock` still composes while
+        # real elapsed time moves the clock on its own. Sleeping without a
+        # clock that observes the sleep was the half-fix: an open breaker could
+        # never close (its cooldown is compared against `_now_ms`, and a
+        # fast-failing call performs no wait to advance it) and a cache entry's
+        # TTL could never expire (#119).
+        self._clock_offset_ms = 0
         self._trace_seq = 0
         self._breakers: dict[str, dict[str, Any]] = {}
         self._token_buckets: dict[str, dict[str, int]] = {}
         self._cache: dict[str, tuple[int, Any]] = {}
         self._metrics: dict[str, dict[str, int]] = {}
+
+    @property
+    def _now_ms(self) -> int:
+        """The clock every layer reads. Paused: purely virtual. Unpaused: a real
+        monotonic clock (plus any `advance_clock` offset), which is what makes
+        breaker cooldowns and cache TTLs expire on their own."""
+        if self._paused:
+            return self._clock_offset_ms
+        return int(time.monotonic() * 1000.0) + self._clock_offset_ms
+
+    def _wait(self, ms: int) -> None:
+        """Honor a scheduled wait: sleep it, or advance the virtual clock."""
+        if ms <= 0:
+            return
+        if self._paused:
+            self._clock_offset_ms += ms
+        else:
+            # No hand-advance: `_now_ms` reads the real clock, which the sleep
+            # has already moved. Adding `ms` here would double-count it.
+            time.sleep(ms / 1000.0)
 
     # -- configure ---------------------------------------------------------
 
@@ -960,7 +996,7 @@ class KeelCoreStub:
             if wait > 0:
                 out["throttle_wait_ms"] = wait
                 out["throttled"] = True
-                self._now_ms += wait
+                self._wait(wait)
                 m["throttled"] += 1
 
         # breaker check (observes post-retry call outcomes)
@@ -1033,7 +1069,7 @@ class KeelCoreStub:
                 if res.get("retry_after_ms") is not None:
                     wait = max(wait, res["retry_after_ms"])
                 out["waits_ms"].append(wait)
-                self._now_ms += wait
+                self._wait(wait)
                 m["retries"] += 1
             raise AssertionError("loop always returns by the final attempt")
 
@@ -1061,7 +1097,7 @@ class KeelCoreStub:
                             ),
                         }
                         break
-                    self._now_ms += interval
+                    self._wait(interval)
                     continue
             break
 
@@ -1135,7 +1171,9 @@ class KeelCoreStub:
         return {"v": 1, "clock_ms": self._now_ms, "targets": targets}
 
     def advance_clock(self, ms: int) -> None:
-        self._now_ms += ms
+        """Move the clock forward by `ms`. Under `paused=True` this IS the
+        clock; unpaused it composes with real elapsed time as an offset."""
+        self._clock_offset_ms += ms
 
 
 __all__ = ["KeelCoreStub", "KeelError", "ENVELOPE_VERSION"]

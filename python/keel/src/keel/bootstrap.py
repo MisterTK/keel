@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
-from ._backend import load_backend
+from ._backend import backend_name, load_backend
 from ._cachepoll import CachePollDetector
 from ._defaults import apply_pack_defaults
 from ._deploy import ephemeral_journal_warning
@@ -174,6 +174,12 @@ def install_keel(
     # whether the LLM dev cache resolves to `scope=persistent` (cross-run replay).
     backend = load_backend(env.get("KEEL_BACKEND"), cwd=cwd, env=env)
     persistent = bool(getattr(backend, "persistent", False))
+    # #119 transparency: which backend actually resolved (the DEFAULT
+    # `KEEL_BACKEND=auto` falls back to the stub silently on a failed native
+    # import) — carried in `_STATE.meta` so both the banner and the JSON
+    # summary can say so, and folded into the activation row below for free.
+    bname = backend_name(backend)
+    _STATE.meta["backend"] = bname
     # Layer the embedded pack defaults (and any present provider pack) UNDER the
     # user config, then resolve the LLM dev cache (`mode = "dev"` → a concrete
     # ttl off-prod, dropped when KEEL_ENV=prod; scope=persistent when the backend
@@ -277,7 +283,7 @@ def install_keel(
     mcp = install_mcp_pack()
     _STATE.mcp_uninstall = mcp.get("uninstall") if mcp.get("active") else None
 
-    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd, cwd_source)
+    _banner(env, source, [t.key for t in targets], adapters, mcp, cwd, cwd_source, backend_name=bname)
 
     state = {
         "enabled": True,
@@ -429,6 +435,8 @@ def _banner(
     mcp: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
     cwd_source: str = "cwd",
+    *,
+    backend_name: str = "native",
 ) -> None:
     if env.get("KEEL_QUIET", "").strip().lower() in _TRUTHY:
         return
@@ -491,7 +499,18 @@ def _banner(
             note = f"no keel.toml in {root}; `keel init` to customize"
         else:
             note = "`keel init` to customize"
-    text = f"{head}\n" if note is None else f"{head} — {note}\n"
+    # #119: the pure-Python stub differs from the native core in Tier 2 support
+    # and cache persistence — say so, but ONLY off the common path. The native
+    # line must stay byte-identical (golden tests pin it). This is its own
+    # TRAILING segment, not part of `desc`: inside `desc` it would land between
+    # "production defaults" and the em-dash (breaking the adjacency the
+    # KEEL_CWD/KEEL_POLICY tests assert) and stack a second parenthetical onto
+    # the serverless "(dev cache off: …)" one.
+    backend_note = (
+        "" if backend_name == "native" else " (pure-Python backend: no durable flows, no cross-run cache)"
+    )
+    body = head if note is None else f"{head} — {note}"
+    text = f"{body}{backend_note}\n"
     obj: dict[str, Any] = {
         "dev_cache_off": dev_cache_off,
         "keel": "activation",

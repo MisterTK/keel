@@ -74,6 +74,12 @@
       "why": "The target's `poll` policy re-issues the (idempotent) request while the response's `until.field` is not terminal, bounded by `deadline`. The job never finished inside that bound. This is breaker-countable like any terminal failure.",
       "next": "Check the job service's own status view; if the job legitimately needs longer, raise `poll.deadline` (and consider a longer `interval`)."
     },
+    "KEEL-E017": {
+      "name": "nested-sync-effect",
+      "what": "A synchronous effect inside an open flow could not acquire the flow's step lock before the nested-effect deadline (30s by default).",
+      "why": "Keel's synchronous path serializes an effect against the flow it belongs to, and only a flow-scoped step can hold that lock. The most likely cause is a nested call: an outer effect of the same flow, running on a different OS thread, cannot return until this inner one does, and the thread-local re-entrancy guard cannot see nesting that crosses threads. Keel observes only that the lock stayed held, not who held it, so a merely slow outer step is the other explanation.",
+      "next": "Make the inner call from the same thread as the outer one, use the async path (which composes nesting), or move the nested call outside the wrapped effect. A FastAPI/Starlette TestClient suite hits this because the ASGI app runs in a portal thread inside the client's own intercepted request."
+    },
     "KEEL-E020": {
       "name": "cache-codec",
       "what": "A response could not be serialized into (or out of) the cache.",
