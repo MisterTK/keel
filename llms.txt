@@ -10,7 +10,7 @@ Keel intercepts a program's outbound calls (httpx/requests/fetch, LLM SDKs,
 it is `keel run app.py` / `keel run app.mjs` — no imports, no context objects, no
 base classes. Uninstalling the package removes the behavior and nothing else.
 
-Status (v0.6.1, 2026-09-16): Tier 1 and Tier 2 (including async flows) work
+Status (v0.6.5, 2026-09-17): Tier 1 and Tier 2 (including async flows) work
 end-to-end in both Python and Node on the real Rust core, with `kill -9`
 resume, a Postgres journal backend for fleet durability, `keel
 record`/`keel sim`, and a scoped Rust front end (`#[keel::wrap]` +
@@ -25,8 +25,12 @@ host map); **`cmd:` durable flows** and `keel exec` for external commands
 (KEEL-E033); a console **exit summary** plus `keel report` (static /
 `--watch` / `--serve` HTML); and a deployment-honesty pass — strict
 `KEEL_CWD`, serverless-aware dev-cache defaults, activation evidence in
-`keel status`/`keel doctor`, and Dockerfile `COPY keel.toml` checks.
-Wrapped-call overhead ~0.8 µs vs a 10 µs budget. Published: `pip install
+`keel status`/`keel doctor`, and Dockerfile `COPY keel.toml` checks. 0.6.5
+made synchronous effects run concurrently (they had all serialized behind one
+process-wide lock, which is what made `poll` unadoptable in threaded sync
+code), gave the pure-Python fallback backend a real wall clock, and added
+KEEL-E017 for a nested synchronous effect that cannot acquire its flow's step
+lock. Wrapped-call overhead ~0.8 µs vs a 10 µs budget. Published: `pip install
 keelrun keelrun-cli`, `npm install keelrun keelrun-cli`, `cargo add keelrun
 --rename keel` + `cargo install keelrun-cli`, or zero-install via `uvx --from
 keelrun-cli keel run app.py`. Every registry is live except one npm platform
@@ -49,8 +53,8 @@ hand-rolled retry/poll loops) ship too.
 - [Level 2 — durable flows](demos/durable-pipeline/README.md): list `py:mod:fn` (Python) or `ts:mod#fn` (Node) under `[flows]`; a crashed run resumes and replays completed steps without re-firing effects, including concurrent async effects inside one flow.
 - [Targets](contracts/policy.schema.json): `host` (e.g. `api.stripe.com`), `py:`/`ts:` functions, semantic `llm:<provider>` / `tool:<name>` / `mcp:<server>`, `cmd:<name>` for external commands, and **route keys** — a key carrying a method and path (`POST *-aiplatform.googleapis.com/*:fetchPredictOperation`) that beats the LLM host map for that route.
 - [LLM dev-cache](demos/agent-demo/README.md): `cache = { mode = "dev" }` replays identical prompts off `KEEL_ENV=prod`; with the native core it persists across runs (~0 API calls on a repeat). `cache = { mode = "off" }` disables it for a target; the cache is off by default on serverless platforms.
-- [Poll until terminal](README.md): `poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true] } }` turns a submit-then-poll long-running operation into one awaited call. Poll wraps retry; cache/rate/breaker see one call; KEEL-E016 on deadline. It applies to any call Keel judges idempotent — including Google `:fetch*Operation` POSTs.
-- [Observability](README.md): a one-screen exit summary on every run, `keel report` for a self-contained HTML view (`--watch` / `--serve`), and `KEEL_LOG_FORMAT=json` to emit the startup line, the summary, and errors as one JSON object per line.
+- [Poll until terminal](README.md): `poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true], absent = "pending" } }` turns a submit-then-poll long-running operation into one awaited call. Poll wraps retry; cache/rate/breaker see one call; KEEL-E016 on deadline. It applies to any call Keel judges idempotent — including Google `:fetch*Operation` POSTs. `absent` says what a response that does not carry `until.field` **at all** means: it defaults to `"fail_open"` (return the body, end the poll), and you must set `"pending"` for any `google.longrunning.Operation` route, because proto3 JSON omits a false bool so a running body is just `{"name": "..."}` and `done` appears only on completion. Without it that block ends the poll on attempt one (CCR-11, issue #128).
+- [Observability](README.md): a one-screen exit summary on every run, `keel report` for a self-contained HTML view (`--watch` / `--serve`), `KEEL_LOG_FORMAT=json` to emit the startup line, the summary, the activation refusal and both runtime warnings as one JSON object per line — each carrying a Cloud-Logging `severity` (`INFO`/`WARNING`/`ERROR`) — and `KEEL_EVENTS=stderr` to send the NDJSON event feed to stderr instead of `.keel/events/` (native core only).
 - [ADK Runner flows + cross-model fallback](README.md): designate `py:google.adk.runners:Runner.run_async` under `[flows] entrypoints` for durable, crash-resumable agent turns, and set `fallback = [...]` on `llm:google-genai` for real cross-provider fallback via the plugin's `on_model_error` hook — both farm-certified against real `google-adk`.
 
 ## Reference

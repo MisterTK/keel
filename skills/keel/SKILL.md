@@ -91,7 +91,7 @@ crate's own README otherwise); a `cargo-keel` subcommand does not exist.
 
 ## Reading what Keel did
 
-Four levels of evidence, cheapest first — reach for `keel doctor`/`keel
+Six levels of evidence, cheapest first — reach for `keel doctor`/`keel
 status --json` for structured diagnosis (see the protocol below), but for a
 human-facing "what happened" check these first:
 
@@ -103,8 +103,24 @@ human-facing "what happened" check these first:
   `uvx` equivalent). A no-op run stays silent. `console = false` under
   `[telemetry]`, or `KEEL_QUIET=1`, turns it off. In a container stderr is
   the surface that survives — a parent that captures a child's stderr
-  silently swallows it — and `KEEL_LOG_FORMAT=json` makes that summary, the
-  startup line, and any activation error one JSON object per line.
+  silently swallows it — and `KEEL_LOG_FORMAT=json` makes five lines one JSON
+  object each: that summary, the startup line, an activation error, and the
+  two runtime warnings (`journal-ephemeral-storage`, `cache-poll-suspect`).
+  All five carry a `severity` — `INFO`, `WARNING`, `ERROR` — which is the only
+  thing Cloud Logging and CloudWatch read to rank an entry, so a
+  `severity>=ERROR` view now shows a refusal to activate instead of hiding it
+  among healthy starts.
+- **Per-attempt evidence off the instance — `KEEL_EVENTS=stderr`.** Keel's
+  NDJSON event feed (one line per attempt, backoff, breaker transition)
+  normally lands in `.keel/events/<run>.ndjson`, which does not survive a
+  scale-to-zero instance. `KEEL_EVENTS=stderr` sends the same feed to stderr,
+  which on Cloud Run / GKE / Lambda already is the log pipeline. Say the
+  limits when recommending it: **native core only** (the pure-Python and JS
+  fallback backends have no event sink), the feed shares stderr with Keel's
+  console output with nothing coordinating the two (tell them apart by the
+  event lines' `v`/`seq`/`ms`/`event` keys), and with no file on disk `keel
+  tail` has nothing to follow and `keel report` shows an empty event stream.
+  It is not yet a remote evidence sink.
 - **Which backend ran — check this before trusting any timing.** The startup
   line and the activation JSON name the backend, and `KEEL_BACKEND=auto` (the
   default) falls back from the native core to a pure-Python one whenever the
@@ -114,7 +130,10 @@ human-facing "what happened" check these first:
   the fallback honors wall time like the native core does — before that it
   advanced a counter instead of sleeping, so retry backoff, rate limits and
   poll intervals were not real. If you are diagnosing "the policy did not
-  seem to apply", establish the backend first.
+  seem to apply", establish the backend first. After the fact, `keel status`
+  names it on the last-activation line and `keel doctor --json` carries it as
+  `activation_backend` (`null` when `runtime_activation` is `"unverified"`,
+  or when the recorded row predates the field).
 - **`keel report`** — a self-contained HTML page at `.keel/report.html`:
   per-target tables, a calls/failures trend, the newest run's event stream,
   and flow status. `--open` launches it; `--json` prints the same evidence
@@ -172,7 +191,9 @@ the six phases in order; the static scan is evidence, not the verdict.
    languages, shell/Makefile/CI files, `CLAUDE.md`/`AGENTS.md` governance
    prose) — and `findings`, which carries `warn` items that are not follow-up
    codes. `runtime_activation` says whether this checkout has ever activated
-   with this policy; `journal-ephemeral-storage` fires when `[flows]` meets
+   with this policy and `activation_backend` says which backend that
+   activation ran on (`null` when unverified, or when the recorded row
+   predates the field); `journal-ephemeral-storage` fires when `[flows]` meets
    SQLite in a container artifact.
 4. **Baseline before you mutate.** Before proposing any *behavior-changing*
    policy — retry, breaker, or a timeout that alters an outcome, as opposed to
@@ -188,7 +209,15 @@ the six phases in order; the static scan is evidence, not the verdict.
    before recommending a behavior change. Two more codes worth recognizing:
    `KEEL-E016` means a `poll` ran out its `deadline` without the response ever
    looking terminal — usually `until.field`/`until.terminal` naming the wrong
-   signal rather than a genuinely slow operation; `KEEL-E017` means a
+   signal rather than a genuinely slow operation. Its silent opposite is worth
+   checking for by hand, because it raises nothing: a `poll` that returns on
+   attempt one and never loops. A response that does not carry `until.field`
+   **at all** is `fail_open` by default — returned as-is, poll over — and a
+   running `google.longrunning.Operation` body is exactly that, just
+   `{"name": "..."}`, because proto3 JSON omits a false bool and `done`
+   appears only on completion. Any Google LRO route therefore needs
+   `absent = "pending"` inside `until`, or the block validates, shows up in
+   `keel status`, and does nothing. `KEEL-E017` means a
    synchronous effect could not acquire its flow's step lock, whose likeliest
    cause is a nested call from another thread inside an open flow (a
    FastAPI/Starlette `TestClient` suite is the classic shape).
@@ -199,7 +228,12 @@ the six phases in order; the static scan is evidence, not the verdict.
    attributed to an SDK poll call (per provider) carries an applyable `fix`
    (a route-key `poll` block that beats the LLM host map for that route;
    Vertex `:fetch*Operation` POSTs are judged idempotent since 0.6.0) — apply
-   it with `git apply`, then tune `interval`/`deadline`; later findings for
+   it with `git apply`, then tune `interval`/`deadline`. The two Google
+   proposals emit `absent = "pending"`; the OpenAI and Anthropic ones
+   deliberately do not, because those status bodies always carry their
+   terminal field. If you write a `poll` block by hand for any other
+   long-running-operation API, decide that question explicitly rather than
+   inheriting a template. Later findings for
    the same provider carry `fix_ref` instead of a `fix` — the `file:line` of
    the finding that actually holds the patch — rather than repeating it.
    Each is either replaced by policy (note which `keel.toml` key) or explicitly
@@ -242,9 +276,13 @@ the six phases in order; the static scan is evidence, not the verdict.
    is on storage that survives a redeploy if durable flows are used. Then
    read the deploy logs for the one startup line: `with policy <path>` is
    proof, `with production defaults` means the policy did not ship. Set
-   `KEEL_LOG_FORMAT=json` in containers so that line and the exit summary
-   are queryable fields. Locally, `keel status` shows the last activation:
-   language, version, the policy it loaded, and the pid.
+   `KEEL_LOG_FORMAT=json` in containers so that line, the exit summary, the
+   warnings and any refusal are queryable fields, each carrying a `severity`
+   the platform actually ranks on. Add `KEEL_EVENTS=stderr` if you also want
+   the per-attempt event feed in the log pipeline instead of on a filesystem
+   that will not survive — with the limits named above. Locally, `keel status`
+   shows the last activation: language, version, the policy it loaded, the
+   backend, and the pid.
 
 ## Driving Keel via MCP
 
