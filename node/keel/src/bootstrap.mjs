@@ -23,7 +23,7 @@ import {
 import { backendName, loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
-import { createCachePollDetector } from "./cachepoll.mjs";
+import { createCachePollDetector, cachePollSuspectWarning } from "./cachepoll.mjs";
 import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
@@ -216,21 +216,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   const summary = consoleEnabled ? createSummary() : null;
   const cachepoll = createCachePollDetector({
     onSuspect: (target, hits, spanS) => {
-      emit(
-        env,
-        `keel ▸ warning: ${target} served ${hits} consecutive cache hits for one identical ` +
-          `call over ${spanS}s — if this is a status poll, set cache = ` +
-          `{ mode = "off" } on that target ` +
-          `— or give the status route its own poll policy (README: Poll)\n`,
-        {
-          keel: "warning",
-          code: "cache-poll-suspect",
-          target,
-          hits,
-          span_s: spanS,
-          version: VERSION,
-        }
-      );
+      emit(env, ...cachePollSuspectWarning(target, hits, spanS, VERSION));
     },
   });
   const discovery = createDiscovery(cwd, { knownTargets, summary, cachepoll });

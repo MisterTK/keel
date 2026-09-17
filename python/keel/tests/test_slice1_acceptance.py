@@ -253,6 +253,9 @@ class Slice1AcceptanceTest(unittest.TestCase):
         suspects = [o for o in objs if o.get("code") == "cache-poll-suspect"]
         self.assertEqual(len(suspects), 1, proc.stderr)
         self.assertEqual(suspects[0]["hits"], 5)
+        # #130: the warning must be as filterable as the activation/refusal
+        # lines are — proven end to end, not just at the builder unit test.
+        self.assertEqual(suspects[0]["severity"], "WARNING", proc.stderr)
         self.assertEqual(objs[-1]["keel"], "summary")
         self.assertEqual(objs[-1]["cache_poll_suspects"], 1)
 

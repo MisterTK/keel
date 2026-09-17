@@ -1,12 +1,21 @@
 /**
- * `KEEL_LOG_FORMAT=json`: Keel's three deployment-evidence lines — the
- * activation banner, the exit summary, and the activation refusal — each
- * become one JSON object (sorted keys, no spaces) so container log pipelines
- * index their fields (field report 2026-09-15, F10). Nothing else converts:
- * other `keel ▸ …` prose Keel can write at runtime (a pack's unwrapped-tool
- * warning, a `KEEL_SIM_PLAN` read failure, …) stays prose. Text is the
- * default; there is no auto-detect (byte-identity tests and `keel run` piping
- * depend on the text form).
+ * `KEEL_LOG_FORMAT=json`: Keel's five deployment-evidence lines — the
+ * activation banner, the exit summary, the activation refusal, the
+ * ephemeral-journal warning (`journal-ephemeral-storage`), and the
+ * cache-poll warning (`cache-poll-suspect`) — each become one JSON object
+ * (sorted keys, no spaces) so container log pipelines index their fields
+ * (field report 2026-09-15, F10). Nothing else converts: other `keel ▸ …`
+ * prose Keel can write at runtime (a pack's unwrapped-tool warning, a
+ * `KEEL_SIM_PLAN` read failure, …) stays prose. Text is the default; there
+ * is no auto-detect (byte-identity tests and `keel run` piping depend on the
+ * text form).
+ *
+ * Severity coverage is UNIVERSAL across all five, not a subset (#130):
+ * `INFO` on the activation and summary, `ERROR` on the refusal, `WARNING` on
+ * both warning kinds — Cloud Run fills an entry's severity only from a
+ * `severity` field in the payload, so any kind left out is indistinguishable
+ * from a healthy line in a severity-filtered view. A sixth kind introduced
+ * later must carry one too, or this docstring is lying again.
  *
  * The Python front end's `keel/_log.py` is the byte-for-byte twin: same
  * recognized value, same separators, same key ordering. Keep every emitted

@@ -22,7 +22,7 @@ from typing import Any, Mapping
 
 from . import __version__
 from ._backend import _stub_paused, backend_name, load_backend
-from ._cachepoll import CachePollDetector
+from ._cachepoll import CachePollDetector, cache_poll_suspect_warning
 from ._defaults import apply_pack_defaults
 from ._deploy import ephemeral_journal_warning
 from ._discovery import Discovery
@@ -209,21 +209,7 @@ def install_keel(
     summary = Summary() if _console_enabled(policy, env) else None
 
     def _cache_poll_suspect(target: str, hits: int, span_s: int) -> None:
-        emit(
-            env,
-            f"keel ▸ warning: {target} served {hits} consecutive cache hits for one identical "
-            f"call over {span_s}s — if this is a status poll, set cache = "
-            "{ mode = \"off\" } on that target "
-            "— or give the status route its own poll policy (README: Poll)\n",
-            {
-                "keel": "warning",
-                "code": "cache-poll-suspect",
-                "target": target,
-                "hits": hits,
-                "span_s": span_s,
-                "version": __version__,
-            },
-        )
+        emit(env, *cache_poll_suspect_warning(target, hits, span_s, __version__))
 
     cachepoll = CachePollDetector(on_suspect=_cache_poll_suspect)
     discovery = Discovery(cwd, known_targets, summary=summary, cachepoll=cachepoll)

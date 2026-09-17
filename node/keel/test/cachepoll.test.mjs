@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createCachePollDetector, MAX_FIRED, MAX_RUNS } from "../src/cachepoll.mjs";
+import {
+  createCachePollDetector,
+  cachePollSuspectWarning,
+  MAX_FIRED,
+  MAX_RUNS,
+} from "../src/cachepoll.mjs";
 
 const HIT = { v: 1, result: "ok", attempts: 0, from_cache: true };
 const MISS = { v: 1, result: "ok", attempts: 1, from_cache: false };
@@ -89,4 +94,19 @@ test("fired set eviction caps growth", () => {
     d.observe("llm:openai", `f${i}`, HIT); // second hit fires (minHits=1, span=0)
   }
   assert.ok(d._debugSizes().fired <= MAX_FIRED);
+});
+
+// #130: a cache-poll suspicion is exactly the operator-visible pathology a
+// severity-filtered view exists to surface — must be as filterable as the
+// activation and refusal lines are.
+test("cachePollSuspectWarning carries a WARNING severity", () => {
+  const [text, obj] = cachePollSuspectWarning("llm:google-genai", 5, 40, "0.6.5");
+  assert.equal(obj.keel, "warning");
+  assert.equal(obj.code, "cache-poll-suspect");
+  assert.equal(obj.target, "llm:google-genai");
+  assert.equal(obj.hits, 5);
+  assert.equal(obj.span_s, 40);
+  assert.equal(obj.version, "0.6.5");
+  assert.equal(obj.severity, "WARNING");
+  assert.ok(text.includes("llm:google-genai served 5 consecutive cache hits"));
 });

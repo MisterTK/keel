@@ -33,6 +33,9 @@ test("serverless marker with flows and sqlite warns", () => {
     assert.equal(obj.code, "journal-ephemeral-storage");
     assert.equal(obj.marker, "K_SERVICE");
     assert.ok(obj.journal.endsWith(`${join(".keel", "journal.db")}`));
+    // #130: a durable-flows-on-ephemeral-storage misconfiguration is exactly
+    // the operator-visible pathology a severity-filtered view exists to surface.
+    assert.equal(obj.severity, "WARNING");
 
     // Byte-identity with Python's exact template, built independently here.
     const journal = join(d, ".keel", "journal.db");

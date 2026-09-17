@@ -20,6 +20,10 @@ class EphemeralJournalWarningTest(unittest.TestCase):
         self.assertEqual(obj["code"], "journal-ephemeral-storage")
         self.assertEqual(obj["marker"], "K_SERVICE")
         self.assertTrue(obj["journal"].endswith("/.keel/journal.db"))
+        # #130: a durable-flows-on-ephemeral-storage misconfiguration is
+        # exactly the operator-visible pathology a severity-filtered view
+        # exists to surface.
+        self.assertEqual(obj["severity"], "WARNING")
 
     def test_dockerenv_and_read_only_cwd_are_markers(self) -> None:
         with TemporaryDirectory() as d:

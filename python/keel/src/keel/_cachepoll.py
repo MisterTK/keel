@@ -110,3 +110,31 @@ class CachePollDetector:
             oldest = next(iter(self._fired))
             del self._fired[oldest]
         self._fired[key] = None
+
+
+def cache_poll_suspect_warning(
+    target: str, hits: int, span_s: int, version: str
+) -> tuple[str, dict[str, Any]]:
+    """The text + `KEEL_LOG_FORMAT=json` twin for one `CachePollDetector`
+    firing (#78/WS9), pulled out as its own testable builder (mirroring
+    `_deploy.py`'s `ephemeral_journal_warning`) rather than inlined at each of
+    bootstrap.py's/bootstrap.mjs's call sites. `severity` is `WARNING` (#130):
+    this line names an operator-visible pathology — a status poll silently
+    fed a replayed response — and must be as filterable as the activation and
+    refusal lines are."""
+    text = (
+        f"keel ▸ warning: {target} served {hits} consecutive cache hits for one identical "
+        f"call over {span_s}s — if this is a status poll, set cache = "
+        "{ mode = \"off\" } on that target "
+        "— or give the status route its own poll policy (README: Poll)\n"
+    )
+    obj: dict[str, Any] = {
+        "keel": "warning",
+        "code": "cache-poll-suspect",
+        "target": target,
+        "hits": hits,
+        "span_s": span_s,
+        "severity": "WARNING",
+        "version": version,
+    }
+    return text, obj
