@@ -180,6 +180,61 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How long a synchronous effect waits for a lock an outer effect may be
+/// holding before concluding that it is nested inside that effect on another
+/// thread. The thread-local `IN_EFFECT` guard catches same-thread nesting for
+/// free; this catches the cross-thread case, which it structurally cannot see
+/// (issue #117). Generous enough that a merely SLOW outer effect is never
+/// mistaken for a deadlocked one.
+const NESTED_EFFECT_WAIT: Duration = Duration::from_secs(5);
+
+/// [`lock_recover`]'s bounded-wait twin for `execute`'s `runtime` mutex.
+/// Returns `None` on expiry, which the caller reports as KEEL-E017, rather
+/// than blocking forever. Polls `try_lock`, recovering a poisoned guard the
+/// same way `lock_recover` does — it costs nothing in the uncontended case
+/// (first `try_lock` succeeds) and only ever spins on a path that would
+/// otherwise deadlock forever: an outer sync effect on another OS thread
+/// holding `runtime` across its own `block_on` (see the module docs' "async
+/// flow bridge" section for why this mutex exists at all).
+fn lock_recover_timeout<T>(
+    mutex: &Mutex<T>,
+    wait: Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Acquire `m` for a synchronous caller, giving up after `wait`. Returns
+/// `None` on expiry, which the caller reports as KEEL-E017. `tokio::sync::Mutex`
+/// offers no blocking timed acquire, so this polls `try_lock`; it costs nothing
+/// in the uncontended case (first `try_lock` succeeds) and only ever spins on a
+/// path that would otherwise deadlock forever.
+fn blocking_lock_timeout<T>(
+    m: &AsyncMutex<T>,
+    wait: Duration,
+) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(g) = m.try_lock() {
+            return Some(g);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Build a terminal [`Outcome`] from a single effect attempt, applying no layer
 /// chain. This is the *passthrough* a re-entrant (nested) intercepted call
 /// returns: the outer call keeps full Tier 1 resilience, the inner one degrades
@@ -605,21 +660,32 @@ impl KeelCore {
         // replayable; otherwise run the bare engine (identical to before). The
         // effect runs under an `InEffectGuard` so any re-entrant intercepted call
         // or time/random read it triggers passes through instead of deadlocking.
-        let (outcome, replayed) = py.detach(move || {
-            let guard = lock_recover(runtime);
-            // `blocking_lock` (never the async `.lock().await`, which would need
-            // an executor polling us) — safe here because we already released
-            // the GIL above, so we cannot deadlock an `execute_async` step that
-            // needs the GIL to invoke its Python effect before releasing this
-            // same lock (see the module docs' "async flow bridge" section).
-            let mut flow = active.blocking_lock();
+        // Nested on another thread: an outer sync effect elsewhere holds one of
+        // these locks and won't release it until ITS effect returns — which,
+        // if that effect is what dispatched to this call, is exactly this
+        // call. `in_effect()` above only sees same-thread nesting; this bounded
+        // wait is what turns the cross-thread case from an unbounded hang into
+        // KEEL-E017 (issue #117, CCR-9) instead. Both `runtime` (contended
+        // whenever ANY sync effect is in flight — issue #116) and `active_flow`
+        // (contended only inside an open flow, where Task 4 makes it
+        // legitimate) are guarded: outside a flow `active_flow` is unheld and
+        // this costs one uncontended `try_lock`.
+        let acquired = py.detach(move || -> Option<(Outcome, Option<bool>)> {
+            let guard = lock_recover_timeout(runtime, NESTED_EFFECT_WAIT)?;
+            // `blocking_lock_timeout` (never the async `.lock().await`, which
+            // would need an executor polling us) — safe here because we already
+            // released the GIL above, so we cannot deadlock an `execute_async`
+            // step that needs the GIL to invoke its Python effect before
+            // releasing this same lock (see the module docs' "async flow
+            // bridge" section).
+            let mut flow = blocking_lock_timeout(active, NESTED_EFFECT_WAIT)?;
             let effect_fn = async |attempt: u32| {
                 Python::attach(|py| {
                     let _in_effect = InEffectGuard::enter();
                     invoke_sync_effect(py, &effect, attempt)
                 })
             };
-            match flow.as_mut() {
+            Some(match flow.as_mut() {
                 Some(handle) => {
                     let (outcome, replayed) =
                         guard.block_on(handle.execute_step_with_idempotency_key(
@@ -630,8 +696,17 @@ impl KeelCore {
                     (outcome, Some(replayed))
                 }
                 None => (guard.block_on(engine.execute(&request, effect_fn)), None),
-            }
+            })
         });
+        let Some((outcome, replayed)) = acquired else {
+            return Err(keel_error(
+                py,
+                "KEEL-E017",
+                "a synchronous effect was started from inside another synchronous \
+                 effect running on a different thread; the inner call cannot proceed \
+                 until the outer one returns, and the outer one is waiting for it",
+            ));
+        };
         match replayed {
             Some(r) => flow_outcome_to_py(py, &outcome, r),
             None => outcome_to_py(py, &outcome),
