@@ -105,6 +105,16 @@ human-facing "what happened" check these first:
   the surface that survives — a parent that captures a child's stderr
   silently swallows it — and `KEEL_LOG_FORMAT=json` makes that summary, the
   startup line, and any activation error one JSON object per line.
+- **Which backend ran — check this before trusting any timing.** The startup
+  line and the activation JSON name the backend, and `KEEL_BACKEND=auto` (the
+  default) falls back from the native core to a pure-Python one whenever the
+  native module cannot be imported. That fallback is silent otherwise, and it
+  costs durable flows and cross-run cache persistence, so the banner says so:
+  `(pure-Python backend: no durable flows, no cross-run cache)`. Since 0.6.5
+  the fallback honors wall time like the native core does — before that it
+  advanced a counter instead of sleeping, so retry backoff, rate limits and
+  poll intervals were not real. If you are diagnosing "the policy did not
+  seem to apply", establish the backend first.
 - **`keel report`** — a self-contained HTML page at `.keel/report.html`:
   per-target tables, a calls/failures trend, the newest run's event stream,
   and flow status. `--open` launches it; `--json` prints the same evidence
@@ -175,7 +185,13 @@ the six phases in order; the static scan is evidence, not the verdict.
    4xx returns KEEL-E015 and is never retried, so wrapping it in retry buys
    latency, not resilience. Non-idempotent calls are `KEEL-E014` "observed,
    not retried" by default — confirm the transient hypothesis with evidence
-   before recommending a behavior change.
+   before recommending a behavior change. Two more codes worth recognizing:
+   `KEEL-E016` means a `poll` ran out its `deadline` without the response ever
+   looking terminal — usually `until.field`/`until.terminal` naming the wrong
+   signal rather than a genuinely slow operation; `KEEL-E017` means a
+   synchronous effect could not acquire its flow's step lock, whose likeliest
+   cause is a nested call from another thread inside an open flow (a
+   FastAPI/Starlette `TestClient` suite is the classic shape).
 5. **Analyze & propose.** Hunt hand-rolled resilience the scan may not flag
    yet: retry loops with sleeps, poll-until-status loops, `mkdir`-style
    mutexes, per-day guard files, broad `except: return None` swallows. When a
