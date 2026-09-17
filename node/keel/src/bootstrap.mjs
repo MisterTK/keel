@@ -149,6 +149,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
       code: "policy-missing-at-keel-cwd",
       keel_cwd: String(cwd),
       message: text.slice("keel ▸ error: ".length).replace(/\n$/, ""),
+      severity: "ERROR",
       version: VERSION,
     });
     refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd, cwdSource };
@@ -509,6 +510,7 @@ function banner(
     policy_source: source,
     root: String(cwd),
     root_source: cwdSource,
+    severity: "INFO",
     version: VERSION,
     wrapped: seams.join(" + "),
   };

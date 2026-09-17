@@ -468,6 +468,11 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(activation["keel"], "activation", defaults.stderr)
         self.assertEqual(activation["policy_source"], "defaults")
         self.assertEqual(activation["note"], f"no keel.toml in {sub}; `keel init` to customize")
+        # #130: Cloud Run fills an entry's severity only from a `severity`
+        # field in the payload — a healthy activation must read INFO, not
+        # DEFAULT, or it is indistinguishable from the refusal line below in
+        # any severity>=ERROR view.
+        self.assertEqual(activation["severity"], "INFO", defaults.stderr)
 
         (self.root / "keel.toml").write_text("")
         proc = _run(
@@ -484,6 +489,9 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(objs[0]["root_source"], "KEEL_CWD")
         self.assertNotIn("note", objs[0], "a loaded policy has no em-dash tail — no note key")
         self.assertEqual(objs[1]["keel_cwd"], str(self.root))
+        # #130: both the activation and the summary line are INFO.
+        self.assertEqual(objs[0]["severity"], "INFO", proc.stderr)
+        self.assertEqual(objs[1]["severity"], "INFO", proc.stderr)
 
     def test_backend_is_named_end_to_end_under_the_stub(self) -> None:
         # #119 transparency: KEEL_BACKEND=auto (the default) falls back to the
@@ -594,6 +602,10 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(objs[0]["keel"], "error")
         self.assertEqual(objs[0]["code"], "policy-missing-at-keel-cwd")
         self.assertEqual(objs[0]["keel_cwd"], str(self.root))
+        # #130: the refusal is the one line that MUST read ERROR — it is the
+        # line saying Keel did not activate, and it must not be
+        # indistinguishable from a healthy activation in a severity>=ERROR view.
+        self.assertEqual(objs[0]["severity"], "ERROR", proc.stderr)
 
 
 if __name__ == "__main__":

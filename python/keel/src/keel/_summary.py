@@ -165,6 +165,7 @@ def format_summary_json(
     obj: dict[str, Any] = {k: int(counts.get(k, 0)) for k in COUNT_KEYS}
     obj["unprotected_by_target"] = dict(sorted((by_target or {}).items()))
     obj["cache_poll_suspects"] = int(cache_poll_suspects)
+    obj["severity"] = "INFO"
     obj.update({"keel": "summary", **meta})
     return dumps_line(obj)
 

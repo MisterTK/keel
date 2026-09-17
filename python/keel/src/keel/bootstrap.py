@@ -154,6 +154,7 @@ def install_keel(
                 "code": "policy-missing-at-keel-cwd",
                 "keel_cwd": str(cwd),
                 "message": text[len("keel ▸ error: ") :].rstrip("\n"),
+                "severity": "ERROR",
                 "version": __version__,
             },
         )
@@ -539,6 +540,7 @@ def _banner(
         "policy_source": source,
         "root": str(root) if root is not None else None,
         "root_source": cwd_source,
+        "severity": "INFO",
         "version": __version__,
         "wrapped": wrapped,
     }

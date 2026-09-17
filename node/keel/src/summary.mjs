@@ -118,6 +118,7 @@ export function formatSummaryJson(counts, meta, byTarget = null, cachePollSuspec
   for (const k of KEYS) obj[k] = Number(counts?.[k] ?? 0);
   obj.unprotected_by_target = { ...(byTarget ?? {}) };
   obj.cache_poll_suspects = Number(cachePollSuspects ?? 0);
+  obj.severity = "INFO";
   return dumpsLine({ ...obj, keel: "summary", ...meta });
 }
 

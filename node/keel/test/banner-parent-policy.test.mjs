@@ -263,6 +263,9 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
     const defaults = keelJsonLines(run(root, { KEEL_LOG_FORMAT: "json" }).stderr);
     assert.equal(defaults[0].policy_source, "defaults");
     assert.equal(defaults[0].note, `no keel.toml in ${realpathSync(root)}; \`keel init\` to customize`);
+    // #130: Cloud Run fills an entry's severity only from a `severity` field
+    // in the payload — a healthy activation must read INFO, not DEFAULT.
+    assert.equal(defaults[0].severity, "INFO", JSON.stringify(defaults[0]));
 
     writeFileSync(join(root, "keel.toml"), "");
     const realRoot = realpathSync(root);
@@ -277,6 +280,9 @@ test("KEEL_LOG_FORMAT=json emits one JSON object per line", () => {
     assert.equal(objs[0].root_source, "cwd");
     assert.ok(!("note" in objs[0]), `a loaded policy has no em-dash tail — no note key: ${objs[0].note}`);
     assert.equal(objs[0].dev_cache_off, null, "no serverless marker here — the dev cache stayed on");
+    // #130: both the activation and the summary line are INFO.
+    assert.equal(objs[0].severity, "INFO", proc.stderr);
+    assert.equal(objs[1].severity, "INFO", proc.stderr);
     // Which backend resolved has to be a FIELD, not just prose: `emit` writes
     // the object INSTEAD of the text in json mode, so a structured-logging
     // deployment can only index what the object names (F10, the same reason
@@ -332,6 +338,9 @@ test("KEEL_LOG_FORMAT=json turns the refusal into one error object", () => {
     assert.equal(objs[0].keel, "error");
     assert.equal(objs[0].code, "policy-missing-at-keel-cwd");
     assert.equal(objs[0].keel_cwd, realRoot);
+    // #130: the refusal is the one line that MUST read ERROR — it must not be
+    // indistinguishable from a healthy activation in a severity>=ERROR view.
+    assert.equal(objs[0].severity, "ERROR", proc.stderr);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
