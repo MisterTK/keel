@@ -68,7 +68,7 @@ re-fire); the rest run live. `keel flows` lists resumable/completed flows;
 `random.random` reads inside a flow are virtualized so a resumed run sees the
 same values.
 
-v0.1 limits (precise, never silent): a flow needs a journal (native core).
+Limits (precise, never silent): a flow needs a journal (native core).
 Async flow bodies are supported: an `async def` entrypoint's awaited
 intercepted calls route through the same open flow handle as a synchronous
 flow's, journaled identically; concurrent awaited effects (`asyncio.gather`)
@@ -92,6 +92,16 @@ A policy entry is `[target."<key>"]`. Kinds:
 - **semantic** — `llm:<provider>` (openai/anthropic/google-genai/…),
   `tool:<name>`, `mcp:<server>`. Auto-detected from provider hosts / framework
   adapters.
+- **`cmd:<name>`** — an external command dispatched as a journaled Tier-2
+  durable flow, matched on argv under `[flows.match."cmd:<name>"]` (prefix
+  match: the observed argv must be at least as long as the declared pattern,
+  trailing args unconstrained).
+- **route key** — a key carrying a method and a path, e.g.
+  `[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]`. It is
+  matched on method, host, effective port and path, and it beats Keel's own
+  LLM host-map classification for that route, so a status-poll route can carry
+  its own timeout, breaker and poll policy while the chat route keeps the LLM
+  pack. A host-only glob is NOT a route key and never captures LLM traffic.
 
 Canonical policy example:
 
@@ -113,7 +123,10 @@ cache = { mode = "dev" }                # dev-loop cache; inert when KEEL_ENV=pr
 - **Circuit breaker:** `breaker = { failures = 5, cooldown = "15s" }` — opens after N failures, half-opens after cooldown (KEEL-E012 while open).
 - **Rate limit:** `rate = "60/min"` — token bucket; KEEL-E013 if the wait budget is exceeded.
 - **Idempotency:** `idempotency = { header = "Idempotency-Key" }` — makes a non-idempotent call retryable (otherwise KEEL-E014, observed-not-retried).
-- **Cache / LLM dev-cache:** `cache = { mode = "dev" }` — identical request+args replay off `KEEL_ENV=prod`; with the native core + journal it persists across separate runs (a repeated prompt costs ~0).
+- **Cache / LLM dev-cache:** `cache = { mode = "dev" }` — identical request+args replay off `KEEL_ENV=prod`; with the native core + journal it persists across separate runs (a repeated prompt costs ~0). `cache = { mode = "off" }` disables caching for a target outright. The dev cache is also off by default on serverless platforms, and never derives a key for a streaming (`text/event-stream`) or long-running-operation-shaped call.
+- **Poll until terminal:** `poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true] } }` — turns a submit-then-poll long-running operation into one awaited call. Poll wraps retry, so each probe still retries; cache, rate and breaker see one logical call. `until.field` may be a dotted path (`response.state`) and `until.terminal` matches by JSON type, so `"true"` and `true` are distinguishable. KEEL-E016 when the deadline runs out. The gate is idempotency, not method: any call Keel judges idempotent can be polled, which includes Google `:fetch*Operation` POSTs (see below) — scope the poll with a route key if that is broader than you want.
+- **Operation reads:** a `POST` to a host under `googleapis.com` whose last path segment is a `:fetch…Operation` custom method is judged idempotent without an idempotency key — re-issuing it is exactly what polling does. It is retried under Level 0 defaults and gets the per-attempt `timeout`, identically in Python, Node and Rust. The submit side (`:predictLongRunning`) is untouched and stays non-idempotent.
+- **Fallback:** `fallback = ["llm:anthropic", …]` on an LLM target — after the primary's retries are exhausted, the call is re-judged and re-dispatched at the next provider, each hop under its own target's policy.
 
 ## LLM / agent frameworks
 
@@ -146,12 +159,15 @@ timestamps) instead of prose. Same command, two audiences.
 - `keel run <target> [args...]` — run a script/package/dir under Keel. `--disable` runs it byte-identically with Keel off.
 - `keel init [--diff] [--stamp] [--agents]` — generate `keel.toml` from evidence; `--diff` previews; `--stamp` dates the header; `--agents` writes the Keel section into `AGENTS.md` instead.
 - `keel doctor [--effective-policy]` — the honesty report: what's wrapped, what's visible-but-unwrapped and why, adapter version pins, policy validity, journal backend. `--effective-policy` prints the composed `defaults < packs < user` policy `keel_configure` actually receives.
-- `keel status` — coverage %, retries saved this week, breaker events, cache hit rate, resumable flows.
+- `keel status` — coverage %, retries saved this week, breaker events, cache hit rate, resumable flows, and the last recorded activation.
+- `keel report [--out PATH] [--open] [--watch] [--serve] [--port N]` — render `keel status` + the newest run's events + flows into one self-contained HTML file at `.keel/report.html`. `--watch` rewrites it on an interval; `--serve` serves it on 127.0.0.1. `--json` prints the report's data blob instead.
+- `keel exec -- <command...>` — wrap one external command as a journaled Tier-2 durable flow (CCR-4): at-most-once dispatch per identity, crash-safe retry gating, and a declared-side-effect gate (KEEL-E033). NOT exactly-once execution inside the child.
 - `keel explain <KEEL-E0NN>` — the exact what/why/next for an error code.
 - `keel flows [--dead]` — list durable flows (id, entrypoint, status, steps, age).
 - `keel flows suggest` — analyze candidate flow entrypoints for replay-safety (effect counts, idempotent-unsafe effects, time/random reads, an estimated replay-safe verdict).
 - `keel flows add <entrypoint> [--diff]` — designate an entrypoint as a durable flow: appends it to `[flows] entrypoints`, idempotent re-run.
 - `keel flows resume [<flow> | --all]` — re-invoke a resumable flow's recorded entrypoint through `keel run`.
+- `keel flows force <flow>` — arm the durable one-shot KEEL-E033 override: the next re-dispatch that would otherwise be refused because the declared side-effect files changed proceeds exactly once, then the override clears itself. The out-of-process, config-free equivalent of `keel exec --force`.
 - `keel trace <flow>` — one flow's steps (outcomes, attempts, timings).
 - `keel replay <flow> [--step N]` — a journal-driven dry run of what re-entering the flow would do: which steps substitute, which re-execute, where replay resumes.
 - `keel tail [--run ID] [--no-follow]` — live view of attempts/backoffs/breaker transitions while a program runs, reading `.keel/events/`; no daemon.
@@ -160,13 +176,34 @@ timestamps) instead of prose. Same command, two audiences.
 - `keel record run <target> [args...]` / `keel record list` / `keel record test <recording>` — capture every intercepted effect during a run into `.keel/recordings/`, then turn a recording into a replayable offline test fixture (a pytest fixture or `node:test` file) that fails loudly on any unmatched effect.
 - `keel sim <plan>` — replay a declarative fault plan (injected errors, latency, crash-restart points) against a script or a recording, asserting the policy holds (retries within budget, breaker opens as configured, flows resume). Adapter-level fault injection, not hermetic simulation.
 
+## Observability
+
+Silence on success is a DX invariant, not a lack of evidence:
+
+- **Exit summary** — every run ends with one screen: calls, retries, cache
+  hits, breaker trips, unprotected calls (with the top targets named), and
+  any runtime suspicions such as `cache-poll-suspect` (5 consecutive cache
+  hits on one identical key spanning ≥20s — the shape of a poll loop being
+  replayed).
+- **`keel report`** — the same evidence as a self-contained HTML page, live
+  with `--watch` or `--serve`.
+- **`KEEL_LOG_FORMAT=json`** — the startup line, the exit summary, and errors
+  become one JSON object per line, byte-identical between Python and Node.
+  Use it in containers.
+- **`keel tail`** — attempts, backoffs and breaker transitions as they
+  happen, read from `.keel/events/`. No daemon.
+- **OpenTelemetry** is opt-in and build-time: the `otel` cargo feature plus
+  `KEEL_OTEL=1`. It is NOT enabled in any published package.
+
 ## Dependency activation (without `keel run`)
 
 When another tool owns the process (test runners, `agents-cli`, `adk api_server`, uvicorn), activate Keel via environment variables:
 
 - **Python**: the `keelrun` wheel ships a `.pth` shim gated on `KEEL_ENABLE=1`. Set it in your `.env` and every Python process boots with the same policy engine as `keel run` — loading `keel.toml` from the working directory, or from `KEEL_CWD=<dir>` when config lives in the deployable app. `KEEL_DISABLE=1` always wins.
-- **Node**: add `NODE_OPTIONS="--import keelrun/register"` alongside `KEEL_ENABLE=1`. Same `KEEL_ENABLE` gate as Python; `KEEL_CWD` is Python-only — Node always uses the process working directory.
-- Activation is fail-open: a broken install or invalid `keel.toml` prints one `keel ▸` warning line; your app runs unwrapped. The preflight resilience advisory stays a `keel run`-only, CLI-side feature in both languages. Python's `.pth` shim additionally skips `keel record` / `keel sim` wiring and flow-entrypoint dispatch (designated via `[flows] entrypoints`, not auto-detected). Node's `keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload `keel run` uses — flow-entrypoint dispatch and `KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
+- **Node**: add `NODE_OPTIONS="--import keelrun/register"` alongside `KEEL_ENABLE=1`. Same `KEEL_ENABLE` gate as Python, and Node honors `KEEL_CWD` too — both front ends read `keel.toml` from the working directory and both relocate that root when `KEEL_CWD` is set.
+- **`KEEL_CWD` is an assertion, not a hint.** If it names a directory with no `keel.toml`, Keel prints `keel ▸ error: KEEL_CWD=… is set but …/keel.toml does not exist — Keel NOT activated` and the host runs keel-free; `keel run` exits 2 instead. `KEEL_POLICY=optional` restores the older behavior of running Level 0 defaults with a warning. Without `KEEL_CWD`, a missing `keel.toml` still means Level 0 defaults, and the banner names the directory it searched (and any `keel.toml` found above it).
+- Activation is fail-open for the host: a broken install or invalid `keel.toml` prints one `keel ▸` line; your app runs unwrapped. The preflight resilience advisory stays a `keel run`-only, CLI-side feature in both languages. Python's `.pth` shim additionally skips `keel record` / `keel sim` wiring and flow-entrypoint dispatch (designated via `[flows] entrypoints`, not auto-detected). Node's `keelrun/register` is a thin `KEEL_ENABLE` gate around the same preload `keel run` uses — flow-entrypoint dispatch and `KEEL_RECORD`/`KEEL_SIM_PLAN` wiring behave exactly as under `keel run`.
+- **Deployment honesty.** On a serverless platform (`K_SERVICE`, `AWS_LAMBDA_FUNCTION_NAME`, …) the default LLM dev cache is off unless `KEEL_ENV=dev` says otherwise, and a SQLite journal on ephemeral storage draws a runtime warning plus a `journal-ephemeral-storage` doctor finding. `keel doctor` reads a root `Dockerfile` for `COPY keel.toml` (`keel-toml-not-in-image`), and every activation writes an evidence row that `keel status` / `keel report` show and `keel doctor --json` reports as `runtime_activation: "verified" | "unverified"`.
 
 ## Error codes (frozen taxonomy)
 
@@ -184,10 +221,12 @@ a `--json` twin, and a trace reference. `keel explain <code>` prints the detail.
 - KEEL-E013 rate-budget-exceeded — could not queue under the rate limit within the wait budget.
 - KEEL-E014 non-idempotent-not-retried — a retryable failure on a non-idempotent call; observed, not retried (Level 0 hard rule). Add `idempotency = { header = "…" }` to make it retryable.
 - KEEL-E015 non-retryable-error — error class not in `retry.on`; original re-raised.
+- KEEL-E016 poll-deadline-exceeded — a poll-until-terminal call kept returning a pending status until `poll.deadline` ran out. Next: raise the deadline, or check that `until.field`/`until.terminal` name the response's real terminal signal.
 - KEEL-E020 cache-codec — a response could not be (de)serialized for the cache.
 - KEEL-E030 flow-lease-held — the flow is being executed by another process (live lease).
 - KEEL-E031 flow-nondeterminism — on replay the code diverged from the journal (or code changed). Set `flows.on_nondeterminism = "warn"|"branch"` to continue.
 - KEEL-E032 flow-dead — the flow exhausted its resume-attempt cap (poison flow).
+- KEEL-E033 cmd-side-effects-changed — a `cmd:` flow (or `keel exec`) refused to re-dispatch a failed command because its declared side-effect files changed since the last attempt. Next: inspect them, then `keel exec --force` or the durable, out-of-process `keel flows force <flow>`.
 - KEEL-E040 internal — a Keel bug (invariant violation inside the core). File an issue with the trace id.
 
 ## DX invariants (tested in CI as behaviors)
@@ -229,9 +268,11 @@ cargo build -p keelrun-cli                      # the `keel` binary
 
 ## Conformance
 
-34 scenarios in `conformance/scenarios/` (21 Tier 1: 01–15 plus
-18/19/20/21–22/23; 13 Tier 2: 16–27, with two Tier-2 scenarios sharing number
-24), run by the real Rust core (all of them — Tier 2 additionally against a
-real Postgres journal backend), the Rust/Python/Node stubs (every Tier 1
-scenario; Tier 2 skipped by design — no journal), and the native front ends.
-`conformance/README.md` is the normative semantics.
+55 scenarios in `conformance/scenarios/` (42 Tier 1, 13 Tier 2), run by the
+real Rust core (all of them — Tier 2 additionally against a real Postgres
+journal backend), the Rust/Python/Node stubs (every Tier 1 scenario; Tier 2
+skipped by design — no journal), and the native front ends.
+`conformance/README.md` is the normative semantics. Cross-language rules too
+fine-grained for a scenario live in shared corpora under `conformance/`
+(e.g. `operation_read/cases.json`, the referee for the Google operation-read
+idempotency rule in all three front ends).

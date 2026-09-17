@@ -6,9 +6,12 @@ circuit breaking, and rate limiting from one `keel.toml` (or conservative
 built-in defaults). This is the Node twin of the Python front end; both drive
 the same core semantics (see `../keel-core-stub`, `../../conformance`).
 
-> Status: v0.1 front end on the pure-Node backend (`AsyncEngine`, a parity-tested
-> async port of `keel-core-stub`). The native async core swaps in transparently
-> once built (`keel-core-native`) — see "Backend".
+> Status: shipping. `npm install keelrun` pulls the native async core
+> (`keelrun-core-native`) as a prebuilt optional dependency on the supported
+> platforms and uses it transparently; where no prebuild applies, the
+> pure-Node `AsyncEngine` (a parity-tested async port of `keel-core-stub`)
+> takes over with identical Tier 1 semantics. Tier 2 durable flows need the
+> native core. See "Backend selection".
 
 ## Use it
 
@@ -66,12 +69,23 @@ Judgments (kept in parity with the Python adapters):
   attempt (`contracts/adapter-pack.md`'s idempotency-key injection, reusing a
   crashed predecessor's key when inside an open Tier 2 flow), making the call
   retryable without the caller supplying one. A non-idempotent transient
-  failure is *observed, not retried* → **KEEL-E014**.
+  failure is *observed, not retried* → **KEEL-E014**. One exemption
+  (`contracts/adapter-pack.md`, CCR-8): a `POST` to a host under
+  `googleapis.com` whose last path segment is a `:fetch…Operation` custom
+  method is a long-running-operation **read**, judged idempotent with no key
+  and no injection — re-issuing it is exactly what polling does. The submit
+  side (`:predictLongRunning`) is untouched. The shared corpus
+  `../../conformance/operation_read/cases.json` is the referee for this rule
+  in all three front ends.
 - **args_hash** (cache/journal key material) is derived only for idempotent
   GET requests on non-`llm:` targets (sha256 over method+URL) and for `llm:`
   POSTs (canonicalized JSON body — the dev-cache replay key); `null` for
-  everything else, including every GET on an `llm:` target (state queries,
-  issue #76).
+  everything else. Deliberately `null` — each one a case where a cached
+  replay would be a lie: every GET on an `llm:` target (state queries, #76),
+  a stream-shaped LLM POST (`:streamGenerateContent`, or a body with
+  top-level `"stream": true` — #84), and a long-running-operation submit or
+  poll POST (`:predictLongRunning`, `:fetch…Operation` — #83), which must see
+  the operation's real current state, never a replay of "still running".
 - **Transient vs. success** — only `429` and `≥500` are treated as retryable
   typed errors (`Retry-After` is parsed to ms and overrides the backoff:
   `wait = max(schedule, retry_after)`). **Every other status** (2xx/3xx and
@@ -101,11 +115,11 @@ async function __keel$run(...) { <body> }              // body byte-identical
 export const run = __keel$wrap("ts:jobs/*.mjs#run", __keel$run);
 ```
 
-**Matching rules (v0.1):** `<pathGlob>` (`*` = non-`/`, `**` = any, `?` = one
+**Matching rules:** `<pathGlob>` (`*` = non-`/`, `**` = any, `?` = one
 char) is matched against the module's path relative to cwd *and* its basename;
 `<exportName>` is the export to wrap. **Supported forms** (a documented
 simplification): `export function NAME` and `export async function NAME`.
-**Not** wrapped in v0.1 (left untouched, unchanged behavior): arrow/const
+**Not** wrapped today (left untouched, unchanged behavior): arrow/const
 exports, `export { NAME }` lists, `export default`, class methods, and a target
 with no `#exportName`.
 
@@ -196,7 +210,7 @@ one seam covers both. Each request routes through the backend as target
   `prompts/get`, `completion/complete`) are retried per policy; **`tools/call`
   and any unknown method are observed, not retried** (KEEL-E014) — the MCP
   analogue of the fetch seam's POST model, so a side-effecting tool is never
-  auto-retried in v0.1 (no per-method opt-in surface is invented). Calls are
+  auto-retried (no per-method opt-in surface is invented). Calls are
   **not cached** (potentially side-effecting).
 - A **hung server on a read-ish (idempotent) call** times out per policy (the
   pack imposes a per-attempt deadline and passes an `AbortSignal` into the
@@ -285,7 +299,7 @@ code needed for the first:
   wraps its `execute` function, so it routes through the backend as target
   `tool:<name>` (`<name>` = the tool file's basename) before eve ever calls it.
   Only that exact, unaliased import form is rewritten — anything else is left
-  untouched (a documented v0.1 simplification, like `ts:` targets).
+  untouched (a documented simplification, like `ts:` targets).
 
 `tool:` calls are **non-idempotent by default** — unlike a `ts:` target (where
 listing it in `keel.toml` is itself the safety assertion), eve discovers tools
@@ -354,9 +368,10 @@ discovery, no banner, no `node:sqlite` load. `uninstall = remove the package.`
 ## Backend selection (`KEEL_BACKEND`)
 
 Isolated in `src/backend.mjs`. Priority: the native addon `keel-core-native`
-when loadable (probed by dynamic import; may not exist yet), else the in-repo
-`AsyncEngine`. Override with `KEEL_BACKEND=stub` (force engine) or
-`KEEL_BACKEND=native` (require the addon; **KEEL-E040** if missing).
+when loadable (probed by dynamic import; absent on an unsupported platform or
+an in-repo checkout that has not built it), else the in-repo `AsyncEngine`.
+Override with `KEEL_BACKEND=stub` (force engine) or `KEEL_BACKEND=native`
+(require the addon; **KEEL-E040** if missing).
 
 ## Tier 2 — durable flows (Level 2)
 
