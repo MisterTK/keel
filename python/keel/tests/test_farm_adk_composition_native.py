@@ -316,11 +316,14 @@ class RealAdkNativeFlowEndToEndTest(_NativeAdkCompositionTestBase):
         self.assertEqual(randoms[0]["step_key"], "adk:invocation_id")
         self.assertEqual(
             [s["step_key"] for s in effects],
-            ["tool:echo#-", "tool:echo#-"],
-            "both real MCP echo calls journaled as effects, in call order",
+            ["tool:adk.session_identity#-", "tool:echo#-", "tool:echo#-"],
+            "both real MCP echo calls journaled as effects, in call order "
+            "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
-        self.assertLess(randoms[0]["seq"], effects[0]["seq"], "effects admit after correlation")
-        self.assertLess(effects[0]["seq"], effects[1]["seq"])
+        self.assertLess(
+            randoms[0]["seq"], effects[1]["seq"], "the tool effects admit after correlation"
+        )
+        self.assertLess(effects[1]["seq"], effects[2]["seq"])
 
 
 @unittest.skipUnless(FARM and _NATIVE, SKIP if not FARM else _NATIVE_SKIP)
@@ -436,8 +439,9 @@ class RealAdkNativeFlowCrashResumeTest(_NativeAdkCompositionTestBase):
         self.assertEqual(markers[0]["attempt"], 2, "abandonment consumed attempt 1; resume is attempt 2")
         self.assertEqual(
             [s["step_key"] for s in effects],
-            ["tool:echo#-", "tool:echo#-"],
-            "exactly one journal row per real effect, ever — no duplicate for the substituted one",
+            ["tool:adk.session_identity#-", "tool:echo#-", "tool:echo#-"],
+            "exactly one journal row per real effect, ever — no duplicate for the substituted one "
+            "(plus the session_identity step every designated flow entry now writes, issue #15)",
         )
 
 
