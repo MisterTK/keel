@@ -20,7 +20,7 @@ WORK="$(mktemp -d)"
 cp "$SCRIPT_DIR/pipeline.py" "$SCRIPT_DIR/keel.toml" "$WORK/"
 cd "$WORK"
 LOG="$WORK/effects.log"
-export KEEL_DEMO_LOG="$LOG" KEEL_FLOW_LEASE_MS=800 KEEL_QUIET=1 KEEL_BACKEND=native
+export KEEL_DEMO_LOG="$LOG" KEEL_FLOW_LEASE_MS=800 KEEL_BACKEND=native
 
 echo "== run 1: crash (kill -9) right before step 6 =="
 set +e

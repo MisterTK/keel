@@ -5,6 +5,12 @@ real network — [`tools/faultproxy`](../tools/faultproxy) serves scripted fault
 sequences). They prefer the repo's `.venv` (which has the native core); set
 `KEEL_PYTHON=/path/to/python` to override.
 
+Every demo runs **loud** on purpose: the startup banner and the exit summary
+are part of what is being demonstrated. `flaky ok` is the promise; `keel ▸ 1
+call · 1 retry succeeded` is the receipt, and `keel ▸ 1 call · 1 served from
+cache` in `agent-demo`'s second run is the dev-cache claim proving itself. Set
+`KEEL_QUIET=1` if you want a demo's own output alone.
+
 | Demo | What it proves | Language | Needs native core |
 |------|----------------|----------|-------------------|
 | [`flaky-python`](flaky-python) | Bare httpx script dies on a 503; `keel run` retries it and it survives — zero code changes | Python | no |
