@@ -694,6 +694,80 @@ fn keel_events_stderr_resolves_to_stderr_and_creates_no_events_directory() {
     drop(sink);
 }
 
+/// `EventSink::open_stderr` must actually land well-formed NDJSON on the
+/// real fd 2 — the two tests above only assert what it does NOT do
+/// (create a file). Capturing real stderr needs a genuine child process: a
+/// same-process capture would need `std::io::set_output_capture` (nightly)
+/// or an fd-2 `dup2` (a new `libc` dependency), neither of which is
+/// available here, and `std::env::set_var` is off the table (unsound in
+/// this repo — see CLAUDE.md). Instead this test re-execs the compiled test
+/// binary itself (`std::env::current_exe`) filtered to just this one test,
+/// with a private sentinel env var in the CHILD's own environment — the
+/// spawned-child seam the review explicitly allowed. The parent then reads
+/// the child's real stderr.
+#[test]
+fn open_stderr_writes_well_formed_ndjson_to_real_fd_2() {
+    const SENTINEL: &str = "KEEL_EVENTS_TEST_STDERR_CHILD";
+    const TEST_NAME: &str = "open_stderr_writes_well_formed_ndjson_to_real_fd_2";
+
+    if std::env::var_os(SENTINEL).is_some() {
+        // We ARE the spawned child: write one real event straight to the
+        // process's stderr (bypassing libtest's capture, which only
+        // intercepts the `print!`/`eprintln!` macros, not raw `io::stderr()`
+        // writes) and exit. The parent inspects our fd 2, not us.
+        let sink = EventSink::open_stderr().expect("stderr sink must start");
+        sink.emit(
+            0,
+            EventKind::BreakerReject {
+                call: "t-000001".to_owned(),
+                target: "api.example.com".to_owned(),
+            },
+        );
+        sink.flush();
+        drop(sink);
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current test binary");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(SENTINEL, "1")
+        .output()
+        .expect("spawn self as a child process");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let mut saw_run_start_with_pid = false;
+    let mut saw_breaker_reject = false;
+    for line in stderr.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue; // libtest chatter, if any — not an event line
+        };
+        assert_eq!(v["v"], 1, "every event line carries the format version");
+        match v["event"].as_str() {
+            Some("run_start") => {
+                saw_run_start_with_pid = v.get("pid").and_then(serde_json::Value::as_u64).is_some()
+                    && v.get("wall_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some();
+            }
+            Some("breaker_reject") => {
+                assert_eq!(v["call"], "t-000001");
+                assert_eq!(v["target"], "api.example.com");
+                saw_breaker_reject = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_run_start_with_pid,
+        "expected a production run_start header (wall_ms + pid) on real stderr: {stderr:?}"
+    );
+    assert!(
+        saw_breaker_reject,
+        "expected the emitted event on real stderr: {stderr:?}"
+    );
+}
+
 /// Without a sink — the conformance condition — failure messages carry no
 /// trace ref, byte-identical to the stubs (parity rule).
 #[tokio::test(start_paused = true)]

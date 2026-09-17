@@ -46,11 +46,27 @@
 //! survives an instance that dies mid-run. An extra buffer that only empties
 //! on drain-or-shutdown is exactly the mechanism that would make the last
 //! few events vanish with the container instead of reaching the log
-//! pipeline. `io::Stderr` itself performs one `write(2)` per `write_all`
-//! call with no internal line-buffering (unlike `io::Stdout`), so each event
-//! the writer thread processes reaches the OS as soon as it is serialized —
-//! no explicit flush required for durability, only for a *reader* (e.g. a
-//! same-process `keel trace`) to see it promptly.
+//! pipeline.
+//!
+//! [`write_events`] serializes each event plus its trailing newline into one
+//! in-memory buffer *before* touching `out`, then issues exactly **one**
+//! `write_all` per event — never a separate call for the JSON body and the
+//! newline. That single call is what makes "no explicit flush required for
+//! durability" true: with `io::Stderr`'s lack of internal buffering (unlike
+//! `io::Stdout`), one `write_all` reaches the OS as one `write(2)`. What this
+//! does **not** buy: a single `write(2)` is not a guaranteed-atomic unit on
+//! every platform or stream type, so a line can still interleave with
+//! concurrent writers of the *same* fd (Keel's own console output, or the
+//! host application's own direct `stderr` writes) under extreme conditions —
+//! e.g. a line wider than the OS pipe buffer, or a destination that isn't a
+//! pipe/regular file. What holds: on the common case (a line that fits in one
+//! `write(2)`, going to a pipe or regular file — true for essentially every
+//! real event line on a real deployment target), POSIX guarantees that write
+//! is atomic with respect to other writers of the same fd, so this is as
+//! close to atomic as a userspace program gets without its own external
+//! locking. An explicit flush is still only ever about a *reader* (e.g. a
+//! same-process `keel trace`) seeing the file's tail promptly, not about
+//! durability.
 //!
 //! ## Interleaving with Keel's other stderr output
 //!
@@ -564,8 +580,21 @@ impl Drop for EventSink {
 /// drains (so a tail sees events promptly, without a flush syscall per line).
 /// Write failures drop lines, never the call. `Shutdown` still drains what is
 /// already queued — messages ahead of it in the channel are processed first.
+///
+/// Each event is serialized into a scratch buffer first and reaches `out`
+/// through exactly **one** `write_all` call (JSON body + trailing newline
+/// together) — never two separate calls. Two calls would mean two raw
+/// `write(2)`s per event on an unbuffered destination (stderr), and nothing
+/// stops the file's own bytes and a newline from landing on either side of
+/// unrelated output the same fd receives between them (Keel's own console
+/// lines, or the host application's own writes) — corrupting the very line
+/// this sink exists to make trustworthy. One `write_all` is not a portable
+/// atomicity guarantee in every case (see the module docs), but it is the
+/// most any userspace writer can do without its own external locking, and it
+/// is exact for the common case that matters here.
 fn write_events(rx: &Receiver<Msg>, mut out: Box<dyn Write + Send>) {
     let mut dirty = false;
+    let mut line = Vec::with_capacity(256);
     loop {
         let msg = if dirty {
             match rx.try_recv() {
@@ -585,8 +614,12 @@ fn write_events(rx: &Receiver<Msg>, mut out: Box<dyn Write + Send>) {
         };
         match msg {
             Msg::Event(event) => {
-                if serde_json::to_writer(&mut out, &event).is_ok() && out.write_all(b"\n").is_ok() {
-                    dirty = true;
+                line.clear();
+                if serde_json::to_writer(&mut line, &event).is_ok() {
+                    line.push(b'\n');
+                    if out.write_all(&line).is_ok() {
+                        dirty = true;
+                    }
                 }
             }
             Msg::Flush(ack) => {

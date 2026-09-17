@@ -235,3 +235,37 @@ mod read_events_tests {
         assert!(read_events(&project, Some("nope"), None, 10).is_err());
     }
 }
+
+/// `keel tail` under `KEEL_EVENTS=stderr`: it must say events are going to
+/// stderr instead of the generic "nothing to tail" guidance, which would
+/// tell someone who deliberately opted into stderr evidence that there is
+/// none. `tail::run` reads the real process environment internally
+/// (`EventsEnv::capture`), so this needs a real child process with the
+/// variable in ITS environment — never `std::env::set_var` in-process
+/// (unsound in this repo, see CLAUDE.md).
+mod stderr_destination {
+    use std::process::Command;
+
+    #[test]
+    fn tail_explains_that_events_are_going_to_stderr_instead_of_a_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_keel"))
+            .args(["tail", "--no-follow"])
+            .current_dir(dir.path())
+            .env("KEEL_EVENTS", "stderr")
+            .output()
+            .expect("spawn keel tail");
+        assert!(
+            !out.status.success(),
+            "nothing on disk to tail, so this must fail"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("events are going to stderr"),
+            "stderr: {stderr}"
+        );
+        // Must NOT fall back to the generic "there is none" guidance.
+        assert!(!stderr.contains("nothing to tail"), "stderr: {stderr}");
+        assert!(!stderr.contains("no runs recorded"), "stderr: {stderr}");
+    }
+}
