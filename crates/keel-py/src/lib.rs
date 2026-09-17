@@ -29,13 +29,22 @@
 //!
 //! # Runtime & clock (mirrors `keel-ffi`)
 //!
-//! Each handle owns a current-thread tokio runtime (time driver only — the
-//! engine uses the timer wheel, never IO). [`Engine::new`], `report()`, and clock
-//! advancement all run **inside** that runtime under `block_on`, because they
-//! read `tokio::time::Instant`; under `paused=True` that anchors and advances the
-//! virtual clock the conformance suite drives. The runtime is behind a `Mutex`
-//! so calls on one handle serialize (no `.await` is held across that std mutex —
-//! `block_on` is synchronous from our side).
+//! Each handle owns a tokio runtime (time driver only — the engine uses the
+//! timer wheel, never IO). [`Engine::new`], `report()`, and clock advancement all
+//! run **inside** that runtime under `block_on`, because they read
+//! `tokio::time::Instant`; under `paused=True` that anchors and advances the
+//! virtual clock the conformance suite drives.
+//!
+//! The runtime's *flavor* follows the clock (see [`RuntimeHandle`], issue #116).
+//! Production (`paused=false`) gets a **multi-threaded** runtime held by a plain
+//! `Arc`: `Runtime::block_on` takes `&self`, so several OS threads can each drive
+//! their own future at the same time and no handle-wide mutex is needed — which
+//! is what lets independent synchronous effects overlap instead of serializing.
+//! The harness (`paused=true`) keeps a **current-thread** runtime behind a
+//! `Mutex`, because `tokio::time::pause()` requires that flavor and the
+//! conformance suite's determinism depends on exactly one `block_on` at a time
+//! anyway. Only `active_flow` serializes in production, and only while a flow is
+//! open — see below.
 //!
 //! The async path instead runs the engine future on the `pyo3-async-runtimes`
 //! tokio runtime (real, non-paused time, and — unless configured otherwise —
@@ -133,16 +142,16 @@ fn synth_other(message: String) -> AttemptResult {
 thread_local! {
     /// `true` while a synchronous effect is executing on this OS thread.
     ///
-    /// The sync `execute` path holds this handle's `runtime` (and, in a flow, its
-    /// `active_flow`) mutex across a `block_on`, and the effect runs Python on the
-    /// *same* thread. Anything the effect body does that re-enters this core —
+    /// The sync `execute` path drives a `block_on` (and, in a flow, holds
+    /// `active_flow` across it), and the effect runs Python on the *same*
+    /// thread. Anything the effect body does that re-enters this core —
     /// a nested intercepted call (a wrapped `py:` function whose body calls
     /// `requests.get`), or a patched `time.time`/`random.random` read that routes
     /// to `journal_time`/`journal_random` (e.g. `http.cookiejar` inside every
     /// `requests` response) — would otherwise re-lock a held mutex (deadlock) or
-    /// start a second `block_on` on the current-thread runtime (panic). While
-    /// this flag is set, those re-entrant paths *pass through* (run directly)
-    /// instead of routing back through the engine/journal.
+    /// start a second `block_on` from inside a runtime (panic). While this flag
+    /// is set, those re-entrant paths *pass through* (run directly) instead of
+    /// routing back through the engine/journal.
     static IN_EFFECT: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -180,11 +189,13 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// How long a synchronous effect waits for a lock an outer effect may be
-/// holding before concluding that it is nested inside that effect on another
-/// thread. The thread-local `IN_EFFECT` guard catches same-thread nesting for
-/// free; this catches the cross-thread case, which it structurally cannot see
-/// (issue #117). Generous enough that a merely SLOW outer effect is never
+/// How long a synchronous effect waits for `active_flow` — a lock an outer
+/// step of the same open flow may be holding — before concluding that it is
+/// nested inside that step on another thread. The thread-local `IN_EFFECT`
+/// guard catches same-thread nesting for free; this catches the cross-thread
+/// case, which it structurally cannot see (issue #117). Since #116 this only
+/// ever applies INSIDE a flow: outside one there is no handle-wide lock left
+/// to contend, so a cross-thread nested effect simply runs. Generous enough that a merely SLOW outer effect is never
 /// mistaken for a deadlocked one: the detection mechanism (`try_lock` still
 /// failing) is IDENTICAL for "the outer effect dispatched to me" and "the
 /// outer effect is just slow" — this value is the only thing separating a
@@ -211,74 +222,20 @@ fn nested_effect_wait() -> Duration {
         .map_or(NESTED_EFFECT_WAIT, Duration::from_millis)
 }
 
-/// [`lock_recover`]'s bounded-wait twin for `execute`'s `runtime` mutex.
-/// Returns `None` at `deadline`, which the caller reports as KEEL-E017,
-/// rather than blocking forever. Polls `try_lock`, recovering a poisoned
-/// guard the same way `lock_recover` does — it costs nothing in the
-/// uncontended case (first `try_lock` succeeds) and only ever spins on a
-/// path that would otherwise deadlock forever: an outer sync effect on
-/// another OS thread holding `runtime` across its own `block_on` (see the
-/// module docs' "async flow bridge" section for why this mutex exists at
-/// all).
+/// The KEEL-E017 message raised when `execute`'s bounded wait for
+/// `active_flow` expires.
 ///
-/// Not FIFO: a later-arriving thread's `try_lock` can win a race against one
-/// that has been polling longer (no queue, no ordering guarantee), and
-/// detection of a just-freed lock lags by up to the 5ms poll interval below.
-/// Under SUSTAINED contention (not this function's target case — that's a
-/// single outer holder, not a queue of waiters) this is a second, narrower
-/// route to a spurious KEEL-E017 for a caller that never actually deadlocked,
-/// just lost every race — another reason the bound stays generous.
-fn lock_recover_timeout<T>(
-    mutex: &Mutex<T>,
-    deadline: std::time::Instant,
-) -> Option<std::sync::MutexGuard<'_, T>> {
-    loop {
-        match mutex.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Which of `execute`'s two locks a bounded wait gave up on — the two
-/// conditions mean different things (a `Runtime` timeout only says "some
-/// sync effect is in flight on this handle somewhere, possibly with no
-/// nesting at all"; an `ActiveFlow` timeout says "an outer step in THIS
-/// flow, on another thread, holds the handle"), so the raised KEEL-E017
-/// names which one actually expired rather than asserting the more specific
-/// (and often wrong) claim unconditionally. Task 4 deletes the `Runtime`
-/// arm's call site (issue #116 removes that contention outside a flow); this
-/// enum is what lets the message stay accurate on both sides of that change.
-enum NestedLock {
-    Runtime,
-    ActiveFlow,
-}
-
-impl NestedLock {
-    fn message(&self) -> &'static str {
-        match self {
-            NestedLock::Runtime => {
-                "a synchronous effect could not acquire this handle's runtime lock in time; \
-                 another synchronous effect is in flight on a different thread and holds it \
-                 for its own call's whole duration — this does not necessarily mean this call \
-                 is nested inside that one, only that they contend the same handle-wide lock; \
-                 if it IS nested (the other call dispatched to this one), it cannot proceed \
-                 until the outer call returns, and the outer call is waiting for it"
-            }
-            NestedLock::ActiveFlow => {
-                "a synchronous effect was started from inside another synchronous effect \
-                 running on a different thread, both belonging to the same open flow; the \
-                 inner call cannot proceed until the outer one returns, and the outer one is \
-                 waiting for it"
-            }
-        }
-    }
-}
+/// There used to be a second message for a handle-wide `runtime` mutex that
+/// `execute` also had to acquire. Issue #116 removed that mutex outside the
+/// paused-clock harness, so `active_flow` is now the only lock a synchronous
+/// effect can be blocked on — and it is only ever held while a flow is open,
+/// which makes this diagnosis specific rather than a guess: if the lock is
+/// held, an outer step of THIS flow holds it, on another thread.
+const NESTED_FLOW_EFFECT_MESSAGE: &str = concat!(
+    "a synchronous effect was started from inside another synchronous effect running on a ",
+    "different thread, both belonging to the same open flow; the inner call cannot proceed ",
+    "until the outer one returns, and the outer one is waiting for it"
+);
 
 /// Acquire `m` for a synchronous caller, giving up at `deadline`. Returns
 /// `None` on expiry, which the caller reports as KEEL-E017. `tokio::sync::Mutex`
@@ -512,15 +469,45 @@ fn async_in_effect(py: Python<'_>) -> bool {
         .unwrap_or(false)
 }
 
-/// Build a current-thread runtime with only the time driver; `paused` turns on
-/// tokio's virtual clock (the conformance harness's model of time).
-fn build_runtime(paused: bool) -> std::io::Result<Runtime> {
-    let mut builder = Builder::new_current_thread();
-    builder.enable_time();
-    if paused {
-        builder.start_paused(true);
+/// The sync path's runtime. Production (`paused=false`) gets a multi-threaded
+/// runtime behind an `Arc`: [`Runtime::block_on`] takes `&self`, so several OS
+/// threads can drive their own futures concurrently and no mutex is needed —
+/// which is what lets independent sync effects overlap (#116). The harness
+/// (`paused=true`) keeps a current-thread runtime behind a `Mutex`, because
+/// `tokio::time::pause()` requires that flavor and the conformance suite's
+/// determinism depends on exactly one `block_on` at a time anyway.
+enum RuntimeHandle {
+    Shared(Arc<Runtime>),
+    Exclusive(Mutex<Runtime>),
+}
+
+impl RuntimeHandle {
+    /// Drive `fut` to completion on this handle's runtime. On `Shared` this
+    /// takes no lock at all, so concurrent callers genuinely overlap; on
+    /// `Exclusive` it serializes behind the runtime mutex exactly as every
+    /// call site did before #116.
+    fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        match self {
+            Self::Shared(rt) => rt.block_on(fut),
+            Self::Exclusive(m) => lock_recover(m).block_on(fut),
+        }
     }
-    builder.build()
+}
+
+/// Build the runtime, with only the time driver enabled (the engine uses the
+/// timer wheel, never IO). `paused` turns on tokio's virtual clock (the
+/// conformance harness's model of time) — which only the current-thread flavor
+/// supports, hence the split; see [`RuntimeHandle`].
+fn build_runtime(paused: bool) -> std::io::Result<RuntimeHandle> {
+    if paused {
+        let mut builder = Builder::new_current_thread();
+        builder.enable_time();
+        builder.start_paused(true);
+        return Ok(RuntimeHandle::Exclusive(Mutex::new(builder.build()?)));
+    }
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_time();
+    Ok(RuntimeHandle::Shared(Arc::new(builder.build()?)))
 }
 
 /// Best-effort OTLP span + metrics export, gated by the `otel` build feature
@@ -542,7 +529,7 @@ static OTEL_GUARD: std::sync::OnceLock<Option<keel_engine::otel::OtelGuard>> =
     std::sync::OnceLock::new();
 
 #[cfg(feature = "otel")]
-fn maybe_init_otel(runtime: &Runtime, policy_endpoint: Option<&str>) {
+fn maybe_init_otel(runtime: &RuntimeHandle, policy_endpoint: Option<&str>) {
     if !keel_engine::otel::export_enabled(policy_endpoint) {
         return;
     }
@@ -563,7 +550,7 @@ fn maybe_init_otel(runtime: &Runtime, policy_endpoint: Option<&str>) {
 /// No-op when the `otel` feature is off (the default): no OpenTelemetry
 /// dependency is linked and the core never touches telemetry.
 #[cfg(not(feature = "otel"))]
-fn maybe_init_otel(_runtime: &Runtime, _policy_endpoint: Option<&str>) {}
+fn maybe_init_otel(_runtime: &RuntimeHandle, _policy_endpoint: Option<&str>) {}
 
 /// Open (creating the parent dir + file as needed) a WAL SQLite journal at
 /// `path` on the wall clock and attach it — enabling the `scope = persistent`
@@ -589,7 +576,9 @@ fn status_str(status: FlowStatus) -> &'static str {
 }
 
 /// The native core handle. `engine` is the shared, `&self`-concurrent kernel;
-/// `runtime` (behind a `Mutex`) drives the synchronous/paused-clock paths.
+/// `runtime` (a [`RuntimeHandle`] — lock-free and multi-threaded in production,
+/// a current-thread runtime behind a `Mutex` only under the paused harness
+/// clock) drives the synchronous/paused-clock paths.
 ///
 /// Tier 2 flow state (native-only): the journal a [`FlowManager`] runs steps
 /// over is read *live* from `engine.journal()` (the same store the engine
@@ -605,7 +594,7 @@ fn status_str(status: FlowStatus) -> &'static str {
 #[pyclass(module = "keel_core")]
 struct KeelCore {
     engine: Arc<Engine>,
-    runtime: Mutex<Runtime>,
+    runtime: RuntimeHandle,
     /// True when the runtime runs on tokio's paused virtual clock (harness only).
     /// `advance_clock` is valid only on such a handle — advancing a real-time
     /// runtime panics tokio, so we refuse it precisely instead.
@@ -650,7 +639,7 @@ impl KeelCore {
         }
         Ok(Self {
             engine: Arc::new(engine),
-            runtime: Mutex::new(runtime),
+            runtime,
             paused,
             active_flow: Arc::new(AsyncMutex::new(None)),
         })
@@ -676,7 +665,7 @@ impl KeelCore {
         // Retry OTLP init now that `telemetry.otlp_endpoint` is known — a no-op
         // if construction's env-only attempt already exported (`OnceLock`).
         maybe_init_otel(
-            &lock_recover(&self.runtime),
+            &self.runtime,
             self.engine.telemetry_otlp_endpoint().as_deref(),
         );
         Ok(())
@@ -706,9 +695,8 @@ impl KeelCore {
         let request = decode_request(py, request)?;
         // Re-entrant call: this `execute` is running inside another call's effect
         // on the same thread (a wrapped `py:` function whose body makes an
-        // intercepted call). A nested `block_on` on the current-thread runtime
-        // panics and the `runtime` mutex is already held by the outer call, so we
-        // pass through — run the effect once with no layer chain. The OUTER call
+        // intercepted call). A nested `block_on` from inside a runtime panics, so
+        // we pass through — run the effect once with no layer chain. The OUTER call
         // keeps full resilience; the inner one degrades to a direct invocation
         // rather than deadlocking (a v0.1 native-core limitation; the pure-Python
         // stub composes nesting fully).
@@ -720,57 +708,62 @@ impl KeelCore {
         let runtime = &self.runtime;
         let active = &self.active_flow;
         // Release the GIL across the (possibly blocking) engine run; re-acquire
-        // per attempt inside the effect. Holding the runtime mutex across the
-        // synchronous `block_on` serializes calls on this handle. While a flow is
-        // open, route the call through its `execute_step` so it is journaled and
-        // replayable; otherwise run the bare engine (identical to before). The
-        // effect runs under an `InEffectGuard` so any re-entrant intercepted call
-        // or time/random read it triggers passes through instead of deadlocking.
-        // Nested on another thread: an outer sync effect elsewhere holds one of
-        // these locks and won't release it until ITS effect returns — which,
-        // if that effect is what dispatched to this call, is exactly this
-        // call. `in_effect()` above only sees same-thread nesting; this bounded
-        // wait is what turns the cross-thread case from an unbounded hang into
-        // KEEL-E017 (issue #117, CCR-9) instead. Both `runtime` (contended
-        // whenever ANY sync effect is in flight — issue #116) and `active_flow`
-        // (contended only inside an open flow, where Task 4 makes it
-        // legitimate) are guarded: outside a flow `active_flow` is unheld and
-        // this costs one uncontended `try_lock`. ONE deadline is computed and
-        // shared by both acquisitions below (not `wait` applied twice
-        // sequentially) — otherwise the worst case would be 2x the bound
-        // rather than the bound itself.
+        // per attempt inside the effect. In production the runtime is
+        // multi-threaded and `block_on` takes `&self`, so nothing here is
+        // handle-wide serialized — independent sync effects overlap (issue
+        // #116). While a flow is open, route the call through its
+        // `execute_step` so it is journaled and replayable; otherwise run the
+        // bare engine. The effect runs under an `InEffectGuard` so any
+        // re-entrant intercepted call or time/random read it triggers passes
+        // through instead of deadlocking.
+        //
+        // `active_flow` is the one lock left, and it is exactly the one Tier 2
+        // needs: it is held for a step's whole duration so steps inside one
+        // flow are admitted — and journaled — in call order. That makes the
+        // cross-thread nesting case (an outer sync effect in this flow, on
+        // another thread, that dispatched to this call) a real deadlock, which
+        // `in_effect()` above structurally cannot see because it is a
+        // thread-local. The bounded acquire below turns that unbounded hang
+        // into KEEL-E017 (issue #117, CCR-9). Outside a flow the lock is unheld
+        // and this costs one uncontended `try_lock`.
         let deadline = std::time::Instant::now() + nested_effect_wait();
-        let acquired = py.detach(move || -> Result<(Outcome, Option<bool>), NestedLock> {
-            let guard = lock_recover_timeout(runtime, deadline).ok_or(NestedLock::Runtime)?;
+        let acquired = py.detach(move || -> Option<(Outcome, Option<bool>)> {
             // `blocking_lock_timeout` (never the async `.lock().await`, which
             // would need an executor polling us) — safe here because we already
             // released the GIL above, so we cannot deadlock an `execute_async`
             // step that needs the GIL to invoke its Python effect before
             // releasing this same lock (see the module docs' "async flow
             // bridge" section).
-            let mut flow = blocking_lock_timeout(active, deadline).ok_or(NestedLock::ActiveFlow)?;
+            let mut flow = blocking_lock_timeout(active, deadline)?;
             let effect_fn = async |attempt: u32| {
                 Python::attach(|py| {
                     let _in_effect = InEffectGuard::enter();
                     invoke_sync_effect(py, &effect, attempt)
                 })
             };
-            Ok(match flow.as_mut() {
-                Some(handle) => {
-                    let (outcome, replayed) =
-                        guard.block_on(handle.execute_step_with_idempotency_key(
-                            &request,
-                            idempotency_key.as_deref(),
-                            effect_fn,
-                        ));
-                    (outcome, Some(replayed))
-                }
-                None => (guard.block_on(engine.execute(&request, effect_fn)), None),
+            Some(if let Some(handle) = flow.as_mut() {
+                // Inside a flow the guard is deliberately held for the step's
+                // WHOLE duration: that is what admits (and journals) steps in
+                // call order (Tier 2, conformance/README.md "Async steps
+                // inside a flow").
+                let (outcome, replayed) =
+                    runtime.block_on(handle.execute_step_with_idempotency_key(
+                        &request,
+                        idempotency_key.as_deref(),
+                        effect_fn,
+                    ));
+                (outcome, Some(replayed))
+            } else {
+                // Outside a flow the lock is held only long enough to observe
+                // `None` — exactly as `execute_async` does. Holding it across
+                // the engine run would reintroduce the handle-wide
+                // serialization #116 removed, one mutex further down.
+                drop(flow);
+                (runtime.block_on(engine.execute(&request, effect_fn)), None)
             })
         });
-        let (outcome, replayed) = match acquired {
-            Ok(v) => v,
-            Err(which) => return Err(keel_error(py, "KEEL-E017", which.message())),
+        let Some((outcome, replayed)) = acquired else {
+            return Err(keel_error(py, "KEEL-E017", NESTED_FLOW_EFFECT_MESSAGE));
         };
         match replayed {
             Some(r) => flow_outcome_to_py(py, &outcome, r),
@@ -873,10 +866,7 @@ impl KeelCore {
     /// The deterministic per-target metrics/discovery report (dict). Read inside
     /// the runtime so `clock_ms` reflects this handle's (possibly paused) clock.
     fn report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value = {
-            let guard = lock_recover(&self.runtime);
-            guard.block_on(async { self.engine.report() })
-        };
+        let value = self.runtime.block_on(async { self.engine.report() });
         pythonize(py, &value)
             .map(Bound::unbind)
             .map_err(|e| keel_error(py, "KEEL-E040", &format!("report not encodable: {e}")))
@@ -912,8 +902,10 @@ impl KeelCore {
                  the real clock",
             ));
         }
-        let guard = lock_recover(&self.runtime);
-        guard.block_on(async move {
+        // `paused` is true here, so `runtime` is always the `Exclusive`
+        // (current-thread, virtual-clock) variant — the only flavor
+        // `tokio::time::advance` is valid on.
+        self.runtime.block_on(async move {
             tokio::time::advance(Duration::from_millis(ms)).await;
         });
         Ok(())
@@ -971,11 +963,10 @@ impl KeelCore {
         );
         // Enter inside the runtime so the lease heartbeat can spawn (it no-ops
         // outside a runtime); the enter itself is synchronous journal work.
-        let handle = {
-            let guard = lock_recover(&self.runtime);
-            guard.block_on(async { manager.enter_flow(&desc) })
-        }
-        .map_err(|e| keel_error_from(py, &e))?;
+        let handle = self
+            .runtime
+            .block_on(async { manager.enter_flow(&desc) })
+            .map_err(|e| keel_error_from(py, &e))?;
 
         let info = json!({
             "flow_id": handle.flow_id().to_string(),
