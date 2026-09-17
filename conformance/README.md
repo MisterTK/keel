@@ -165,7 +165,7 @@ enforcing wall-clock timeouts).
      (CCR-11, scenario 49 — which pins both halves, because a running
      `google.longrunning.Operation` omits `done` entirely: proto3 JSON drops
      a false bool). `until.absent` is optional; any value other than those
-     two words is `KEEL-E001` at configure. Lookup is **own-keys only**:
+     two words is `KEEL-E001` at configure (scenario 50). Lookup is **own-keys only**:
      a segment naming an inherited property of the host language's object type
      (JavaScript's `constructor`, `__proto__`, …) is a MISSING key, exactly as
      it is on a Rust map or a Python dict (scenario 48). The value is

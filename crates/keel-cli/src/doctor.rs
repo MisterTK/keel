@@ -2977,9 +2977,8 @@ mod tests {
             fix.patch
         );
         assert!(
-            fix.patch.contains(
-                "until = { field = \"done\", terminal = [true], absent = \"pending\" }"
-            ),
+            fix.patch
+                .contains("until = { field = \"done\", terminal = [true], absent = \"pending\" }"),
             "a running google.longrunning.Operation omits `done` entirely — \
              the proposal must say absence means pending, not just terminal \
              values, or the applied block never polls (#128): {}",

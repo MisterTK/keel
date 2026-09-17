@@ -1,0 +1,9 @@
+{
+  "name": "poll-absent-invalid-word",
+  "description": "CCR-11: until.absent accepts only \"fail_open\" or \"pending\" — any other word is KEEL-E001 at configure, in every implementation (and fails contracts/policy.schema.json, so check_schema.py sees it as invalid-as-designed). Modeled on scenario 47 (until.terminal item type), the sibling rule in the same paragraph of conformance/README.md's verdict section.",
+  "policy": { "target": {
+    "jobs.example": { "poll": { "interval": "10s", "deadline": "90s", "until": { "field": "status", "terminal": ["done"], "absent": "maybe" } } }
+  } },
+  "expect_configure_error": "KEEL-E001",
+  "steps": []
+}
