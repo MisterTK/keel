@@ -10,9 +10,17 @@
 //! # Activation (the decision, documented)
 //!
 //! Resolved once per [`Engine::new`](crate::Engine::new) from the process
-//! environment ([`EventSink::from_env`], testable as [`resolve_events_dir`]):
+//! environment ([`EventSink::from_env`], testable as [`resolve_events_dir`],
+//! which returns an [`EventDestination`]):
 //!
 //! - `KEEL_EVENTS` set to `0` / `false` / `off` / empty — force **off**.
+//! - `KEEL_EVENTS` set to `stderr` (case-insensitive) — every line goes to
+//!   the process's **stderr** instead of a file; `./.keel/events/` is never
+//!   created. On Cloud Run, GKE and Lambda stderr already **is** the log
+//!   pipeline, so this is the whole remote-evidence story for a 12-factor
+//!   deploy — no collector, no volume, no custom wheel (partial step toward
+//!   #94; the real remote-sink design stays open). Native core only: the
+//!   stub backends have no event sink to redirect.
 //! - `KEEL_EVENTS` set to anything else (`1`, `true`, …) — force **on**
 //!   (creates `./.keel/events/` on demand).
 //! - unset — **on** exactly when `./.keel` already exists (a Keel-initialized
@@ -22,8 +30,43 @@
 //! Off is a zero-cost no-op: the engine holds no sink and every emit site is
 //! one `Option` discriminant check (the overhead bench's `a_empty` /
 //! `b_cache_miss` / `c_cache_hit` cases run this path; `d_events` measures
-//! the on path). A sink that cannot open (unwritable directory) degrades to a
-//! `warn!` and off — observability never fails the wrapped call.
+//! the on path). A sink that cannot open (unwritable directory, or — in
+//! principle — a broken stderr fd) degrades to a `warn!` and off —
+//! observability never fails the wrapped call.
+//!
+//! ## The stderr sink is deliberately unbuffered
+//!
+//! The file sink wraps its `File` in [`io::BufWriter`] (see
+//! [`EventSink::open`]) because the writer thread already flushes whenever
+//! its queue drains, so the extra userspace buffer only saves syscalls
+//! between drains. The stderr sink ([`EventSink::open_stderr`]) does **not**
+//! wrap [`io::stderr`] in a `BufWriter`: stderr exists to be captured
+//! mid-stream by whatever is watching the process (a platform's log
+//! pipeline), and the entire point of this destination is that evidence
+//! survives an instance that dies mid-run. An extra buffer that only empties
+//! on drain-or-shutdown is exactly the mechanism that would make the last
+//! few events vanish with the container instead of reaching the log
+//! pipeline. `io::Stderr` itself performs one `write(2)` per `write_all`
+//! call with no internal line-buffering (unlike `io::Stdout`), so each event
+//! the writer thread processes reaches the OS as soon as it is serialized —
+//! no explicit flush required for durability, only for a *reader* (e.g. a
+//! same-process `keel trace`) to see it promptly.
+//!
+//! ## Interleaving with Keel's other stderr output
+//!
+//! `KEEL_EVENTS=stderr` shares the stream with Keel's activation banner,
+//! exit summary, and warning/error lines — this module does not coordinate
+//! with them (it has no knowledge of `KEEL_LOG_FORMAT`, which is a front-end
+//! concern). Every event line is a bare NDJSON object (`{"v":1,"seq":...}`,
+//! no envelope beyond the format documented above) whether or not
+//! `KEEL_LOG_FORMAT=json` is set; the two are structurally distinguishable
+//! (event lines are recognizable by their fixed `v`/`seq`/`ms`/`event` keys)
+//! but a consumer wanting to tell them apart reliably should route them to
+//! separate destinations (e.g. `2>events.ndjson` isn't available on a
+//! platform that only captures one stderr stream, but a structured-log
+//! collector can still filter on the `event` key's presence). This is a
+//! known limitation of shipping evidence and console output on one stream —
+//! not solved here, and out of scope for this partial step toward #94.
 //!
 //! # Hot-path budget (dx invariant 8: ≤10µs)
 //!
@@ -295,10 +338,22 @@ impl EventsEnv {
     }
 }
 
-/// Where events should be written, or `None` when the sink is off. See the
-/// module docs for the decision table this implements.
+/// Where the event feed should go — off, a per-run file under a directory,
+/// or the process's stderr. See the module docs for the decision table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDestination {
+    /// No sink; the engine holds `None`.
+    Off,
+    /// File-backed: a fresh `<run>.ndjson` is created under this directory.
+    Dir(PathBuf),
+    /// Every line goes to the process's stderr (`KEEL_EVENTS=stderr`).
+    Stderr,
+}
+
+/// Where events should be written. See the module docs for the decision
+/// table this implements.
 #[must_use]
-pub fn resolve_events_dir(env: &EventsEnv) -> Option<PathBuf> {
+pub fn resolve_events_dir(env: &EventsEnv) -> EventDestination {
     let keel_dir = env.base_dir.join(".keel");
     match env.keel_events.as_deref().map(str::trim) {
         Some(v)
@@ -307,10 +362,12 @@ pub fn resolve_events_dir(env: &EventsEnv) -> Option<PathBuf> {
                 || v.eq_ignore_ascii_case("false")
                 || v.eq_ignore_ascii_case("off") =>
         {
-            None
+            EventDestination::Off
         }
-        Some(_) => Some(keel_dir.join(EVENTS_SUBDIR)),
-        None => keel_dir.is_dir().then(|| keel_dir.join(EVENTS_SUBDIR)),
+        Some(v) if v.eq_ignore_ascii_case("stderr") => EventDestination::Stderr,
+        Some(_) => EventDestination::Dir(keel_dir.join(EVENTS_SUBDIR)),
+        None if keel_dir.is_dir() => EventDestination::Dir(keel_dir.join(EVENTS_SUBDIR)),
+        None => EventDestination::Off,
     }
 }
 
@@ -344,17 +401,27 @@ pub struct EventSink {
 
 impl EventSink {
     /// Resolve activation from the process environment (see module docs) and
-    /// open the per-run file. `None` when off — or when the sink cannot open,
-    /// which degrades to a `warn!` (observability never fails the call).
+    /// open the resolved destination. `None` when off — or when the sink
+    /// cannot open, which degrades to a `warn!` (observability never fails
+    /// the wrapped call).
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let dir = resolve_events_dir(&EventsEnv::capture())?;
-        match Self::open(&dir) {
-            Ok(sink) => Some(sink),
-            Err(error) => {
-                warn!(dir = %dir.display(), error = %error, "event sink unavailable; live events disabled");
-                None
-            }
+        match resolve_events_dir(&EventsEnv::capture()) {
+            EventDestination::Off => None,
+            EventDestination::Stderr => match Self::open_stderr() {
+                Ok(sink) => Some(sink),
+                Err(error) => {
+                    warn!(error = %error, "stderr event sink unavailable; live events disabled");
+                    None
+                }
+            },
+            EventDestination::Dir(dir) => match Self::open(&dir) {
+                Ok(sink) => Some(sink),
+                Err(error) => {
+                    warn!(dir = %dir.display(), error = %error, "event sink unavailable; live events disabled");
+                    None
+                }
+            },
         }
     }
 
@@ -384,6 +451,20 @@ impl EventSink {
             }
         }
         Err(collision)
+    }
+
+    /// Open a production sink that writes to the process's stderr instead of
+    /// a file: a fresh run id and a `run_start` header anchored to wall time,
+    /// same as [`Self::open`], but no file, no directory, and — see the
+    /// module docs — deliberately no [`io::BufWriter`] around the writer.
+    pub fn open_stderr() -> io::Result<Self> {
+        Self::start(
+            Box::new(io::stderr()),
+            new_run_id(),
+            None,
+            Some(epoch_ms()),
+            Some(std::process::id()),
+        )
     }
 
     /// Deterministic test/bench sink: write to any `Write` under a caller-fixed
@@ -536,8 +617,8 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        EVENTS_SUBDIR, Event, EventKind, EventSink, EventsEnv, ParseTraceRefError, TraceRef,
-        resolve_events_dir,
+        EVENTS_SUBDIR, Event, EventDestination, EventKind, EventSink, EventsEnv,
+        ParseTraceRefError, TraceRef, resolve_events_dir,
     };
     use std::io::Write;
     use std::path::PathBuf;
@@ -602,27 +683,80 @@ mod tests {
         let bare = tmp.path(); // no .keel yet
 
         // Unset + no .keel dir: off.
-        assert_eq!(resolve_events_dir(&env(None, bare)), None);
+        assert_eq!(resolve_events_dir(&env(None, bare)), EventDestination::Off);
         // Explicitly off, in every accepted spelling, beats everything.
         for off in ["0", "false", "off", "FALSE", "Off", "", "  "] {
-            assert_eq!(resolve_events_dir(&env(Some(off), bare)), None, "{off:?}");
+            assert_eq!(
+                resolve_events_dir(&env(Some(off), bare)),
+                EventDestination::Off,
+                "{off:?}"
+            );
         }
         // Any other set value forces on, .keel dir or not.
         let expected = bare.join(".keel").join(EVENTS_SUBDIR);
         for on in ["1", "true", "on", "yes"] {
             assert_eq!(
                 resolve_events_dir(&env(Some(on), bare)),
-                Some(expected.clone()),
+                EventDestination::Dir(expected.clone()),
                 "{on:?}"
             );
         }
         // Unset + an existing .keel dir: on (the keel-initialized project case).
         std::fs::create_dir(bare.join(".keel")).expect("mk .keel");
-        assert_eq!(resolve_events_dir(&env(None, bare)), Some(expected));
+        assert_eq!(
+            resolve_events_dir(&env(None, bare)),
+            EventDestination::Dir(expected)
+        );
         // A .keel FILE is not a project marker.
         let tmp2 = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp2.path().join(".keel"), b"not a dir").expect("write file");
-        assert_eq!(resolve_events_dir(&env(None, tmp2.path())), None);
+        assert_eq!(
+            resolve_events_dir(&env(None, tmp2.path())),
+            EventDestination::Off
+        );
+    }
+
+    #[test]
+    fn keel_events_stderr_selects_stderr_and_never_touches_the_filesystem() {
+        // #94 (partial): KEEL_EVENTS=stderr must win regardless of whether
+        // `.keel` exists, and must never resolve to a directory — a
+        // regression here would silently start writing (or looking for) a
+        // file again.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for spelling in ["stderr", "STDERR", "StdErr", " stderr "] {
+            assert_eq!(
+                resolve_events_dir(&env(Some(spelling), tmp.path())),
+                EventDestination::Stderr,
+                "{spelling:?}"
+            );
+        }
+        // Even with a real `.keel` dir present, stderr still wins (it is not
+        // shadowed by the unset-with-.keel-present branch).
+        std::fs::create_dir(tmp.path().join(".keel")).expect("mk .keel");
+        assert_eq!(
+            resolve_events_dir(&env(Some("stderr"), tmp.path())),
+            EventDestination::Stderr
+        );
+        assert!(
+            !tmp.path().join(".keel").join(EVENTS_SUBDIR).exists(),
+            "resolving to Stderr must not create .keel/events"
+        );
+    }
+
+    #[test]
+    fn open_stderr_is_not_file_backed_and_creates_no_directory() {
+        // Regression guard for the destination-change: `open_stderr` must
+        // never carry a `path()` (it is not file-backed) and must never
+        // touch the filesystem, unlike `EventSink::open`. This does write one
+        // `run_start` line to the real process stderr — that IS the feature.
+        let cwd = std::env::current_dir().expect("cwd");
+        let sink = EventSink::open_stderr().expect("stderr sink must start");
+        assert_eq!(sink.path(), None, "stderr sink is not file-backed");
+        assert!(
+            !cwd.join(".keel").join(EVENTS_SUBDIR).exists(),
+            "open_stderr must not create .keel/events"
+        );
+        drop(sink);
     }
 
     #[test]

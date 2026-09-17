@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use keel_core_api::{AttemptResult, ENVELOPE_VERSION, ErrorClass, ErrorCode, Request};
 use keelrun_core::Engine;
-use keelrun_core::events::{CacheStore, Event, EventKind, EventSink, TraceRef};
+use keelrun_core::events::{
+    CacheStore, Event, EventDestination, EventKind, EventSink, EventsEnv, TraceRef,
+    resolve_events_dir,
+};
 use serde_json::json;
 
 /// A `Write` the test keeps a handle on after the sink boxes it.
@@ -664,6 +667,31 @@ async fn envelope_version_failures_still_open_and_close_the_call_in_the_feed() {
             ..
         }
     ));
+}
+
+/// `KEEL_EVENTS=stderr` (#94, partial): the destination resolves to
+/// [`EventDestination::Stderr`] — never a directory — and, unlike every
+/// other "on" spelling, opening it never touches `.keel/events/`. Uses the
+/// injected [`EventsEnv`]/[`resolve_events_dir`] seam rather than
+/// `std::env::set_var` (unsound in this repo — see CLAUDE.md).
+#[test]
+fn keel_events_stderr_resolves_to_stderr_and_creates_no_events_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let env = EventsEnv {
+        keel_events: Some("stderr".to_owned()),
+        base_dir: tmp.path().to_owned(),
+    };
+    assert_eq!(resolve_events_dir(&env), EventDestination::Stderr);
+
+    // Opening the real stderr sink must not create the directory a file
+    // sink would have (the whole point: no filesystem involved at all).
+    let sink = EventSink::open_stderr().expect("stderr sink must start");
+    assert_eq!(sink.path(), None, "stderr sink is not file-backed");
+    assert!(
+        !tmp.path().join(".keel").exists(),
+        "KEEL_EVENTS=stderr must never create .keel/events"
+    );
+    drop(sink);
 }
 
 /// Without a sink — the conformance condition — failure messages carry no
