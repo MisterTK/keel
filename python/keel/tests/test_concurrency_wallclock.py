@@ -33,12 +33,12 @@ def _native_available() -> bool:
     return NATIVE
 
 
-def _run(script: str, policy: str, backend: str, timeout: int = 90):
+def _run(script: str, policy: str, backend: str, timeout: int = 90, extra_env: dict | None = None):
     """Run `script` under `keel run` with `policy` as keel.toml and KEEL_BACKEND=backend."""
     with TemporaryDirectory() as d:
         Path(d, "keel.toml").write_text(textwrap.dedent(policy))
         Path(d, "prog.py").write_text(textwrap.dedent(script))
-        env = {**os.environ, "KEEL_BACKEND": backend, "KEEL_QUIET": "1"}
+        env = {**os.environ, "KEEL_BACKEND": backend, "KEEL_QUIET": "1", **(extra_env or {})}
         return subprocess.run(
             [sys.executable, "-m", "keel", "run", "prog.py"],
             cwd=d, env=env, capture_output=True, timeout=timeout,
@@ -178,7 +178,28 @@ class SyncConcurrencyTest(unittest.TestCase):
 
 
 class NestedEffectTest(unittest.TestCase):
-    """#117: a nested sync effect must never hang. It completes, or it raises."""
+    """#117: a nested sync effect must never hang. It completes, or it raises.
+
+    The native path's real bound (`NESTED_EFFECT_WAIT` in
+    `crates/keel-py/src/lib.rs`) is 30s in production — deliberately generous,
+    since the detection mechanism (`try_lock` still failing) cannot tell "the
+    outer effect dispatched to me" from "the outer effect is merely slow";
+    the timeout's magnitude is the only thing separating a correct diagnosis
+    from a false accusation against a legitimately slow concurrent caller
+    (a Vertex/OpenAI generate call, a minute-scale poll deadline). This test's
+    own budgets (`t.join`, the subprocess timeout below) are sized to fit
+    THAT 30s constant with margin for the HTTP round-trip this reproduction
+    needs on top of it — the test fits the product, not the other way round.
+    `KEEL_NESTED_EFFECT_WAIT_MS` (unstable, test-only — see the constant's
+    doc in lib.rs) shrinks the bound actually exercised here so the gate
+    still runs fast without touching the production default.
+    """
+
+    #: Test-only override for `NESTED_EFFECT_WAIT` (native only; the stub has
+    #: no such bound — it composes nesting fully). Comfortably above the
+    #: 5ms poll interval and this reproduction's own network/thread overhead,
+    #: comfortably below the ~45s budgets below.
+    NATIVE_WAIT_OVERRIDE_MS = 2000
 
     PROG = SERVER + """
     import httpx, threading
@@ -194,10 +215,15 @@ class NestedEffectTest(unittest.TestCase):
     out = {}
     def outer():
         try:
-            out["body"] = httpx.get(f"http://127.0.0.1:{APP_PORT}/", timeout=15).text
+            out["body"] = httpx.get(f"http://127.0.0.1:{APP_PORT}/", timeout=40).text
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
-    t = threading.Thread(target=outer); t.start(); t.join(timeout=25)
+    # Sized to the REAL product bound (30s) plus this reproduction's own
+    # HTTP-round-trip overhead, not to whatever made the test fast — the
+    # native run overrides the bound down via KEEL_NESTED_EFFECT_WAIT_MS so
+    # this rarely waits anywhere near 45s in practice, but the budget itself
+    # must stay correct even if that override were absent.
+    t = threading.Thread(target=outer); t.start(); t.join(timeout=45)
     print(json.dumps(out or {"hung": True}))
     """
     POLICY = """
@@ -205,8 +231,8 @@ class NestedEffectTest(unittest.TestCase):
     retry = { attempts = 3 }
     """
 
-    def _result(self, backend: str) -> dict:
-        r = _run(self.PROG, self.POLICY, backend, timeout=90)
+    def _result(self, backend: str, *, extra_env: dict | None = None) -> dict:
+        r = _run(self.PROG, self.POLICY, backend, timeout=75, extra_env=extra_env)
         self.assertEqual(r.returncode, 0, r.stderr.decode())
         return json.loads(r.stdout.decode().strip().splitlines()[-1])
 
@@ -215,9 +241,13 @@ class NestedEffectTest(unittest.TestCase):
 
     @unittest.skipUnless(_native_available(), "native core not built")
     def test_native_nested_effect_does_not_hang(self) -> None:
-        # Outside a flow this must SUCCEED once #116 lands. Until then it hangs,
-        # and this test fails by timeout rather than wedging the suite.
-        got = self._result("native")
+        # Outside a flow this must SUCCEED once #116 lands. Until then it
+        # raises KEEL-E017 (this test's actual assertion), and this test
+        # fails on a clean assertion rather than wedging the suite.
+        got = self._result(
+            "native",
+            extra_env={"KEEL_NESTED_EFFECT_WAIT_MS": str(self.NATIVE_WAIT_OVERRIDE_MS)},
+        )
         self.assertNotIn("hung", got, "nested sync effect hung — #117")
         self.assertEqual(got.get("body"), "ok", got)
 

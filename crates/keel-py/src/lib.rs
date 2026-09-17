@@ -185,22 +185,53 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// thread. The thread-local `IN_EFFECT` guard catches same-thread nesting for
 /// free; this catches the cross-thread case, which it structurally cannot see
 /// (issue #117). Generous enough that a merely SLOW outer effect is never
-/// mistaken for a deadlocked one.
-const NESTED_EFFECT_WAIT: Duration = Duration::from_secs(5);
+/// mistaken for a deadlocked one: the detection mechanism (`try_lock` still
+/// failing) is IDENTICAL for "the outer effect dispatched to me" and "the
+/// outer effect is just slow" — this value is the only thing separating a
+/// correct diagnosis from a false accusation, so it must stay generous
+/// (30s), not be shrunk to make a test finish quickly. See
+/// [`nested_effect_wait`] for how a test shrinks it WITHOUT touching this
+/// constant.
+const NESTED_EFFECT_WAIT: Duration = Duration::from_secs(30);
+
+/// [`NESTED_EFFECT_WAIT`], overridable by `KEEL_NESTED_EFFECT_WAIT_MS`.
+///
+/// `KEEL_NESTED_EFFECT_WAIT_MS` is UNSTABLE — test-only, read fresh on every
+/// call (this is not a hot path: it only runs once per `execute`, alongside a
+/// lock acquisition). It exists so an acceptance test can shrink the ~30s real
+/// bound into a fast run WITHOUT lowering the production default and thereby
+/// reintroducing false-accusation risk for real slow effects (the mistake an
+/// earlier version of this fix made — see CCR-9's history). Same convention as
+/// `KEEL_CACHEPOLL_MIN_SPAN_S` (`node/keel/src/cachepoll.mjs`,
+/// `python/keel/src/keel/_cachepoll.py`).
+fn nested_effect_wait() -> Duration {
+    std::env::var("KEEL_NESTED_EFFECT_WAIT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(NESTED_EFFECT_WAIT, Duration::from_millis)
+}
 
 /// [`lock_recover`]'s bounded-wait twin for `execute`'s `runtime` mutex.
-/// Returns `None` on expiry, which the caller reports as KEEL-E017, rather
-/// than blocking forever. Polls `try_lock`, recovering a poisoned guard the
-/// same way `lock_recover` does — it costs nothing in the uncontended case
-/// (first `try_lock` succeeds) and only ever spins on a path that would
-/// otherwise deadlock forever: an outer sync effect on another OS thread
-/// holding `runtime` across its own `block_on` (see the module docs' "async
-/// flow bridge" section for why this mutex exists at all).
+/// Returns `None` at `deadline`, which the caller reports as KEEL-E017,
+/// rather than blocking forever. Polls `try_lock`, recovering a poisoned
+/// guard the same way `lock_recover` does — it costs nothing in the
+/// uncontended case (first `try_lock` succeeds) and only ever spins on a
+/// path that would otherwise deadlock forever: an outer sync effect on
+/// another OS thread holding `runtime` across its own `block_on` (see the
+/// module docs' "async flow bridge" section for why this mutex exists at
+/// all).
+///
+/// Not FIFO: a later-arriving thread's `try_lock` can win a race against one
+/// that has been polling longer (no queue, no ordering guarantee), and
+/// detection of a just-freed lock lags by up to the 5ms poll interval below.
+/// Under SUSTAINED contention (not this function's target case — that's a
+/// single outer holder, not a queue of waiters) this is a second, narrower
+/// route to a spurious KEEL-E017 for a caller that never actually deadlocked,
+/// just lost every race — another reason the bound stays generous.
 fn lock_recover_timeout<T>(
     mutex: &Mutex<T>,
-    wait: Duration,
+    deadline: std::time::Instant,
 ) -> Option<std::sync::MutexGuard<'_, T>> {
-    let deadline = std::time::Instant::now() + wait;
     loop {
         match mutex.try_lock() {
             Ok(guard) => return Some(guard),
@@ -214,16 +245,51 @@ fn lock_recover_timeout<T>(
     }
 }
 
-/// Acquire `m` for a synchronous caller, giving up after `wait`. Returns
+/// Which of `execute`'s two locks a bounded wait gave up on — the two
+/// conditions mean different things (a `Runtime` timeout only says "some
+/// sync effect is in flight on this handle somewhere, possibly with no
+/// nesting at all"; an `ActiveFlow` timeout says "an outer step in THIS
+/// flow, on another thread, holds the handle"), so the raised KEEL-E017
+/// names which one actually expired rather than asserting the more specific
+/// (and often wrong) claim unconditionally. Task 4 deletes the `Runtime`
+/// arm's call site (issue #116 removes that contention outside a flow); this
+/// enum is what lets the message stay accurate on both sides of that change.
+enum NestedLock {
+    Runtime,
+    ActiveFlow,
+}
+
+impl NestedLock {
+    fn message(&self) -> &'static str {
+        match self {
+            NestedLock::Runtime => {
+                "a synchronous effect could not acquire this handle's runtime lock in time; \
+                 another synchronous effect is in flight on a different thread and holds it \
+                 for its own call's whole duration — this does not necessarily mean this call \
+                 is nested inside that one, only that they contend the same handle-wide lock; \
+                 if it IS nested (the other call dispatched to this one), it cannot proceed \
+                 until the outer call returns, and the outer call is waiting for it"
+            }
+            NestedLock::ActiveFlow => {
+                "a synchronous effect was started from inside another synchronous effect \
+                 running on a different thread, both belonging to the same open flow; the \
+                 inner call cannot proceed until the outer one returns, and the outer one is \
+                 waiting for it"
+            }
+        }
+    }
+}
+
+/// Acquire `m` for a synchronous caller, giving up at `deadline`. Returns
 /// `None` on expiry, which the caller reports as KEEL-E017. `tokio::sync::Mutex`
 /// offers no blocking timed acquire, so this polls `try_lock`; it costs nothing
 /// in the uncontended case (first `try_lock` succeeds) and only ever spins on a
-/// path that would otherwise deadlock forever.
+/// path that would otherwise deadlock forever. Same non-FIFO/barging and
+/// up-to-5ms handoff-latency caveat as [`lock_recover_timeout`] above.
 fn blocking_lock_timeout<T>(
     m: &AsyncMutex<T>,
-    wait: Duration,
+    deadline: std::time::Instant,
 ) -> Option<tokio::sync::MutexGuard<'_, T>> {
-    let deadline = std::time::Instant::now() + wait;
     loop {
         if let Ok(g) = m.try_lock() {
             return Some(g);
@@ -669,23 +735,27 @@ impl KeelCore {
         // whenever ANY sync effect is in flight — issue #116) and `active_flow`
         // (contended only inside an open flow, where Task 4 makes it
         // legitimate) are guarded: outside a flow `active_flow` is unheld and
-        // this costs one uncontended `try_lock`.
-        let acquired = py.detach(move || -> Option<(Outcome, Option<bool>)> {
-            let guard = lock_recover_timeout(runtime, NESTED_EFFECT_WAIT)?;
+        // this costs one uncontended `try_lock`. ONE deadline is computed and
+        // shared by both acquisitions below (not `wait` applied twice
+        // sequentially) — otherwise the worst case would be 2x the bound
+        // rather than the bound itself.
+        let deadline = std::time::Instant::now() + nested_effect_wait();
+        let acquired = py.detach(move || -> Result<(Outcome, Option<bool>), NestedLock> {
+            let guard = lock_recover_timeout(runtime, deadline).ok_or(NestedLock::Runtime)?;
             // `blocking_lock_timeout` (never the async `.lock().await`, which
             // would need an executor polling us) — safe here because we already
             // released the GIL above, so we cannot deadlock an `execute_async`
             // step that needs the GIL to invoke its Python effect before
             // releasing this same lock (see the module docs' "async flow
             // bridge" section).
-            let mut flow = blocking_lock_timeout(active, NESTED_EFFECT_WAIT)?;
+            let mut flow = blocking_lock_timeout(active, deadline).ok_or(NestedLock::ActiveFlow)?;
             let effect_fn = async |attempt: u32| {
                 Python::attach(|py| {
                     let _in_effect = InEffectGuard::enter();
                     invoke_sync_effect(py, &effect, attempt)
                 })
             };
-            Some(match flow.as_mut() {
+            Ok(match flow.as_mut() {
                 Some(handle) => {
                     let (outcome, replayed) =
                         guard.block_on(handle.execute_step_with_idempotency_key(
@@ -698,14 +768,9 @@ impl KeelCore {
                 None => (guard.block_on(engine.execute(&request, effect_fn)), None),
             })
         });
-        let Some((outcome, replayed)) = acquired else {
-            return Err(keel_error(
-                py,
-                "KEEL-E017",
-                "a synchronous effect was started from inside another synchronous \
-                 effect running on a different thread; the inner call cannot proceed \
-                 until the outer one returns, and the outer one is waiting for it",
-            ));
+        let (outcome, replayed) = match acquired {
+            Ok(v) => v,
+            Err(which) => return Err(keel_error(py, "KEEL-E017", which.message())),
         };
         match replayed {
             Some(r) => flow_outcome_to_py(py, &outcome, r),
