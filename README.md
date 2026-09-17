@@ -208,7 +208,10 @@ dashboard — pick whichever fits the moment:
    `KEEL_LOG_FORMAT=json` and this line, the startup line, and any
    activation error each become one JSON object per line, so
    `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are queryable
-   fields in Cloud Logging or CloudWatch rather than prose.
+   fields in Cloud Logging or CloudWatch rather than prose. The summary's
+   `backend` field (Python only) names which backend actually ran —
+   `"native"` or `"stub"` — since `KEEL_BACKEND=auto` silently falls back to
+   the pure-Python backend when the native module can't be imported.
 
 2. **Static HTML report — one command, no persistent install needed.**
    `keel report --open` (or, with no CLI installed at all, `uvx --from
