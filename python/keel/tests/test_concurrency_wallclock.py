@@ -288,10 +288,20 @@ class InFlowNestedEffectTest(unittest.TestCase):
     the override clamps to (a stray `=0` inherited by a production process
     would fail every contended in-flow effect instantly), so asking for less
     would silently get this anyway.
+
+    Margin: the race thread's contended `inner()` attempt starts at 0.3s and
+    the (floored) 1000ms bound expires it at ~1.3s; `OUTER_SECONDS` must clear
+    that with real headroom on a loaded CI runner, which has never run this
+    test. 3.0s gives ~1.7s of slack (vs. the original 2.0s's bare 0.7s) —
+    comfortably larger without making the test slow. Removing the
+    `KEEL_NESTED_EFFECT_WAIT_MS` override (production bound 30s) must still
+    make this test fail: the outer step then releases the lock at 3.0s, well
+    inside the 30s bound, so `inner()` succeeds instead of raising KEEL-E017 —
+    proving this pins the expiry, not a constant.
     """
 
     WAIT_OVERRIDE_MS = 1000
-    OUTER_SECONDS = 2.0
+    OUTER_SECONDS = 3.0
 
     PROG = """
     import threading, time, json
