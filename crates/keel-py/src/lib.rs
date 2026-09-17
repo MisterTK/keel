@@ -1076,7 +1076,28 @@ impl KeelCore {
     /// Close the active flow, stamping its terminal `status` (`"completed"` or
     /// `"failed"`) and aborting the lease heartbeat. A no-op if no flow is open,
     /// so the front end can call it unconditionally on scope exit.
+    ///
+    /// Defensive, not currently reachable (issue #120 follow-up): guarded
+    /// with the same `KEEL-E005` as `enter_flow` for the identical
+    /// `active_flow.blocking_lock()` hazard, even though every known caller
+    /// (`_flow.py`'s top-level flow close, `adk_pack.py`, `subprocess_pack.py`'s
+    /// `exit_flow_or_warn`) only reaches this after a matching `enter_flow`
+    /// has already succeeded — and `enter_flow` now refuses to open a flow
+    /// while `in_effect()`, so no flow exists in that state for this to close.
+    /// That protection is transitive, not structural: it depends on every
+    /// future caller continuing to pair this with a gated `enter_flow` rather
+    /// than calling `exit_flow` standalone on an already-open flow from a
+    /// re-entrant context. Guarding here directly removes that dependency.
     fn exit_flow(&self, py: Python<'_>, status: &str) -> PyResult<()> {
+        if in_effect() {
+            return Err(keel_error(
+                py,
+                "KEEL-E005",
+                "exit_flow() cannot close a flow from inside a synchronous effect (a nested call \
+                 from within another wrapped call's own effect body); call it outside any \
+                 intercepted call.",
+            ));
+        }
         let final_status = match status {
             "completed" => FlowStatus::Completed,
             "failed" => FlowStatus::Failed,

@@ -30,7 +30,7 @@
       "name": "unsupported-configuration",
       "what": "The policy is valid, but it requests a capability this build or runtime configuration does not provide.",
       "why": "Two things trigger this in v0.1: a durable flow with no journal to record to (Tier 2 needs the native backend with a journal attached), and KEEL_BACKEND=native with no native module installed. (Async effects inside a flow are supported — serialized in await order per conformance/README.md — and no longer trigger this code.)",
-      "next": "Build/install the native module (`maturin develop -m crates/keel-py/Cargo.toml`) and make sure `.keel/` is writable. `keel doctor` reports which backend and journal are in play."
+      "next": "If this came from opening/closing a flow or reading its journal, build/install the native module (`maturin develop -m crates/keel-py/Cargo.toml`) and make sure `.keel/` is writable — `keel doctor` reports which backend and journal are in play. If instead this came from `report()`/`enter_flow()`/`exit_flow()` raised while another wrapped call's own effect was still running (a nested `py:`/`tool:`/`cmd:` call, or a flow entrypoint invoked from inside one) — call it outside that nested effect; no reinstall or config change fixes this case."
     },
     "KEEL-E010": {
       "name": "attempts-exhausted",

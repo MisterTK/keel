@@ -636,14 +636,19 @@ class StubRealClockTest(unittest.TestCase):
 
 
 class InEffectGuardTest(unittest.TestCase):
-    """#120: `report()`/`enter_flow()` refuse with `KEEL-E005`, and
-    `recorded_idempotency_key()` degrades to `None`, when called from inside
-    a synchronous effect — instead of the native core's undocumented
+    """#120: `report()`/`enter_flow()`/`exit_flow()` refuse with `KEEL-E005`,
+    and `recorded_idempotency_key()` degrades to `None`, when called from
+    inside a synchronous effect — instead of the native core's undocumented
     `PanicException` (a `tokio::sync::Mutex::blocking_lock`/`Runtime::block_on`
     panic from within an already-running runtime context).
     `journal_time`/`journal_random` already had this `in_effect()` guard
     (the model this fix follows for `recorded_idempotency_key`);
     `report`/`enter_flow` had none at all — see `crates/keel-py/src/lib.rs`.
+    `exit_flow`'s guard is defensive (its own docstring notes no known call
+    site reaches it in this state today, transitively protected by
+    `enter_flow`'s guard) rather than a reachable-today bug like the other
+    two, but the mechanism is identical and this test exercises it the same
+    way for the same reason: a documented landmine is still a landmine.
 
     The reproduction is a REAL nested effect, not a direct unit-test call
     against a bare `KeelCore`: `probe` is a `py:` function target, so by the
@@ -680,6 +685,11 @@ class InEffectGuardTest(unittest.TestCase):
             out["recorded_idempotency_key"] = backend.recorded_idempotency_key("t#-")
         except Exception as e:
             out["recorded_idempotency_key"] = f"raised:{getattr(e, 'code', type(e).__name__)}"
+        try:
+            backend.exit_flow("completed")
+            out["exit_flow"] = "no_error"
+        except Exception as e:
+            out["exit_flow"] = getattr(e, "code", type(e).__name__)
         return out
 
     def main():
@@ -703,3 +713,4 @@ class InEffectGuardTest(unittest.TestCase):
         self.assertEqual(got["report"], "KEEL-E005", got)
         self.assertEqual(got["enter_flow"], "KEEL-E005", got)
         self.assertIsNone(got["recorded_idempotency_key"], got)
+        self.assertEqual(got["exit_flow"], "KEEL-E005", got)
