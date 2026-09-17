@@ -149,7 +149,11 @@ enforcing wall-clock timeouts).
      that base64-decodes and JSON-parses to an object, which becomes the
      document; any other payload object is the document itself; anything
      else (non-object payload, undecodable/non-object body) is **fail-open**:
-     the payload is returned as-is. The decode is **canonical/strict**
+     the payload is returned as-is. This step runs BEFORE the verdict below,
+     so `until.absent` is **not consulted** for any of it — `absent` answers
+     "the document parsed and the field is not in it", never "the document
+     could not be read" (scenario 51 pins a bodyless envelope failing open
+     under `absent = "pending"`). The decode is **canonical/strict**
      (RFC 4648 §4 alphabet only, correct padding, and zero discarded
      padding bits — matching Rust's `base64::engine::general_purpose::
      STANDARD.decode`, not a lenient decoder): a `body_b64` that would only
@@ -158,7 +162,14 @@ enforcing wall-clock timeouts).
      than being judged, in every implementation (scenario 35).
    - Verdict: `until.field` is a dotted path walked through nested objects
      (`response.state`); a missing segment, a non-object intermediate, or a
-     key that merely contains a dot → fail-open. Lookup is **own-keys only**:
+     key that merely contains a dot means the field is **absent**, and
+     `until.absent` says what that means: `"fail_open"` (the default, and the
+     pre-CCR-11 rule) returns the payload as-is and ends the poll, while
+     `"pending"` treats the absence as the pending signal and keeps polling
+     (CCR-11, scenario 49 — which pins both halves, because a running
+     `google.longrunning.Operation` omits `done` entirely: proto3 JSON drops
+     a false bool). `until.absent` is optional; any value other than those
+     two words is `KEEL-E001` at configure (scenario 50). Lookup is **own-keys only**:
      a segment naming an inherited property of the host language's object type
      (JavaScript's `constructor`, `__proto__`, …) is a MISSING key, exactly as
      it is on a Rust map or a Python dict (scenario 48). The value is

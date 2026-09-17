@@ -16,5 +16,5 @@
     "policy_source": "defaults",
     "version": "0.6.1"
   },
-  "expected": "{\"backend\":\"stub\",\"breaker_trips\":0,\"cache_hits\":0,\"cache_poll_suspects\":0,\"calls\":1,\"keel\":\"summary\",\"keel_cwd\":null,\"not_retried\":0,\"policy_path\":null,\"policy_source\":\"defaults\",\"retries_succeeded\":0,\"throttled\":0,\"unprotected\":0,\"unprotected_by_target\":{},\"version\":\"0.6.1\"}\n"
+  "expected": "{\"backend\":\"stub\",\"breaker_trips\":0,\"cache_hits\":0,\"cache_poll_suspects\":0,\"calls\":1,\"keel\":\"summary\",\"keel_cwd\":null,\"not_retried\":0,\"policy_path\":null,\"policy_source\":\"defaults\",\"retries_succeeded\":0,\"severity\":\"INFO\",\"throttled\":0,\"unprotected\":0,\"unprotected_by_target\":{},\"version\":\"0.6.1\"}\n"
 }

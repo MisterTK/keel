@@ -55,7 +55,8 @@
 //!     policy_source    TEXT    NOT NULL,               -- "keel.toml" | "defaults" | …
 //!     policy_path      TEXT,
 //!     flows_configured INTEGER NOT NULL DEFAULT 0,
-//!     argv0            TEXT    NOT NULL DEFAULT ''
+//!     argv0            TEXT    NOT NULL DEFAULT '',
+//!     backend          TEXT                            -- v4: "native" | "stub" (#129)
 //! );
 //! ```
 //!
@@ -87,7 +88,13 @@
 //! file is upgraded to v3 by adding the `activations` table alone — the v1→v2
 //! block above is gated on its own version check, so it never re-runs. A v2 (or
 //! v1) file opened read-only reads back an empty [`DiscoveryStore::activations_snapshot`]
-//! rather than an error, since the table does not exist yet.
+//! rather than an error, since the table does not exist yet. A v3 file is
+//! upgraded to v4 by appending the `backend` column alone (#129: the column
+//! existed nowhere before, so every writer had been silently dropping the
+//! resolved backend); a v3 file opened READ-ONLY (no migration) reads back
+//! `backend: None` for every row rather than erroring on the missing column —
+//! [`DiscoveryStore::activations_snapshot`] probes for the column the same way
+//! [`DiscoveryStore::snapshot`] probes `not_retried`/`unwrapped_calls`.
 //!
 //! Every mutation is a single UPSERT (one per table), so two processes
 //! recording into one file accumulate correctly without a transaction.
@@ -108,7 +115,8 @@ use crate::types::{error_class_from_db, error_class_str};
 /// Version 0 is the legacy v1 schema (no counter columns, no daily table).
 /// Version 2 added `not_retried`/`unwrapped_calls` plus `discovery_daily`.
 /// Version 3 added the `activations` table (see [`Activation`]).
-pub const DISCOVERY_SCHEMA_VERSION: i64 = 3;
+/// Version 4 added `activations.backend` (#129).
+pub const DISCOVERY_SCHEMA_VERSION: i64 = 4;
 
 /// How many trailing UTC days of `discovery_daily` buckets are kept (the
 /// current day plus `RETENTION_DAYS - 1` before it). Weekly windows need 7;
@@ -170,7 +178,8 @@ CREATE TABLE IF NOT EXISTS activations (
     policy_source    TEXT    NOT NULL,
     policy_path      TEXT,
     flows_configured INTEGER NOT NULL DEFAULT 0,
-    argv0            TEXT    NOT NULL DEFAULT ''
+    argv0            TEXT    NOT NULL DEFAULT '',
+    backend          TEXT
 );";
 
 const CONNECTION_PRAGMAS: &str = "\
@@ -377,6 +386,10 @@ pub struct Activation {
     pub flows_configured: bool,
     /// The invoking process's `argv[0]`.
     pub argv0: String,
+    /// Which runtime backend resolved: `"native"` or `"stub"` (#129). `None`
+    /// on a row written before this field existed, or read back from a v3
+    /// file opened read-only (no migration ever ran).
+    pub backend: Option<String>,
 }
 
 /// One `discovery` row's worth of values to feed the [`UPSERT`], borrowing its
@@ -581,7 +594,8 @@ impl<C: Clock> DiscoveryStore<C> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source, \
-             policy_path, flows_configured, argv0) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             policy_path, flows_configured, argv0, backend) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 a.ts_ms,
                 a.pid,
@@ -592,7 +606,8 @@ impl<C: Clock> DiscoveryStore<C> {
                 a.policy_source,
                 a.policy_path,
                 i64::from(a.flows_configured),
-                a.argv0
+                a.argv0,
+                a.backend,
             ],
         )?;
         conn.execute(
@@ -615,10 +630,23 @@ impl<C: Clock> DiscoveryStore<C> {
         if !has_table {
             return Ok(Vec::new());
         }
-        let mut stmt = conn.prepare(
-            "SELECT ts_ms, pid, language, version, cwd, keel_cwd, policy_source, policy_path, \
-             flows_configured, argv0 FROM activations ORDER BY ts_ms DESC, rowid DESC",
+        // A read-only open never migrates (see module docs), so a genuine v3
+        // file's `activations` table may still lack `backend` (#129) — probe
+        // for the column exactly like `snapshot()` probes `not_retried`, and
+        // degrade to `NULL` rather than erroring on the missing column.
+        let has_backend: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activations') WHERE name = 'backend')",
+            [],
+            |r| r.get(0),
         )?;
+        let sql = if has_backend {
+            "SELECT ts_ms, pid, language, version, cwd, keel_cwd, policy_source, policy_path, \
+             flows_configured, argv0, backend FROM activations ORDER BY ts_ms DESC, rowid DESC"
+        } else {
+            "SELECT ts_ms, pid, language, version, cwd, keel_cwd, policy_source, policy_path, \
+             flows_configured, argv0, NULL FROM activations ORDER BY ts_ms DESC, rowid DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(Activation {
@@ -632,6 +660,7 @@ impl<C: Clock> DiscoveryStore<C> {
                     policy_path: r.get(7)?,
                     flows_configured: r.get::<_, i64>(8)? != 0,
                     argv0: r.get(9)?,
+                    backend: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -719,7 +748,20 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
     if v < 3 {
         conn.execute_batch(ACTIVATIONS_SCHEMA)?;
     }
-    conn.execute_batch("PRAGMA user_version = 3")?;
+    if v < 4 {
+        let has_column: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activations') WHERE name = 'backend')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_column {
+            // Appended, so a migrated v3 file's column order matches a fresh
+            // v4 one; a no-op here when the `v < 3` branch above just created
+            // the table fresh (ACTIVATIONS_SCHEMA already carries `backend`).
+            conn.execute_batch("ALTER TABLE activations ADD COLUMN backend TEXT;")?;
+        }
+    }
+    conn.execute_batch(&format!("PRAGMA user_version = {DISCOVERY_SCHEMA_VERSION}"))?;
     Ok(())
 }
 
@@ -1219,6 +1261,7 @@ CREATE TABLE IF NOT EXISTS discovery (
                     policy_path: Some("/code/keel.toml".into()),
                     flows_configured: i % 2 == 0,
                     argv0: "app.py".into(),
+                    backend: Some("native".into()),
                 })
                 .unwrap();
         }
@@ -1228,6 +1271,7 @@ CREATE TABLE IF NOT EXISTS discovery (
         assert_eq!(rows[49].ts_ms, 1_005);
         assert_eq!(rows[0].policy_path.as_deref(), Some("/code/keel.toml"));
         assert!(rows[0].flows_configured);
+        assert_eq!(rows[0].backend.as_deref(), Some("native"));
     }
 
     #[test]
@@ -1248,7 +1292,10 @@ CREATE TABLE IF NOT EXISTS discovery (
         );
         drop(ro);
         let rw = DiscoveryStore::open(&path, ManualClock::new(0)).unwrap();
-        assert_eq!(schema_version(&rw.lock()).unwrap(), 3);
+        assert_eq!(
+            schema_version(&rw.lock()).unwrap(),
+            DISCOVERY_SCHEMA_VERSION
+        );
         rw.record_activation(&Activation {
             ts_ms: 1,
             pid: 1,
@@ -1260,10 +1307,99 @@ CREATE TABLE IF NOT EXISTS discovery (
             policy_path: None,
             flows_configured: false,
             argv0: String::new(),
+            backend: Some("stub".into()),
         })
         .unwrap();
-        assert_eq!(rw.activations_snapshot().unwrap().len(), 1);
+        let rows = rw.activations_snapshot().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].backend.as_deref(), Some("stub"));
         assert_eq!(rw.snapshot().unwrap().len(), 0, "v2 tables untouched");
+    }
+
+    /// A genuine v3 file (real `activations` table, no `backend` column yet —
+    /// the exact shape #129 shipped in v0.5.6..v0.6.5) is migrated to v4 in
+    /// place on the first read-write open, and a fresh row records a real
+    /// `backend` value that survives the round trip.
+    #[test]
+    fn v3_file_migrates_to_v4_and_gains_the_backend_column() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("d.db");
+        {
+            // Build a v3 file by hand: v3 schema (no `backend` column), stamped 3.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DISCOVERY_SCHEMA).unwrap();
+            conn.execute_batch(DAILY_SCHEMA).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE activations (
+                    ts_ms INTEGER NOT NULL, pid INTEGER NOT NULL, language TEXT NOT NULL,
+                    version TEXT NOT NULL, cwd TEXT NOT NULL, keel_cwd TEXT,
+                    policy_source TEXT NOT NULL, policy_path TEXT,
+                    flows_configured INTEGER NOT NULL DEFAULT 0,
+                    argv0 TEXT NOT NULL DEFAULT ''
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, \
+                 policy_source, policy_path, flows_configured, argv0) \
+                 VALUES (1, 1, 'python', '0.6.5', '/code', '/code', 'keel.toml', \
+                 '/code/keel.toml', 1, 'app.py')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        }
+
+        // A read-only open never migrates: the pre-existing row reads back
+        // with `backend: None`, not an error on the missing column.
+        let ro = DiscoveryStore::open_readonly(&path, ManualClock::new(0)).unwrap();
+        let ro_rows = ro.activations_snapshot().unwrap();
+        assert_eq!(ro_rows.len(), 1);
+        assert_eq!(
+            ro_rows[0].backend, None,
+            "v3 file has no backend column yet"
+        );
+        drop(ro);
+        {
+            let conn =
+                Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            assert_eq!(
+                schema_version(&conn).unwrap(),
+                3,
+                "read-only open must not migrate"
+            );
+        }
+
+        // Opening read-write migrates the file to v4 in place, preserving the
+        // pre-existing row (now with `backend: None`, never fabricated).
+        let rw = DiscoveryStore::open(&path, ManualClock::new(2)).unwrap();
+        assert_eq!(
+            schema_version(&rw.lock()).unwrap(),
+            DISCOVERY_SCHEMA_VERSION
+        );
+        let rows = rw.activations_snapshot().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].backend, None, "a pre-#129 row is never backfilled");
+
+        // And the migrated file records a fresh activation's real backend.
+        rw.record_activation(&Activation {
+            ts_ms: 2,
+            pid: 2,
+            language: "python".into(),
+            version: "0.7.0".into(),
+            cwd: "/code".into(),
+            keel_cwd: Some("/code".into()),
+            policy_source: "keel.toml".into(),
+            policy_path: Some("/code/keel.toml".into()),
+            flows_configured: true,
+            argv0: "app.py".into(),
+            backend: Some("native".into()),
+        })
+        .unwrap();
+        let rows = rw.activations_snapshot().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].backend.as_deref(), Some("native"), "newest first");
+        assert_eq!(rows[1].backend, None);
     }
 
     /// A genuine v2 file (real `not_retried`/`unwrapped_calls` columns, a

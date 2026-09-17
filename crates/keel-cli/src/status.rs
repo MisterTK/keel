@@ -313,9 +313,17 @@ fn human(r: &StatusReport) -> String {
             (_, Some(p)) => format!("policy {p}"),
             (_, None) => "policy keel.toml".to_owned(),
         };
+        // `backend` (#129) is absent on a row written before the column
+        // existed, so the suffix is omitted rather than printing "backend
+        // unknown" — byte-identical to the pre-#129 line in that case.
+        let backend = a
+            .backend
+            .as_deref()
+            .map(|b| format!(" \u{b7} backend {b}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  last activation:  {} {} \u{b7} {} \u{b7} pid {}\n",
-            a.language, a.version, policy, a.pid,
+            "  last activation:  {} {} \u{b7} {}{} \u{b7} pid {}\n",
+            a.language, a.version, policy, backend, a.pid,
         ));
     }
     lines.push(format!(
@@ -393,6 +401,7 @@ mod tests {
             policy_path: Some("/code/keel.toml".into()),
             flows_configured: false,
             argv0: "app.py".into(),
+            backend: Some("native".into()),
         };
         let s = summarize_activations(vec![a(20), a(10)]);
         assert_eq!(s.count, 2);
@@ -421,6 +430,43 @@ mod tests {
                 policy_path: None,
                 flows_configured: false,
                 argv0: String::new(),
+                backend: Some("native".into()),
+            }]),
+        );
+        assert!(
+            human(&r).contains(
+                "  last activation:  python 0.5.6 \u{b7} production defaults (no keel.toml in /code) \u{b7} backend native \u{b7} pid 4242\n"
+            ),
+            "{}",
+            human(&r)
+        );
+    }
+
+    /// A row written before #129 (or read back from a v3 file with no
+    /// `backend` column — see `keel_journal::discovery`) has `backend: None`;
+    /// the line must stay byte-identical to the pre-#129 form rather than
+    /// printing a "backend unknown" placeholder.
+    #[test]
+    fn human_status_omits_the_backend_segment_when_absent() {
+        let r = aggregate(
+            vec![],
+            &[],
+            FlowSummary::default(),
+            true,
+            false,
+            T0,
+            summarize_activations(vec![Activation {
+                ts_ms: 1,
+                pid: 4242,
+                language: "python".into(),
+                version: "0.5.6".into(),
+                cwd: "/code".into(),
+                keel_cwd: Some("/code".into()),
+                policy_source: "defaults".into(),
+                policy_path: None,
+                flows_configured: false,
+                argv0: String::new(),
+                backend: None,
             }]),
         );
         assert!(

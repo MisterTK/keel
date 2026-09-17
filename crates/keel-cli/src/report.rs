@@ -8,6 +8,15 @@
 //! reloads itself) and `--serve` (`report_serve`: a `127.0.0.1` listener the
 //! page polls). Every mode is a pure function of the evidence files plus the
 //! injected `now_ms` (dx-spec §5).
+//!
+//! Under `KEEL_EVENTS=stderr` (#94, partial) [`tail::read_events`] finds no
+//! on-disk run, so [`assemble`] carries `run: None, events: []` — the same
+//! shape as "no program has run under Keel yet", which this module makes no
+//! attempt to distinguish from "events are going elsewhere". `status` and
+//! `daily` are unaffected: neither reads `.keel/events/`, so the rest of the
+//! report stays complete. Unlike `keel tail`, `keel report` never asserts an
+//! explicit "there is none" claim about events, so there is nothing false to
+//! correct here — only an omission, left as-is for this partial step.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

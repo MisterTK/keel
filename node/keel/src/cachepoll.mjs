@@ -102,3 +102,30 @@ export function createCachePollDetector({
     },
   };
 }
+
+/**
+ * The text + `KEEL_LOG_FORMAT=json` twin for one detector firing (#78/WS9),
+ * pulled out as its own testable builder (mirroring `deploy.mjs`'s
+ * `ephemeralJournalWarning`) rather than inlined at `bootstrap.mjs`'s call
+ * site. `severity` is `WARNING` (#130): this line names an operator-visible
+ * pathology — a status poll silently fed a replayed response — and must be
+ * as filterable as the activation and refusal lines are. Python twin:
+ * `_cachepoll.py`'s `cache_poll_suspect_warning`.
+ */
+export function cachePollSuspectWarning(target, hits, spanS, version) {
+  const text =
+    `keel ▸ warning: ${target} served ${hits} consecutive cache hits for one identical ` +
+    `call over ${spanS}s — if this is a status poll, set cache = ` +
+    `{ mode = "off" } on that target ` +
+    `— or give the status route its own poll policy (README: Poll)\n`;
+  const obj = {
+    keel: "warning",
+    code: "cache-poll-suspect",
+    target,
+    hits,
+    span_s: spanS,
+    severity: "WARNING",
+    version,
+  };
+  return [text, obj];
+}

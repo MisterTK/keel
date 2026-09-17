@@ -38,7 +38,8 @@
  * upgraded in place at flush — the two counter columns are appended
  * (`ALTER TABLE … ADD COLUMN`), the daily table is created, and
  * `user_version` is stamped to 2. A v2 file gains the `activations` table
- * (one row per process, WS8/#92) and is stamped to 3. Mirrors
+ * (one row per process, WS8/#92) and is stamped to 3. A v3 file gains the
+ * `activations.backend` column (#129) and is stamped to 4. Mirrors
  * `keel_journal::discovery::migrate` exactly, so either writer can open a file
  * the other created.
  *
@@ -54,7 +55,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /** Current discovery schema version, stamped in `PRAGMA user_version`. */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** How many trailing UTC days of `discovery_daily` buckets are kept. */
 export const RETENTION_DAYS = 30;
@@ -155,6 +156,7 @@ export function createDiscovery(
               Number(activation.ts_ms), Number(activation.pid), String(activation.language), String(activation.version),
               String(activation.cwd), activation.keel_cwd ?? null, String(activation.policy_source),
               activation.policy_path ?? null, activation.flows_configured ? 1 : 0, String(activation.argv0 ?? ""),
+              activation.backend ?? null,
             );
             db.prepare(ACTIVATION_PRUNE).run();
             activationWritten = true;
@@ -275,6 +277,21 @@ function migrate(db) {
     db.exec(DAILY_SCHEMA);
   }
   if (version < 3) db.exec(ACTIVATIONS_SCHEMA);
+  if (version < 4) {
+    const hasColumn = Boolean(
+      db
+        .prepare(
+          "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activations') WHERE name = 'backend') AS x"
+        )
+        .get().x
+    );
+    if (!hasColumn) {
+      // Appended, so a migrated v3 file's column order matches a fresh v4
+      // one; a no-op when the `version < 3` branch above just created the
+      // table fresh (ACTIVATIONS_SCHEMA already carries `backend`).
+      db.exec("ALTER TABLE activations ADD COLUMN backend TEXT;");
+    }
+  }
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
 }
 
@@ -390,13 +407,14 @@ CREATE TABLE IF NOT EXISTS activations (
     policy_source    TEXT    NOT NULL,
     policy_path      TEXT,
     flows_configured INTEGER NOT NULL DEFAULT 0,
-    argv0            TEXT    NOT NULL DEFAULT ''
+    argv0            TEXT    NOT NULL DEFAULT '',
+    backend          TEXT
 );
 `;
 
 const ACTIVATION_INSERT = `
 INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source,
-  policy_path, flows_configured, argv0) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  policy_path, flows_configured, argv0, backend) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
 // Retention: keep the newest 50 rows, mirroring the crate and the Python twin.

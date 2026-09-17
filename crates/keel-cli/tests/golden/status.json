@@ -3,6 +3,7 @@
     "count": 1,
     "last": {
       "argv0": "app.py",
+      "backend": "native",
       "cwd": "/code",
       "flows_configured": true,
       "keel_cwd": "/code",

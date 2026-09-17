@@ -63,17 +63,21 @@ upgraded in place on first open — the two counter columns are appended
 (`ALTER TABLE … ADD COLUMN`, so column order matches a fresh v2 file), the
 daily table is created, and `user_version` is stamped to 2. A v2 file gains
 the `activations` table (one row per process, WS8/#92) and is stamped to 3.
+A v3 file gains the `activations.backend` column (#129) and is stamped to 4.
 Mirrors `crates/keel-journal/src/discovery.rs::migrate` exactly, so either
 writer can open a file the other created.
 
 `activations` records one row per process's lazily-remembered call to
 `record_activation` (ts_ms/pid/language/version/cwd/keel_cwd/policy_source/
-policy_path/flows_configured/argv0), written on the first successful
+policy_path/flows_configured/argv0/backend), written on the first successful
 `_connect()` (i.e. the first recorded call) or at `close()` if no call ever
 happened — whichever comes first, and exactly once — so an activated-but-idle
 process still leaves exactly one row of evidence at exit, and a process that
 never activates never touches the filesystem. Retention keeps the newest 50
-rows (by `ts_ms` then `rowid`), mirroring the crate.
+rows (by `ts_ms` then `rowid`), mirroring the crate. `backend` ("native" |
+"stub") is `bootstrap.py`'s `_STATE.meta["backend"]`, spread into the row
+`record_activation` receives — it used to be silently dropped here because
+this module's insert used a fixed column tuple that never included it (#129).
 
 Discovery is best-effort: it must never throw into, slow, or add output to
 the user's program (DX invariant 4). Every public method swallows its own
@@ -94,7 +98,7 @@ if TYPE_CHECKING:
 
 #: Current discovery schema version, stamped in `PRAGMA user_version`.
 #: Mirrors `keel_journal::discovery::DISCOVERY_SCHEMA_VERSION`.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: How many trailing UTC days of `discovery_daily` buckets are kept. Mirrors
 #: `keel_journal::discovery::RETENTION_DAYS`.
@@ -199,12 +203,13 @@ CREATE TABLE IF NOT EXISTS activations (
     policy_source    TEXT    NOT NULL,
     policy_path      TEXT,
     flows_configured INTEGER NOT NULL DEFAULT 0,
-    argv0            TEXT    NOT NULL DEFAULT ''
+    argv0            TEXT    NOT NULL DEFAULT '',
+    backend          TEXT
 );"""
 
 _ACTIVATION_INSERT = (
     "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source, "
-    "policy_path, flows_configured, argv0) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "policy_path, flows_configured, argv0, backend) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 _ACTIVATION_PRUNE = (
     "DELETE FROM activations WHERE rowid NOT IN "
@@ -327,6 +332,7 @@ class Discovery:
         conn.execute(_ACTIVATION_INSERT, (
             int(a["ts_ms"]), int(a["pid"]), a["language"], a["version"], a["cwd"], a.get("keel_cwd"),
             a["policy_source"], a.get("policy_path"), int(bool(a.get("flows_configured"))), a.get("argv0") or "",
+            a.get("backend"),
         ))
         conn.execute(_ACTIVATION_PRUNE)
         self._activation_written = True
@@ -378,6 +384,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.executescript(_DAILY_SCHEMA)
     if version < 3:
         conn.executescript(_ACTIVATIONS_SCHEMA)
+    if version < 4:
+        has_column = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('activations') WHERE name = 'backend')"
+        ).fetchone()[0]
+        if not has_column:
+            # Appended, so a migrated v3 file's column order matches a fresh
+            # v4 one; a no-op when the `version < 3` branch above just
+            # created the table fresh (`_ACTIVATIONS_SCHEMA` already carries
+            # `backend`).
+            conn.execute("ALTER TABLE activations ADD COLUMN backend TEXT")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 

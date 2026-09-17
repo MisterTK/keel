@@ -72,6 +72,7 @@ def ephemeral_journal_warning(
         "code": "journal-ephemeral-storage",
         "journal": str(journal),
         "marker": marker,
+        "severity": "WARNING",
         "version": __version__,
     }
     return text, obj

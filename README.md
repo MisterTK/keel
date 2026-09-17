@@ -69,8 +69,10 @@ daemon. No port. No new abstractions in your code.
   unprotected` — and `keel report --open` turns the same evidence into a
   self-contained HTML page you can watch live with `--watch` or `--serve`.
   In a container this is the surface that survives; set
-  `KEEL_LOG_FORMAT=json` to emit it (and the startup line) as one JSON
-  object per line for Cloud Logging / CloudWatch. See
+  `KEEL_LOG_FORMAT=json` to emit it (and the startup line, and every warning
+  and refusal, each with a `severity`) as one JSON object per line for Cloud
+  Logging / CloudWatch, or `KEEL_EVENTS=stderr` to put the per-attempt event
+  feed on the same stream. See
   [Observability](#observability) below. OpenTelemetry spans and metrics for
   every call and attempt are a source build with the `otel` feature plus one
   env var away — off by default, so the shipped library carries no
@@ -171,7 +173,7 @@ policy:
 
 ## Observability
 
-"What did Keel actually do?" has four answers, from zero setup to a live
+"What did Keel actually do?" has five answers, from zero setup to a live
 dashboard — pick whichever fits the moment:
 
 1. **Console summary — automatic, library-only.** Every process that runs
@@ -205,13 +207,18 @@ dashboard — pick whichever fits the moment:
 
    In a container, stderr is the surface that survives — though a parent
    that captures a child's stderr silently swallows it. Set
-   `KEEL_LOG_FORMAT=json` and this line, the startup line, and any
-   activation error each become one JSON object per line, so
-   `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are queryable
-   fields in Cloud Logging or CloudWatch rather than prose. The summary's
-   `backend` field (Python only) names which backend actually ran —
-   `"native"` or `"stub"` — since `KEEL_BACKEND=auto` silently falls back to
-   the pure-Python backend when the native module can't be imported.
+   `KEEL_LOG_FORMAT=json` and five lines each become one JSON object: this
+   summary, the startup line, an activation error, and both warnings above —
+   so `policy_source`, `policy_path`, `keel_cwd` and `cache_hits` are
+   queryable fields in Cloud Logging or CloudWatch rather than prose. Every
+   one of the five carries a `severity` (`INFO` on the startup line and the
+   summary, `WARNING` on the two warnings, `ERROR` on the activation error):
+   those platforms fill an entry's severity only from that field, so without
+   it a refusal to activate reads as a healthy start in any `severity>=ERROR`
+   view. The summary's `backend` field names which backend actually ran —
+   `"native"` or `"stub"` — since `KEEL_BACKEND=auto` falls back silently when
+   the native module can't be imported; `keel status` and `keel doctor --json`
+   (`activation_backend`) report the same fact from the recorded activation.
 
 2. **Static HTML report — one command, no persistent install needed.**
    `keel report --open` (or, with no CLI installed at all, `uvx --from
@@ -232,7 +239,22 @@ dashboard — pick whichever fits the moment:
      mismatched `Host` header is rejected (DNS-rebinding protection). Either
      way, Ctrl-C stops it cleanly.
 
-4. **What this is not.** OpenTelemetry export (spans and metrics, not logs)
+4. **Per-attempt evidence off the instance — `KEEL_EVENTS=stderr`.** Keel's
+   NDJSON event feed (one line per attempt, backoff, breaker transition)
+   normally lands in `.keel/events/<run>.ndjson`, which on a scale-to-zero
+   platform dies with the instance. Set `KEEL_EVENTS=stderr` and the same
+   feed goes to the process's stderr instead — on Cloud Run, GKE or Lambda
+   that is already the log pipeline, so it needs no collector, no volume and
+   no custom build. Three limits worth knowing up front: it works on the
+   native core only (the pure-Python and JS fallback backends have no event
+   sink to redirect); the feed then shares stderr with Keel's own console
+   output, and nothing coordinates the two streams — tell them apart by the
+   event lines' fixed `v`/`seq`/`ms`/`event` keys; and with no file to read,
+   `keel tail` says so instead of following anything, while `keel report`
+   renders with an empty event stream. It is a step toward a real remote
+   evidence sink, not that sink.
+
+5. **What this is not.** OpenTelemetry export (spans and metrics, not logs)
    requires a source build with the `otel` feature — the published wheels
    and npm addon do not include it — and lands in a tracing/metrics backend,
    never in your log search. Everything under `.keel/` is a local file: on a
@@ -274,6 +296,24 @@ Two tiers, one policy file:
   `KEEL-E016`; a response whose body isn't JSON (or lacks `until.field`)
   fails OPEN and is returned unchanged on the first attempt — polling never
   turns an ordinary response into an error.
+
+  Some APIs omit the field entirely while the job runs: a running
+  `google.longrunning.Operation` body is just `{"name": "..."}`, because
+  proto3 JSON drops a false bool, and `done` only appears on completion.
+  Fail-open would end such a poll on attempt one, so say that absence is the
+  pending signal:
+
+  ```toml
+  [target."POST *-aiplatform.googleapis.com/**:fetchPredictOperation"]
+  poll = { interval = "10s", deadline = "10m", until = { field = "done", terminal = [true], absent = "pending" } }
+  ```
+
+  `absent` defaults to `"fail_open"`, so every policy written without it
+  behaves exactly as before. It governs a *parsed JSON object* that lacks the
+  field; a response Keel cannot parse into one at all (a 502 HTML page, a
+  bodyless envelope) still fails open regardless. And it is new in 0.7.0 —
+  an older Keel rejects the unknown key with `KEEL-E001`, so upgrade every
+  process that reads this `keel.toml` before adding it.
 - **Tier 2 — durable flows (opt-in).** Designate an entrypoint in `[flows]`
   and its steps are journaled to a local SQLite file (or Postgres, for
   fleet deployments) as they run. A crash — or a deliberate restart —
@@ -304,7 +344,8 @@ timeout = "120s"                       # chat and generate calls
 
 [target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]
 timeout = "30s"                        # one poll attempt
-poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true] } }
+# `absent = "pending"` is required here: a running operation body omits `done`
+poll = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true], absent = "pending" } }
 ```
 
 The route is an ordinary target (its own breaker, rate limit, and `keel
@@ -313,7 +354,9 @@ dev cache). A host-only glob such as `*.googleapis.com` never captures LLM
 traffic. When a valid `keel.toml` is present, `keel doctor` attaches this
 block as an applyable patch to the first `hand-rolled-poll` finding it can
 attribute to an SDK poll call (one patch per provider; later findings for
-the same provider point at it).
+the same provider point at it). Its two Google proposals carry `absent =
+"pending"`; the OpenAI and Anthropic ones do not, because those status
+bodies always carry their terminal field.
 
 ### `keel exec` — durable external commands (CCR-4)
 

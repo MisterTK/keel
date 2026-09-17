@@ -1,7 +1,7 @@
 import threading
 import unittest
 
-from keel._cachepoll import MAX_FIRED, MAX_RUNS, CachePollDetector
+from keel._cachepoll import MAX_FIRED, MAX_RUNS, CachePollDetector, cache_poll_suspect_warning
 
 HIT = {"v": 1, "result": "ok", "attempts": 0, "from_cache": True}
 MISS = {"v": 1, "result": "ok", "attempts": 1, "from_cache": False}
@@ -119,6 +119,23 @@ class CachePollConcurrencyTest(unittest.TestCase):
         total_hits = n_threads * hits_per_thread
         run = d._runs[("llm:google-genai", "h1")]
         self.assertEqual(run[0], total_hits, "no hit lost to the read-modify-write race")
+
+
+class CachePollSuspectWarningTest(unittest.TestCase):
+    """#130: a cache-poll suspicion is exactly the operator-visible pathology
+    a severity-filtered view exists to surface — must be as filterable as the
+    activation and refusal lines are."""
+
+    def test_the_object_carries_a_warning_severity(self) -> None:
+        text, obj = cache_poll_suspect_warning("llm:google-genai", 5, 40, "0.6.5")
+        self.assertEqual(obj["keel"], "warning")
+        self.assertEqual(obj["code"], "cache-poll-suspect")
+        self.assertEqual(obj["target"], "llm:google-genai")
+        self.assertEqual(obj["hits"], 5)
+        self.assertEqual(obj["span_s"], 40)
+        self.assertEqual(obj["version"], "0.6.5")
+        self.assertEqual(obj["severity"], "WARNING")
+        self.assertIn("llm:google-genai served 5 consecutive cache hits", text)
 
 
 if __name__ == "__main__":

@@ -181,7 +181,7 @@
     "poll": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3; widened by CCR-8). Applies to requests the front end judged idempotent (safe to re-issue); the HTTP method is not consulted. A JSON response whose `until.field` value is not terminal is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). Non-JSON responses and responses without `until.field` are returned as-is (fail-open). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
+      "description": "Poll-until-terminal for submit-then-poll job APIs (CCR-3; widened by CCR-8). Applies to requests the front end judged idempotent (safe to re-issue); the HTTP method is not consulted. A JSON response whose `until.field` value is not terminal is pending: sleep `interval`, re-issue, until terminal or `deadline` elapses (KEEL-E016, breaker-countable). A response Keel cannot parse into a JSON object is returned as-is (fail-open), and `until` is never consulted for it; so is a parsed object that does not carry `until.field`, unless `until.absent = \"pending\"` (CCR-11). Layer order: cache, rate, breaker, timeout, poll, retry — `timeout` is per-attempt, `deadline` bounds the whole poll, and a failed poll attempt is a normal error for retry to consider.",
       "properties": {
         "interval": {
           "type": "string",
@@ -203,6 +203,11 @@
               "items": { "type": ["string", "boolean", "number"] },
               "minItems": 1,
               "description": "Values of `until.field` that end the poll. A value is terminal when it is JSON-equal to an item of the SAME JSON type: \"true\" does not match true, 1 does not match true; numbers compare by value (100 matches 100.0). (CCR-8)"
+            },
+            "absent": {
+              "enum": ["fail_open", "pending"],
+              "default": "fail_open",
+              "description": "What a PARSED JSON OBJECT that does not carry `until.field` means. `fail_open` (the default, and the behavior of every policy written before CCR-11) returns the response as-is and ends the poll. `pending` treats the absence as the pending signal and keeps polling. Set `pending` for APIs that omit the field while the job runs: a running `google.longrunning.Operation` body is `{\"name\": \"...\"}`, because proto3 JSON omits a false bool, so `done` appears only on completion. This key governs ABSENCE, not unreadability: a response Keel cannot parse into a JSON object at all — a non-object payload, an envelope with no `body_b64`, a body that will not strictly base64-decode, a body that is not JSON, or a body that is JSON but not an object — still fails open regardless of `absent`, because a predicate cannot be applied to a document that was never parsed. (CCR-11)"
             }
           },
           "required": ["field", "terminal"]

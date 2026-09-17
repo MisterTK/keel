@@ -78,6 +78,7 @@ export function ephemeralJournalWarning(policy, env, cwd, { dockerenv = DOCKEREN
     code: "journal-ephemeral-storage",
     journal: String(journal),
     marker,
+    severity: "WARNING",
     version: VERSION,
   };
   return [text, obj];

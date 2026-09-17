@@ -483,6 +483,13 @@ struct DoctorReport {
     /// resolved policy identity, `"unverified"` otherwise — including when
     /// there is no discovery evidence at all (#92).
     runtime_activation: &'static str,
+    /// Which runtime backend the verifying activation row named — `"native"`
+    /// or `"stub"` (#129, the field `runtime_activation` explains: `keel
+    /// doctor` previously had no way to say which backend actually ran,
+    /// though the CLI's own live banner/JSON summary always could). `None`
+    /// when `runtime_activation` is `"unverified"`, or when the verifying row
+    /// predates #129 and so was written with no `backend` column at all.
+    activation_backend: Option<String>,
     topology: Topology,
 }
 
@@ -569,7 +576,8 @@ pub fn run(project: &Path) -> Rendered {
     let build_files = crate::dockerfile::analyze(project);
     let artifacts = deploy_artifacts(project, &build_files);
     let stale_flows = crate::flows::stale_code_hash_flows(project);
-    let runtime_activation_value = runtime_activation(project, policy.check.present, &activations);
+    let (runtime_activation_value, activation_backend_value) =
+        runtime_activation(project, policy.check.present, &activations);
     let report = build_report(
         &scan,
         &discovery,
@@ -582,6 +590,7 @@ pub fn run(project: &Path) -> Rendered {
         &artifacts,
         &stale_flows,
         runtime_activation_value,
+        activation_backend_value,
     );
     let exit = if report.ok { EXIT_OK } else { EXIT_USAGE };
     let human = human(&report);
@@ -825,6 +834,16 @@ struct RouteKeyProposal {
     key: &'static str,
     field: &'static str,
     terminal: &'static str,
+    /// `Some("pending")` when this route's terminal field is OMITTED (not
+    /// `false`) while the job is still running — i.e. `until.absent =
+    /// "pending"` (CCR-11) belongs in the emitted block. `None` keeps the
+    /// schema default (`fail_open`) for routes where absence is not known to
+    /// mean pending; this is a per-proposal field rather than a hardcoded
+    /// addition to [`render_route_block`]'s format string specifically so a
+    /// future non-Google proposal doesn't silently inherit "absence means
+    /// pending" — that inference must be made per API family, not per
+    /// template.
+    absent: Option<&'static str>,
     note: &'static str,
 }
 
@@ -839,12 +858,18 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                     key: "POST *-aiplatform.googleapis.com/*:fetchPredictOperation",
                     field: "done",
                     terminal: "[true]",
+                    // A running google.longrunning.Operation omits `done`
+                    // entirely (proto3 JSON drops a false bool) — absence IS
+                    // the pending signal here, not an unknown shape (#128,
+                    // CCR-11).
+                    absent: Some("pending"),
                     note: "Vertex AI operation read (delete if you use the Gemini API)",
                 });
                 out.push(RouteKeyProposal {
                     key: "GET generativelanguage.googleapis.com/*/operations/*",
                     field: "done",
                     terminal: "[true]",
+                    absent: Some("pending"),
                     note: "Gemini API operation read (delete if you use Vertex AI)",
                 });
             }
@@ -852,24 +877,31 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                 key: "GET api.openai.com/v1/batches/*",
                 field: "status",
                 terminal: "[\"completed\", \"failed\", \"expired\", \"cancelled\"]",
+                // OpenAI's batch/video/job status bodies always carry
+                // `status`; an absent field here is genuinely unknown shape,
+                // so the schema default (fail_open) stays.
+                absent: None,
                 note: "OpenAI batch status",
             }),
             ("llm:openai", "videos.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/videos/*",
                 field: "status",
                 terminal: "[\"completed\", \"failed\"]",
+                absent: None,
                 note: "OpenAI video status",
             }),
             ("llm:openai", "fine_tuning.jobs.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/fine_tuning/jobs/*",
                 field: "status",
                 terminal: "[\"succeeded\", \"failed\", \"cancelled\"]",
+                absent: None,
                 note: "OpenAI fine-tuning job status",
             }),
             ("llm:anthropic", "batches.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.anthropic.com/v1/messages/batches/*",
                 field: "processing_status",
                 terminal: "[\"ended\"]",
+                absent: None,
                 note: "Anthropic message batch status",
             }),
             _ => {}
@@ -961,11 +993,42 @@ fn render_route_block(
             s.file, s.line, s.function
         )
     };
+    // A proposal carrying `absent` also carries its own upgrade caveat, on
+    // the line above the key it annotates. `absent` is CCR-11; a Keel that
+    // predates it rejects any unknown key under `until` with KEEL-E001, and
+    // under `.pth`/`--import` auto-activation that KEEL-E001 puts Keel fully
+    // OFF for that process. Applying an applyable patch must not be how an
+    // operator with a mixed fleet discovers that. A standalone `#` line is
+    // valid TOML and does not touch what the patch configures, so the
+    // applyable output stays applyable. Deliberately carries no version
+    // number: this binary is by construction new enough, `CARGO_PKG_VERSION`
+    // would be stale in every built-but-unreleased tree, and a wrong floor
+    // is worse than a named hazard with no floor.
+    let (caveat, until) = p.absent.map_or_else(
+        || {
+            (
+                String::new(),
+                format!("{{ field = \"{}\", terminal = {} }}", p.field, p.terminal),
+            )
+        },
+        |absent| {
+            (
+                "# `absent` is CCR-11: an older Keel rejects the key (KEEL-E001) and \
+                 runs unprotected — upgrade every process that reads this file first\n"
+                    .to_owned(),
+                format!(
+                    "{{ field = \"{}\", terminal = {}, absent = \"{}\" }}",
+                    p.field, p.terminal, absent
+                ),
+            )
+        },
+    );
     format!(
         "[target.\"{}\"]   # keel doctor: {} — {}\n\
+         {caveat}\
          timeout = \"30s\"\n\
-         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {{ field = \"{}\", terminal = {} }} }}\n",
-        p.key, p.note, provenance, interval, deadline, p.field, p.terminal
+         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {} }}\n",
+        p.key, p.note, provenance, interval, deadline, until
     )
 }
 
@@ -1616,9 +1679,14 @@ fn same_path(a: &str, b: &Path) -> bool {
 /// for the exact predicate. `"verified"` requires a row whose policy
 /// identity (path when a `keel.toml` is present, else defaults-rooted-here)
 /// matches; otherwise `"unverified"`, including when there are no rows at
-/// all.
-fn runtime_activation(project: &Path, policy_present: bool, rows: &[Activation]) -> &'static str {
-    let verified = rows.iter().any(|r| {
+/// all. Alongside the verdict, returns that row's `backend` (#129) — `None`
+/// when unverified, or when the matching row predates the `backend` column.
+fn runtime_activation(
+    project: &Path,
+    policy_present: bool,
+    rows: &[Activation],
+) -> (&'static str, Option<String>) {
+    let matches = |r: &&Activation| {
         if policy_present {
             r.policy_path
                 .as_deref()
@@ -1626,8 +1694,11 @@ fn runtime_activation(project: &Path, policy_present: bool, rows: &[Activation])
         } else {
             r.policy_source == "defaults" && same_path(&r.cwd, project)
         }
-    });
-    if verified { "verified" } else { "unverified" }
+    };
+    match rows.iter().find(matches) {
+        Some(r) => ("verified", r.backend.clone()),
+        None => ("unverified", None),
+    }
 }
 
 /// Assemble the report from the ten evidence inputs. Pure, so the golden test
@@ -1644,9 +1715,9 @@ fn runtime_activation(project: &Path, policy_present: bool, rows: &[Activation])
 #[allow(clippy::too_many_lines)]
 // straight-line report assembly, one section per
 // DoctorReport field; issue #41 added the cmd_match plumbing, not new complexity.
-#[allow(clippy::too_many_arguments)] // eleven already-resolved evidence inputs (see doc
+#[allow(clippy::too_many_arguments)] // twelve already-resolved evidence inputs (see doc
 // comment above); issue #85 added config_above_cwd_finding, WS3 added build_files,
-// #92 added runtime_activation, issue #90 added artifacts.
+// #92 added runtime_activation, issue #90 added artifacts, #129 added activation_backend.
 fn build_report(
     scan: &ScanResult,
     wrapped_targets: &BTreeSet<String>,
@@ -1659,6 +1730,7 @@ fn build_report(
     artifacts: &[String],
     stale_flows: &[crate::flows::StaleFlow],
     runtime_activation: &'static str,
+    activation_backend: Option<String>,
 ) -> DoctorReport {
     let PolicyValidation {
         check: policy,
@@ -1858,6 +1930,7 @@ fn build_report(
         ok,
         policy,
         runtime_activation,
+        activation_backend,
         topology,
     }
 }
@@ -2329,6 +2402,9 @@ fn human(r: &DoctorReport) -> String {
         out.push_str(&line);
     }
     let _ = writeln!(out, "  runtime activation: {}", r.runtime_activation);
+    if let Some(b) = &r.activation_backend {
+        let _ = writeln!(out, "  activation backend: {b}");
+    }
 
     out.push_str("\njournal\n");
     let journal_line = if r.journal.supported {
@@ -2508,6 +2584,7 @@ mod tests {
             policy_path: path,
             flows_configured: false,
             argv0: String::new(),
+            backend: Some("native".into()),
         };
         let here = project.to_string_lossy().into_owned();
         let mine = row(
@@ -2522,20 +2599,37 @@ mod tests {
         );
         assert_eq!(
             runtime_activation(project, true, std::slice::from_ref(&mine)),
-            "verified"
+            ("verified", Some("native".to_owned()))
         );
         assert_eq!(
             runtime_activation(project, true, std::slice::from_ref(&elsewhere)),
-            "unverified"
+            ("unverified", None)
         );
-        assert_eq!(runtime_activation(project, true, &[]), "unverified");
+        assert_eq!(runtime_activation(project, true, &[]), ("unverified", None));
         // A project with no keel.toml is verified by a defaults activation rooted here.
         std::fs::remove_file(project.join("keel.toml")).unwrap();
         assert_eq!(
             runtime_activation(project, false, &[row("defaults", None, here)]),
-            "verified"
+            ("verified", Some("native".to_owned()))
         );
-        assert_eq!(runtime_activation(project, false, &[mine]), "unverified");
+        assert_eq!(
+            runtime_activation(project, false, &[mine]),
+            ("unverified", None)
+        );
+        // A verified row written before #129 has no backend column value.
+        let no_backend = Activation {
+            backend: None,
+            ..row(
+                "keel.toml",
+                Some(project.join("keel.toml").to_string_lossy().into_owned()),
+                project.to_string_lossy().into_owned(),
+            )
+        };
+        std::fs::write(project.join("keel.toml"), "").unwrap();
+        assert_eq!(
+            runtime_activation(project, true, &[no_backend]),
+            ("verified", None)
+        );
     }
 
     #[test]
@@ -2571,6 +2665,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
 
         assert_eq!(r.coverage.wrapped, vec!["api.observed.com"]);
@@ -2668,6 +2763,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert_eq!(r.topology.wrappable, vec!["api.ok.com"]);
         assert_eq!(r.topology.unreachable.len(), 1);
@@ -2754,6 +2850,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
 
         assert_eq!(r.topology.external_processes.len(), 2);
@@ -2843,6 +2940,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             r.topology
@@ -2902,8 +3000,10 @@ mod tests {
         );
         assert!(
             fix.patch
-                .contains("until = { field = \"done\", terminal = [true] }"),
-            "{}",
+                .contains("until = { field = \"done\", terminal = [true], absent = \"pending\" }"),
+            "a running google.longrunning.Operation omits `done` entirely — \
+             the proposal must say absence means pending, not just terminal \
+             values, or the applied block never polls (#128): {}",
             fix.patch
         );
         assert!(
@@ -3217,6 +3317,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         let retry = r
             .findings
@@ -3330,6 +3431,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
 
         let got: Vec<(u32, &str, &str)> = r
@@ -3382,6 +3484,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         let hit: Vec<_> = r
             .follow_ups
@@ -3445,6 +3548,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(!r.follow_ups.iter().any(|f| f.code == "sdk-client-timeout"));
     }
@@ -3470,6 +3574,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(r.follow_ups.is_empty(), "{:?}", r.follow_ups);
     }
@@ -3560,6 +3665,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
 
         assert!(
@@ -3640,6 +3746,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             !r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -3713,6 +3820,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             r.topology.wrappable.contains(&"127.0.0.1".to_owned()),
@@ -3820,6 +3928,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
 
         assert!(
@@ -3889,6 +3998,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         let mcp = r
             .adapters
@@ -3945,6 +4055,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         let row = r
             .adapters
@@ -3983,6 +4094,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         let finding = r
             .findings
@@ -4016,6 +4128,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             !r.findings
@@ -4039,6 +4152,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             !r.findings
@@ -4077,6 +4191,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(!r.ok);
         assert!(
@@ -4125,6 +4240,7 @@ mod tests {
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(!r.ok, "an unbootable configuration must not be ok");
         let finding = r
@@ -4645,6 +4761,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(r.boundaries.parsed_languages.contains(&"js-ts"));
         assert!(r.boundaries.unparsed.contains(&"ci-workflow"));
@@ -4703,6 +4820,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let text = human(&r);
         assert!(text.contains("\nboundaries\n"), "{text}");
@@ -4745,6 +4863,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let f = r
             .findings
@@ -4787,6 +4906,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let f = r
             .findings
@@ -4812,6 +4932,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(
             !r.findings
@@ -4841,6 +4962,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let up = r
             .follow_ups
@@ -4881,6 +5003,7 @@ def caller():
                 &[],
                 &[],
                 "unverified",
+                None,
             );
             let entry = r
                 .topology
@@ -4946,6 +5069,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let e = r
             .topology
@@ -4976,6 +5100,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
     }
@@ -4998,6 +5123,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(r.topology.wrappable.contains(&"example.com".to_owned()));
         assert!(r.topology.excluded.is_empty());
@@ -5039,6 +5165,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(r2.topology.wrappable.contains(&"api.vendor.com".to_owned()));
         assert!(r2.topology.excluded.is_empty(), "{:?}", r2.topology);
@@ -5061,6 +5188,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         assert!(!r.findings.iter().any(|f| f.topic == "visible-unwrapped"));
         assert_eq!(
@@ -5110,6 +5238,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let procs = &r.topology.external_processes;
         assert_eq!(procs.iter().filter(|p| p.in_tests).count(), 1);
@@ -5211,6 +5340,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let fu = r
             .follow_ups
@@ -5268,6 +5398,7 @@ def caller():
             &[],
             &[],
             "unverified",
+            None,
         );
         let fu = r
             .follow_ups

@@ -23,7 +23,7 @@ import {
 import { backendName, loadBackend } from "./backend.mjs";
 import { installFetch } from "./fetch.mjs";
 import { createDiscovery } from "./discovery.mjs";
-import { createCachePollDetector } from "./cachepoll.mjs";
+import { createCachePollDetector, cachePollSuspectWarning } from "./cachepoll.mjs";
 import { createSummary, formatSummary, formatSummaryJson, keelOnPath } from "./summary.mjs";
 import { emit, jsonLogs } from "./log.mjs";
 import { setRuntime } from "./runtime.mjs";
@@ -149,6 +149,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
       code: "policy-missing-at-keel-cwd",
       keel_cwd: String(cwd),
       message: text.slice("keel ▸ error: ".length).replace(/\n$/, ""),
+      severity: "ERROR",
       version: VERSION,
     });
     refused = { enabled: false, reason: "policy-missing-at-keel-cwd", root: cwd, cwdSource };
@@ -167,6 +168,14 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // Backend first: whether it's persistent (native + attached journal) decides
   // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
   const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
+  // Which backend actually resolved (the DEFAULT `KEEL_BACKEND=auto` can fall
+  // back to the JS engine silently) — carried in `meta` so both the banner
+  // and the activation row agree, and folded into the activation row below
+  // for free (#129: it used to be computed only for the banner, at the OLD
+  // call site further down, so `recordActivation`'s spread of `meta` never
+  // saw it). Mirrors the Python front end's `_STATE.meta["backend"] = bname`.
+  const bname = backendName(backend);
+  meta.backend = bname;
   // Layer the embedded pack defaults UNDER user config, then resolve the LLM
   // dev cache (mode:"dev" → concrete ttl off-prod, inert when KEEL_ENV=prod;
   // scope=persistent when the backend can persist). Mirrors the Python front end.
@@ -215,21 +224,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   const summary = consoleEnabled ? createSummary() : null;
   const cachepoll = createCachePollDetector({
     onSuspect: (target, hits, spanS) => {
-      emit(
-        env,
-        `keel ▸ warning: ${target} served ${hits} consecutive cache hits for one identical ` +
-          `call over ${spanS}s — if this is a status poll, set cache = ` +
-          `{ mode = "off" } on that target ` +
-          `— or give the status route its own poll policy (README: Poll)\n`,
-        {
-          keel: "warning",
-          code: "cache-poll-suspect",
-          target,
-          hits,
-          span_s: spanS,
-          version: VERSION,
-        }
-      );
+      emit(env, ...cachePollSuspectWarning(target, hits, spanS, VERSION));
     },
   });
   const discovery = createDiscovery(cwd, { knownTargets, summary, cachepoll });
@@ -299,7 +294,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
 
   installExitFlush(discovery, { backend: effectiveBackend, summary, meta, env });
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource, {
-    backendName: backendName(backend),
+    backendName: bname,
   });
   return {
     enabled: true,
@@ -509,6 +504,7 @@ function banner(
     policy_source: source,
     root: String(cwd),
     root_source: cwdSource,
+    severity: "INFO",
     version: VERSION,
     wrapped: seams.join(" + "),
   };

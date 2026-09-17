@@ -337,7 +337,17 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
     "fail_open". Parity with keel-core's ``poll_verdict``
     (conformance/README.md "Poll"). CCR-8: `until.field` is a dotted path
     walked through nested objects, and `until.terminal` matches by same-JSON-
-    type equality (not string coercion)."""
+    type equality (not string coercion). CCR-11: a PARSED JSON OBJECT that
+    does not carry the field is judged by `until.absent` — "fail_open" by
+    default, "pending" when the operator declared absence the pending signal
+    (a running google.longrunning.Operation omits `done` entirely).
+
+    `absent` governs absence, not unreadability. Every "fail_open" return
+    below the envelope branch happens BEFORE `until.absent` is consulted and
+    is unaffected by it: a non-dict payload, an envelope with no string
+    `body_b64`, a body that will not strictly base64-decode, a body that is
+    not JSON, and a body that is JSON but not an object all fail open even
+    under `absent = "pending"`."""
     if not isinstance(payload, dict):
         return "fail_open"
     doc = payload
@@ -357,7 +367,7 @@ def _poll_verdict(poll: dict[str, Any], payload: Any) -> str:
         doc = parsed
     found, value = _lookup_field(doc, poll["until"]["field"])
     if not found:
-        return "fail_open"
+        return "pending" if poll["until"].get("absent") == "pending" else "fail_open"
     return "terminal" if _terminal_match(value, poll["until"]["terminal"]) else "pending"
 
 
@@ -817,7 +827,7 @@ class KeelCoreStub:
             until = poll.get("until")
             if not isinstance(until, dict):
                 raise cls._invalid(path, "poll.until must be a table")
-            cls._reject_unknown(f"{path}.poll.until", until, ("field", "terminal"))
+            cls._reject_unknown(f"{path}.poll.until", until, ("field", "terminal", "absent"))
             field = until.get("field")
             if not isinstance(field, str) or not field:
                 raise cls._invalid(path, "poll.until.field must be a non-empty string")
@@ -830,6 +840,11 @@ class KeelCoreStub:
                 raise cls._invalid(
                     path, "poll.until.terminal must be a non-empty array of strings, booleans, or numbers"
                 )
+            # CCR-11: optional, defaults to "fail_open" (the pre-CCR-11 rule).
+            # Presence is tested with `in`, not `.get()`: an explicit null is a
+            # value the enum does not admit, and the Rust core rejects it.
+            if "absent" in until and until["absent"] not in ("fail_open", "pending"):
+                raise cls._invalid(path, 'poll.until.absent must be "fail_open" or "pending"')
 
     # -- resolution --------------------------------------------------------
 

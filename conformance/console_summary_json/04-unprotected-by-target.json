@@ -16,5 +16,5 @@
     "policy_source": "keel.toml",
     "version": "0.5.5"
   },
-  "expected": "{\"breaker_trips\":0,\"cache_hits\":0,\"cache_poll_suspects\":0,\"calls\":185,\"keel\":\"summary\",\"keel_cwd\":null,\"not_retried\":1,\"policy_path\":\"/code/keel.toml\",\"policy_source\":\"keel.toml\",\"retries_succeeded\":0,\"throttled\":0,\"unprotected\":78,\"unprotected_by_target\":{\"api.github.com\":2,\"metadata.google.internal\":22,\"oauth2.googleapis.com\":9,\"pypi.org\":4,\"storage.googleapis.com\":41},\"version\":\"0.5.5\"}\n"
+  "expected": "{\"breaker_trips\":0,\"cache_hits\":0,\"cache_poll_suspects\":0,\"calls\":185,\"keel\":\"summary\",\"keel_cwd\":null,\"not_retried\":1,\"policy_path\":\"/code/keel.toml\",\"policy_source\":\"keel.toml\",\"retries_succeeded\":0,\"severity\":\"INFO\",\"throttled\":0,\"unprotected\":78,\"unprotected_by_target\":{\"api.github.com\":2,\"metadata.google.internal\":22,\"oauth2.googleapis.com\":9,\"pypi.org\":4,\"storage.googleapis.com\":41},\"version\":\"0.5.5\"}\n"
 }

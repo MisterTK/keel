@@ -314,20 +314,22 @@ class ActivationsTest(unittest.TestCase):
     def _row(self, **over):
         base = {"ts_ms": 1_000, "pid": 42, "language": "python", "version": "0.5.6", "cwd": "/code",
                 "keel_cwd": "/code", "policy_source": "keel.toml", "policy_path": "/code/keel.toml",
-                "flows_configured": True, "argv0": "app.py"}
+                "flows_configured": True, "argv0": "app.py", "backend": "native"}
         base.update(over)
         return base
 
-    def test_schema_version_is_three_and_table_exists_on_fresh_file(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 3)
+    def test_schema_version_is_four_and_table_has_a_backend_column_on_fresh_file(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 4)
         with TemporaryDirectory() as d:
             disc = Discovery(d)
             disc.record_activation(self._row())
             disc.close()
             conn = sqlite3.connect(Path(d, ".keel", "discovery.db"))
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
-            rows = conn.execute("SELECT language, policy_path, flows_configured FROM activations").fetchall()
-            self.assertEqual(rows, [("python", "/code/keel.toml", 1)])
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            rows = conn.execute(
+                "SELECT language, policy_path, flows_configured, backend FROM activations"
+            ).fetchall()
+            self.assertEqual(rows, [("python", "/code/keel.toml", 1, "native")])
 
     def test_activation_is_written_once_on_first_record_or_close(self) -> None:
         with TemporaryDirectory() as d:
@@ -347,11 +349,48 @@ class ActivationsTest(unittest.TestCase):
             conn.executescript(_DISCOVERY_SCHEMA + _DAILY_SCHEMA + "PRAGMA user_version = 2;")
             conn.commit(); conn.close()
             disc = Discovery(d)
-            disc.record_activation(self._row(policy_source="defaults", policy_path=None))
+            disc.record_activation(self._row(policy_source="defaults", policy_path=None, backend="stub"))
             disc.close()
             conn = sqlite3.connect(path)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
-            self.assertEqual(conn.execute("SELECT policy_source FROM activations").fetchone(), ("defaults",))
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(
+                conn.execute("SELECT policy_source, backend FROM activations").fetchone(),
+                ("defaults", "stub"),
+            )
+
+    def test_v3_file_migrates_to_v4_and_gains_the_backend_column(self) -> None:
+        """#129: a v3 file (real `activations` table, no `backend` column yet —
+        the exact shape v0.5.6..v0.6.5 shipped) is migrated to v4 in place on
+        the first open, and a fresh row records a real `backend` value that
+        survives the round trip. The pre-existing row is never backfilled."""
+        legacy_activations_schema = """\
+CREATE TABLE activations (
+    ts_ms INTEGER NOT NULL, pid INTEGER NOT NULL, language TEXT NOT NULL,
+    version TEXT NOT NULL, cwd TEXT NOT NULL, keel_cwd TEXT,
+    policy_source TEXT NOT NULL, policy_path TEXT,
+    flows_configured INTEGER NOT NULL DEFAULT 0, argv0 TEXT NOT NULL DEFAULT ''
+);"""
+        with TemporaryDirectory() as d:
+            path = Path(d, ".keel", "discovery.db")
+            path.parent.mkdir()
+            conn = sqlite3.connect(path)
+            conn.executescript(_DISCOVERY_SCHEMA + _DAILY_SCHEMA + legacy_activations_schema)
+            conn.execute(
+                "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, "
+                "policy_source, policy_path, flows_configured, argv0) VALUES "
+                "(1, 1, 'python', '0.6.5', '/code', '/code', 'keel.toml', '/code/keel.toml', 1, 'app.py')"
+            )
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit(); conn.close()
+
+            disc = Discovery(d)
+            disc.record_activation(self._row(ts_ms=2, backend="native"))
+            disc.close()
+
+            conn = sqlite3.connect(path)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            rows = conn.execute("SELECT ts_ms, backend FROM activations ORDER BY ts_ms").fetchall()
+            self.assertEqual(rows, [(1, None), (2, "native")])
 
     def test_retention_keeps_the_newest_fifty(self) -> None:
         with TemporaryDirectory() as d:

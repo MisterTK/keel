@@ -11,6 +11,13 @@
 //! JSON values so an unknown future event degrades to a generic line instead
 //! of a parse failure.
 //!
+//! `KEEL_EVENTS=stderr` redirects the sink away from that on-disk feed
+//! entirely (#94, partial) — there is nothing here for this command to read,
+//! so [`run`] detects that destination up front and says so rather than
+//! falling through to the generic "nothing to tail" guidance below, which
+//! would otherwise tell someone who deliberately opted into stderr evidence
+//! that there is none.
+//!
 //! # Modes
 //!
 //! - default: follow the newest run file, polling for appended lines and for
@@ -36,6 +43,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use keel_core::events::{EventDestination, EventsEnv, resolve_events_dir};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -187,6 +195,16 @@ pub fn run(
     out: &mut dyn Write,
     ticker: &mut dyn Ticker,
 ) -> Result<(), Rendered> {
+    // KEEL_EVENTS=stderr means there is no on-disk feed at all — say so
+    // instead of reporting the generic "nothing here" guidance below, which
+    // would tell someone who deliberately opted into stderr evidence that
+    // there is none.
+    if matches!(
+        resolve_events_dir(&EventsEnv::capture()),
+        EventDestination::Stderr
+    ) {
+        return Err(events_on_stderr());
+    }
     let keel = project.join(".keel");
     if !keel.is_dir() {
         return Err(guidance(
@@ -532,6 +550,21 @@ fn guidance(what: &str, why: &str, next: &str) -> Rendered {
         exit: EXIT_FAILURE,
         to_stderr: true,
     }
+}
+
+/// `KEEL_EVENTS=stderr` is set: the sink writes straight to the process's
+/// stderr, so there is no on-disk feed for `keel tail` to read at all.
+fn events_on_stderr() -> Rendered {
+    guidance(
+        "events are going to stderr \u{2014} nothing here to tail.",
+        "KEEL_EVENTS=stderr sends the live event feed straight to the \
+         program's stderr instead of .keel/events/<run>.ndjson; \
+         `keel tail` only reads that on-disk feed (dx invariant 3: no \
+         daemon, no IPC).",
+        "read the program's own stderr for live events, or unset \
+         KEEL_EVENTS (or set it to anything other than `stderr`) to get \
+         a file-backed feed `keel tail` can follow.",
+    )
 }
 
 /// `--no-follow` with nothing recorded yet.

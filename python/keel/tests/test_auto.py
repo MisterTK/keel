@@ -325,6 +325,45 @@ class StrictKeelCwdTest(unittest.TestCase):
         row = conn.execute("SELECT language, policy_source, policy_path, keel_cwd, cwd FROM activations").fetchone()
         self.assertEqual(row, ("python", "keel.toml", str(self.root / "keel.toml"), str(self.root), str(self.root)))
 
+    def test_activation_row_carries_the_resolved_backend(self) -> None:
+        """#129: `bootstrap.py` always folded `backend` into the row handed to
+        `record_activation` (`_STATE.meta["backend"]`), but `_write_activation`'s
+        fixed column tuple silently dropped it — so `keel doctor --json` (which
+        reads this row) had no way to say which backend actually ran. Proven
+        through the real end-to-end activation path, not just the discovery
+        module in isolation."""
+        (self.root / "keel.toml").write_text("")
+        proc = _run(
+            "import keel._auto",
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub"),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        import sqlite3 as _sq
+        conn = _sq.connect(self.root / ".keel" / "discovery.db")
+        self.assertEqual(conn.execute("SELECT backend FROM activations").fetchone(), ("stub",))
+        conn.close()
+
+        # `KEEL_BACKEND=native` is a hard failure without the module, so this
+        # half only runs where the native core is actually built — and the
+        # `importlib` probe, not the child's exit code, decides (same
+        # convention as `AutoActivationJsonLogTest`'s native half).
+        if importlib.util.find_spec("keel_core") is not None:
+            root2 = self.root / "native"
+            root2.mkdir()
+            (root2 / "keel.toml").write_text("")
+            native_proc = _run(
+                "import keel._auto",
+                env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(root2), KEEL_BACKEND="native"),
+                cwd=str(root2),
+            )
+            self.assertEqual(native_proc.returncode, 0, native_proc.stderr)
+            native_conn = _sq.connect(root2 / ".keel" / "discovery.db")
+            self.assertEqual(
+                native_conn.execute("SELECT backend FROM activations").fetchone(), ("native",)
+            )
+            native_conn.close()
+
     def test_refused_activation_writes_no_row(self) -> None:
         proc = _run("import keel._auto", env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
         self.assertFalse((self.root / ".keel").exists())
@@ -468,6 +507,11 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(activation["keel"], "activation", defaults.stderr)
         self.assertEqual(activation["policy_source"], "defaults")
         self.assertEqual(activation["note"], f"no keel.toml in {sub}; `keel init` to customize")
+        # #130: Cloud Run fills an entry's severity only from a `severity`
+        # field in the payload — a healthy activation must read INFO, not
+        # DEFAULT, or it is indistinguishable from the refusal line below in
+        # any severity>=ERROR view.
+        self.assertEqual(activation["severity"], "INFO", defaults.stderr)
 
         (self.root / "keel.toml").write_text("")
         proc = _run(
@@ -484,6 +528,9 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(objs[0]["root_source"], "KEEL_CWD")
         self.assertNotIn("note", objs[0], "a loaded policy has no em-dash tail — no note key")
         self.assertEqual(objs[1]["keel_cwd"], str(self.root))
+        # #130: both the activation and the summary line are INFO.
+        self.assertEqual(objs[0]["severity"], "INFO", proc.stderr)
+        self.assertEqual(objs[1]["severity"], "INFO", proc.stderr)
 
     def test_backend_is_named_end_to_end_under_the_stub(self) -> None:
         # #119 transparency: KEEL_BACKEND=auto (the default) falls back to the
@@ -594,6 +641,64 @@ class StrictKeelCwdTest(unittest.TestCase):
         self.assertEqual(objs[0]["keel"], "error")
         self.assertEqual(objs[0]["code"], "policy-missing-at-keel-cwd")
         self.assertEqual(objs[0]["keel_cwd"], str(self.root))
+        # #130: the refusal is the one line that MUST read ERROR — it is the
+        # line saying Keel did not activate, and it must not be
+        # indistinguishable from a healthy activation in a severity>=ERROR view.
+        self.assertEqual(objs[0]["severity"], "ERROR", proc.stderr)
+
+    def test_json_log_format_activation_failure_is_an_error_object(self) -> None:
+        """#130's second refusal: ANY bootstrap exception also puts Keel fully
+        off while the host keeps serving, so it must be structured and ERROR
+        too — it was prose at the platform's default severity, which is
+        exactly the invisibility #130 was filed about.
+
+        The failure used here is the forward-compatibility shape CCR-11 makes
+        likely: a `keel.toml` carrying a `poll.until` key this Keel does not
+        know is KEEL-E001 at configure, and under `.pth` auto-activation that
+        lands the whole process unprotected. (An older Keel reads
+        `absent = "pending"` exactly this way; a placeholder key reproduces it
+        against the current one.)
+        """
+        import json as _json
+
+        (self.root / "keel.toml").write_text(
+            '[target."api.example.com"]\n'
+            'poll = { interval = "10s", deadline = "90s", '
+            'until = { field = "done", terminal = [true], futurekey = "pending" } }\n'
+        )
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_LOG_FORMAT="json"),
+            cwd=str(self.root),
+        )
+        objs = [_json.loads(l) for l in proc.stderr.decode().splitlines() if l.strip()]
+        self.assertEqual(len(objs), 1, proc.stderr)
+        self.assertEqual(objs[0]["keel"], "error")
+        self.assertEqual(objs[0]["code"], "activation-failed")
+        self.assertEqual(objs[0]["keel_cwd"], str(self.root))
+        self.assertEqual(objs[0]["severity"], "ERROR", proc.stderr)
+        self.assertIn("KEEL-E001", objs[0]["message"], objs[0])
+        # No prose escaped alongside the object: KEEL_LOG_FORMAT=json REPLACES
+        # the text line, it does not accompany it.
+        self.assertNotIn("keel ▸", proc.stderr.decode(), proc.stderr)
+        # ...and the host survived, which is the whole point of the fail-open
+        # contract this line reports on.
+        self.assertIn(b"INSTALLED False", proc.stdout, proc.stdout)
+
+    def test_activation_failure_text_form_is_unchanged(self) -> None:
+        """The default (text) form of the same failure must be byte-identical
+        to what it has always been — `keel run` piping and three existing test
+        modules assert on this exact prose."""
+        (self.root / "keel.toml").write_text("not [valid toml\n")
+        proc = _run(
+            _PROBE_INSTALLED,
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)),
+            cwd=str(self.root),
+        )
+        lines = self._keel_lines(proc)
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertTrue(lines[0].startswith("keel ▸ auto-activation failed ("), lines[0])
+        self.assertTrue(lines[0].endswith("); continuing without keel"), lines[0])
 
 
 if __name__ == "__main__":

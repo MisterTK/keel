@@ -1,4 +1,5 @@
 {
+  "activation_backend": null,
   "adapters": [
     {
       "detected": false,
@@ -187,6 +188,7 @@
                 "deadline": "30m",
                 "interval": "10s",
                 "until": {
+                  "absent": "pending",
                   "field": "done",
                   "terminal": [
                     true
@@ -204,6 +206,7 @@
                 "deadline": "30m",
                 "interval": "10s",
                 "until": {
+                  "absent": "pending",
                   "field": "done",
                   "terminal": [
                     true
@@ -216,7 +219,7 @@
             "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\""
           }
         ],
-        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,10 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval is the slowest of them, deadline is Keel's default (a loop on this route declares none)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval is the slowest of them, deadline is Keel's default (a loop on this route declares none)\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n"
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -1,2 +1,12 @@\n [target.\"llm:google-genai\"]\n timeout = \"1800s\"\n+\n+[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]   # keel doctor: Vertex AI operation read (delete if you use the Gemini API) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval is the slowest of them, deadline is Keel's default (a loop on this route declares none)\n+# `absent` is CCR-11: an older Keel rejects the key (KEEL-E001) and runs unprotected — upgrade every process that reads this file first\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true], absent = \"pending\" } }\n+\n+[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]   # keel doctor: Gemini API operation read (delete if you use Vertex AI) — replaces 3 hand-rolled polls on this route, the first in inline.py:6 (wait); interval is the slowest of them, deadline is Keel's default (a loop on this route declares none)\n+# `absent` is CCR-11: an older Keel rejects the key (KEEL-E001) and runs unprotected — upgrade every process that reads this file first\n+timeout = \"30s\"\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true], absent = \"pending\" } }\n"
       },
       "level": "warn",
       "topic": "hand-rolled-poll"

@@ -406,6 +406,13 @@ enum PollVerdict {
 /// Judge `payload` against the poll predicate. An adapter HTTP envelope
 /// (`body_b64`, or `status`+`headers`) is judged by its decoded JSON body;
 /// a plain object is judged directly; everything else fails open.
+///
+/// "Everything else" is judged BEFORE `until.absent` (CCR-11) is consulted,
+/// and is therefore unaffected by it: a non-object payload, an envelope with
+/// no string `body_b64`, a body that will not strictly base64-decode, a body
+/// that is not JSON, and a body that is JSON but not an object all return
+/// `FailOpen` even under `absent = "pending"`. `absent` answers "the document
+/// parsed and the field is not in it", not "the document could not be read".
 fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> PollVerdict {
     use base64::Engine as _;
     let Some(obj) = payload.as_object() else {
@@ -433,6 +440,14 @@ fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> Po
         obj
     };
     match poll.until.judge(doc) {
+        // CCR-11: a PARSED JSON OBJECT that does not carry the field means
+        // whatever `until.absent` says — fail-open unless the operator
+        // declared that absence IS the pending signal. A response Keel
+        // cannot parse into an object at all never reaches here; the
+        // fail-open returns above this match already took it.
+        None if poll.until.absent == keel_core_api::policy::PollAbsent::Pending => {
+            PollVerdict::Pending
+        }
         None => PollVerdict::FailOpen,
         Some(true) => PollVerdict::Terminal,
         Some(false) => PollVerdict::Pending,

@@ -138,6 +138,53 @@ class ValidatorTest(unittest.TestCase):
             self.assertEqual(cm.exception.code, "KEEL-E001")
             self.assertIn("poll.until.terminal must be a non-empty array of strings, booleans, or numbers", str(cm.exception))
 
+    def test_absent_accepts_only_the_two_words(self) -> None:
+        """CCR-11 (#128): optional, and only "fail_open" | "pending"."""
+        for good in ("fail_open", "pending"):
+            KeelCoreStub(paused=True).configure(
+                {"target": {"x": {"poll": _poll({"field": "f", "terminal": [True], "absent": good})}}}
+            )
+        for bad in ("maybe", "", True, None, 1):
+            with self.assertRaises(KeelError, msg=bad) as cm:
+                KeelCoreStub(paused=True).configure(
+                    {"target": {"x": {"poll": _poll({"field": "f", "terminal": [True], "absent": bad})}}}
+                )
+            self.assertEqual(cm.exception.code, "KEEL-E001")
+
+
+class AbsentTest(unittest.TestCase):
+    """CCR-11 (#128): a running google.longrunning.Operation body is
+    `{"name": ...}` — proto3 JSON omits a false bool, so `done` is ABSENT
+    while running. `absent = "pending"` makes that absence the pending
+    signal; the default stays fail-open."""
+
+    RUNNING = {"name": "projects/p/operations/op1"}
+    DONE = {"name": "projects/p/operations/op1", "done": True, "response": {"videos": 1}}
+
+    def test_absent_pending_keeps_polling_to_the_terminal_body(self) -> None:
+        core = KeelCoreStub(paused=True)
+        core.configure({"target": {"ops.internal": {"poll": _poll(
+            {"field": "done", "terminal": [True], "absent": "pending"})}}})
+        out = _run(core, "POST ops.internal/op:fetchPredictOperation", True,
+                   [self.RUNNING, self.RUNNING, self.DONE])
+        self.assertEqual(out["attempts"], 3)
+        self.assertEqual(out["payload"], self.DONE)
+
+    def test_default_still_fails_open_on_the_same_bodies(self) -> None:
+        core = KeelCoreStub(paused=True)
+        core.configure({"target": {"ops.internal": {"poll": _poll(
+            {"field": "done", "terminal": [True]})}}})
+        out = _run(core, "POST ops.internal/op:fetchPredictOperation", True, [self.RUNNING])
+        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(out["payload"], self.RUNNING)
+
+    def test_absent_pending_still_reaches_the_deadline(self) -> None:
+        core = KeelCoreStub(paused=True)
+        core.configure({"target": {"ops.internal": {"poll": {"interval": "10s", "deadline": "25s", "until": {
+            "field": "done", "terminal": [True], "absent": "pending"}}}}})
+        out = _run(core, "GET ops.internal/op", True, [self.RUNNING] * 3)
+        self.assertEqual(out["error"]["code"], "KEEL-E016")
+
 
 if __name__ == "__main__":
     unittest.main()
