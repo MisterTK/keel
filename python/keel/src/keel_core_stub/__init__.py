@@ -28,6 +28,7 @@ import base64
 import json
 import math
 import re
+import time
 from typing import Any, Callable
 
 ENVELOPE_VERSION = 1
@@ -530,7 +531,13 @@ def _resolve_outbound(
 
 
 class KeelCoreStub:
-    def __init__(self) -> None:
+    def __init__(self, paused: bool = False) -> None:
+        # `paused=True` is the conformance harness's virtual clock: waits advance
+        # a counter instead of sleeping, and `advance_clock` drives time. The
+        # DEFAULT is a real clock, because `_backend.resolve` selects this class
+        # in production whenever the native module is missing, and a backend that
+        # reinterprets every duration in the policy is not a backend (#119).
+        self._paused = paused
         self._policy: dict[str, Any] = {}
         self._now_ms = 0
         self._trace_seq = 0
@@ -538,6 +545,16 @@ class KeelCoreStub:
         self._token_buckets: dict[str, dict[str, int]] = {}
         self._cache: dict[str, tuple[int, Any]] = {}
         self._metrics: dict[str, dict[str, int]] = {}
+
+    def _wait(self, ms: int) -> None:
+        """Honor a scheduled wait: sleep it, or advance the virtual clock."""
+        if ms <= 0:
+            return
+        if self._paused:
+            self._now_ms += ms
+        else:
+            time.sleep(ms / 1000.0)
+            self._now_ms += ms
 
     # -- configure ---------------------------------------------------------
 
@@ -960,7 +977,7 @@ class KeelCoreStub:
             if wait > 0:
                 out["throttle_wait_ms"] = wait
                 out["throttled"] = True
-                self._now_ms += wait
+                self._wait(wait)
                 m["throttled"] += 1
 
         # breaker check (observes post-retry call outcomes)
@@ -1033,7 +1050,7 @@ class KeelCoreStub:
                 if res.get("retry_after_ms") is not None:
                     wait = max(wait, res["retry_after_ms"])
                 out["waits_ms"].append(wait)
-                self._now_ms += wait
+                self._wait(wait)
                 m["retries"] += 1
             raise AssertionError("loop always returns by the final attempt")
 
@@ -1061,7 +1078,7 @@ class KeelCoreStub:
                             ),
                         }
                         break
-                    self._now_ms += interval
+                    self._wait(interval)
                     continue
             break
 

@@ -34,7 +34,7 @@ def load_impl(name: str) -> tuple[Callable[[], Any], type[Exception]]:
         sys.path.insert(0, str(ROOT / "python" / "keel-core-stub"))
         from keel_core_stub import KeelCoreStub, KeelError
 
-        return KeelCoreStub, KeelError
+        return (lambda: KeelCoreStub(paused=True)), KeelError
     if name == "native":
         try:
             import keel_core
