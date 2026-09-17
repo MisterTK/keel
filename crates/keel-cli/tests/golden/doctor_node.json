@@ -1,4 +1,5 @@
 {
+  "activation_backend": null,
   "adapters": [
     {
       "detected": false,

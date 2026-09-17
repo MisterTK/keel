@@ -168,6 +168,14 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
   // Backend first: whether it's persistent (native + attached journal) decides
   // whether the LLM dev cache resolves to `scope="persistent"` (cross-run replay).
   const backend = await loadBackend({ preferred: env.KEEL_BACKEND, cwd, env });
+  // Which backend actually resolved (the DEFAULT `KEEL_BACKEND=auto` can fall
+  // back to the JS engine silently) — carried in `meta` so both the banner
+  // and the activation row agree, and folded into the activation row below
+  // for free (#129: it used to be computed only for the banner, at the OLD
+  // call site further down, so `recordActivation`'s spread of `meta` never
+  // saw it). Mirrors the Python front end's `_STATE.meta["backend"] = bname`.
+  const bname = backendName(backend);
+  meta.backend = bname;
   // Layer the embedded pack defaults UNDER user config, then resolve the LLM
   // dev cache (mode:"dev" → concrete ttl off-prod, inert when KEEL_ENV=prod;
   // scope=persistent when the backend can persist). Mirrors the Python front end.
@@ -286,7 +294,7 @@ export async function installKeel({ cwd = process.cwd(), env = process.env, cwdS
 
   installExitFlush(discovery, { backend: effectiveBackend, summary, meta, env });
   banner(env, source, wrappable.length, packs, eveDetection, aiSdkDetection, cwd, cwdSource, {
-    backendName: backendName(backend),
+    backendName: bname,
   });
   return {
     enabled: true,

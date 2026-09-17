@@ -357,25 +357,25 @@ test("daily buckets older than retention are pruned when the day advances", () =
   });
 });
 
-test("schema is v3 with an activations table; recordActivation writes one row at flush", () => {
+test("schema is v4 with an activations.backend column; recordActivation writes one row at flush", () => {
   withDir((dir) => {
     const d = createDiscovery(dir, { now: () => 1_000 });
     d.recordActivation({ ts_ms: 1_000, pid: 42, language: "node", version: "0.5.6", cwd: dir, keel_cwd: null,
-      policy_source: "defaults", policy_path: null, flows_configured: false, argv0: "app.mjs" });
+      policy_source: "defaults", policy_path: null, flows_configured: false, argv0: "app.mjs", backend: "native" });
     assert.equal(d.flushSync(), true, "an activation alone is worth a flush");
     const db = new DatabaseSync(join(dir, ".keel", "discovery.db"));
-    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 3);
-    assert.equal(SCHEMA_VERSION, 3);
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 4);
+    assert.equal(SCHEMA_VERSION, 4);
     // node:sqlite rows are null-prototype objects (`Object.create(null)`) —
     // spread into plain objects so deepEqual compares values, not prototypes
     // (same convention as this file's existing CANONICAL_COLUMNS mapping).
-    const rows = db.prepare("SELECT language, policy_source, flows_configured FROM activations").all().map((r) => ({ ...r }));
-    assert.deepEqual(rows, [{ language: "node", policy_source: "defaults", flows_configured: 0 }]);
+    const rows = db.prepare("SELECT language, policy_source, flows_configured, backend FROM activations").all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [{ language: "node", policy_source: "defaults", flows_configured: 0, backend: "native" }]);
     assert.equal(d.flushSync(), false, "second flush has nothing new");
   });
 });
 
-test("a v2 file migrates to v3 in place and keeps its aggregates", () => {
+test("a v2 file migrates to v4 in place and keeps its aggregates", () => {
   withDir((dir) => {
     const path = join(dir, ".keel", "discovery.db");
     mkdirSync(join(dir, ".keel"), { recursive: true });
@@ -385,12 +385,51 @@ test("a v2 file migrates to v3 in place and keeps its aggregates", () => {
     const d = createDiscovery(dir, { now: () => 5 });
     d.observe("api.example.com", ok(1), 3);
     d.recordActivation({ ts_ms: 5, pid: 1, language: "node", version: "x", cwd: dir, keel_cwd: null,
-      policy_source: "keel.toml", policy_path: join(dir, "keel.toml"), flows_configured: true, argv0: "" });
+      policy_source: "keel.toml", policy_path: join(dir, "keel.toml"), flows_configured: true, argv0: "", backend: "stub" });
     d.flushSync();
     const db = new DatabaseSync(path);
-    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 3);
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 4);
     assert.equal(db.prepare("SELECT COUNT(*) AS n FROM activations").get().n, 1);
+    assert.equal(db.prepare("SELECT backend FROM activations").get().backend, "stub");
     assert.equal(db.prepare("SELECT calls FROM discovery WHERE target = 'api.example.com'").get().calls, 1);
+  });
+});
+
+// #129: a v3 file (real `activations` table, no `backend` column yet — the
+// exact shape v0.5.6..v0.6.5 shipped) migrates to v4 in place, gaining the
+// column, and a fresh row records a real backend value.
+test("a v3 file migrates to v4 in place and gains the backend column", () => {
+  withDir((dir) => {
+    const path = join(dir, ".keel", "discovery.db");
+    mkdirSync(join(dir, ".keel"), { recursive: true });
+    const seed = new DatabaseSync(path);
+    seed.exec(DISCOVERY_SCHEMA);
+    seed.exec(DAILY_SCHEMA);
+    seed.exec(`CREATE TABLE activations (
+      ts_ms INTEGER NOT NULL, pid INTEGER NOT NULL, language TEXT NOT NULL,
+      version TEXT NOT NULL, cwd TEXT NOT NULL, keel_cwd TEXT,
+      policy_source TEXT NOT NULL, policy_path TEXT,
+      flows_configured INTEGER NOT NULL DEFAULT 0, argv0 TEXT NOT NULL DEFAULT ''
+    );`);
+    seed.prepare(
+      "INSERT INTO activations (ts_ms, pid, language, version, cwd, keel_cwd, policy_source, " +
+      "policy_path, flows_configured, argv0) VALUES (1, 1, 'node', '0.6.5', ?, NULL, 'defaults', NULL, 0, '')"
+    ).run(dir);
+    seed.exec("PRAGMA user_version = 3");
+    seed.close();
+
+    const d = createDiscovery(dir, { now: () => 2 });
+    d.recordActivation({ ts_ms: 2, pid: 2, language: "node", version: "0.7.0", cwd: dir, keel_cwd: null,
+      policy_source: "defaults", policy_path: null, flows_configured: false, argv0: "app.mjs", backend: "native" });
+    d.flushSync();
+
+    const db = new DatabaseSync(path);
+    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 4);
+    const rows = db.prepare("SELECT ts_ms, backend FROM activations ORDER BY ts_ms").all().map((r) => ({ ...r }));
+    assert.deepEqual(rows, [
+      { ts_ms: 1, backend: null },
+      { ts_ms: 2, backend: "native" },
+    ]);
   });
 });
 

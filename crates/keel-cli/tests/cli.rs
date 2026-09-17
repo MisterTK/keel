@@ -165,6 +165,7 @@ fn build_discovery(project: &Path) {
             policy_path: Some("/code/keel.toml".to_owned()),
             flows_configured: true,
             argv0: "app.py".to_owned(),
+            backend: Some("native".to_owned()),
         })
         .unwrap();
 }
@@ -810,6 +811,45 @@ fn doctor_json_matches_golden_for_dockerfile_without_keel_toml() {
         json_string(&r.json)
     );
     check_golden("doctor_dockerfile_no_copy.json", &json_string(&r.json));
+}
+
+/// #129: a native activation's `backend` must reach `keel doctor --json` —
+/// `bootstrap.py`/`bootstrap.mjs` always folded `backend` into the row handed
+/// to `record_activation`, but `_write_activation`'s fixed column tuple
+/// silently dropped it, so doctor had no way to say which backend actually
+/// ran even though the row otherwise verified. Builds `.keel/discovery.db`
+/// directly through `keel-journal`'s own API (the same convention `Activation`
+/// fixtures elsewhere in this file use) with a row whose policy identity
+/// matches `project`, so `runtime_activation` is "verified" and
+/// `activation_backend` is exercised, not left null by an unverified row.
+#[test]
+fn doctor_reports_the_activation_backend_from_a_verified_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path();
+    std::fs::write(project.join("keel.toml"), "").unwrap();
+    let keel = project.join(".keel");
+    std::fs::create_dir_all(&keel).unwrap();
+    let store = DiscoveryStore::open(keel.join("discovery.db"), ManualClock::new(T0)).unwrap();
+    store
+        .record_activation(&Activation {
+            ts_ms: T0,
+            pid: 4242,
+            language: "python".to_owned(),
+            version: "0.7.0".to_owned(),
+            cwd: project.to_string_lossy().into_owned(),
+            keel_cwd: None,
+            policy_source: "keel.toml".to_owned(),
+            policy_path: Some(project.join("keel.toml").to_string_lossy().into_owned()),
+            flows_configured: false,
+            argv0: "app.py".to_owned(),
+            backend: Some("native".to_owned()),
+        })
+        .unwrap();
+    drop(store);
+
+    let r = doctor::run(project);
+    assert_eq!(r.json["runtime_activation"], "verified", "{}", r.json);
+    assert_eq!(r.json["activation_backend"], "native", "{}", r.json);
 }
 
 /// A project with `[flows]` configured, a default SQLite journal, and a root

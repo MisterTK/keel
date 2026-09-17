@@ -325,6 +325,45 @@ class StrictKeelCwdTest(unittest.TestCase):
         row = conn.execute("SELECT language, policy_source, policy_path, keel_cwd, cwd FROM activations").fetchone()
         self.assertEqual(row, ("python", "keel.toml", str(self.root / "keel.toml"), str(self.root), str(self.root)))
 
+    def test_activation_row_carries_the_resolved_backend(self) -> None:
+        """#129: `bootstrap.py` always folded `backend` into the row handed to
+        `record_activation` (`_STATE.meta["backend"]`), but `_write_activation`'s
+        fixed column tuple silently dropped it — so `keel doctor --json` (which
+        reads this row) had no way to say which backend actually ran. Proven
+        through the real end-to-end activation path, not just the discovery
+        module in isolation."""
+        (self.root / "keel.toml").write_text("")
+        proc = _run(
+            "import keel._auto",
+            env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root), KEEL_BACKEND="stub"),
+            cwd=str(self.root),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        import sqlite3 as _sq
+        conn = _sq.connect(self.root / ".keel" / "discovery.db")
+        self.assertEqual(conn.execute("SELECT backend FROM activations").fetchone(), ("stub",))
+        conn.close()
+
+        # `KEEL_BACKEND=native` is a hard failure without the module, so this
+        # half only runs where the native core is actually built — and the
+        # `importlib` probe, not the child's exit code, decides (same
+        # convention as `AutoActivationJsonLogTest`'s native half).
+        if importlib.util.find_spec("keel_core") is not None:
+            root2 = self.root / "native"
+            root2.mkdir()
+            (root2 / "keel.toml").write_text("")
+            native_proc = _run(
+                "import keel._auto",
+                env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(root2), KEEL_BACKEND="native"),
+                cwd=str(root2),
+            )
+            self.assertEqual(native_proc.returncode, 0, native_proc.stderr)
+            native_conn = _sq.connect(root2 / ".keel" / "discovery.db")
+            self.assertEqual(
+                native_conn.execute("SELECT backend FROM activations").fetchone(), ("native",)
+            )
+            native_conn.close()
+
     def test_refused_activation_writes_no_row(self) -> None:
         proc = _run("import keel._auto", env=child_env(KEEL_ENABLE="1", KEEL_CWD=str(self.root)), cwd=str(self.root))
         self.assertFalse((self.root / ".keel").exists())
