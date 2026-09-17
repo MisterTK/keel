@@ -993,17 +993,39 @@ fn render_route_block(
             s.file, s.line, s.function
         )
     };
-    let until = p.absent.map_or_else(
-        || format!("{{ field = \"{}\", terminal = {} }}", p.field, p.terminal),
+    // A proposal carrying `absent` also carries its own upgrade caveat, on
+    // the line above the key it annotates. `absent` is CCR-11; a Keel that
+    // predates it rejects any unknown key under `until` with KEEL-E001, and
+    // under `.pth`/`--import` auto-activation that KEEL-E001 puts Keel fully
+    // OFF for that process. Applying an applyable patch must not be how an
+    // operator with a mixed fleet discovers that. A standalone `#` line is
+    // valid TOML and does not touch what the patch configures, so the
+    // applyable output stays applyable. Deliberately carries no version
+    // number: this binary is by construction new enough, `CARGO_PKG_VERSION`
+    // would be stale in every built-but-unreleased tree, and a wrong floor
+    // is worse than a named hazard with no floor.
+    let (caveat, until) = p.absent.map_or_else(
+        || {
+            (
+                String::new(),
+                format!("{{ field = \"{}\", terminal = {} }}", p.field, p.terminal),
+            )
+        },
         |absent| {
-            format!(
-                "{{ field = \"{}\", terminal = {}, absent = \"{}\" }}",
-                p.field, p.terminal, absent
+            (
+                "# `absent` is CCR-11: an older Keel rejects the key (KEEL-E001) and \
+                 runs unprotected — upgrade every process that reads this file first\n"
+                    .to_owned(),
+                format!(
+                    "{{ field = \"{}\", terminal = {}, absent = \"{}\" }}",
+                    p.field, p.terminal, absent
+                ),
             )
         },
     );
     format!(
         "[target.\"{}\"]   # keel doctor: {} — {}\n\
+         {caveat}\
          timeout = \"30s\"\n\
          poll    = {{ interval = \"{}\", deadline = \"{}\", until = {} }}\n",
         p.key, p.note, provenance, interval, deadline, until
