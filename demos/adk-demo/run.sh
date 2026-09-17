@@ -34,7 +34,7 @@ cp "$SCRIPT_DIR/keel.toml" "$WORK/keel.toml"
 cd "$WORK"
 
 echo "== agent turn: a real ADK LlmAgent rides out a 429 storm below its own loop =="
-KEEL_DEMO_URL="$URL" KEEL_QUIET=1 "$PY" -m keel run "$SCRIPT_DIR/agent.py"
+KEEL_DEMO_URL="$URL" "$PY" -m keel run "$SCRIPT_DIR/agent.py"
 
 CALLS="$(count)"
 echo "   upstream calls: ${CALLS} (2x429 + 1x200 — all absorbed inside ONE agent turn)"

@@ -34,9 +34,9 @@ cp "$SCRIPT_DIR/keel.toml" "$WORK/keel.toml"
 cd "$WORK"
 
 echo "== run 1 (KEEL_ENV=dev): rides the 429 storm, then caches the completion =="
-KEEL_DEMO_URL="$URL" KEEL_ENV="" KEEL_QUIET=1 "$PY" -m keel run "$SCRIPT_DIR/agent.py"
+KEEL_DEMO_URL="$URL" KEEL_ENV="" "$PY" -m keel run "$SCRIPT_DIR/agent.py"
 echo "   upstream calls so far: $(count)"
 
 echo "== run 2 (same prompt): served from the dev cache =="
-KEEL_DEMO_URL="$URL" KEEL_ENV="" KEEL_QUIET=1 "$PY" -m keel run "$SCRIPT_DIR/agent.py"
+KEEL_DEMO_URL="$URL" KEEL_ENV="" "$PY" -m keel run "$SCRIPT_DIR/agent.py"
 echo "   upstream calls total: $(count)   (unchanged ⇒ run 2 was free)"

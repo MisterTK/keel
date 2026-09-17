@@ -28,5 +28,5 @@ if KEEL_DEMO_URL="$URL" node "$SCRIPT_DIR/app.mjs"; then
 curl -s -X POST "http://127.0.0.1:${PORT}/__faultproxy__/reset" >/dev/null
 
 echo "== 2) keel run app.mjs (expect SURVIVES: 500 retried → 200) =="
-KEEL_DEMO_URL="$URL" KEEL_QUIET=1 node "$NODE_RUN" "$SCRIPT_DIR/app.mjs"
+KEEL_DEMO_URL="$URL" node "$NODE_RUN" "$SCRIPT_DIR/app.mjs"
 echo "   ✓ same code, now resilient"

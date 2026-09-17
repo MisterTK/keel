@@ -30,5 +30,5 @@ if KEEL_DEMO_URL="$URL" "$PY" "$SCRIPT_DIR/app.py"; then
 curl -s -X POST "http://127.0.0.1:${PORT}/__faultproxy__/reset" >/dev/null
 
 echo "== 2) keel run app.py (expect SURVIVES: 503 retried → 200) =="
-KEEL_DEMO_URL="$URL" KEEL_QUIET=1 "$PY" -m keel run "$SCRIPT_DIR/app.py"
+KEEL_DEMO_URL="$URL" "$PY" -m keel run "$SCRIPT_DIR/app.py"
 echo "   ✓ same code, now resilient"
