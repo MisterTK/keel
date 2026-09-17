@@ -834,6 +834,16 @@ struct RouteKeyProposal {
     key: &'static str,
     field: &'static str,
     terminal: &'static str,
+    /// `Some("pending")` when this route's terminal field is OMITTED (not
+    /// `false`) while the job is still running — i.e. `until.absent =
+    /// "pending"` (CCR-11) belongs in the emitted block. `None` keeps the
+    /// schema default (`fail_open`) for routes where absence is not known to
+    /// mean pending; this is a per-proposal field rather than a hardcoded
+    /// addition to [`render_route_block`]'s format string specifically so a
+    /// future non-Google proposal doesn't silently inherit "absence means
+    /// pending" — that inference must be made per API family, not per
+    /// template.
+    absent: Option<&'static str>,
     note: &'static str,
 }
 
@@ -848,12 +858,18 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                     key: "POST *-aiplatform.googleapis.com/*:fetchPredictOperation",
                     field: "done",
                     terminal: "[true]",
+                    // A running google.longrunning.Operation omits `done`
+                    // entirely (proto3 JSON drops a false bool) — absence IS
+                    // the pending signal here, not an unknown shape (#128,
+                    // CCR-11).
+                    absent: Some("pending"),
                     note: "Vertex AI operation read (delete if you use the Gemini API)",
                 });
                 out.push(RouteKeyProposal {
                     key: "GET generativelanguage.googleapis.com/*/operations/*",
                     field: "done",
                     terminal: "[true]",
+                    absent: Some("pending"),
                     note: "Gemini API operation read (delete if you use Vertex AI)",
                 });
             }
@@ -861,24 +877,31 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                 key: "GET api.openai.com/v1/batches/*",
                 field: "status",
                 terminal: "[\"completed\", \"failed\", \"expired\", \"cancelled\"]",
+                // OpenAI's batch/video/job status bodies always carry
+                // `status`; an absent field here is genuinely unknown shape,
+                // so the schema default (fail_open) stays.
+                absent: None,
                 note: "OpenAI batch status",
             }),
             ("llm:openai", "videos.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/videos/*",
                 field: "status",
                 terminal: "[\"completed\", \"failed\"]",
+                absent: None,
                 note: "OpenAI video status",
             }),
             ("llm:openai", "fine_tuning.jobs.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/fine_tuning/jobs/*",
                 field: "status",
                 terminal: "[\"succeeded\", \"failed\", \"cancelled\"]",
+                absent: None,
                 note: "OpenAI fine-tuning job status",
             }),
             ("llm:anthropic", "batches.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.anthropic.com/v1/messages/batches/*",
                 field: "processing_status",
                 terminal: "[\"ended\"]",
+                absent: None,
                 note: "Anthropic message batch status",
             }),
             _ => {}
@@ -970,11 +993,20 @@ fn render_route_block(
             s.file, s.line, s.function
         )
     };
+    let until = p.absent.map_or_else(
+        || format!("{{ field = \"{}\", terminal = {} }}", p.field, p.terminal),
+        |absent| {
+            format!(
+                "{{ field = \"{}\", terminal = {}, absent = \"{}\" }}",
+                p.field, p.terminal, absent
+            )
+        },
+    );
     format!(
         "[target.\"{}\"]   # keel doctor: {} — {}\n\
          timeout = \"30s\"\n\
-         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {{ field = \"{}\", terminal = {} }} }}\n",
-        p.key, p.note, provenance, interval, deadline, p.field, p.terminal
+         poll    = {{ interval = \"{}\", deadline = \"{}\", until = {} }}\n",
+        p.key, p.note, provenance, interval, deadline, until
     )
 }
 
@@ -2945,9 +2977,12 @@ mod tests {
             fix.patch
         );
         assert!(
-            fix.patch
-                .contains("until = { field = \"done\", terminal = [true] }"),
-            "{}",
+            fix.patch.contains(
+                "until = { field = \"done\", terminal = [true], absent = \"pending\" }"
+            ),
+            "a running google.longrunning.Operation omits `done` entirely — \
+             the proposal must say absence means pending, not just terminal \
+             values, or the applied block never polls (#128): {}",
             fix.patch
         );
         assert!(
