@@ -376,9 +376,11 @@ fn poll_verdict(poll: &keel_core_api::policy::PollPolicy, payload: &Value) -> Po
         obj
     };
     match poll.until.judge(doc) {
-        // CCR-11: a response that does not carry the field at all means
+        // CCR-11: a PARSED JSON OBJECT that does not carry the field means
         // whatever `until.absent` says — fail-open unless the operator
-        // declared that absence IS the pending signal.
+        // declared that absence IS the pending signal. A response Keel
+        // cannot parse into an object at all never reaches here; the
+        // fail-open returns above this match already took it.
         None if poll.until.absent == keel_core_api::policy::PollAbsent::Pending => {
             PollVerdict::Pending
         }

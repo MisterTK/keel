@@ -311,7 +311,7 @@ Two tiers, one policy file:
   `absent` defaults to `"fail_open"`, so every policy written without it
   behaves exactly as before. It governs a *parsed JSON object* that lacks the
   field; a response Keel cannot parse into one at all (a 502 HTML page, a
-  bodyless envelope) still fails open regardless. And it is new in 0.6.6 —
+  bodyless envelope) still fails open regardless. And it is new in 0.7.0 —
   an older Keel rejects the unknown key with `KEEL-E001`, so upgrade every
   process that reads this `keel.toml` before adding it.
 - **Tier 2 — durable flows (opt-in).** Designate an entrypoint in `[flows]`

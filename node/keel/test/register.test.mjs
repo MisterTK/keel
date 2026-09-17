@@ -82,7 +82,7 @@ test("KEEL_LOG_FORMAT=json: an activation failure is an ERROR object, not prose"
   assert.equal(objs[0].keel, "error");
   assert.equal(objs[0].code, "activation-failed");
   assert.equal(objs[0].severity, "ERROR", proc.stderr);
-  assert.ok(objs[0].message.includes("KEEL-E001"), proc.stderr);
+  assert.ok(objs[0].message.includes("policy invalid"), proc.stderr);
   assert.ok(Object.hasOwn(objs[0], "keel_cwd"), proc.stderr);
   // json REPLACES the text line; it never accompanies it.
   assert.ok(!proc.stderr.includes("keel ▸"), proc.stderr);

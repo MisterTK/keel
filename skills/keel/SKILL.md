@@ -218,7 +218,7 @@ the six phases in order; the static scan is evidence, not the verdict.
    appears only on completion. Any Google LRO route therefore needs
    `absent = "pending"` inside `until`, or the block validates, shows up in
    `keel status`, and does nothing. **Check the fleet before you add it:**
-   `absent` is new in 0.6.6, and any older Keel reading that `keel.toml`
+   `absent` is new in 0.7.0, and any older Keel reading that `keel.toml`
    rejects the unknown key with `KEEL-E001` — which under `.pth`/`--import`
    auto-activation means that process runs with no Keel at all. `KEEL-E017` means a
    synchronous effect could not acquire its flow's step lock, whose likeliest
