@@ -58,6 +58,11 @@ jobs:
           node-version: "22"
       - name: Node front end + stub/native — zero-dep / dev-dependency license check
         run: node scripts/check-licenses.mjs
+      # Doc surfaces nothing else routes to: llms*.txt, both SKILL twins, and
+      # the agents-snippet template Keel writes into an adopter's AGENTS.md.
+      # Only the claims derivable from the repo are checked — see the script.
+      - name: Doc surfaces — countable claims match the code
+        run: python3 scripts/check-docs-facts.py
 
   # Real core + stub conformance + FFI + CLI + Tier 2 all ride `cargo test --all`.
   rust:
