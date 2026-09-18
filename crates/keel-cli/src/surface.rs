@@ -96,6 +96,58 @@ pub(crate) fn detect_surfaces(
     }
 }
 
+/// The hosts a project's own `keel.toml` names in its `[target."…"]` keys.
+///
+/// A key is a bare host, a host with a port, an `llm:`/`cmd:` scheme name, or
+/// a route key (`METHOD host/path-glob`). Only the host part is returned, and
+/// scheme names contribute nothing — they name no host. A leading `*` is kept
+/// deliberately: `classify_host` matches the regional Vertex suffix with
+/// `ends_with`, so `*-aiplatform.googleapis.com` must arrive intact.
+pub(crate) fn policy_hosts(policy_text: Option<&str>) -> Vec<String> {
+    let Some(text) = policy_text else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table_like) else {
+        return Vec::new();
+    };
+
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for (key, _) in targets.iter() {
+        // A route key is "METHOD host/path"; take the part after the space.
+        let after_method = key.rsplit(' ').next().unwrap_or(key);
+        // Drop any path glob.
+        let host_and_port = after_method.split('/').next().unwrap_or(after_method);
+        if host_and_port.contains(':') && !host_and_port.starts_with('*') {
+            // Either a scheme name (`llm:…`, `cmd:…`) or `host:port`. A scheme
+            // name has a non-numeric tail; a port does not.
+            let (left, right) = host_and_port
+                .rsplit_once(':')
+                .unwrap_or((host_and_port, ""));
+            if right.chars().all(|c| c.is_ascii_digit()) && !right.is_empty() {
+                out.insert(left.to_owned());
+            }
+            // Scheme names name no host — contribute nothing.
+            continue;
+        }
+        if !host_and_port.is_empty() {
+            out.insert(host_and_port.to_owned());
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The hosts the scanner sighted.
+///
+/// `scan.targets` is keyed by raw hosts (from URL literals) AND by
+/// `llm:<provider>` names (from SDK calls). Scheme names classify to `None`
+/// and drop out, so no filtering is needed here.
+pub(crate) fn scan_hosts(scan: &crate::scan::ScanResult) -> Vec<String> {
+    scan.targets.keys().cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +233,50 @@ mod tests {
         assert!(got.detected.is_empty());
         assert_eq!(got.source, "none");
         assert!(got.evidence.is_empty());
+    }
+
+    #[test]
+    fn policy_hosts_reads_plain_keys_and_route_keys_and_skips_scheme_names() {
+        let toml = r#"
+[target."llm:google-genai"]
+timeout = "1800s"
+
+[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]
+timeout = "30s"
+
+[target."generativelanguage.googleapis.com"]
+timeout = "30s"
+
+[target."cmd:render"]
+timeout = "30s"
+
+[target."api.openai.com:443"]
+timeout = "30s"
+"#;
+        let got = policy_hosts(Some(toml));
+        assert_eq!(
+            got,
+            s(&[
+                "*-aiplatform.googleapis.com",
+                "api.openai.com",
+                "generativelanguage.googleapis.com",
+            ])
+        );
+    }
+
+    #[test]
+    fn policy_hosts_is_empty_without_a_parseable_document() {
+        assert!(policy_hosts(None).is_empty());
+        assert!(policy_hosts(Some("not [valid toml")).is_empty());
+    }
+
+    #[test]
+    fn a_route_key_host_glob_still_classifies_as_vertex() {
+        // The leading `*` must survive extraction or `ends_with` fails.
+        assert_eq!(
+            classify_host("*-aiplatform.googleapis.com"),
+            Some(Surface::Vertex)
+        );
     }
 
     #[test]
