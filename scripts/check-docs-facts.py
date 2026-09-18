@@ -18,6 +18,8 @@ is exactly the set that actually drifted:
   - the error-code set in `llms-full.txt`, which claims to be exhaustive
   - `llms.txt`'s version stamp, swept by neither bump-version.sh nor
     check-versions.py
+  - `demos/README.md`'s demo count, and that its smoke-coverage list accounts
+    for every demo on disk and names test files that exist
 
 A fact only belongs here if a wrong value is checkable without judgment. Prose
 accuracy stays a human problem; these numbers no longer are.
@@ -114,6 +116,11 @@ def workspace_version() -> str:
     return m.group(1)
 
 
+def demo_dirs() -> list[str]:
+    """The demos on disk, by the README's own definition: a `./run.sh` each."""
+    return sorted(d.name for d in (ROOT / "demos").iterdir() if (d / "run.sh").is_file())
+
+
 def stated_counts(text: str, noun_pat: str) -> set[int]:
     """Every count stated immediately before `noun_pat`, digits or number-words."""
     found: set[int] = set()
@@ -204,6 +211,38 @@ def main() -> int:
                 f"{version} — bump-version.sh does not sweep this, so it must be edited by hand",
             )
 
+    # --- demos/README.md: the count, and the smoke-coverage list ----------
+    demos = demo_dirs()
+    demos_doc = (ROOT / "demos" / "README.md").read_text()
+    stated = stated_counts(demos_doc, r"runnable demos?\b")
+    if not stated:
+        fail(problems, "demos/README.md: no 'N runnable demos' claim found")
+    elif stated != {len(demos)}:
+        fail(
+            problems,
+            f"demos/README.md claims {sorted(stated)} runnable demo(s); demos/ holds "
+            f"{len(demos)} ({', '.join(demos)})",
+        )
+    # The smoke-coverage list is the README's promise that no demo is merely
+    # documented. A new demo that nobody wired to a test is the exact drift.
+    smoke = demos_doc.partition("## Smoke coverage")[2].partition("\n## ")[0]
+    if not smoke.strip():
+        fail(problems, "demos/README.md: no '## Smoke coverage' section")
+    else:
+        uncovered = [d for d in demos if f"`{d}`" not in smoke]
+        if uncovered:
+            fail(
+                problems,
+                f"demos/README.md's smoke-coverage list never names {', '.join(uncovered)} — "
+                "every demo on disk must be claimed by a test there",
+            )
+        # Whether each named test really drives its demo is not mechanically
+        # decidable (test_resume_demo.py covers `durable-pipeline` without ever
+        # spelling the directory name), but the paths themselves must exist.
+        for rel in sorted(set(re.findall(r"`((?:python|node)/[\w./-]+\.(?:py|mjs))`", smoke))):
+            if not (ROOT / rel).exists():
+                fail(problems, f"demos/README.md's smoke-coverage list names {rel}, which does not exist")
+
     if problems:
         for p in problems:
             print(f"check-docs-facts: {p}")
@@ -212,7 +251,8 @@ def main() -> int:
 
     print(
         f"check-docs-facts: OK — {total} scenarios ({tier1} Tier 1, {tier2} Tier 2), "
-        f"{kinds} JSON line kinds (py == node), {len(real)} error codes, stamp names {version}"
+        f"{kinds} JSON line kinds (py == node), {len(real)} error codes, stamp names {version}, "
+        f"{len(demos)} demos all smoke-covered"
     )
     return 0
 
