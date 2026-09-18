@@ -9,10 +9,6 @@
 //! Deliberately host-only: the richer signals (SDK construction kwargs, env
 //! var names) are out of scope — see the spec's D3.
 
-// Consumed starting in a later task of this program (route-key inference);
-// this task lays the classifier down on its own.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use keel_core_api::policy::VERTEX_REGIONAL_SUFFIX;
