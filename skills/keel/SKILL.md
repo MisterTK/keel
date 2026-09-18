@@ -247,7 +247,10 @@ the six phases in order; the static scan is evidence, not the verdict.
    doctor hedges with both Google blocks, each note saying which to delete.
    The key is also absent — harmlessly — from any project that has no
    `llm:google-genai` target at all, so never read the key's presence as
-   evidence that a project uses the SDK. Whichever it proposes, the Google blocks emit
+   evidence that a project uses the SDK. The human report's `policy` section
+   prints the same verdict, and prints `surface: could not determine` for the
+   unknown case rather than omitting the line, so the two absences are
+   distinguishable there without reading the JSON. Whichever it proposes, the Google blocks emit
    `absent = "pending"` — a running `google.longrunning.Operation` omits `done`
    entirely, because proto3 JSON drops a false bool, so the same block without
    it returns the running body on attempt one and never polls. If the project

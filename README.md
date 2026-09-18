@@ -359,9 +359,11 @@ the same provider point at it). Google serves generative AI over two
 surfaces sharing one SDK and therefore one target — Vertex AI and the Gemini
 Developer API — so doctor infers which one this project uses from the hosts
 named in its `keel.toml` and sighted by the scan, proposes only that route,
-and reports the verdict as `llm_surfaces` in `keel doctor --json`. It
-proposes both blocks, each noting which to delete, only when it detects
-neither surface; when it detects both, both blocks are the answer. Either
+and reports the verdict as `llm_surfaces` in `keel doctor --json` and on a
+`surface:` line in the human report. It proposes both blocks, each noting
+which to delete, only when it detects neither surface — and says
+`surface: could not determine` out loud rather than leaving the line off;
+when it detects both, both blocks are the answer. Either
 Google proposal carries `absent = "pending"`; the OpenAI and Anthropic ones
 do not, because those status bodies always carry their terminal field.
 
