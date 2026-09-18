@@ -821,6 +821,120 @@ fn doctor_amends_an_inert_route_key_and_the_patch_applies() {
     }
 }
 
+// ---- `keel init --diff` and the two Google surfaces ----
+
+/// The `keel init --diff --json` report a real child process produces in
+/// `cwd`, plus the raw stdout it came from (so a test can assert on the whole
+/// document, not just the fields it happens to parse). Child-process cwd, never
+/// `std::env::set_current_dir` (issue #72).
+fn init_diff_json_from(cwd: &Path) -> (serde_json::Value, String) {
+    let out = Command::new(keel_bin())
+        .current_dir(cwd)
+        .args(["init", "--diff", "--json"])
+        .output()
+        .expect("spawn keel init --diff --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(
+        out.status.success(),
+        "keel init --diff --json exited {:?}: {stdout}{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("unparseable init --diff --json ({e}): {stdout}"));
+    (report, stdout)
+}
+
+/// Write a one-file Google-genai project into `dir`: `policy` becomes its
+/// `keel.toml`, and `app/render.py` builds a client and carries `host` as a URL
+/// literal plus a hand-rolled poll loop over `client.operations.get`.
+fn write_google_genai_project(dir: &Path, policy: &str, client_args: &str, url: &str) {
+    std::fs::write(dir.join("keel.toml"), policy).unwrap();
+    std::fs::create_dir(dir.join("app")).unwrap();
+    std::fs::write(
+        dir.join("app/render.py"),
+        format!(
+            "import time\n\
+             from google import genai\n\
+             client = genai.Client({client_args})\n\
+             URL = '{url}'\n\
+             def poll(op):\n\
+             \x20   while not op.done:\n\
+             \x20       time.sleep(10)\n\
+             \x20       op = client.operations.get(op)\n\
+             \x20   return op\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A Vertex project must never be offered the Gemini Developer API host by
+/// `keel init --diff`, and a Gemini project must be — the twin that keeps the
+/// first assertion from passing vacuously.
+///
+/// This is an end-to-end CLI test on purpose. The surface program's filtering
+/// lives in `doctor::route_key_proposals_for`, and `init --diff` does NOT call
+/// it: init proposes only `[target."<host>"]` blocks for hosts its own scan and
+/// discovery actually saw, so it can never synthesize a provider route the
+/// project does not use. The guarantee is therefore structural rather than
+/// inherited — and this test is what would notice if init ever grew a
+/// proposal path that invents provider hosts, which is exactly the day the
+/// filtering would have to be threaded through here.
+#[test]
+fn init_diff_offers_each_google_surface_only_to_the_project_that_uses_it() {
+    if !python3_present() {
+        return;
+    }
+
+    let vertex = tempfile::TempDir::new().unwrap();
+    write_google_genai_project(
+        vertex.path(),
+        "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\ntimeout = \"30s\"\n",
+        "vertexai=True, project='p', location='us-central1'",
+        "https://us-central1-aiplatform.googleapis.com/v1/x:fetchPredictOperation",
+    );
+    let (report, stdout) = init_diff_json_from(vertex.path());
+    // Negative control: the run really did produce Google proposals, so the
+    // absence asserted below is evidence-driven, not an empty report.
+    let added: Vec<&str> = report["added"]
+        .as_array()
+        .expect("added array")
+        .iter()
+        .map(|t| t.as_str().expect("target string"))
+        .collect();
+    assert!(
+        added.contains(&"us-central1-aiplatform.googleapis.com")
+            && added.contains(&"llm:google-genai"),
+        "the Vertex project's own hosts must be proposed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("generativelanguage"),
+        "a Vertex project must not be offered a Gemini route by init: {stdout}"
+    );
+
+    // The same command, the same shape of project, the other surface: the
+    // Gemini host IS proposed. Without this leg the assertion above would
+    // still pass if init stopped proposing Google hosts altogether.
+    let gemini = tempfile::TempDir::new().unwrap();
+    write_google_genai_project(
+        gemini.path(),
+        "[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n",
+        "api_key='k'",
+        "https://generativelanguage.googleapis.com/v1beta/models",
+    );
+    let (gemini_report, gemini_stdout) = init_diff_json_from(gemini.path());
+    let gemini_added: Vec<&str> = gemini_report["added"]
+        .as_array()
+        .expect("added array")
+        .iter()
+        .map(|t| t.as_str().expect("target string"))
+        .collect();
+    assert!(
+        gemini_added.contains(&"generativelanguage.googleapis.com"),
+        "a Gemini project must be offered its own host: {gemini_stdout}"
+    );
+}
+
 // ---- config-above-cwd through the REAL binary (issue #85) ----
 
 /// The built `keel` binary (the `CARGO_BIN_EXE_keel` convention `tests/exec.rs`
