@@ -4213,6 +4213,75 @@ mod tests {
         assert!(!a.contains("put `poll` on a route key"), "{a}");
     }
 
+    /// The same two arms as above, but entered through `build_report` — which is
+    /// where the `policy.present` vs `policy.valid` decision is actually made,
+    /// and therefore the only level at which the round-1 regression can be
+    /// caught. The test above calls `simplification_findings` directly and
+    /// passes `policy_present` as a literal, so it cannot see that wiring at
+    /// all; the one pre-existing `build_report` case with `present: false` and a
+    /// poll sighting is against `api.tavily.com`, which proposes no route key
+    /// and so reads identically whichever arm runs.
+    ///
+    /// Both arms are asserted in both directions against one fixture, so
+    /// swapping the argument at the call site flips BOTH: a no-`keel.toml`
+    /// project would go silent (round 1's regression) and an unreadable
+    /// `keel.toml` would start being advised keys it may already declare (D1).
+    #[test]
+    fn build_report_routes_policy_presence_not_validity_into_the_advice() {
+        const VERTEX: &str = "`[target.\"POST \
+                              *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`";
+        let poll_action = |policy: PolicyValidation| {
+            // A Vertex host literal in the scan, so the surface verdict is
+            // unambiguous and exactly one Google key can be advised.
+            let (scan, _) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+            let r = build_report(
+                &scan,
+                &BTreeSet::new(),
+                policy,
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            );
+            r.findings
+                .iter()
+                .find(|f| f.topic == "hand-rolled-poll")
+                .expect("the poll finding stands in every policy state")
+                .action
+                .clone()
+        };
+
+        // Arm 2 — no `keel.toml` at all (`default_policy()` is already
+        // `present: false, valid: true`). Nothing declares the key, so the
+        // advice names it. Under `policy.valid` this project reads as
+        // "document doctor could not classify" and goes silent.
+        let a = poll_action(default_policy());
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({VERTEX})")),
+            "no keel.toml → the surface-narrowed key: {a}"
+        );
+
+        // Arm 3 — a `keel.toml` doctor could not read. It may already declare
+        // this key, so nothing is advised. Under `policy.valid` this project
+        // reads as "no document at all" and gets advised the key anyway.
+        let mut invalid = default_policy();
+        invalid.check.present = true;
+        invalid.check.valid = false;
+        invalid.check.field = Some("target.\"llm:google-genai\".poll.until".to_owned());
+        invalid.check.message = Some("unknown key".to_owned());
+        invalid.text = Some("[target.\"llm:google-genai\"]\n".to_owned());
+        let a = poll_action(invalid);
+        assert!(
+            !a.contains("put `poll` on a route key"),
+            "an unreadable keel.toml may already declare it: {a}"
+        );
+    }
+
     /// D3: when one patch carries a block for BOTH surfaces it also carries the
     /// same provenance twice, and at most one of the two blocks is the surface
     /// the sighted loop actually calls. The claim is qualified in that case —
