@@ -710,6 +710,92 @@ fn doctor_sdk_poll_route_key_fix_matches_golden_and_applies() {
     }
 }
 
+/// #139: a project that ALREADY adopted the Vertex route key, with a
+/// pre-CCR-11 `poll` block that therefore never polls. Doctor used to drop the
+/// proposal on the mere presence of the section and offer only the irrelevant
+/// Gemini block. It must instead (a) narrow to Vertex — the declared route key
+/// is itself the evidence — and (b) amend the inert block in place with
+/// `until.absent = "pending"`, via a patch that really applies and re-validates.
+#[test]
+fn doctor_amends_an_inert_route_key_and_the_patch_applies() {
+    if !python3_present() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    for f in ["render.py", "keel.toml"] {
+        std::fs::copy(
+            fixtures().join("py_sdk_poll_inert").join(f),
+            dir.path().join(f),
+        )
+        .unwrap();
+    }
+    let r = doctor::run(dir.path());
+    assert_eq!(r.exit, keel_cli::EXIT_OK, "a poll lead does not flip ok");
+    check_golden("doctor_sdk_poll_amend.json", &json_string(&r.json));
+
+    if !git_present() {
+        eprintln!("skip: git not available");
+        return;
+    }
+    let poll = r.json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["topic"] == "hand-rolled-poll")
+        .expect("a hand-rolled-poll finding");
+    let patch = poll["fix"]["patch"]
+        .as_str()
+        .expect("the inert block is amended, not suppressed");
+    assert!(
+        !patch.contains("generativelanguage"),
+        "a Vertex project must not be handed a Gemini route: {patch}"
+    );
+    assert!(
+        !patch.contains("+[target.\"POST *-aiplatform"),
+        "the section exists — amend it, never duplicate it: {patch}"
+    );
+    assert!(
+        poll["action"]
+            .as_str()
+            .unwrap()
+            .contains("returns on the FIRST response"),
+        "{poll}"
+    );
+    std::fs::write(dir.path().join("keel.patch"), patch).unwrap();
+    let out = Command::new("git")
+        .args(["apply", "keel.patch"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = std::fs::read_to_string(dir.path().join("keel.toml")).unwrap();
+    assert!(applied.contains("absent = \"pending\""), "{applied}");
+    assert!(
+        applied.contains("# The route key an operator adopted before CCR-11"),
+        "surgical edit: the operator's comments survive: {applied}"
+    );
+    let again = doctor::run(dir.path());
+    assert_eq!(
+        again.exit,
+        keel_cli::EXIT_OK,
+        "the amended route key validates: {}",
+        json_string(&again.json)
+    );
+    for f in again.json["findings"].as_array().unwrap() {
+        if f["topic"] == "hand-rolled-poll" {
+            assert!(
+                f["fix"].is_null(),
+                "the route key now carries `absent` — nothing left to propose: {f}"
+            );
+        }
+    }
+}
+
 // ---- config-above-cwd through the REAL binary (issue #85) ----
 
 /// The built `keel` binary (the `CARGO_BIN_EXE_keel` convention `tests/exec.rs`

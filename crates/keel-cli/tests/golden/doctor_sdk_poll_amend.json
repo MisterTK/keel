@@ -1,0 +1,221 @@
+{
+  "activation_backend": null,
+  "adapters": [
+    {
+      "detected": false,
+      "lib": "httpx",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "requests",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "aiohttp",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib3",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "urllib.request",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "boto3",
+      "status": "best-effort",
+      "target": "tool:aws.*"
+    },
+    {
+      "detected": false,
+      "lib": "psycopg",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "openai",
+      "status": "pinned",
+      "target": "llm:openai"
+    },
+    {
+      "detected": false,
+      "lib": "anthropic",
+      "status": "pinned",
+      "target": "llm:anthropic"
+    },
+    {
+      "detected": false,
+      "lib": "google-adk",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": true,
+      "lib": "google-genai",
+      "status": "pinned",
+      "target": "llm:google-genai"
+    },
+    {
+      "detected": false,
+      "lib": "pydantic-ai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "openai-agents",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "crewai",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "langgraph",
+      "status": "pinned",
+      "target": "tool:<name>"
+    },
+    {
+      "detected": false,
+      "lib": "mcp",
+      "status": "pinned",
+      "target": "mcp:<server>"
+    },
+    {
+      "detected": false,
+      "lib": "fetch",
+      "status": "pinned",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "undici",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "http",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "ai-sdk",
+      "status": "pinned",
+      "target": "llm:*"
+    },
+    {
+      "detected": false,
+      "lib": "ioredis",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "mysql2",
+      "status": "best-effort",
+      "target": "host"
+    },
+    {
+      "detected": false,
+      "lib": "pg",
+      "status": "best-effort",
+      "target": "host"
+    }
+  ],
+  "boundaries": {
+    "governance_files": [],
+    "parsed_files": [
+      "dockerfile (COPY/ADD directives only)"
+    ],
+    "parsed_languages": [
+      "python",
+      "js-ts"
+    ],
+    "protocol": "Static + adapter-interception evidence, not a verdict. Drive an evaluate/adopt/review task through the keel skill's six phases: Scope every I/O process (including shell/CI launchers) -> Explore how each call is dispatched -> Collect this report -> Baseline real failure classes in observe mode (`keel record run`) -> Analyze & propose -> Ship (policy in the artifact, activation reaching the I/O process, durable evidence). Retry only helps genuinely-transient classes (conn/timeout/5xx/429).",
+    "unparsed": [
+      "shell",
+      "makefile",
+      "ci-workflow",
+      "governance-prose"
+    ]
+  },
+  "coverage": {
+    "invisible": [],
+    "visible_unwrapped": [
+      "llm:google-genai"
+    ],
+    "wrapped": []
+  },
+  "findings": [
+    {
+      "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
+      "detail": "`llm:google-genai` is visible in your code but has no observed runtime evidence.",
+      "level": "warn",
+      "topic": "visible-unwrapped"
+    },
+    {
+      "action": "If a dependency makes calls Keel never reports, file an adapter request.",
+      "detail": "Raw sockets and unknown native libraries are invisible to static and adapter-based interception.",
+      "level": "info",
+      "topic": "invisible"
+    },
+    {
+      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. Or apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on the route-key `poll` block this project already declares — as written, that block returns on the FIRST response and does not poll at all, because a running `google.longrunning.Operation` omits `done` entirely (proto3 JSON drops a false bool).",
+      "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
+      "fix": {
+        "changes": [
+          {
+            "after": "pending",
+            "before": null,
+            "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\".poll.until.absent"
+          }
+        ],
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -6,4 +6,4 @@\n # google.longrunning.Operation omits `done` entirely (#139).\n [target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n timeout = \"30s\"\n-poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true], absent = \"pending\" } }\n"
+      },
+      "level": "warn",
+      "topic": "hand-rolled-poll"
+    }
+  ],
+  "follow_ups": [],
+  "journal": {
+    "backend": "sqlite",
+    "location": ".keel/journal.db",
+    "source": "default",
+    "supported": true
+  },
+  "ok": true,
+  "policy": {
+    "field": null,
+    "message": null,
+    "path": "keel.toml",
+    "present": true,
+    "valid": true
+  },
+  "runtime_activation": "unverified",
+  "topology": {
+    "excluded": [],
+    "external_processes": [],
+    "unreachable": [],
+    "wrappable": [
+      "llm:google-genai"
+    ]
+  }
+}

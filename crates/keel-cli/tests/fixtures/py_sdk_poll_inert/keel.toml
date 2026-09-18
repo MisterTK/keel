@@ -1,0 +1,9 @@
+[target."llm:google-genai"]
+timeout = "120s"
+
+# The route key an operator adopted before CCR-11 existed: it validates, it
+# attributes the calls, and it never polls — a running
+# google.longrunning.Operation omits `done` entirely (#139).
+[target."POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]
+timeout = "30s"
+poll    = { interval = "10s", deadline = "30m", until = { field = "done", terminal = [true] } }

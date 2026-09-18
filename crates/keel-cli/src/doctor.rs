@@ -854,6 +854,16 @@ struct RouteKeyProposal {
     note: String,
 }
 
+/// The two Google notes, each with ONE home. [`route_key_proposals_for`]
+/// appends its hedge suffix rather than restating the phrase, so a wording
+/// edit here cannot be silently overwritten downstream.
+const VERTEX_NOTE: &str = "Vertex AI operation read";
+const GEMINI_NOTE: &str = "Gemini API operation read";
+/// Appended to [`VERTEX_NOTE`] / [`GEMINI_NOTE`] only when the surface is
+/// genuinely unknown and doctor has to propose both blocks.
+const VERTEX_HEDGE: &str = " (delete if you use the Gemini API)";
+const GEMINI_HEDGE: &str = " (delete if you use Vertex AI)";
+
 /// The route keys that carry an operation read for one `(target, SDK poll
 /// shape)` pair. Unknown pairs propose nothing — doctor never guesses a route.
 fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyProposal> {
@@ -871,7 +881,7 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                     // CCR-11).
                     absent: Some("pending"),
                     surface: Some(crate::surface::Surface::Vertex),
-                    note: "Vertex AI operation read (delete if you use the Gemini API)".to_owned(),
+                    note: VERTEX_NOTE.to_owned(),
                 });
                 out.push(RouteKeyProposal {
                     key: "GET generativelanguage.googleapis.com/*/operations/*",
@@ -879,7 +889,7 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                     terminal: "[true]",
                     absent: Some("pending"),
                     surface: Some(crate::surface::Surface::GeminiApi),
-                    note: "Gemini API operation read (delete if you use Vertex AI)".to_owned(),
+                    note: GEMINI_NOTE.to_owned(),
                 });
             }
             ("llm:openai", "batches.retrieve") => out.push(RouteKeyProposal {
@@ -937,28 +947,18 @@ fn route_key_proposals_for(
 ) -> Vec<RouteKeyProposal> {
     use crate::surface::Surface;
     let mut out = route_key_proposals(target, sdk_polls);
-    if !detected.is_empty() {
-        out.retain(|p| p.surface.is_none_or(|s| detected.contains(&s)));
-    }
-    let hedging = detected.is_empty();
-    for p in &mut out {
-        match p.surface {
-            Some(Surface::Vertex) => {
-                p.note = if hedging {
-                    "Vertex AI operation read (delete if you use the Gemini API)".to_owned()
-                } else {
-                    "Vertex AI operation read".to_owned()
-                };
+    if detected.is_empty() {
+        // Only a genuinely unknown surface gets the hedge appended; the table's
+        // note is the plain phrase, and this is the one place the suffix lives.
+        for p in &mut out {
+            match p.surface {
+                Some(Surface::Vertex) => p.note.push_str(VERTEX_HEDGE),
+                Some(Surface::GeminiApi) => p.note.push_str(GEMINI_HEDGE),
+                None => {}
             }
-            Some(Surface::GeminiApi) => {
-                p.note = if hedging {
-                    "Gemini API operation read (delete if you use Vertex AI)".to_owned()
-                } else {
-                    "Gemini API operation read".to_owned()
-                };
-            }
-            None => {}
         }
+    } else {
+        out.retain(|p| p.surface.is_none_or(|s| detected.contains(&s)));
     }
     out
 }
@@ -1085,57 +1085,172 @@ fn render_route_block(
     )
 }
 
-/// The route keys one `hand-rolled-poll` sighting would append to
-/// `policy_text`, already filtered against what that document configures.
+/// What doctor does about ONE proposal, given what the project's `keel.toml`
+/// already says about that route key (#139, spec §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKeyPlan {
+    /// No `[target."<key>"]` section at all: append the whole rendered block.
+    Append,
+    /// The section exists and carries a `poll` whose `until.absent` is missing
+    /// — the inert block #139 is about. Set that one key to the carried value;
+    /// appending would duplicate the section, and staying silent leaves a poll
+    /// that never polls. The value rides along so the op cannot be built for a
+    /// proposal that has none.
+    AmendAbsent(&'static str),
+}
+
+/// The three-way verdict for one sighting's route keys (#139): what to act on,
+/// and the keys doctor deliberately declined to touch.
+struct RouteKeyPlans {
+    /// Each proposal doctor will act on, paired with how.
+    acting: Vec<(RouteKeyProposal, RouteKeyPlan)>,
+    /// Keys this project already declares as a `[target."…"]` section carrying
+    /// no usable `poll` table. Doctor will not duplicate the section, and
+    /// writing a poll policy into it is a separate decision — so the finding
+    /// names them rather than going quiet.
+    unpolled: Vec<&'static str>,
+}
+
+impl RouteKeyPlans {
+    /// The sorted key set the acted-on proposals form — the dedupe identity
+    /// and the [`RouteCadence`] fold key (see [`simplification_findings`]).
+    fn keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self.acting.iter().map(|(p, _)| p.key).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn amending(&self) -> bool {
+        self.acting
+            .iter()
+            .any(|(_, plan)| matches!(plan, RouteKeyPlan::AmendAbsent(_)))
+    }
+
+    fn appending(&self) -> bool {
+        self.acting
+            .iter()
+            .any(|(_, plan)| matches!(plan, RouteKeyPlan::Append))
+    }
+}
+
+/// Classify one proposal against the project's existing document. `None` means
+/// "leave this key alone"; [`section_lacks_poll`] then says WHICH kind of
+/// leaving-alone it was, since only one of the two is worth reporting.
+fn route_key_plan(existing: &toml_edit::DocumentMut, p: &RouteKeyProposal) -> Option<RouteKeyPlan> {
+    let Some(section) = existing
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|t| t.get(p.key))
+    else {
+        return Some(RouteKeyPlan::Append);
+    };
+    let until = section
+        .as_table_like()
+        .and_then(|t| t.get("poll"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|poll| poll.get("until"))
+        .and_then(toml_edit::Item::as_table_like);
+    let Some(until) = until else {
+        // No `poll`, or a `poll` with no `until` (already schema-invalid; the
+        // policy finding owns that file). Either way there is no inert poll
+        // here to repair — see `RouteKeyPlans::unpolled`.
+        return None;
+    };
+    // `until.field` is required by the schema; amending a document that lacks
+    // it would write `absent` onto an `until` that still does not validate.
+    if until.get("absent").is_some() || until.get("field").is_none() {
+        return None;
+    }
+    // A route whose absence is not known to mean pending has nothing to amend.
+    Some(RouteKeyPlan::AmendAbsent(p.absent?))
+}
+
+/// Whether the existing `[target."<key>"]` section carries no usable `poll`
+/// table — the "different conversation" arm of the §4.2 table.
+fn section_lacks_poll(existing: &toml_edit::DocumentMut, key: &str) -> bool {
+    existing
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|t| t.get(key))
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|section| {
+            section
+                .get("poll")
+                .and_then(toml_edit::Item::as_table_like)
+                .is_none()
+        })
+}
+
+/// The route keys one `hand-rolled-poll` sighting proposes against
+/// `policy_text`, each classified against what that document ACTUALLY
+/// configures for it — not merely whether the section exists (#139): absent ⇒
+/// append the block, present-but-inert (`poll` without `until.absent`) ⇒ amend
+/// that one key, present and already carrying `absent` ⇒ leave alone,
+/// present with no `poll` ⇒ leave alone and name it.
+///
 /// `None` when there is no base document to edit (absent or invalid
 /// `keel.toml`: propose nothing rather than a patch that would create/clobber
-/// the file), or when the sighting names no proposable route.
+/// the file), or when the sighting names no proposable route at all.
 fn route_key_candidates(
     s: &SimplificationSighting,
     policy_text: Option<&str>,
     detected: &[crate::surface::Surface],
-) -> Option<Vec<RouteKeyProposal>> {
+) -> Option<RouteKeyPlans> {
     let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
-    let has_key = |k: &str| {
-        existing
-            .get("target")
-            .and_then(toml_edit::Item::as_table_like)
-            .is_some_and(|t| t.contains_key(k))
-    };
     let proposals: Vec<RouteKeyProposal> = s
         .targets
         .iter()
         .flat_map(|t| route_key_proposals_for(t, &s.sdk_polls, detected))
-        .filter(|p| !has_key(p.key))
         .collect();
-    (!proposals.is_empty()).then_some(proposals)
-}
-
-/// The sorted key set a sighting's candidates form — the dedupe identity and
-/// the [`RouteCadence`] fold key (see [`simplification_findings`]).
-fn route_key_set(proposals: &[RouteKeyProposal]) -> Vec<&'static str> {
-    let mut keys: Vec<&'static str> = proposals.iter().map(|p| p.key).collect();
-    keys.sort_unstable();
-    keys
+    if proposals.is_empty() {
+        return None;
+    }
+    let mut plans = RouteKeyPlans {
+        acting: Vec::new(),
+        unpolled: Vec::new(),
+    };
+    for p in proposals {
+        match route_key_plan(&existing, &p) {
+            Some(plan) => plans.acting.push((p, plan)),
+            None => {
+                if section_lacks_poll(&existing, p.key) {
+                    plans.unpolled.push(p.key);
+                }
+            }
+        }
+    }
+    Some(plans)
 }
 
 /// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
-/// the key set it would append. `None` when no shape is known, every proposed
-/// key is already configured, or the resulting document would not parse. The
-/// cadence is looked up by key set, NOT read off `s` — see [`RouteCadence`].
+/// the key set it covers. `None` when no shape is known, every proposed key is
+/// already correctly configured, or the resulting document would not parse.
+/// The cadence is looked up by key set, NOT read off `s` — see
+/// [`RouteCadence`]. `detected` is the Google surface verdict the proposals are
+/// narrowed to (see [`route_key_proposals_for`]).
 fn route_key_fix(
     s: &SimplificationSighting,
     policy_text: Option<&str>,
     cadences: &BTreeMap<Vec<&'static str>, RouteCadence>,
     detected: &[crate::surface::Surface],
 ) -> Option<(Vec<&'static str>, Proposal)> {
-    let proposals = route_key_candidates(s, policy_text, detected)?;
-    let keys = route_key_set(&proposals);
+    let plans = route_key_candidates(s, policy_text, detected)?;
+    if plans.acting.is_empty() {
+        return None;
+    }
+    let keys = plans.keys();
     let cadence = cadences.get(&keys).copied().unwrap_or_default();
-    let ops: Vec<PolicyOp> = proposals
+    let ops: Vec<PolicyOp> = plans
+        .acting
         .iter()
-        .map(|p| PolicyOp::AppendBlock {
-            text: render_route_block(p, s, cadence),
+        .map(|(p, plan)| match plan {
+            RouteKeyPlan::Append => PolicyOp::AppendBlock {
+                text: render_route_block(p, s, cadence),
+            },
+            RouteKeyPlan::AmendAbsent(absent) => PolicyOp::Set {
+                path: PolicyPath::new(["target", p.key, "poll", "until", "absent"]),
+                value: (*absent).into(),
+            },
         })
         .collect();
     let proposal = propose(policy_text, &ops).ok()?;
@@ -1144,7 +1259,9 @@ fn route_key_fix(
 
 /// Fold every `hand-rolled-poll` sighting into the cadence of the route-key
 /// set it would propose, BEFORE any finding is rendered — the patch the first
-/// sighting carries has to speak for all of them.
+/// sighting carries has to speak for all of them. `detected` is passed through
+/// to [`route_key_candidates`] so the fold keys match the key sets the emitted
+/// patches actually carry.
 fn route_cadences(
     scan: &ScanResult,
     policy_text: Option<&str>,
@@ -1155,10 +1272,13 @@ fn route_cadences(
         if s.kind != "hand-rolled-poll" {
             continue;
         }
-        let Some(proposals) = route_key_candidates(s, policy_text, detected) else {
+        let Some(plans) = route_key_candidates(s, policy_text, detected) else {
             continue;
         };
-        out.entry(route_key_set(&proposals))
+        if plans.acting.is_empty() {
+            continue;
+        }
+        out.entry(plans.keys())
             .and_modify(|c| c.fold(s))
             .or_insert_with(|| RouteCadence::of(s));
     }
@@ -1224,6 +1344,7 @@ fn simplification_findings(
         let mut fix = None;
         let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
             "hand-rolled-poll" => {
+                let plans = route_key_candidates(s, policy_text, &detected);
                 // The first sighting for a key set carries the patch; later
                 // ones name it, since only one of two identical patches can
                 // apply against the same base file.
@@ -1244,15 +1365,60 @@ fn simplification_findings(
                      LLM host map for that route."
                     .to_owned();
                 if fix.is_some() {
-                    action.push_str(
-                        " Or apply the attached patch (`git apply`): it adds the route-key \
-                         `poll` block for this provider — tune `interval`/`deadline` to the job.",
-                    );
+                    // One patch can carry both an appended block and an amend
+                    // to a block the project already has, so each clause is
+                    // emitted only when it is true of THIS patch.
+                    let appending = plans.as_ref().is_some_and(RouteKeyPlans::appending);
+                    action.push_str(" Or apply the attached patch (`git apply`):");
+                    if appending {
+                        action.push_str(
+                            " it adds the route-key `poll` block for this provider — tune \
+                             `interval`/`deadline` to the job.",
+                        );
+                    }
+                    if plans.as_ref().is_some_and(RouteKeyPlans::amending) {
+                        // #139: the operator already adopted the route key, so
+                        // `keel status` attributes the calls and the block
+                        // validates — and it still never polls. Say that here,
+                        // not in a footnote.
+                        action.push_str(if appending {
+                            " It ALSO sets"
+                        } else {
+                            " it sets"
+                        });
+                        action.push_str(
+                            " `until.absent = \"pending\"` on the route-key `poll` block this \
+                             project already declares — as written, that block returns on the \
+                             FIRST response and does not poll at all, because a running \
+                             `google.longrunning.Operation` omits `done` entirely (proto3 JSON \
+                             drops a false bool).",
+                        );
+                    }
                 } else if let Some(holder) = &fix_ref {
                     let _ = write!(
                         action,
                         " The route-key patch for this provider is attached to the \
                          `hand-rolled-poll` finding for {holder} (`fix_ref`)."
+                    );
+                }
+                // A route key the project declares with no `poll` table: doctor
+                // will not duplicate the section, and it will not guess a poll
+                // policy into someone else's block either. Name it instead of
+                // going quiet — silence here is exactly the #139 failure.
+                if fix_ref.is_none()
+                    && let Some(unpolled) = plans.as_ref().map(|p| p.unpolled.as_slice())
+                    && !unpolled.is_empty()
+                {
+                    let names = unpolled
+                        .iter()
+                        .map(|k| format!("`[target.\"{k}\"]`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = write!(
+                        action,
+                        " This project already declares {names} with no `poll` table — doctor \
+                         leaves that section alone; adding poll-until-terminal to it is a \
+                         separate decision."
                     );
                 }
                 (
@@ -3324,6 +3490,216 @@ mod tests {
             "{patch}"
         );
         assert!(patch.contains("delete if you use"), "{patch}");
+    }
+
+    /// #139, the whole point of this program: an operator who already adopted
+    /// the Vertex route key with a pre-CCR-11 `poll` block has an INERT poll —
+    /// a running `google.longrunning.Operation` omits `done`, so the block
+    /// returns on attempt one. Doctor used to drop the proposal on the mere
+    /// presence of the section. It must amend it instead.
+    #[test]
+    fn an_existing_route_key_missing_absent_is_amended_not_suppressed() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let fix = f[0].fix.as_ref().expect("an amend fix must be attached");
+
+        assert!(
+            fix.patch.contains("absent"),
+            "the inert block must be amended to add absent: {}",
+            fix.patch
+        );
+        assert!(
+            !fix.patch.contains("+[target.\"POST *-aiplatform"),
+            "must not append a duplicate section: {}",
+            fix.patch
+        );
+        // The applied document must carry the key where the poll layer reads
+        // it, not merely somewhere in the file.
+        assert!(
+            fix.new_text
+                .contains("until = { field = \"done\", terminal = [true], absent = \"pending\" }"),
+            "{}",
+            fix.new_text
+        );
+        assert!(
+            f[0].action.contains("returns on the FIRST response"),
+            "the finding must say the block the operator has does not poll: {}",
+            f[0].action
+        );
+    }
+
+    /// The case the original dedupe rule was actually written for: a route key
+    /// that is already configured CORRECTLY is left entirely alone.
+    #[test]
+    fn an_existing_route_key_that_already_has_absent_is_left_alone() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true], absent = \"pending\" } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        // Only ADDED lines count: the route key appears in the patch's context
+        // lines whenever anything else in the file moves.
+        let touches_vertex = |patch: &str| {
+            patch
+                .lines()
+                .any(|l| l.starts_with('+') && l.contains("aiplatform"))
+        };
+        assert!(
+            !f.iter()
+                .filter_map(|x| x.fix.as_ref())
+                .any(|fix| touches_vertex(&fix.patch)),
+            "a correctly-configured block must be left alone: {f:?}"
+        );
+
+        // A no-op `Set` writes an empty patch, so "no patch" alone would pass
+        // even if the amend fired. Give the same sighting a SECOND route that
+        // really is missing, and the prose has to stay honest about which of
+        // the two the patch touches.
+        let (mut scan, mut topology) =
+            sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.simplifications[0].targets.push("llm:openai".into());
+        scan.simplifications[0]
+            .sdk_polls
+            .push("batches.retrieve".into());
+        topology.wrappable.push("llm:openai".to_owned());
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let fix = f[0].fix.as_ref().expect("the OpenAI block is still added");
+        assert!(fix.patch.contains("api.openai.com"), "{}", fix.patch);
+        assert!(
+            !touches_vertex(&fix.patch),
+            "the Vertex block is already correct: {}",
+            fix.patch
+        );
+        assert!(
+            !f[0].action.contains("returns on the FIRST response"),
+            "nothing was amended — the prose must not claim one was: {}",
+            f[0].action
+        );
+    }
+
+    /// One patch can carry both kinds of op — an appended block for a route
+    /// the project does not declare, and an amend to one it declares inertly.
+    /// Both clauses appear, and each is true of the patch.
+    #[test]
+    fn one_patch_can_both_append_a_block_and_amend_an_inert_one() {
+        let (mut scan, mut topology) =
+            sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.simplifications[0].targets.push("llm:openai".into());
+        scan.simplifications[0]
+            .sdk_polls
+            .push("batches.retrieve".into());
+        topology.wrappable.push("llm:openai".to_owned());
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let fix = f[0].fix.as_ref().expect("a patch is attached");
+        assert!(
+            fix.new_text.contains("absent = \"pending\""),
+            "the inert Vertex block is amended: {}",
+            fix.new_text
+        );
+        assert!(
+            fix.new_text
+                .contains("[target.\"GET api.openai.com/v1/batches/*\"]"),
+            "the OpenAI block is appended: {}",
+            fix.new_text
+        );
+        assert!(
+            f[0].action.contains("it adds the route-key"),
+            "{}",
+            f[0].action
+        );
+        assert!(f[0].action.contains("It ALSO sets"), "{}", f[0].action);
+    }
+
+    /// A target section with no `poll` table at all is a different
+    /// conversation: appending the block would duplicate the section, so
+    /// doctor skips it — and SAYS it skipped it rather than going quiet.
+    #[test]
+    fn an_existing_route_key_with_no_poll_table_is_named_not_duplicated() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+                       timeout = \"30s\"\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        assert!(
+            f[0].fix.is_none(),
+            "nothing to propose for this route: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("with no `poll` table"),
+            "the skip must be stated: {}",
+            f[0].action
+        );
+    }
+
+    /// Declaring the Vertex route key is itself Vertex evidence (`policy_hosts`
+    /// reads the key), so the Gemini proposal is gone — #139's second half.
+    #[test]
+    fn declaring_the_vertex_route_key_stops_the_gemini_proposal() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        for fix in f.iter().filter_map(|x| x.fix.as_ref()) {
+            assert!(
+                !fix.patch.contains("generativelanguage"),
+                "a Vertex project must not be handed a Gemini route: {}",
+                fix.patch
+            );
+        }
+    }
+
+    #[test]
+    fn a_gemini_only_project_is_offered_only_the_gemini_route() {
+        let (scan, topology) = sdk_poll_fixture(Some("generativelanguage.googleapis.com"));
+        let (f, _) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+        );
+        let fix = f[0].fix.as_ref().expect("a proposal must be attached");
+        assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
+        assert!(!fix.patch.contains("aiplatform"), "{}", fix.patch);
+    }
+
+    #[test]
+    fn a_project_using_both_surfaces_is_offered_both_without_a_delete_hint() {
+        let (mut scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.targets.insert(
+            "generativelanguage.googleapis.com".to_owned(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "render.py".into(),
+                    line: 8,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let (f, _) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+        );
+        let fix = f[0].fix.as_ref().expect("a proposal must be attached");
+        assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
+        assert!(fix.patch.contains("aiplatform"), "{}", fix.patch);
+        assert!(
+            !fix.patch.contains("delete"),
+            "both surfaces are in use — nothing to delete: {}",
+            fix.patch
+        );
     }
 
     /// #107.2: the proposed `poll` block states the loop's OWN cadence when
