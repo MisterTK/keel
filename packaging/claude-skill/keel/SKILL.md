@@ -241,10 +241,13 @@ the six phases in order; the static scan is evidence, not the verdict.
    one this project uses — `detected`, plus the `source` and `evidence` hosts
    that decided it — and doctor proposes only that route. When `detected` names
    both, you get both blocks as a statement of fact, with nothing to delete.
-   When the key is missing from the report the inference found nothing to go
-   on: it is static, so a factory-built client with no host literal anywhere
-   reads as unknown, and doctor hedges with both Google blocks, each note
-   saying which to delete. Whichever it proposes, the Google blocks emit
+   When the key is missing from a report whose scan DID see
+   `llm:google-genai`, the inference found nothing to go on: it is static, so
+   a factory-built client with no host literal anywhere reads as unknown, and
+   doctor hedges with both Google blocks, each note saying which to delete.
+   The key is also absent — harmlessly — from any project that has no
+   `llm:google-genai` target at all, so never read the key's presence as
+   evidence that a project uses the SDK. Whichever it proposes, the Google blocks emit
    `absent = "pending"` — a running `google.longrunning.Operation` omits `done`
    entirely, because proto3 JSON drops a false bool, so the same block without
    it returns the running body on attempt one and never polls. If the project
