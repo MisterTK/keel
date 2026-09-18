@@ -499,6 +499,14 @@ fn doctor_json_matches_golden() {
     .unwrap();
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK);
+    // Nothing Google-shaped anywhere in this project: the whole `llm_surfaces`
+    // map is omitted, not reported as an empty object. The golden pins the
+    // same fact; this says out loud that the absence is the assertion.
+    assert!(
+        r.json.get("llm_surfaces").is_none(),
+        "a non-Google project carries no Google-shaped hole: {}",
+        json_string(&r.json)
+    );
     check_golden("doctor_node.json", &json_string(&r.json));
 }
 
@@ -732,6 +740,23 @@ fn doctor_amends_an_inert_route_key_and_the_patch_applies() {
     }
     let r = doctor::run(dir.path());
     assert_eq!(r.exit, keel_cli::EXIT_OK, "a poll lead does not flip ok");
+    // The verdict that narrowed the proposal is reported, not just acted on:
+    // here the declared route key is itself the Vertex evidence.
+    assert_eq!(
+        r.json["llm_surfaces"]["llm:google-genai"],
+        serde_json::json!({
+            "detected": ["vertex"],
+            "source": "policy",
+            "evidence": ["*-aiplatform.googleapis.com"],
+        }),
+        "{}",
+        json_string(&r.json)
+    );
+    assert!(
+        r.human.contains("google surface: vertex"),
+        "the human report says it too: {}",
+        r.human
+    );
     check_golden("doctor_sdk_poll_amend.json", &json_string(&r.json));
 
     if !git_present() {

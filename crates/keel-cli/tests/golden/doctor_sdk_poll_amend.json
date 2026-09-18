@@ -178,7 +178,7 @@
       "topic": "invisible"
     },
     {
-      "action": "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put `poll` on a route key (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the LLM host map for that route. Or apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on the route-key `poll` block this project already declares — as written, that block returns on the FIRST response and does not poll at all, because a running `google.longrunning.Operation` omits `done` entirely (proto3 JSON drops a false bool).",
+      "action": "The route-key `poll` block this project already declares does not poll: as written it returns on the FIRST response, because a running `google.longrunning.Operation` omits `done` entirely (proto3 JSON drops a false bool). Apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on that block. Then delete the hand-rolled loop: `poll.deadline` bounds the whole loop, `timeout` bounds one attempt.",
       "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
       "fix": {
         "changes": [
@@ -200,6 +200,17 @@
     "location": ".keel/journal.db",
     "source": "default",
     "supported": true
+  },
+  "llm_surfaces": {
+    "llm:google-genai": {
+      "detected": [
+        "vertex"
+      ],
+      "evidence": [
+        "*-aiplatform.googleapis.com"
+      ],
+      "source": "policy"
+    }
   },
   "ok": true,
   "policy": {

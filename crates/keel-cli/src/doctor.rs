@@ -477,6 +477,24 @@ struct DoctorReport {
     findings: Vec<Finding>,
     follow_ups: Vec<FollowUp>,
     journal: JournalReport,
+    /// Which generative-AI surface each LLM target resolves to, and the
+    /// evidence that decided it — the verdict that narrows the route-key
+    /// proposals above (#139), published so an operator can check it rather
+    /// than infer it from which patch they were handed.
+    ///
+    /// Keyed by target even though only `llm:google-genai` populates it today
+    /// and the detection is deliberately Google-specific (YAGNI). The map is
+    /// the cheap half: `keel doctor --json` is consumer-facing — the MCP
+    /// server returns it byte-identical and the skill reads it — so renaming a
+    /// key later breaks consumers, while getting the container right now costs
+    /// nothing. Anthropic's Bedrock/Vertex clients and Azure OpenAI are the
+    /// identical shape (one SDK, one target name, several surfaces) and
+    /// acquire this exact problem the moment their hosts enter the host map.
+    ///
+    /// Omitted entirely — absent, not `{}` — when no target has a surface to
+    /// report, so a non-Google project's report carries no Google-shaped hole.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    llm_surfaces: BTreeMap<String, crate::surface::SurfaceEvidence>,
     ok: bool,
     policy: PolicyCheck,
     /// `"verified"` when some recorded activation row matches this project's
@@ -1104,10 +1122,11 @@ enum RouteKeyPlan {
 struct RouteKeyPlans {
     /// Each proposal doctor will act on, paired with how.
     acting: Vec<(RouteKeyProposal, RouteKeyPlan)>,
-    /// Keys this project already declares as a `[target."…"]` section carrying
-    /// no usable `poll` table. Doctor will not duplicate the section, and
-    /// writing a poll policy into it is a separate decision — so the finding
-    /// names them rather than going quiet.
+    /// Keys this project already declares as a `[target."…"]` section that
+    /// carries no poll-until-terminal rule — no `poll` table, or a `poll` with
+    /// no `until`. Doctor will not duplicate the section, and writing a poll
+    /// predicate into it is a separate decision — so the finding names them
+    /// rather than going quiet.
     unpolled: Vec<&'static str>,
 }
 
@@ -1134,7 +1153,7 @@ impl RouteKeyPlans {
 }
 
 /// Classify one proposal against the project's existing document. `None` means
-/// "leave this key alone"; [`section_lacks_poll`] then says WHICH kind of
+/// "leave this key alone"; [`section_lacks_poll_until`] then says WHICH kind of
 /// leaving-alone it was, since only one of the two is worth reporting.
 fn route_key_plan(existing: &toml_edit::DocumentMut, p: &RouteKeyProposal) -> Option<RouteKeyPlan> {
     let Some(section) = existing
@@ -1165,9 +1184,16 @@ fn route_key_plan(existing: &toml_edit::DocumentMut, p: &RouteKeyProposal) -> Op
     Some(RouteKeyPlan::AmendAbsent(p.absent?))
 }
 
-/// Whether the existing `[target."<key>"]` section carries no usable `poll`
-/// table — the "different conversation" arm of the §4.2 table.
-fn section_lacks_poll(existing: &toml_edit::DocumentMut, key: &str) -> bool {
+/// Whether the existing `[target."<key>"]` section declares no
+/// poll-until-terminal rule — the "different conversation" arm of the §4.2
+/// table. That is either no `poll` table at all, or a `poll` table carrying no
+/// `until`: both are sections doctor will neither duplicate nor guess a poll
+/// predicate into, and both are worth naming. (The second is also
+/// schema-invalid — `until` is required — so through `keel doctor` the policy
+/// finding owns that file and this arm is unreachable; it is covered here so
+/// the classification is total at the one place it is made, rather than
+/// depending on a validation gate two call sites away.)
+fn section_lacks_poll_until(existing: &toml_edit::DocumentMut, key: &str) -> bool {
     existing
         .get("target")
         .and_then(toml_edit::Item::as_table_like)
@@ -1177,7 +1203,7 @@ fn section_lacks_poll(existing: &toml_edit::DocumentMut, key: &str) -> bool {
             section
                 .get("poll")
                 .and_then(toml_edit::Item::as_table_like)
-                .is_none()
+                .is_none_or(|poll| poll.get("until").is_none())
         })
 }
 
@@ -1213,7 +1239,7 @@ fn route_key_candidates(
         match route_key_plan(&existing, &p) {
             Some(plan) => plans.acting.push((p, plan)),
             None => {
-                if section_lacks_poll(&existing, p.key) {
+                if section_lacks_poll_until(&existing, p.key) {
                     plans.unpolled.push(p.key);
                 }
             }
@@ -1357,54 +1383,65 @@ fn simplification_findings(
                         fix = Some(proposal);
                     }
                 }
-                let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
-                     `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
-                     POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
-                     `poll` on a route key (`[target.\"POST \
+                // The generic advice: write a route key. An operator who
+                // already did that must not be told to do it first — see the
+                // amending branch below.
+                let route_key_advice = "Wrap the target, then replace the loop with a `poll` \
+                     policy — `poll.deadline` bounds the whole loop, `timeout` bounds one \
+                     attempt. A POST-shaped operation read (Vertex `:fetch*Operation`) polls \
+                     too: put `poll` on a route key (`[target.\"POST \
                      *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the \
-                     LLM host map for that route."
-                    .to_owned();
-                if fix.is_some() {
-                    // One patch can carry both an appended block and an amend
-                    // to a block the project already has, so each clause is
-                    // emitted only when it is true of THIS patch.
-                    let appending = plans.as_ref().is_some_and(RouteKeyPlans::appending);
-                    action.push_str(" Or apply the attached patch (`git apply`):");
+                     LLM host map for that route.";
+                // One patch can carry both an appended block and an amend to a
+                // block the project already has, so each clause is emitted only
+                // when it is true of THIS patch.
+                let appending =
+                    fix.is_some() && plans.as_ref().is_some_and(RouteKeyPlans::appending);
+                let amending = fix.is_some() && plans.as_ref().is_some_and(RouteKeyPlans::amending);
+                let mut action = if amending {
+                    // #139: the operator already adopted the route key, so
+                    // `keel status` attributes the calls and the block
+                    // validates — and it still never polls. That is the only
+                    // news here, so it leads.
+                    let mut a = "The route-key `poll` block this project already declares does \
+                         not poll: as written it returns on the FIRST response, because a \
+                         running `google.longrunning.Operation` omits `done` entirely (proto3 \
+                         JSON drops a false bool). Apply the attached patch (`git apply`): it \
+                         sets `until.absent = \"pending\"` on that block"
+                        .to_owned();
                     if appending {
-                        action.push_str(
-                            " it adds the route-key `poll` block for this provider — tune \
-                             `interval`/`deadline` to the job.",
+                        a.push_str(
+                            ", and ALSO adds the route-key `poll` block this provider is still \
+                             missing — tune `interval`/`deadline` to the job",
                         );
                     }
-                    if plans.as_ref().is_some_and(RouteKeyPlans::amending) {
-                        // #139: the operator already adopted the route key, so
-                        // `keel status` attributes the calls and the block
-                        // validates — and it still never polls. Say that here,
-                        // not in a footnote.
-                        action.push_str(if appending {
-                            " It ALSO sets"
-                        } else {
-                            " it sets"
-                        });
-                        action.push_str(
-                            " `until.absent = \"pending\"` on the route-key `poll` block this \
-                             project already declares — as written, that block returns on the \
-                             FIRST response and does not poll at all, because a running \
-                             `google.longrunning.Operation` omits `done` entirely (proto3 JSON \
-                             drops a false bool).",
-                        );
-                    }
-                } else if let Some(holder) = &fix_ref {
+                    a.push_str(
+                        ". Then delete the hand-rolled loop: `poll.deadline` bounds the whole \
+                         loop, `timeout` bounds one attempt.",
+                    );
+                    a
+                } else {
+                    route_key_advice.to_owned()
+                };
+                if fix.is_some() && !amending {
+                    action.push_str(
+                        " Or apply the attached patch (`git apply`): it adds the route-key \
+                         `poll` block for this provider — tune `interval`/`deadline` to the job.",
+                    );
+                } else if fix.is_none()
+                    && let Some(holder) = &fix_ref
+                {
                     let _ = write!(
                         action,
                         " The route-key patch for this provider is attached to the \
                          `hand-rolled-poll` finding for {holder} (`fix_ref`)."
                     );
                 }
-                // A route key the project declares with no `poll` table: doctor
+                // A route key the project declares with no poll-until-terminal
+                // rule — no `poll` table, or a `poll` with no `until`. Doctor
                 // will not duplicate the section, and it will not guess a poll
-                // policy into someone else's block either. Name it instead of
-                // going quiet — silence here is exactly the #139 failure.
+                // predicate into someone else's block either. Name it instead
+                // of going quiet — silence here is exactly the #139 failure.
                 if fix_ref.is_none()
                     && let Some(unpolled) = plans.as_ref().map(|p| p.unpolled.as_slice())
                     && !unpolled.is_empty()
@@ -1416,9 +1453,9 @@ fn simplification_findings(
                         .join(", ");
                     let _ = write!(
                         action,
-                        " This project already declares {names} with no `poll` table — doctor \
-                         leaves that section alone; adding poll-until-terminal to it is a \
-                         separate decision."
+                        " This project already declares {names} with no poll-until-terminal rule \
+                         (no `poll.until`) — doctor leaves that section alone; adding one to it \
+                         is a separate decision."
                     );
                 }
                 (
@@ -2096,9 +2133,10 @@ fn build_report(
     findings.extend(topology_findings(&topology));
     // An invalid keel.toml already carries the removal fix on the policy
     // finding; a second patch against the same base file could not apply too.
-    // The surface verdict is computed here and dropped for now; Task 6 reports
-    // it in `keel doctor --json`.
-    let (simplifications, _surfaces) = simplification_findings(
+    // The surface verdict comes back from the ONE place it is decided — a
+    // second `detect_surfaces` call here would be a second source of truth to
+    // go stale against the proposals it narrowed.
+    let (simplifications, surfaces) = simplification_findings(
         scan,
         &topology,
         policy.valid.then_some(policy_text.as_deref()).flatten(),
@@ -2153,6 +2191,13 @@ fn build_report(
         findings.extend(config_above_cwd_finding);
     }
 
+    // Only the target whose surfaces were actually detected gets an entry: an
+    // empty verdict is reported by saying nothing, not by an empty list.
+    let mut llm_surfaces = BTreeMap::new();
+    if !surfaces.detected.is_empty() {
+        llm_surfaces.insert("llm:google-genai".to_owned(), surfaces);
+    }
+
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
         adapters,
@@ -2165,6 +2210,7 @@ fn build_report(
         findings,
         follow_ups,
         journal,
+        llm_surfaces,
         ok,
         policy,
         runtime_activation,
@@ -2642,6 +2688,20 @@ fn human(r: &DoctorReport) -> String {
     let _ = writeln!(out, "  runtime activation: {}", r.runtime_activation);
     if let Some(b) = &r.activation_backend {
         let _ = writeln!(out, "  activation backend: {b}");
+    }
+    if let Some(ev) = r.llm_surfaces.get("llm:google-genai") {
+        let names: Vec<&str> = ev
+            .detected
+            .iter()
+            .map(|s| crate::surface::Surface::as_str(*s))
+            .collect();
+        // `source` is the machine word; say where an operator would go look.
+        let from = match ev.source {
+            "policy" => "keel.toml",
+            "static" => "sighted hosts",
+            other => other,
+        };
+        let _ = writeln!(out, "  google surface: {} (from {from})", names.join(" + "));
     }
 
     out.push_str("\njournal\n");
@@ -3611,12 +3671,20 @@ mod tests {
             "the OpenAI block is appended: {}",
             fix.new_text
         );
+        // The amend leads (the operator already wrote a route key; the news is
+        // that it is inert), and the appended block is named in the same
+        // breath — each clause true of this one patch.
         assert!(
-            f[0].action.contains("it adds the route-key"),
+            f[0].action
+                .starts_with("The route-key `poll` block this project already declares does not"),
             "{}",
             f[0].action
         );
-        assert!(f[0].action.contains("It ALSO sets"), "{}", f[0].action);
+        assert!(
+            f[0].action.contains("ALSO adds the route-key"),
+            "{}",
+            f[0].action
+        );
     }
 
     /// A target section with no `poll` table at all is a different
@@ -3634,9 +3702,63 @@ mod tests {
             f[0].fix
         );
         assert!(
-            f[0].action.contains("with no `poll` table"),
+            f[0].action.contains("no poll-until-terminal rule"),
             "the skip must be stated: {}",
             f[0].action
+        );
+    }
+
+    /// The other half of the same silence: a section that DOES declare a
+    /// `poll` table, but one with no `until`. `route_key_plan` declines it (no
+    /// `until` to amend) and it is not "no `poll` table" either, so before this
+    /// it landed in neither bucket and doctor said nothing about a route key it
+    /// had plenty to say about.
+    #[test]
+    fn an_existing_route_key_whose_poll_has_no_until_is_named_too() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+                       timeout = \"30s\"\n\
+                       poll    = { interval = \"10s\", deadline = \"30m\" }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        assert!(
+            f[0].fix.is_none(),
+            "nothing to propose for this route: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("no poll-until-terminal rule"),
+            "the skip must be stated: {}",
+            f[0].action
+        );
+        assert!(
+            f[0].action
+                .contains("POST *-aiplatform.googleapis.com/*:fetchPredictOperation"),
+            "the key doctor left alone must be named: {}",
+            f[0].action
+        );
+    }
+
+    /// #139's amend case: the operator already took the advice the generic
+    /// prose opens with, so leading with it buries the only news — that the
+    /// block they have is inert. The amend clause goes first.
+    #[test]
+    fn the_amend_case_leads_with_the_inert_block_not_with_route_key_advice() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let action = &f[0].action;
+        assert!(action.contains("returns on the FIRST response"), "{action}");
+        let inert_at = action
+            .find("returns on the FIRST response")
+            .expect("the amend clause");
+        assert!(
+            action
+                .find("beats the LLM host map")
+                .is_none_or(|a| a > inert_at),
+            "the advice the operator already took must not lead: {action}"
         );
     }
 

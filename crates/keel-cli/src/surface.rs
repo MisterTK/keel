@@ -25,6 +25,18 @@ pub(crate) enum Surface {
     Vertex,
 }
 
+impl Surface {
+    /// The one word this surface is called, in both report surfaces. Kept
+    /// identical to the `Serialize` impl by a test — the human renderer prints
+    /// this and `--json` prints that.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::GeminiApi => "gemini-api",
+            Self::Vertex => "vertex",
+        }
+    }
+}
+
 /// The surface a host belongs to, or `None` for any host that is not a Google
 /// generative-AI host.
 pub(crate) fn classify_host(host: &str) -> Option<Surface> {
@@ -273,6 +285,33 @@ timeout = "30s"
             classify_host("*-aiplatform.googleapis.com"),
             Some(Surface::Vertex)
         );
+    }
+
+    /// The `llm_surfaces` value `keel doctor --json` publishes is this type,
+    /// serialized directly — so the documented shape is pinned here, at the
+    /// type, rather than only through a golden report.
+    #[test]
+    fn surface_evidence_serializes_in_the_documented_shape() {
+        let ev = detect_surfaces(&["us-central1-aiplatform.googleapis.com".to_owned()], &[]);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["detected"], serde_json::json!(["vertex"]));
+        assert_eq!(json["source"], "policy");
+        assert_eq!(
+            json["evidence"],
+            serde_json::json!(["us-central1-aiplatform.googleapis.com"])
+        );
+    }
+
+    #[test]
+    fn surface_names_itself_the_same_way_it_serializes() {
+        // The human renderer prints `as_str`; `--json` prints the Serialize
+        // impl. One word, two surfaces — they must not drift.
+        for s in [Surface::GeminiApi, Surface::Vertex] {
+            assert_eq!(
+                serde_json::to_value(s).unwrap(),
+                serde_json::Value::String(s.as_str().to_owned())
+            );
+        }
     }
 
     #[test]

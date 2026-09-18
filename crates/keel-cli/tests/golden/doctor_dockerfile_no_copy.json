@@ -198,6 +198,17 @@
     "source": "default",
     "supported": true
   },
+  "llm_surfaces": {
+    "llm:google-genai": {
+      "detected": [
+        "vertex"
+      ],
+      "evidence": [
+        "us-central1-aiplatform.googleapis.com"
+      ],
+      "source": "static"
+    }
+  },
   "ok": true,
   "policy": {
     "field": null,
