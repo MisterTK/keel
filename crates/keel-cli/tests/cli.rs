@@ -753,7 +753,7 @@ fn doctor_amends_an_inert_route_key_and_the_patch_applies() {
         json_string(&r.json)
     );
     assert!(
-        r.human.contains("google surface: vertex"),
+        r.human.contains("llm:google-genai surface: vertex"),
         "the human report says it too: {}",
         r.human
     );
@@ -910,6 +910,27 @@ fn init_diff_offers_each_google_surface_only_to_the_project_that_uses_it() {
     assert!(
         !stdout.contains("generativelanguage"),
         "a Vertex project must not be offered a Gemini route by init: {stdout}"
+    );
+    // KNOWN DEFECT, pinned here rather than left to be rediscovered: this
+    // project's keel.toml declares the Vertex route key, and `init --diff`
+    // proposes DELETING it as "no longer found in code" — the very key `keel
+    // doctor` proposes amending. `init.rs`'s `removed = existing - generated`
+    // compares against a `generated` set that only ever holds plain hosts from
+    // `merged_targets`, so a `METHOD host/glob` route key is structurally
+    // unreachable in it and always looks removed. Pre-existing since poll v2,
+    // untouched by this branch, filed as its own issue (see
+    // `issue-init-removes-route-keys.md`). Flip this assertion when it is
+    // fixed — this is the pin that will notice.
+    let removed: Vec<&str> = report["removed"]
+        .as_array()
+        .expect("removed array")
+        .iter()
+        .map(|t| t.as_str().expect("target string"))
+        .collect();
+    assert!(
+        removed.contains(&"POST *-aiplatform.googleapis.com/*:fetchPredictOperation"),
+        "expected the known init-vs-doctor contradiction to still reproduce; \
+         if it no longer does, the defect is fixed — update this pin: {stdout}"
     );
 
     // The same command, the same shape of project, the other surface: the

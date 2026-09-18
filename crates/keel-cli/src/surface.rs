@@ -62,7 +62,11 @@ pub(crate) struct SurfaceEvidence {
     /// events feed and cannot be read back (#140). Adding one later is
     /// additive for consumers.
     pub(crate) source: &'static str,
-    /// The hosts that drove the decision, sorted and deduped.
+    /// What drove the decision, sorted and deduped: each entry is the string
+    /// `classify_host` was given. That is a plain host when the scanner sighted
+    /// a URL literal, but a `keel.toml` route key contributes the host part as
+    /// written — a glob such as `*-aiplatform.googleapis.com`. Spec §4.3: hosts
+    /// (or route keys).
     pub(crate) evidence: Vec<String>,
 }
 

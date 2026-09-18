@@ -872,6 +872,10 @@ struct RouteKeyProposal {
     note: String,
 }
 
+/// The one target name both Google generative-AI surfaces share — the key
+/// `llm_surfaces` uses, and the gate `build_report` checks `scan.targets` for.
+const GOOGLE_GENAI_TARGET: &str = "llm:google-genai";
+
 /// The two Google notes, each with ONE home. [`route_key_proposals_for`]
 /// appends its hedge suffix rather than restating the phrase, so a wording
 /// edit here cannot be silently overwritten downstream.
@@ -1405,9 +1409,10 @@ fn simplification_findings(
                     // news here, so it leads.
                     let mut a = "The route-key `poll` block this project already declares does \
                          not poll: as written it returns on the FIRST response, because a \
-                         running `google.longrunning.Operation` omits `done` entirely (proto3 \
-                         JSON drops a false bool). Apply the attached patch (`git apply`): it \
-                         sets `until.absent = \"pending\"` on that block"
+                         running `google.longrunning.Operation` omits the terminal field the \
+                         block names rather than reporting it false (proto3 JSON drops a false \
+                         bool). Apply the attached patch (`git apply`): it sets \
+                         `until.absent = \"pending\"` on that block"
                         .to_owned();
                     if appending {
                         a.push_str(
@@ -2193,9 +2198,20 @@ fn build_report(
 
     // Only the target whose surfaces were actually detected gets an entry: an
     // empty verdict is reported by saying nothing, not by an empty list.
+    //
+    // And only when this project HAS that target. The map is keyed by target,
+    // so an entry is a statement about `llm:google-genai` specifically — but
+    // the evidence is host-shaped, and a project calling a Vertex URL through
+    // plain `requests` produces Vertex evidence with no google-genai target
+    // anywhere. Claiming a surface for a target the rest of the report never
+    // mentions (it is in neither `coverage` nor `topology`) is this program's
+    // own defect class: a key whose name asserts more than its predicate
+    // proves. `scan.targets` is the right gate because it is the set every
+    // other target-keyed section of this report is built from, so a consumer
+    // can always cross-check the claim against `coverage`/`topology`.
     let mut llm_surfaces = BTreeMap::new();
-    if !surfaces.detected.is_empty() {
-        llm_surfaces.insert("llm:google-genai".to_owned(), surfaces);
+    if !surfaces.detected.is_empty() && scan.targets.contains_key(GOOGLE_GENAI_TARGET) {
+        llm_surfaces.insert(GOOGLE_GENAI_TARGET.to_owned(), surfaces);
     }
 
     let ok = (policy.valid || !policy.present) && journal.supported;
@@ -2689,19 +2705,28 @@ fn human(r: &DoctorReport) -> String {
     if let Some(b) = &r.activation_backend {
         let _ = writeln!(out, "  activation backend: {b}");
     }
-    if let Some(ev) = r.llm_surfaces.get("llm:google-genai") {
-        let names: Vec<&str> = ev
-            .detected
-            .iter()
-            .map(|s| crate::surface::Surface::as_str(*s))
-            .collect();
+    // Keyed by target in the JSON, so rendered per target here too — reading
+    // one hardcoded key would silently drop the second the day a second target
+    // gains a surface verdict.
+    for (target, ev) in &r.llm_surfaces {
+        let names: Vec<&str> = ev.detected.iter().map(|s| s.as_str()).collect();
         // `source` is the machine word; say where an operator would go look.
         let from = match ev.source {
             "policy" => "keel.toml",
             "static" => "sighted hosts",
-            other => other,
+            // `"none"` is the third value of the type, and it never reaches
+            // here: it is produced only for an empty verdict, which
+            // `build_report` omits from the map entirely.
+            other => {
+                debug_assert!(false, "unexpected surface source: {other}");
+                other
+            }
         };
-        let _ = writeln!(out, "  google surface: {} (from {from})", names.join(" + "));
+        let _ = writeln!(
+            out,
+            "  {target} surface: {} (from {from})",
+            names.join(" + ")
+        );
     }
 
     out.push_str("\njournal\n");
@@ -3710,9 +3735,17 @@ mod tests {
 
     /// The other half of the same silence: a section that DOES declare a
     /// `poll` table, but one with no `until`. `route_key_plan` declines it (no
-    /// `until` to amend) and it is not "no `poll` table" either, so before this
-    /// it landed in neither bucket and doctor said nothing about a route key it
-    /// had plenty to say about.
+    /// `until` to amend), and [`section_lacks_poll_until`] is what keeps it
+    /// from falling out of the classification entirely.
+    ///
+    /// This state is NOT reachable through `keel doctor`: an `until`-less
+    /// `poll` fails schema validation, so `policy_text` is `None` by the time
+    /// `build_report` gets here and no proposal is made at all (see
+    /// [`section_lacks_poll_until`]'s own note). The test therefore drives
+    /// `simplification_findings` directly, and pins the arm's behavior rather
+    /// than a symptom an operator could ever have seen. The arm stays because
+    /// it makes the classification total at the one place the decision is
+    /// made, instead of depending on a validation gate two call sites away.
     #[test]
     fn an_existing_route_key_whose_poll_has_no_until_is_named_too() {
         let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
@@ -3821,6 +3854,163 @@ mod tests {
             !fix.patch.contains("delete"),
             "both surfaces are in use — nothing to delete: {}",
             fix.patch
+        );
+    }
+
+    /// The presence-only dedupe #139 replaced was never Google-scoped, and
+    /// neither is its replacement: an OpenAI route key the project declares
+    /// with no `poll` is named by the same sentence. Nothing in this arm
+    /// involves the surface verdict, so it is pinned deliberately here rather
+    /// than inherited from the Google cases above.
+    #[test]
+    fn a_non_google_route_key_declared_without_a_poll_is_named_too() {
+        let (mut scan, mut topology) = sdk_poll_fixture(None);
+        scan.simplifications[0].targets = vec!["llm:openai".into()];
+        scan.simplifications[0].sdk_polls = vec!["batches.retrieve".into()];
+        scan.targets.clear();
+        scan.targets.insert(
+            "llm:openai".to_owned(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "render.py".into(),
+                    line: 8,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        topology.wrappable = vec!["llm:openai".to_owned()];
+        let present = "[target.\"GET api.openai.com/v1/batches/*\"]\ntimeout = \"30s\"\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        assert!(
+            f[0].fix.is_none(),
+            "the section exists with no poll — nothing to propose: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("no poll-until-terminal rule"),
+            "the skip must be stated for a non-Google route too: {}",
+            f[0].action
+        );
+        assert!(
+            f[0].action.contains("GET api.openai.com/v1/batches/*"),
+            "the key doctor left alone must be named: {}",
+            f[0].action
+        );
+    }
+
+    /// `llm_surfaces` is keyed by target, so an entry is a claim ABOUT that
+    /// target — it may only appear when the project actually has it. A project
+    /// calling a Vertex URL through plain `requests` yields Vertex evidence
+    /// and no `llm:google-genai` anywhere: `coverage` and `topology` would
+    /// both carry the raw host, and inventing the SDK target here is the one
+    /// thing the skill reads to decide the project uses that SDK.
+    #[test]
+    fn llm_surfaces_needs_the_target_it_names_not_just_the_evidence() {
+        let mut scan = scan_with(
+            "us-central1-aiplatform.googleapis.com",
+            TargetClass::Host,
+            &["requests"],
+        );
+        let report = |scan: &ScanResult| {
+            build_report(
+                scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            )
+        };
+        let r = report(&scan);
+        assert!(
+            r.llm_surfaces.is_empty(),
+            "no google-genai target in this project: {:?}",
+            r.llm_surfaces
+        );
+        assert!(
+            !human(&r).contains("surface:"),
+            "the human report must not name it either: {}",
+            human(&r)
+        );
+
+        // Control: the same evidence, plus the target — now the claim is
+        // checkable against the rest of the report, so it is made.
+        scan.targets.insert(
+            GOOGLE_GENAI_TARGET.to_owned(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let r = report(&scan);
+        assert_eq!(
+            r.llm_surfaces[GOOGLE_GENAI_TARGET].detected,
+            vec![crate::surface::Surface::Vertex]
+        );
+    }
+
+    /// The human line is per target and joins a multi-surface verdict — the
+    /// goldens only ever carry a single Vertex entry, so both the `gemini-api`
+    /// word and the `" + "` join are pinned here.
+    #[test]
+    fn the_human_report_names_each_target_and_joins_its_surfaces() {
+        let mut scan = scan_with(GOOGLE_GENAI_TARGET, TargetClass::Llm, &["google-genai"]);
+        let host = |file: &str| TargetEvidence {
+            class: TargetClass::Host,
+            sightings: [Sighting {
+                file: file.into(),
+                line: 1,
+            }]
+            .into_iter()
+            .collect(),
+        };
+        scan.targets.insert(
+            "generativelanguage.googleapis.com".to_owned(),
+            host("app.py"),
+        );
+        let report = |scan: &ScanResult| {
+            build_report(
+                scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            )
+        };
+        let text = human(&report(&scan));
+        assert!(
+            text.contains("llm:google-genai surface: gemini-api (from sighted hosts)"),
+            "{text}"
+        );
+
+        scan.targets.insert(
+            "us-central1-aiplatform.googleapis.com".to_owned(),
+            host("app.py"),
+        );
+        let text = human(&report(&scan));
+        assert!(
+            text.contains("llm:google-genai surface: gemini-api + vertex (from sighted hosts)"),
+            "both surfaces, joined: {text}"
         );
     }
 

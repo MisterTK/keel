@@ -178,7 +178,7 @@
       "topic": "invisible"
     },
     {
-      "action": "The route-key `poll` block this project already declares does not poll: as written it returns on the FIRST response, because a running `google.longrunning.Operation` omits `done` entirely (proto3 JSON drops a false bool). Apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on that block. Then delete the hand-rolled loop: `poll.deadline` bounds the whole loop, `timeout` bounds one attempt.",
+      "action": "The route-key `poll` block this project already declares does not poll: as written it returns on the FIRST response, because a running `google.longrunning.Operation` omits the terminal field the block names rather than reporting it false (proto3 JSON drops a false bool). Apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on that block. Then delete the hand-rolled loop: `poll.deadline` bounds the whole loop, `timeout` bounds one attempt.",
       "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
       "fix": {
         "changes": [
