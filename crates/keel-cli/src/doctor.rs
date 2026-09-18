@@ -1239,6 +1239,38 @@ enum RouteKeyVerdict {
     Complete,
 }
 
+/// Every route-key proposal one sighting carries, already narrowed to the
+/// Google surface this project uses (see [`route_key_proposals_for`]). This is
+/// the proposal set BEFORE anything is known about what the project's own
+/// `keel.toml` declares — [`route_key_candidates`] classifies it against the
+/// document, and [`hand_rolled_poll_action`] falls back to it when there is no
+/// document to classify against.
+fn sighted_route_proposals(
+    s: &SimplificationSighting,
+    detected: &[crate::surface::Surface],
+) -> Vec<RouteKeyProposal> {
+    s.targets
+        .iter()
+        .flat_map(|t| route_key_proposals_for(t, &s.sdk_polls, detected))
+        .collect()
+}
+
+/// The keys of [`sighted_route_proposals`], sorted and deduped — the route keys
+/// a project with NO `keel.toml` needs, since a project with no policy file
+/// declares none of them.
+fn sighted_route_keys(
+    s: &SimplificationSighting,
+    detected: &[crate::surface::Surface],
+) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = sighted_route_proposals(s, detected)
+        .iter()
+        .map(|p| p.key)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 /// Route keys as an operator would write them, for interpolation into a
 /// finding's action text. One home, so every clause that names a key names it
 /// the same way.
@@ -1300,11 +1332,7 @@ fn route_key_candidates(
     detected: &[crate::surface::Surface],
 ) -> Option<RouteKeyPlans> {
     let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
-    let proposals: Vec<RouteKeyProposal> = s
-        .targets
-        .iter()
-        .flat_map(|t| route_key_proposals_for(t, &s.sdk_polls, detected))
-        .collect();
+    let proposals = sighted_route_proposals(s, detected);
     if proposals.is_empty() {
         return None;
     }
@@ -1361,6 +1389,41 @@ fn route_key_fix(
     (!proposal.patch.is_empty()).then_some((keys, proposal))
 }
 
+/// Which route keys one `hand-rolled-poll` finding's prose may tell an operator
+/// to write. D1's rule is not "never name a route key" — it is "never name one
+/// without consulting the report". There are three states, and the middle one
+/// is the whole point of this function:
+///
+/// 1. **A document doctor classified** (`plans` is `Some`): the keys a patch
+///    from those plans APPENDS. A key the project already declares is reported
+///    by the `unpolled`/`complete` clauses instead, never as advice.
+/// 2. **No `keel.toml` at all**: there are no declarations to consult, but
+///    there IS a surface verdict, and [`sighted_route_proposals`] is already
+///    narrowed to it. A project with no policy file declares none of these
+///    keys, so every one of them is a key it needs — this is the observe-first
+///    adoption path, and going quiet here threw away accurate, actionable
+///    advice that 0.7.0 gave (it just gave the Vertex one to everybody).
+///    An unknown surface names BOTH Google keys, exactly as the
+///    document-backed unknown case does; the hedge itself is carried by the
+///    `surface: could not determine` line that same report necessarily prints.
+/// 3. **A `keel.toml` doctor could not read** (invalid: the policy finding owns
+///    that file, so `policy_text` arrives as `None` with a document on disk):
+///    name nothing. That file may already declare these keys and doctor cannot
+///    tell — advising them back is exactly D1. The operator's first action is
+///    the validation fix, after which they get case 1's answer.
+fn poll_advice_keys(
+    s: &SimplificationSighting,
+    plans: Option<&RouteKeyPlans>,
+    policy_present: bool,
+    detected: &[crate::surface::Surface],
+) -> Vec<&'static str> {
+    match plans {
+        Some(p) => p.append_keys(),
+        None if !policy_present => sighted_route_keys(s, detected),
+        None => Vec::new(),
+    }
+}
+
 /// The action text for one `hand-rolled-poll` finding.
 ///
 /// Every clause past the opening sentence is derived from `plans` — this
@@ -1371,13 +1434,16 @@ fn route_key_fix(
 /// omits, an OpenAI project to write a Google key, and a project that already
 /// declares the key correctly to write it again (D1). The rule is that the
 /// prose may name a route key only when the patch beside it contains that key,
-/// or when it is saying doctor left that key alone and why.
+/// when the project demonstrably needs that key and has no document declaring
+/// it, or when it is saying doctor left that key alone and why.
 ///
-/// `plans` is `None` when there was no base document to classify against (no
-/// `keel.toml`, or one the policy finding owns): doctor then names no key at
-/// all rather than guessing at what the project already has.
+/// `advice_keys` is that middle clause made explicit — see
+/// [`poll_advice_keys`], which decides it. `plans` is `None` when there was no
+/// base document to classify against, and then only `advice_keys` speaks:
+/// there are no declarations to report leaving alone.
 fn hand_rolled_poll_action(
     plans: Option<&RouteKeyPlans>,
+    advice_keys: &[&str],
     has_fix: bool,
     fix_ref: Option<&str>,
 ) -> String {
@@ -1412,17 +1478,14 @@ fn hand_rolled_poll_action(
              `timeout` bounds one attempt.",
         );
         action = a;
-    } else if let Some(keys) = plans.map(RouteKeyPlans::append_keys)
-        && !keys.is_empty()
-    {
-        // The ONLY route keys the prose tells an operator to write: the ones a
-        // patch built from these plans appends, i.e. exactly the keys this
-        // project's own `keel.toml` does not declare.
+    } else if !advice_keys.is_empty() {
+        // The ONLY route keys the prose tells an operator to write: keys this
+        // project needs and does not already have — see `poll_advice_keys`.
         let _ = write!(
             action,
             " The operation read this loop makes has its own route: put `poll` on a route key \
              ({}), which beats the LLM host map for that route.",
-            quoted_target_keys(&keys)
+            quoted_target_keys(advice_keys)
         );
     }
     if has_fix && !amending {
@@ -1536,6 +1599,11 @@ fn simplification_findings(
     scan: &ScanResult,
     topology: &Topology,
     policy_text: Option<&str>,
+    // Whether a `keel.toml` exists at all. `policy_text` is `None` for two
+    // different projects — one with no policy file, one whose file doctor will
+    // not edit because it does not validate — and the route-key advice must
+    // treat them differently (see [`poll_advice_keys`]).
+    policy_present: bool,
 ) -> (Vec<Finding>, crate::surface::SurfaceEvidence) {
     let surfaces = crate::surface::detect_surfaces(
         &crate::surface::policy_hosts(policy_text),
@@ -1574,8 +1642,13 @@ fn simplification_findings(
                         fix = Some(proposal);
                     }
                 }
-                let action =
-                    hand_rolled_poll_action(plans.as_ref(), fix.is_some(), fix_ref.as_deref());
+                let advice_keys = poll_advice_keys(s, plans.as_ref(), policy_present, &detected);
+                let action = hand_rolled_poll_action(
+                    plans.as_ref(),
+                    &advice_keys,
+                    fix.is_some(),
+                    fix_ref.as_deref(),
+                );
                 (
                     "hand-rolled-poll",
                     format!(
@@ -2271,6 +2344,7 @@ fn build_report(
         scan,
         &topology,
         policy.valid.then_some(policy_text.as_deref()).flatten(),
+        policy.present,
     );
     findings.extend(simplifications);
     if !policy.valid && policy.present {
@@ -3462,6 +3536,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         let poll = findings
             .iter()
@@ -3504,7 +3579,7 @@ mod tests {
         // about dedupe, not about surface narrowing (which
         // `the_detected_surface_narrows_the_patch_the_finding_carries` owns).
         let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\ntimeout = \"30s\"\n\n[target.\"generativelanguage.googleapis.com\"]\ntimeout = \"30s\"\n";
-        let (f2, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f2, _) = simplification_findings(&scan, &topology, Some(present), true);
         let fix2 = f2[0].fix.as_ref().unwrap();
         assert!(
             !fix2.patch.contains("+[target.\"POST *-aiplatform"),
@@ -3533,6 +3608,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         assert!(dedup[0].fix.is_some(), "first sighting carries the patch");
         assert!(
@@ -3559,12 +3635,21 @@ mod tests {
         );
         // An invalid (or absent) keel.toml has no base document to edit — the
         // policy finding's removal fix owns that file until it parses.
-        let (invalid, _) = simplification_findings(&scan, &topology, None);
+        let (invalid, _) = simplification_findings(&scan, &topology, None, true);
         assert!(invalid.iter().all(|f| f.fix.is_none()), "{invalid:?}");
+        // And an invalid file is NOT the same as no file: doctor cannot read
+        // what that document already declares, so it must not advise route keys
+        // back at a project that may already have them.
+        assert!(
+            invalid
+                .iter()
+                .all(|f| !f.action.contains("put `poll` on a route key")),
+            "{invalid:?}"
+        );
         scan.simplifications.pop();
         // URL-literal poll (no SDK shape) → no fix, action still updated.
         scan.simplifications[0].sdk_polls.clear();
-        let (f3, _) = simplification_findings(&scan, &topology, Some(""));
+        let (f3, _) = simplification_findings(&scan, &topology, Some(""), true);
         assert!(f3[0].fix.is_none());
         assert!(
             !f3[0].action.contains("attached"),
@@ -3702,6 +3787,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         assert_eq!(surfaces.detected, vec![crate::surface::Surface::Vertex]);
         let patch = &findings[0].fix.as_ref().expect("a patch is attached").patch;
@@ -3725,6 +3811,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         assert!(surfaces.detected.is_empty());
         let patch = &findings[0].fix.as_ref().expect("a patch is attached").patch;
@@ -3748,7 +3835,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true] } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         let fix = f[0].fix.as_ref().expect("an amend fix must be attached");
 
         assert!(
@@ -3785,7 +3872,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true], absent = \"pending\" } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         // Only ADDED lines count: the route key appears in the patch's context
         // lines whenever anything else in the file moves.
         let touches_vertex = |patch: &str| {
@@ -3811,7 +3898,7 @@ mod tests {
             .sdk_polls
             .push("batches.retrieve".into());
         topology.wrappable.push("llm:openai".to_owned());
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         let fix = f[0].fix.as_ref().expect("the OpenAI block is still added");
         assert!(fix.patch.contains("api.openai.com"), "{}", fix.patch);
         assert!(
@@ -3842,7 +3929,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true] } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         let fix = f[0].fix.as_ref().expect("a patch is attached");
         assert!(
             fix.new_text.contains("absent = \"pending\""),
@@ -3879,7 +3966,7 @@ mod tests {
         let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
         let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
                        timeout = \"30s\"\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         assert!(
             f[0].fix.is_none(),
             "nothing to propose for this route: {:?}",
@@ -3911,7 +3998,7 @@ mod tests {
         let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
                        timeout = \"30s\"\n\
                        poll    = { interval = \"10s\", deadline = \"30m\" }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         assert!(
             f[0].fix.is_none(),
             "nothing to propose for this route: {:?}",
@@ -3940,7 +4027,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true] } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         let action = &f[0].action;
         assert!(action.contains("returns on the FIRST response"), "{action}");
         let inert_at = action
@@ -3968,7 +4055,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true], absent = \"pending\" } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         let poll = f
             .iter()
             .find(|x| x.topic == "hand-rolled-poll")
@@ -3998,7 +4085,7 @@ mod tests {
     #[test]
     fn the_route_key_advice_names_the_surface_the_patch_proposes() {
         let (scan, topology) = sdk_poll_fixture(Some("generativelanguage.googleapis.com"));
-        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"));
+        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"), true);
         let poll = f
             .iter()
             .find(|x| x.topic == "hand-rolled-poll")
@@ -4032,7 +4119,7 @@ mod tests {
         let (mut scan, topology) = sdk_poll_fixture(None);
         scan.simplifications[0].targets = vec!["llm:openai".into()];
         scan.simplifications[0].sdk_polls = vec!["batches.retrieve".into()];
-        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"));
+        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"), true);
         let poll = f
             .iter()
             .find(|x| x.topic == "hand-rolled-poll")
@@ -4051,6 +4138,81 @@ mod tests {
         );
     }
 
+    /// D1, round 2: a project with NO `keel.toml` is the observe-first adoption
+    /// path — the commonest shape a first `keel doctor` runs against — and it
+    /// has no declarations to consult, but it does have a surface verdict. The
+    /// advice is narrowed to that verdict instead of being withheld. Each arm
+    /// asserts the finding is PRESENT and names the right key, so a vanished
+    /// finding cannot pass the negative half.
+    #[test]
+    fn with_no_policy_file_the_advice_follows_the_detected_surface() {
+        const VERTEX: &str = "`[target.\"POST \
+                              *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`";
+        const GEMINI: &str = "`[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]`";
+        let poll_action = |host: Option<&str>, targets: &[&str], polls: &[&str]| {
+            let (mut scan, topology) = sdk_poll_fixture(host);
+            if !targets.is_empty() {
+                scan.simplifications[0].targets = targets.iter().map(|t| (*t).to_owned()).collect();
+                scan.simplifications[0].sdk_polls = polls.iter().map(|p| (*p).to_owned()).collect();
+            }
+            // `None` policy text with `policy_present: false` — no keel.toml.
+            let (f, _) = simplification_findings(&scan, &topology, None, false);
+            let poll = f
+                .iter()
+                .find(|x| x.topic == "hand-rolled-poll")
+                .expect("the finding stands with or without a policy file");
+            assert!(poll.detail.contains("render.py:8"), "{}", poll.detail);
+            assert!(
+                poll.fix.is_none(),
+                "no base document, so never a patch: {:?}",
+                poll.fix
+            );
+            poll.action.clone()
+        };
+
+        // {vertex}: a Vertex host literal in the scan.
+        let a = poll_action(Some("us-central1-aiplatform.googleapis.com"), &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({VERTEX})")),
+            "{a}"
+        );
+        assert!(!a.contains("generativelanguage"), "{a}");
+
+        // {gemini-api}: the twin, and the case 0.7.0 got outright wrong.
+        let a = poll_action(Some("generativelanguage.googleapis.com"), &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({GEMINI})")),
+            "{a}"
+        );
+        assert!(!a.contains("aiplatform"), "{a}");
+
+        // {}: no host anywhere. Both keys, as a pair — the same prose the
+        // document-backed unknown case emits. The hedge is not repeated here
+        // because the report already carries `surface: could not determine`
+        // for this exact project (D4).
+        let a = poll_action(None, &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({GEMINI}, {VERTEX})")),
+            "{a}"
+        );
+
+        // Not Google at all: its own route key, and no Google key — 0.7.0 sent
+        // this project the Vertex one.
+        let a = poll_action(None, &["llm:openai"], &["batches.retrieve"]);
+        assert!(
+            a.contains(
+                "put `poll` on a route key (`[target.\"GET api.openai.com/v1/batches/*\"]`)"
+            ),
+            "{a}"
+        );
+        assert!(!a.contains("googleapis.com"), "{a}");
+
+        // A target with no route key in doctor's table proposes none, so the
+        // base sentence stands alone — with or without a policy file.
+        let a = poll_action(None, &["api.tavily.com"], &[]);
+        assert!(!a.contains("put `poll` on a route key"), "{a}");
+    }
+
     /// D3: when one patch carries a block for BOTH surfaces it also carries the
     /// same provenance twice, and at most one of the two blocks is the surface
     /// the sighted loop actually calls. The claim is qualified in that case —
@@ -4062,7 +4224,7 @@ mod tests {
 
         // No host anywhere: surface unknown, so both blocks are proposed.
         let (scan, topology) = sdk_poll_fixture(None);
-        let (f, surfaces) = simplification_findings(&scan, &topology, Some(base));
+        let (f, surfaces) = simplification_findings(&scan, &topology, Some(base), true);
         assert!(
             surfaces.detected.is_empty(),
             "the premise: no host evidence"
@@ -4082,7 +4244,7 @@ mod tests {
         // One surface known: the block IS the surface that loop calls, so the
         // provenance is stated outright.
         let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
-        let (f, _) = simplification_findings(&scan, &topology, Some(base));
+        let (f, _) = simplification_findings(&scan, &topology, Some(base), true);
         let patch = &f[0].fix.as_ref().expect("a patch is attached").patch;
         assert!(
             patch.contains("replaces the hand-rolled poll in render.py:8 (poll_video_takes)\n")
@@ -4137,7 +4299,7 @@ mod tests {
              timeout = \"30s\"\n\
              poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
              terminal = [true] } }\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         for fix in f.iter().filter_map(|x| x.fix.as_ref()) {
             assert!(
                 !fix.patch.contains("generativelanguage"),
@@ -4154,6 +4316,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         let fix = f[0].fix.as_ref().expect("a proposal must be attached");
         assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
@@ -4179,6 +4342,7 @@ mod tests {
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         let fix = f[0].fix.as_ref().expect("a proposal must be attached");
         assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
@@ -4215,7 +4379,7 @@ mod tests {
         );
         topology.wrappable = vec!["llm:openai".to_owned()];
         let present = "[target.\"GET api.openai.com/v1/batches/*\"]\ntimeout = \"30s\"\n";
-        let (f, _) = simplification_findings(&scan, &topology, Some(present));
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
         assert!(
             f[0].fix.is_none(),
             "the section exists with no poll — nothing to propose: {:?}",
@@ -4373,7 +4537,7 @@ mod tests {
         let patch_for = |s: SimplificationSighting| {
             let mut scan = ScanResult::default();
             scan.simplifications.push(s);
-            simplification_findings(&scan, &topology, Some("[flows]\n")).0[0]
+            simplification_findings(&scan, &topology, Some("[flows]\n"), true).0[0]
                 .fix
                 .as_ref()
                 .expect("route-key proposal attached")
@@ -4428,7 +4592,7 @@ mod tests {
                 simplifications: sightings,
                 ..ScanResult::default()
             };
-            let (findings, _) = simplification_findings(&scan, &topology, Some("[flows]\n"));
+            let (findings, _) = simplification_findings(&scan, &topology, Some("[flows]\n"), true);
             findings
                 .iter()
                 .find_map(|f| f.fix.as_ref())
