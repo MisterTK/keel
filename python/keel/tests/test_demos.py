@@ -7,6 +7,9 @@ files (app/scenario/keel.toml) rather than duplicating them.
                   runs with ~0 API calls (native-only; skips otherwise).
   * adk-demo:     a real google-adk LlmAgent's tool call rides out the same
                   storm below the agent loop (needs google-adk; skips otherwise).
+  * lro-poll:     a poll block without `until.absent` does not poll a running
+                  google.longrunning.Operation; adding `absent = "pending"`
+                  makes the same code poll to terminal (Tier 1; stub OK).
 """
 
 from __future__ import annotations
@@ -112,6 +115,60 @@ class AdkDemoTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(result.stdout, b"reply=42\n", result.stderr.decode())
             self.assertEqual(len(proxy.log), 3, "one agent turn absorbed a 2x429 + 1x200 storm")
+
+
+class LroPollAbsentTest(unittest.TestCase):
+    """The demo's CLAIM, not merely its exit code: the pre-CCR-11 poll block
+    makes exactly ONE upstream GET and hands the app a still-running
+    `google.longrunning.Operation` (no `done` key at all — proto3 JSON omits a
+    false bool), while the SAME app.py under the SAME block plus
+    `absent = "pending"` makes four and reaches the terminal body.
+
+    Runs on whichever backend is present; poll is Tier 1, so both must agree.
+    """
+
+    def _run(self, policy: str, url: str) -> tuple[subprocess.CompletedProcess[bytes], str]:
+        demo = _DEMOS / "lro-poll"
+        with TemporaryDirectory() as d:
+            Path(d, "keel.toml").write_text((demo / policy).read_text())
+            proc = subprocess.run(
+                [sys.executable, "-m", "keel", "run", str(demo / "app.py")],
+                env=child_env(KEEL_DEMO_URL=url, KEEL_QUIET="1"),
+                cwd=d,
+                capture_output=True,
+            )
+        return proc, proc.stdout.decode()
+
+    def test_absent_is_the_difference_between_not_polling_and_polling(self) -> None:
+        demo = _DEMOS / "lro-poll"
+        # The two policies must differ by exactly one line — the demo's whole
+        # claim is "same code, one added key".
+        without = (demo / "keel.without-absent.toml").read_text().splitlines()
+        with_ = (demo / "keel.with-absent.toml").read_text().splitlines()
+        self.assertEqual(len(without), len(with_))
+        differing = [i for i, (a, b) in enumerate(zip(without, with_)) if a != b]
+        self.assertEqual(len(differing), 1, "policies must differ by one line only")
+        self.assertNotIn('absent = "pending"', without[differing[0]])
+        self.assertIn('absent = "pending"', with_[differing[0]])
+
+        with FaultProxy(_scenario("lro-poll")) as proxy:
+            url = proxy.url("/v1/projects/demo/locations/us-central1/operations/123")
+
+            # Act 1: fails open on the missing `done`, returns the running body.
+            act1, out1 = self._run("keel.without-absent.toml", url)
+            self.assertNotEqual(act1.returncode, 0, "the app must break on a non-terminal body")
+            self.assertIn("done=None upstream_attempts=1", out1, act1.stderr.decode())
+            self.assertNotIn('"done"', out1, "the running LRO body must not carry `done` at all")
+            self.assertEqual(len(proxy.log), 1, "act 1 did not poll: one upstream GET")
+
+            proxy.scenario.reset()  # rewind so act 2 sees the same body sequence
+
+            # Act 2: same app.py, same block + `absent = "pending"`.
+            act2, out2 = self._run("keel.with-absent.toml", url)
+            self.assertEqual(act2.returncode, 0, act2.stderr.decode())
+            self.assertIn("done=True upstream_attempts=4", out2, act2.stderr.decode())
+            self.assertIn("video: gs://out/video.mp4", out2)
+            self.assertEqual(len(proxy.log), 5, "act 2 polled: 3 pending + 1 terminal, after act 1's 1")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+{
+  "default": {
+    "status": 404,
+    "body": "{\"error\":{\"code\":404,\"message\":\"not found\"}}",
+    "headers": { "content-type": "application/json" }
+  },
+  "paths": {
+    "/v1/projects/demo/locations/us-central1/operations/123": [
+      {
+        "status": 200,
+        "body": "{\"name\":\"projects/demo/locations/us-central1/operations/123\",\"metadata\":{\"@type\":\"type.googleapis.com/google.cloud.aiplatform.v1.GenerateVideoOperationMetadata\"}}",
+        "headers": { "content-type": "application/json" },
+        "repeat": 3
+      },
+      {
+        "status": 200,
+        "body": "{\"name\":\"projects/demo/locations/us-central1/operations/123\",\"done\":true,\"response\":{\"generatedSample\":{\"uri\":\"gs://out/video.mp4\"}}}",
+        "headers": { "content-type": "application/json" }
+      }
+    ]
+  }
+}

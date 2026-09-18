@@ -1,0 +1,6 @@
+# The fake long-running-operation endpoint runs on loopback; wrap that host
+# with a poll block, so one GET of the operation becomes poll-until-terminal.
+# This file and keel.with-absent.toml differ by exactly one thing —
+# `absent = "pending"` — and run.sh diffs them so you can see that.
+[target."127.0.0.1"]
+poll = { interval = "300ms", deadline = "10s", until = { field = "done", terminal = [true] } }
