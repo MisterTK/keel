@@ -355,9 +355,15 @@ dev cache). A host-only glob such as `*.googleapis.com` never captures LLM
 traffic. When a valid `keel.toml` is present, `keel doctor` attaches this
 block as an applyable patch to the first `hand-rolled-poll` finding it can
 attribute to an SDK poll call (one patch per provider; later findings for
-the same provider point at it). Its two Google proposals carry `absent =
-"pending"`; the OpenAI and Anthropic ones do not, because those status
-bodies always carry their terminal field.
+the same provider point at it). Google serves generative AI over two
+surfaces sharing one SDK and therefore one target — Vertex AI and the Gemini
+Developer API — so doctor infers which one this project uses from the hosts
+named in its `keel.toml` and sighted by the scan, proposes only that route,
+and reports the verdict as `llm_surfaces` in `keel doctor --json`. It
+proposes both blocks, each noting which to delete, only when it detects
+neither surface; when it detects both, both blocks are the answer. Either
+Google proposal carries `absent = "pending"`; the OpenAI and Anthropic ones
+do not, because those status bodies always carry their terminal field.
 
 ### `keel exec` — durable external commands (CCR-4)
 

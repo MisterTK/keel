@@ -232,13 +232,29 @@ the six phases in order; the static scan is evidence, not the verdict.
    attributed to an SDK poll call (per provider) carries an applyable `fix`
    (a route-key `poll` block that beats the LLM host map for that route;
    Vertex `:fetch*Operation` POSTs are judged idempotent since 0.6.0) — apply
-   it with `git apply`, then tune `interval`/`deadline`. The two Google
-   proposals emit `absent = "pending"`; the OpenAI and Anthropic ones
-   deliberately do not, because those status bodies always carry their
-   terminal field. If you write a `poll` block by hand for any other
-   long-running-operation API, decide that question explicitly rather than
-   inheriting a template. Later findings for
-   the same provider carry `fix_ref` instead of a `fix` — the `file:line` of
+   it with `git apply`, then tune `interval`/`deadline`. **Google serves
+   generative AI over two surfaces that share one SDK and therefore one Keel
+   target, `llm:google-genai`: Vertex AI and the Gemini Developer API.** They
+   differ in host, auth, and operation-read shape, so a `poll` route key
+   written for one is wrong for the other. Read
+   `llm_surfaces["llm:google-genai"]` from `keel doctor --json` to learn which
+   one this project uses — `detected`, plus the `source` and `evidence` hosts
+   that decided it — and doctor proposes only that route. When `detected` names
+   both, you get both blocks as a statement of fact, with nothing to delete.
+   When the key is missing from the report the inference found nothing to go
+   on: it is static, so a factory-built client with no host literal anywhere
+   reads as unknown, and doctor hedges with both Google blocks, each note
+   saying which to delete. Whichever it proposes, the Google blocks emit
+   `absent = "pending"` — a running `google.longrunning.Operation` omits `done`
+   entirely, because proto3 JSON drops a false bool, so the same block without
+   it returns the running body on attempt one and never polls. If the project
+   already declares such a route key and its `poll.until` lacks `absent`,
+   doctor now says so plainly and the patch amends that block rather than
+   staying silent. The OpenAI and Anthropic proposals deliberately carry no
+   `absent`, because those status bodies always carry their terminal field. If
+   you write a `poll` block by hand for any other long-running-operation API,
+   decide that question explicitly rather than inheriting a template. Later
+   findings for the same provider carry `fix_ref` instead of a `fix` — the `file:line` of
    the finding that actually holds the patch — rather than repeating it.
    Each is either replaced by policy (note which `keel.toml` key) or explicitly
    out of Keel's reach (say so honestly). Respect dependency-averse files —
