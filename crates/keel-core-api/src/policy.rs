@@ -1048,10 +1048,12 @@ const OUTBOUND_METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DEL
 /// Non-outbound target classes (function + semantic targets) — never host keys.
 const CLASS_PREFIXES: [&str; 6] = ["py:", "ts:", "rs:", "llm:", "tool:", "mcp:"];
 
-/// Suffix matching any Vertex AI REGIONAL endpoint host, e.g.
-/// `us-central1-aiplatform.googleapis.com`. Parity contract with the Python
-/// (`adapters/_http.py`) and Node (`judge.mjs`) twins' identical suffix check.
-const VERTEX_REGIONAL_SUFFIX: &str = "-aiplatform.googleapis.com";
+/// The regional Vertex AI host suffix (`us-central1-aiplatform.googleapis.com`).
+///
+/// `pub` so `keel-cli`'s surface classifier reads the one definition instead of
+/// keeping a second copy of a host rule — a duplicate here is the staleness
+/// class this repo keeps having to fix. Additive, so not a breaking change.
+pub const VERTEX_REGIONAL_SUFFIX: &str = "-aiplatform.googleapis.com";
 
 /// Host → LLM provider. Ported verbatim from `adapters/_http.py:61-68`
 /// (`LLM_HOST_PROVIDERS`) — a cross-language parity contract with the Node
