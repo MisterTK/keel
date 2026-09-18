@@ -66,7 +66,7 @@ hand-rolled retry/poll loops) ship too.
 
 ## For coding agents
 
-- Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`).
+- Run `keel doctor --json` before changing resilience behavior; propose edits as a diff (`keel init --diff`). Its `llm_surfaces` field says which Google generative-AI surface a project uses — Vertex AI or the Gemini Developer API, which share one SDK and so one target, `llm:google-genai` — inferred statically from the hosts the `keel.toml` names and the scan sighted, so doctor's `hand-rolled-poll` patch proposes a `poll` block only for the route(s) it detects (both, when the project really uses both).
 - `keel init --agents` drops a Keel section into `AGENTS.md`.
 - `keel mcp` serves the CLI as an MCP server over stdio: tools `get_status`, `get_doctor_report`, `propose_policy` (a keel.toml diff), `get_trace`, `list_flows`, `explain_error` — each byte-identical to the matching `--json` command.
 - Zero-launcher activation: pip/npm dependency + `KEEL_ENABLE=1` (`.pth` / `NODE_OPTIONS=--import keelrun/register`); `KEEL_CWD` relocates the config root in BOTH languages. `KEEL_CWD` is an assertion — if it names a directory with no `keel.toml`, Keel refuses to activate, says so on one line, and the host runs keel-free (`KEEL_POLICY=optional` restores defaults-with-a-warning).

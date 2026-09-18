@@ -477,6 +477,38 @@ struct DoctorReport {
     findings: Vec<Finding>,
     follow_ups: Vec<FollowUp>,
     journal: JournalReport,
+    /// Which generative-AI surface each LLM target resolves to, and the
+    /// evidence that decided it — the verdict that narrows the route-key
+    /// proposals above (#139), published so an operator can check it rather
+    /// than infer it from which patch they were handed.
+    ///
+    /// Keyed by target even though only `llm:google-genai` populates it today
+    /// and the detection is deliberately Google-specific (YAGNI). The map is
+    /// the cheap half: `keel doctor --json` is consumer-facing — the MCP
+    /// server returns it byte-identical and the skill reads it — so renaming a
+    /// key later breaks consumers, while getting the container right now costs
+    /// nothing. Anthropic's Bedrock/Vertex clients and Azure OpenAI are the
+    /// identical shape (one SDK, one target name, several surfaces) and
+    /// acquire this exact problem the moment their hosts enter the host map.
+    ///
+    /// Omitted entirely — absent, not `{}` — when no target has a surface to
+    /// report, so a non-Google project's report carries no Google-shaped hole.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    llm_surfaces: BTreeMap<String, crate::surface::SurfaceEvidence>,
+    /// The targets this project HAS that carry a surface question doctor could
+    /// not answer — `llm_surfaces`'s complement, not a second verdict. The
+    /// human report says so out loud, because an absent line is a weaker signal
+    /// than "could not determine" and the operator otherwise learns doctor is
+    /// hedging only from the `(delete if you use …)` comments inside the
+    /// generated TOML (D4, spec D2).
+    ///
+    /// **Never serialized.** `llm_surfaces` is omitted rather than empty
+    /// precisely so a machine consumer sees no Google-shaped hole in a report
+    /// that has no Google verdict; a sibling key listing the same emptiness
+    /// would put the hole straight back. The human report is where a hedge
+    /// needs saying.
+    #[serde(skip)]
+    unknown_surface_targets: Vec<&'static str>,
     ok: bool,
     policy: PolicyCheck,
     /// `"verified"` when some recorded activation row matches this project's
@@ -844,8 +876,29 @@ struct RouteKeyProposal {
     /// pending" — that inference must be made per API family, not per
     /// template.
     absent: Option<&'static str>,
-    note: &'static str,
+    /// Which Google surface this route belongs to, or `None` for a proposal
+    /// that is not surface-scoped (every OpenAI and Anthropic route). A
+    /// surface-scoped proposal is dropped when the project is known to use the
+    /// other surface; `None` is never filtered.
+    surface: Option<crate::surface::Surface>,
+    /// Set by [`route_key_proposals_for`], which is the only thing that knows
+    /// whether the surface is known well enough to drop the hedge.
+    note: String,
 }
+
+/// The one target name both Google generative-AI surfaces share — the key
+/// `llm_surfaces` uses, and the gate `build_report` checks `scan.targets` for.
+const GOOGLE_GENAI_TARGET: &str = "llm:google-genai";
+
+/// The two Google notes, each with ONE home. [`route_key_proposals_for`]
+/// appends its hedge suffix rather than restating the phrase, so a wording
+/// edit here cannot be silently overwritten downstream.
+const VERTEX_NOTE: &str = "Vertex AI operation read";
+const GEMINI_NOTE: &str = "Gemini API operation read";
+/// Appended to [`VERTEX_NOTE`] / [`GEMINI_NOTE`] only when the surface is
+/// genuinely unknown and doctor has to propose both blocks.
+const VERTEX_HEDGE: &str = " (delete if you use the Gemini API)";
+const GEMINI_HEDGE: &str = " (delete if you use Vertex AI)";
 
 /// The route keys that carry an operation read for one `(target, SDK poll
 /// shape)` pair. Unknown pairs propose nothing — doctor never guesses a route.
@@ -863,14 +916,16 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                     // the pending signal here, not an unknown shape (#128,
                     // CCR-11).
                     absent: Some("pending"),
-                    note: "Vertex AI operation read (delete if you use the Gemini API)",
+                    surface: Some(crate::surface::Surface::Vertex),
+                    note: VERTEX_NOTE.to_owned(),
                 });
                 out.push(RouteKeyProposal {
                     key: "GET generativelanguage.googleapis.com/*/operations/*",
                     field: "done",
                     terminal: "[true]",
                     absent: Some("pending"),
-                    note: "Gemini API operation read (delete if you use Vertex AI)",
+                    surface: Some(crate::surface::Surface::GeminiApi),
+                    note: GEMINI_NOTE.to_owned(),
                 });
             }
             ("llm:openai", "batches.retrieve") => out.push(RouteKeyProposal {
@@ -881,31 +936,65 @@ fn route_key_proposals(target: &str, sdk_polls: &[String]) -> Vec<RouteKeyPropos
                 // `status`; an absent field here is genuinely unknown shape,
                 // so the schema default (fail_open) stays.
                 absent: None,
-                note: "OpenAI batch status",
+                surface: None,
+                note: "OpenAI batch status".to_owned(),
             }),
             ("llm:openai", "videos.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/videos/*",
                 field: "status",
                 terminal: "[\"completed\", \"failed\"]",
                 absent: None,
-                note: "OpenAI video status",
+                surface: None,
+                note: "OpenAI video status".to_owned(),
             }),
             ("llm:openai", "fine_tuning.jobs.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.openai.com/v1/fine_tuning/jobs/*",
                 field: "status",
                 terminal: "[\"succeeded\", \"failed\", \"cancelled\"]",
                 absent: None,
-                note: "OpenAI fine-tuning job status",
+                surface: None,
+                note: "OpenAI fine-tuning job status".to_owned(),
             }),
             ("llm:anthropic", "batches.retrieve") => out.push(RouteKeyProposal {
                 key: "GET api.anthropic.com/v1/messages/batches/*",
                 field: "processing_status",
                 terminal: "[\"ended\"]",
                 absent: None,
-                note: "Anthropic message batch status",
+                surface: None,
+                note: "Anthropic message batch status".to_owned(),
             }),
             _ => {}
         }
+    }
+    out
+}
+
+/// [`route_key_proposals`], narrowed to the surfaces this project actually
+/// uses, with the note reworded to match.
+///
+/// A known single surface yields one block and nothing to delete; `{both}` is
+/// a fact rather than a hedge and wants both blocks kept; only a genuinely
+/// unknown surface gets the "delete the one you do not use" hedge. See the
+/// spec's §4.1.
+fn route_key_proposals_for(
+    target: &str,
+    sdk_polls: &[String],
+    detected: &[crate::surface::Surface],
+) -> Vec<RouteKeyProposal> {
+    use crate::surface::Surface;
+    let mut out = route_key_proposals(target, sdk_polls);
+    if detected.is_empty() {
+        // Only a genuinely unknown surface gets the hedge appended; the table's
+        // note is the plain phrase, and this is the one place the suffix lives.
+        for p in &mut out {
+            match p.surface {
+                Some(Surface::Vertex) => p.note.push_str(VERTEX_HEDGE),
+                Some(Surface::GeminiApi) => p.note.push_str(GEMINI_HEDGE),
+                None => {}
+            }
+        }
+    } else {
+        out.retain(|p| p.surface.is_none_or(|s| detected.contains(&s)));
     }
     out
 }
@@ -954,10 +1043,18 @@ impl RouteCadence {
 /// which, PER COLUMN: a defaulted column was not observed anywhere, and
 /// claiming it was "the slowest of them" would be a false statement sitting
 /// right beside the number.
+///
+/// `ambiguous` says this patch carries a block for MORE THAN ONE Google
+/// surface, so at most one of them is the surface the sighted loop actually
+/// calls — and doctor cannot tell which (the surface evidence is a host
+/// literal, which a poll sighting does not carry). The provenance is per
+/// SIGHTING, not per block; when two blocks share it, the claim is qualified
+/// rather than asserted twice (D3).
 fn render_route_block(
     p: &RouteKeyProposal,
     s: &SimplificationSighting,
     cadence: RouteCadence,
+    ambiguous: bool,
 ) -> String {
     let interval = cadence
         .interval_s
@@ -965,6 +1062,13 @@ fn render_route_block(
     let deadline = cadence
         .deadline_s
         .map_or_else(|| "30m".to_owned(), |v| format!("{v}s"));
+    // Only qualified when the same provenance is about to be printed on a
+    // second surface's block; a single-surface patch states it outright.
+    let scope = match (ambiguous, cadence.sightings > 1) {
+        (false, _) => "",
+        (true, false) => ", if that loop calls this surface",
+        (true, true) => ", if those loops call this surface",
+    };
     let provenance = if cadence.sightings > 1 {
         // Only claim "slowest observed" for a column actually derived from the
         // loops; a defaulted column says so, and says why.
@@ -984,12 +1088,12 @@ fn render_route_block(
             }
         };
         format!(
-            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}); {}",
+            "replaces {} hand-rolled polls on this route, the first in {}:{} ({}){scope}; {}",
             cadence.sightings, s.file, s.line, s.function, source
         )
     } else {
         format!(
-            "replaces the hand-rolled poll in {}:{} ({})",
+            "replaces the hand-rolled poll in {}:{} ({}){scope}",
             s.file, s.line, s.function
         )
     };
@@ -1032,77 +1136,429 @@ fn render_route_block(
     )
 }
 
-/// The route keys one `hand-rolled-poll` sighting would append to
-/// `policy_text`, already filtered against what that document configures.
-/// `None` when there is no base document to edit (absent or invalid
-/// `keel.toml`: propose nothing rather than a patch that would create/clobber
-/// the file), or when the sighting names no proposable route.
-fn route_key_candidates(
-    s: &SimplificationSighting,
-    policy_text: Option<&str>,
-) -> Option<Vec<RouteKeyProposal>> {
-    let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
-    let has_key = |k: &str| {
-        existing
-            .get("target")
-            .and_then(toml_edit::Item::as_table_like)
-            .is_some_and(|t| t.contains_key(k))
-    };
-    let proposals: Vec<RouteKeyProposal> = s
-        .targets
-        .iter()
-        .flat_map(|t| route_key_proposals(t, &s.sdk_polls))
-        .filter(|p| !has_key(p.key))
-        .collect();
-    (!proposals.is_empty()).then_some(proposals)
+/// What doctor does about ONE proposal, given what the project's `keel.toml`
+/// already says about that route key (#139, spec §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKeyPlan {
+    /// No `[target."<key>"]` section at all: append the whole rendered block.
+    Append,
+    /// The section exists and carries a `poll` whose `until.absent` is missing
+    /// — the inert block #139 is about. Set that one key to the carried value;
+    /// appending would duplicate the section, and staying silent leaves a poll
+    /// that never polls. The value rides along so the op cannot be built for a
+    /// proposal that has none.
+    AmendAbsent(&'static str),
 }
 
-/// The sorted key set a sighting's candidates form — the dedupe identity and
-/// the [`RouteCadence`] fold key (see [`simplification_findings`]).
-fn route_key_set(proposals: &[RouteKeyProposal]) -> Vec<&'static str> {
-    let mut keys: Vec<&'static str> = proposals.iter().map(|p| p.key).collect();
+/// The verdict for one sighting's route keys (#139): what to act on, and the
+/// keys doctor deliberately declined to touch — split by WHY it declined,
+/// because the two reasons want different sentences (and the third wants none).
+struct RouteKeyPlans {
+    /// Each proposal doctor will act on, paired with how.
+    acting: Vec<(RouteKeyProposal, RouteKeyPlan)>,
+    /// Keys this project already declares as a `[target."…"]` section that
+    /// carries no poll-until-terminal rule — no `poll` table, or a `poll` with
+    /// no `until`. Doctor will not duplicate the section, and writing a poll
+    /// predicate into it is a separate decision — so the finding names them
+    /// rather than going quiet.
+    unpolled: Vec<&'static str>,
+    /// Keys this project already declares with a poll-until-terminal rule
+    /// doctor has nothing to add to. Named so the finding can say "already
+    /// done" instead of advising the operator to do it again — the state every
+    /// project lands in after applying doctor's own #139 amend patch.
+    complete: Vec<&'static str>,
+}
+
+impl RouteKeyPlans {
+    /// The sorted key set the acted-on proposals form — the dedupe identity
+    /// and the [`RouteCadence`] fold key (see [`simplification_findings`]).
+    fn keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self.acting.iter().map(|(p, _)| p.key).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The keys a patch from these plans would APPEND — the only route keys the
+    /// finding's prose may tell an operator to write, since they are exactly the
+    /// keys the patch contains and the project does not have.
+    fn append_keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self
+            .acting
+            .iter()
+            .filter(|(_, plan)| matches!(plan, RouteKeyPlan::Append))
+            .map(|(p, _)| p.key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// How many of the acted-on proposals are scoped to a Google surface. More
+    /// than one means this single patch carries a block for BOTH surfaces, so
+    /// no block can claim outright to replace the one sighted loop (D3).
+    fn surface_scoped(&self) -> usize {
+        self.acting
+            .iter()
+            .filter(|(p, _)| p.surface.is_some())
+            .count()
+    }
+
+    fn amending(&self) -> bool {
+        self.acting
+            .iter()
+            .any(|(_, plan)| matches!(plan, RouteKeyPlan::AmendAbsent(_)))
+    }
+
+    fn appending(&self) -> bool {
+        self.acting
+            .iter()
+            .any(|(_, plan)| matches!(plan, RouteKeyPlan::Append))
+    }
+}
+
+/// What doctor decided about one proposal, given the project's own document —
+/// total at the one place the decision is made, so no caller has to re-derive
+/// WHY a key was left alone by asking the document a second question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKeyVerdict {
+    /// Act on this key: append the block, or amend the inert one.
+    Act(RouteKeyPlan),
+    /// The section exists and declares no poll-until-terminal rule — the
+    /// "different conversation" arm of the §4.2 table. That is either no `poll`
+    /// table at all, or a `poll` whose `until` doctor cannot use (missing, or
+    /// missing the schema-required `field`): sections doctor will neither
+    /// duplicate nor guess a poll predicate into, and worth naming. (The
+    /// `poll`-without-a-usable-`until` arms are also schema-invalid, so through
+    /// `keel doctor` the policy finding owns that file and they are unreachable;
+    /// they are classified here so the classification is total rather than
+    /// depending on a validation gate two call sites away.)
+    Unpolled,
+    /// The section already declares a poll-until-terminal rule doctor has
+    /// nothing to add to: it carries `until.absent` already, or this route's
+    /// absence is not known to mean pending so there was never an `absent` to
+    /// write. Nothing to do, and nothing to advise.
+    Complete,
+}
+
+/// Every route-key proposal one sighting carries, already narrowed to the
+/// Google surface this project uses (see [`route_key_proposals_for`]). This is
+/// the proposal set BEFORE anything is known about what the project's own
+/// `keel.toml` declares — [`route_key_candidates`] classifies it against the
+/// document, and [`hand_rolled_poll_action`] falls back to it when there is no
+/// document to classify against.
+fn sighted_route_proposals(
+    s: &SimplificationSighting,
+    detected: &[crate::surface::Surface],
+) -> Vec<RouteKeyProposal> {
+    s.targets
+        .iter()
+        .flat_map(|t| route_key_proposals_for(t, &s.sdk_polls, detected))
+        .collect()
+}
+
+/// The keys of [`sighted_route_proposals`], sorted and deduped — the route keys
+/// a project with NO `keel.toml` needs, since a project with no policy file
+/// declares none of them.
+fn sighted_route_keys(
+    s: &SimplificationSighting,
+    detected: &[crate::surface::Surface],
+) -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = sighted_route_proposals(s, detected)
+        .iter()
+        .map(|p| p.key)
+        .collect();
     keys.sort_unstable();
+    keys.dedup();
     keys
 }
 
+/// Route keys as an operator would write them, for interpolation into a
+/// finding's action text. One home, so every clause that names a key names it
+/// the same way.
+fn quoted_target_keys(keys: &[&str]) -> String {
+    keys.iter()
+        .map(|k| format!("`[target.\"{k}\"]`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Classify one proposal against the project's existing document.
+fn route_key_plan(existing: &toml_edit::DocumentMut, p: &RouteKeyProposal) -> RouteKeyVerdict {
+    let Some(section) = existing
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|t| t.get(p.key))
+    else {
+        return RouteKeyVerdict::Act(RouteKeyPlan::Append);
+    };
+    let until = section
+        .as_table_like()
+        .and_then(|t| t.get("poll"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|poll| poll.get("until"))
+        .and_then(toml_edit::Item::as_table_like);
+    // No `poll`, or a `poll` with no `until`: no poll-until-terminal rule here.
+    let Some(until) = until else {
+        return RouteKeyVerdict::Unpolled;
+    };
+    // `until.field` is required by the schema; amending a document that lacks
+    // it would write `absent` onto an `until` that still does not validate — and
+    // an `until` with no `field` states no terminal condition, so it belongs
+    // with the other sections that declare no usable rule.
+    if until.get("field").is_none() {
+        return RouteKeyVerdict::Unpolled;
+    }
+    if until.get("absent").is_some() {
+        return RouteKeyVerdict::Complete;
+    }
+    // A route whose absence is not known to mean pending has nothing to amend.
+    p.absent.map_or(RouteKeyVerdict::Complete, |absent| {
+        RouteKeyVerdict::Act(RouteKeyPlan::AmendAbsent(absent))
+    })
+}
+
+/// The route keys one `hand-rolled-poll` sighting proposes against
+/// `policy_text`, each classified against what that document ACTUALLY
+/// configures for it — not merely whether the section exists (#139): absent ⇒
+/// append the block, present-but-inert (`poll` without `until.absent`) ⇒ amend
+/// that one key, present and already carrying `absent` ⇒ leave alone,
+/// present with no `poll` ⇒ leave alone and name it.
+///
+/// `None` when there is no base document to edit (absent or invalid
+/// `keel.toml`: propose nothing rather than a patch that would create/clobber
+/// the file), or when the sighting names no proposable route at all.
+fn route_key_candidates(
+    s: &SimplificationSighting,
+    policy_text: Option<&str>,
+    detected: &[crate::surface::Surface],
+) -> Option<RouteKeyPlans> {
+    let existing: toml_edit::DocumentMut = policy_text?.parse().ok()?;
+    let proposals = sighted_route_proposals(s, detected);
+    if proposals.is_empty() {
+        return None;
+    }
+    let mut plans = RouteKeyPlans {
+        acting: Vec::new(),
+        unpolled: Vec::new(),
+        complete: Vec::new(),
+    };
+    for p in proposals {
+        match route_key_plan(&existing, &p) {
+            RouteKeyVerdict::Act(plan) => plans.acting.push((p, plan)),
+            RouteKeyVerdict::Unpolled => plans.unpolled.push(p.key),
+            RouteKeyVerdict::Complete => plans.complete.push(p.key),
+        }
+    }
+    Some(plans)
+}
+
 /// The applyable route-key proposal for one `hand-rolled-poll` sighting plus
-/// the key set it would append. `None` when no shape is known, every proposed
-/// key is already configured, or the resulting document would not parse. The
-/// cadence is looked up by key set, NOT read off `s` — see [`RouteCadence`].
+/// the key set it covers. `None` when no shape is known, every proposed key is
+/// already correctly configured, or the resulting document would not parse.
+/// The cadence is looked up by key set, NOT read off `s` — see
+/// [`RouteCadence`]. `detected` is the Google surface verdict the proposals are
+/// narrowed to (see [`route_key_proposals_for`]).
 fn route_key_fix(
     s: &SimplificationSighting,
     policy_text: Option<&str>,
     cadences: &BTreeMap<Vec<&'static str>, RouteCadence>,
+    detected: &[crate::surface::Surface],
 ) -> Option<(Vec<&'static str>, Proposal)> {
-    let proposals = route_key_candidates(s, policy_text)?;
-    let keys = route_key_set(&proposals);
+    let plans = route_key_candidates(s, policy_text, detected)?;
+    if plans.acting.is_empty() {
+        return None;
+    }
+    let keys = plans.keys();
     let cadence = cadences.get(&keys).copied().unwrap_or_default();
-    let ops: Vec<PolicyOp> = proposals
+    // Two surface-scoped blocks in ONE patch share one sighting's provenance;
+    // see `render_route_block`'s `ambiguous`.
+    let ambiguous = plans.surface_scoped() > 1;
+    let ops: Vec<PolicyOp> = plans
+        .acting
         .iter()
-        .map(|p| PolicyOp::AppendBlock {
-            text: render_route_block(p, s, cadence),
+        .map(|(p, plan)| match plan {
+            RouteKeyPlan::Append => PolicyOp::AppendBlock {
+                text: render_route_block(p, s, cadence, ambiguous),
+            },
+            RouteKeyPlan::AmendAbsent(absent) => PolicyOp::Set {
+                path: PolicyPath::new(["target", p.key, "poll", "until", "absent"]),
+                value: (*absent).into(),
+            },
         })
         .collect();
     let proposal = propose(policy_text, &ops).ok()?;
     (!proposal.patch.is_empty()).then_some((keys, proposal))
 }
 
+/// Which route keys one `hand-rolled-poll` finding's prose may tell an operator
+/// to write. D1's rule is not "never name a route key" — it is "never name one
+/// without consulting the report". There are three states, and the middle one
+/// is the whole point of this function:
+///
+/// 1. **A document doctor classified** (`plans` is `Some`): the keys a patch
+///    from those plans APPENDS. A key the project already declares is reported
+///    by the `unpolled`/`complete` clauses instead, never as advice.
+/// 2. **No `keel.toml` at all**: there are no declarations to consult, but
+///    there IS a surface verdict, and [`sighted_route_proposals`] is already
+///    narrowed to it. A project with no policy file declares none of these
+///    keys, so every one of them is a key it needs — this is the observe-first
+///    adoption path, and going quiet here threw away accurate, actionable
+///    advice that 0.7.0 gave (it just gave the Vertex one to everybody).
+///    An unknown surface names BOTH Google keys, exactly as the
+///    document-backed unknown case does; the hedge itself is carried by the
+///    `surface: could not determine` line that same report necessarily prints.
+/// 3. **A `keel.toml` doctor could not read** (invalid: the policy finding owns
+///    that file, so `policy_text` arrives as `None` with a document on disk):
+///    name nothing. That file may already declare these keys and doctor cannot
+///    tell — advising them back is exactly D1. The operator's first action is
+///    the validation fix, after which they get case 1's answer.
+fn poll_advice_keys(
+    s: &SimplificationSighting,
+    plans: Option<&RouteKeyPlans>,
+    policy_present: bool,
+    detected: &[crate::surface::Surface],
+) -> Vec<&'static str> {
+    match plans {
+        Some(p) => p.append_keys(),
+        None if !policy_present => sighted_route_keys(s, detected),
+        None => Vec::new(),
+    }
+}
+
+/// The action text for one `hand-rolled-poll` finding.
+///
+/// Every clause past the opening sentence is derived from `plans` — this
+/// project's own route keys, classified against its own `keel.toml` — and from
+/// whether this finding carries the patch. Nothing here is a fixed sentence
+/// about a particular route: doctor used to append a Vertex route key to every
+/// such finding, which told a Gemini project to write the key its own patch
+/// omits, an OpenAI project to write a Google key, and a project that already
+/// declares the key correctly to write it again (D1). The rule is that the
+/// prose may name a route key only when the patch beside it contains that key,
+/// when the project demonstrably needs that key and has no document declaring
+/// it, or when it is saying doctor left that key alone and why.
+///
+/// `advice_keys` is that middle clause made explicit — see
+/// [`poll_advice_keys`], which decides it. `plans` is `None` when there was no
+/// base document to classify against, and then only `advice_keys` speaks:
+/// there are no declarations to report leaving alone.
+fn hand_rolled_poll_action(
+    plans: Option<&RouteKeyPlans>,
+    advice_keys: &[&str],
+    has_fix: bool,
+    fix_ref: Option<&str>,
+) -> String {
+    // The advice that is true of every hand-rolled poll, whatever provider or
+    // surface it is against.
+    let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
+         `poll.deadline` bounds the whole loop, `timeout` bounds one attempt."
+        .to_owned();
+    // One patch can carry both an appended block and an amend to a block the
+    // project already has, so each clause is emitted only when it is true of
+    // THIS patch.
+    let appending = has_fix && plans.is_some_and(RouteKeyPlans::appending);
+    let amending = has_fix && plans.is_some_and(RouteKeyPlans::amending);
+    if amending {
+        // #139: the operator already adopted the route key, so `keel status`
+        // attributes the calls and the block validates — and it still never
+        // polls. That is the only news here, so it leads.
+        let mut a = "The route-key `poll` block this project already declares does not poll: as \
+             written it returns on the FIRST response, because a running \
+             `google.longrunning.Operation` omits the terminal field the block names rather than \
+             reporting it false (proto3 JSON drops a false bool). Apply the attached patch \
+             (`git apply`): it sets `until.absent = \"pending\"` on that block"
+            .to_owned();
+        if appending {
+            a.push_str(
+                ", and ALSO adds the route-key `poll` block this provider is still missing — \
+                 tune `interval`/`deadline` to the job",
+            );
+        }
+        a.push_str(
+            ". Then delete the hand-rolled loop: `poll.deadline` bounds the whole loop, \
+             `timeout` bounds one attempt.",
+        );
+        action = a;
+    } else if !advice_keys.is_empty() {
+        // The ONLY route keys the prose tells an operator to write: keys this
+        // project needs and does not already have — see `poll_advice_keys`.
+        let _ = write!(
+            action,
+            " The operation read this loop makes has its own route: put `poll` on a route key \
+             ({}), which beats the LLM host map for that route.",
+            quoted_target_keys(advice_keys)
+        );
+    }
+    if has_fix && !amending {
+        action.push_str(
+            " Or apply the attached patch (`git apply`): it adds the route-key `poll` block for \
+             this provider — tune `interval`/`deadline` to the job.",
+        );
+    } else if !has_fix && let Some(holder) = fix_ref {
+        let _ = write!(
+            action,
+            " The route-key patch for this provider is attached to the `hand-rolled-poll` \
+             finding for {holder} (`fix_ref`)."
+        );
+    }
+    // A route key the project declares with no poll-until-terminal rule — no
+    // `poll` table, or a `poll` with no usable `until`. Doctor will not
+    // duplicate the section, and it will not guess a poll predicate into
+    // someone else's block either. Name it instead of going quiet — silence
+    // here is exactly the #139 failure.
+    if fix_ref.is_none()
+        && let Some(unpolled) = plans.map(|p| p.unpolled.as_slice())
+        && !unpolled.is_empty()
+    {
+        let _ = write!(
+            action,
+            " This project already declares {} with no poll-until-terminal rule (no \
+             `poll.until`) — doctor leaves that section alone; adding one to it is a separate \
+             decision.",
+            quoted_target_keys(unpolled)
+        );
+    }
+    // The other reason doctor acts on nothing: the project already declares the
+    // route key with a rule there is nothing to add to — the exact state every
+    // project lands in after applying doctor's own #139 amend patch. Saying
+    // nothing here is what left the generic advice telling an operator to do
+    // the thing they had just done (D1).
+    if fix_ref.is_none()
+        && let Some(complete) = plans.map(|p| p.complete.as_slice())
+        && !complete.is_empty()
+    {
+        let _ = write!(
+            action,
+            " This project already declares {} with a poll-until-terminal rule doctor has \
+             nothing to add to — that route is configured; deleting the hand-rolled loop is what \
+             is left.",
+            quoted_target_keys(complete)
+        );
+    }
+    action
+}
+
 /// Fold every `hand-rolled-poll` sighting into the cadence of the route-key
 /// set it would propose, BEFORE any finding is rendered — the patch the first
-/// sighting carries has to speak for all of them.
+/// sighting carries has to speak for all of them. `detected` is passed through
+/// to [`route_key_candidates`] so the fold keys match the key sets the emitted
+/// patches actually carry.
 fn route_cadences(
     scan: &ScanResult,
     policy_text: Option<&str>,
+    detected: &[crate::surface::Surface],
 ) -> BTreeMap<Vec<&'static str>, RouteCadence> {
     let mut out: BTreeMap<Vec<&'static str>, RouteCadence> = BTreeMap::new();
     for s in &scan.simplifications {
         if s.kind != "hand-rolled-poll" {
             continue;
         }
-        let Some(proposals) = route_key_candidates(s, policy_text) else {
+        let Some(plans) = route_key_candidates(s, policy_text, detected) else {
             continue;
         };
-        out.entry(route_key_set(&proposals))
+        if plans.acting.is_empty() {
+            continue;
+        }
+        out.entry(plans.keys())
             .and_modify(|c| c.fold(s))
             .or_insert_with(|| RouteCadence::of(s));
     }
@@ -1132,18 +1588,35 @@ fn route_cadences(
 /// `policy_text` is the base document a proposal edits; the caller passes
 /// `None` for an invalid `keel.toml` — the removal fix on the policy finding
 /// owns that file until it parses.
+///
+/// Google's two generative-AI surfaces share one target name, so the Google
+/// route-key proposals are filtered to the surface this project actually uses
+/// (see [`route_key_proposals_for`]). That detection is made HERE, once, and
+/// returned alongside the findings: `keel doctor --json` reports the same
+/// verdict, and a second detection call site would be a second source of
+/// truth that could go stale against this one.
 fn simplification_findings(
     scan: &ScanResult,
     topology: &Topology,
     policy_text: Option<&str>,
-) -> Vec<Finding> {
+    // Whether a `keel.toml` exists at all. `policy_text` is `None` for two
+    // different projects — one with no policy file, one whose file doctor will
+    // not edit because it does not validate — and the route-key advice must
+    // treat them differently (see [`poll_advice_keys`]).
+    policy_present: bool,
+) -> (Vec<Finding>, crate::surface::SurfaceEvidence) {
+    let surfaces = crate::surface::detect_surfaces(
+        &crate::surface::policy_hosts(policy_text),
+        &crate::surface::scan_hosts(scan),
+    );
+    let detected = surfaces.detected.clone();
     let wrappable: BTreeSet<&str> = topology.wrappable.iter().map(String::as_str).collect();
     let mut findings = Vec::new();
     // Key sets already proposed in this report -> the `file:line` of the
     // sighting whose finding carries that patch (the `fix_ref` a later
     // duplicate points at, so the pointer survives reordering/filtering).
     let mut proposed: BTreeMap<Vec<&'static str>, String> = BTreeMap::new();
-    let cadences = route_cadences(scan, policy_text);
+    let cadences = route_cadences(scan, policy_text, &detected);
     for s in &scan.simplifications {
         let mut fix_ref = None;
         let targets = s.targets.join(", ");
@@ -1156,10 +1629,12 @@ fn simplification_findings(
         let mut fix = None;
         let (topic, what, action): (&'static str, String, String) = match s.kind.as_str() {
             "hand-rolled-poll" => {
+                let plans = route_key_candidates(s, policy_text, &detected);
                 // The first sighting for a key set carries the patch; later
                 // ones name it, since only one of two identical patches can
                 // apply against the same base file.
-                if let Some((keys, proposal)) = route_key_fix(s, policy_text, &cadences) {
+                if let Some((keys, proposal)) = route_key_fix(s, policy_text, &cadences, &detected)
+                {
                     if let Some(holder) = proposed.get(&keys) {
                         fix_ref = Some(holder.clone());
                     } else {
@@ -1167,25 +1642,13 @@ fn simplification_findings(
                         fix = Some(proposal);
                     }
                 }
-                let mut action = "Wrap the target, then replace the loop with a `poll` policy — \
-                     `poll.deadline` bounds the whole loop, `timeout` bounds one attempt. A \
-                     POST-shaped operation read (Vertex `:fetch*Operation`) polls too: put \
-                     `poll` on a route key (`[target.\"POST \
-                     *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which beats the \
-                     LLM host map for that route."
-                    .to_owned();
-                if fix.is_some() {
-                    action.push_str(
-                        " Or apply the attached patch (`git apply`): it adds the route-key \
-                         `poll` block for this provider — tune `interval`/`deadline` to the job.",
-                    );
-                } else if let Some(holder) = &fix_ref {
-                    let _ = write!(
-                        action,
-                        " The route-key patch for this provider is attached to the \
-                         `hand-rolled-poll` finding for {holder} (`fix_ref`)."
-                    );
-                }
+                let advice_keys = poll_advice_keys(s, plans.as_ref(), policy_present, &detected);
+                let action = hand_rolled_poll_action(
+                    plans.as_ref(),
+                    &advice_keys,
+                    fix.is_some(),
+                    fix_ref.as_deref(),
+                );
                 (
                     "hand-rolled-poll",
                     format!(
@@ -1236,7 +1699,7 @@ fn simplification_findings(
             topic,
         });
     }
-    findings
+    (findings, surfaces)
 }
 
 /// The rank table: ascending Keel-confidence. Rank 1 (url-no-transport) is
@@ -1281,6 +1744,10 @@ fn build_follow_ups(
     scan: &ScanResult,
     stale_flows: &[crate::flows::StaleFlow],
     lro_timeouts: &[(String, u64)],
+    // Whether THIS report carries an applyable patch on a `hand-rolled-poll`
+    // finding — the only condition under which the `sdk-client-timeout`
+    // follow-up may point at one (D5).
+    poll_patch_available: bool,
 ) -> Vec<FollowUp> {
     let mut ups = Vec::new();
     for entry in &topology.unreachable {
@@ -1413,6 +1880,16 @@ fn build_follow_ups(
         });
     }
     for (subject, ms) in lro_timeouts {
+        // The cross-reference is only a pointer if there is something to point
+        // at. A project that has applied doctor's route-key patch (or never had
+        // one offered) carries no `fix` on any `hand-rolled-poll` finding, and
+        // the sentence sent the operator looking for a patch this report does
+        // not contain (D5).
+        let pointer = if poll_patch_available {
+            " — see `hand-rolled-poll` findings for an applyable patch"
+        } else {
+            ""
+        };
         ups.push(FollowUp {
             code: "sdk-client-timeout",
             rank: follow_up_rank("sdk-client-timeout"),
@@ -1424,8 +1901,7 @@ fn build_follow_ups(
                  Keel value, or the SDK gives up first and Keel just sees a retryable timeout. \
                  For a submit-then-poll API a `poll` policy (whose `deadline` bounds the WHOLE \
                  loop) replaces the loop; a POST-shaped operation read (Vertex \
-                 `:fetch*Operation`) takes it on a route key — see `hand-rolled-poll` findings \
-                 for an applyable patch.",
+                 `:fetch*Operation`) takes it on a route key{pointer}.",
                 ms / 1000
             ),
         });
@@ -1861,11 +2337,16 @@ fn build_report(
     findings.extend(topology_findings(&topology));
     // An invalid keel.toml already carries the removal fix on the policy
     // finding; a second patch against the same base file could not apply too.
-    findings.extend(simplification_findings(
+    // The surface verdict comes back from the ONE place it is decided — a
+    // second `detect_surfaces` call here would be a second source of truth to
+    // go stale against the proposals it narrowed.
+    let (simplifications, surfaces) = simplification_findings(
         scan,
         &topology,
         policy.valid.then_some(policy_text.as_deref()).flatten(),
-    ));
+        policy.present,
+    );
+    findings.extend(simplifications);
     if !policy.valid && policy.present {
         let field = policy.field.clone().unwrap_or_default();
         let mut action = "Fix the field above, then re-run `keel doctor`; validate against contracts/policy.schema.json.".to_owned();
@@ -1887,12 +2368,20 @@ fn build_report(
         });
     }
     let resilience = resilience_finding(scan, &registry_libs);
+    // Read off the findings this report actually carries, not off the inputs
+    // that might have produced one: the `hand-rolled-poll` patch is dropped for
+    // a duplicate key set, and it is absent entirely once the operator has
+    // applied it.
+    let poll_patch_available = findings
+        .iter()
+        .any(|f| f.topic == "hand-rolled-poll" && f.fix.is_some());
     let follow_ups = build_follow_ups(
         &topology,
         resilience.as_ref(),
         scan,
         stale_flows,
         &lro_timeouts,
+        poll_patch_available,
     );
     findings.extend(resilience);
     findings.extend(journal_finding(&journal));
@@ -1915,6 +2404,34 @@ fn build_report(
         findings.extend(config_above_cwd_finding);
     }
 
+    // Only the target whose surfaces were actually detected gets an entry: an
+    // empty verdict is reported by saying nothing, not by an empty list.
+    //
+    // And only when this project HAS that target. The map is keyed by target,
+    // so an entry is a statement about `llm:google-genai` specifically — but
+    // the evidence is host-shaped, and a project calling a Vertex URL through
+    // plain `requests` produces Vertex evidence with no google-genai target
+    // anywhere. Claiming a surface for a target the rest of the report never
+    // mentions (it is in neither `coverage` nor `topology`) is this program's
+    // own defect class: a key whose name asserts more than its predicate
+    // proves. `scan.targets` is the right gate because it is the set every
+    // other target-keyed section of this report is built from, so a consumer
+    // can always cross-check the claim against `coverage`/`topology`.
+    //
+    // The same gate decides the other half: a project that HAS the target and
+    // no evidence is a project doctor hedged on, and the human report says so
+    // (D4). A project with no `llm:google-genai` target has no surface question
+    // in the first place, so it gets neither line.
+    let mut llm_surfaces = BTreeMap::new();
+    let mut unknown_surface_targets = Vec::new();
+    if scan.targets.contains_key(GOOGLE_GENAI_TARGET) {
+        if surfaces.detected.is_empty() {
+            unknown_surface_targets.push(GOOGLE_GENAI_TARGET);
+        } else {
+            llm_surfaces.insert(GOOGLE_GENAI_TARGET.to_owned(), surfaces);
+        }
+    }
+
     let ok = (policy.valid || !policy.present) && journal.supported;
     DoctorReport {
         adapters,
@@ -1927,6 +2444,8 @@ fn build_report(
         findings,
         follow_ups,
         journal,
+        llm_surfaces,
+        unknown_surface_targets,
         ok,
         policy,
         runtime_activation,
@@ -2404,6 +2923,43 @@ fn human(r: &DoctorReport) -> String {
     let _ = writeln!(out, "  runtime activation: {}", r.runtime_activation);
     if let Some(b) = &r.activation_backend {
         let _ = writeln!(out, "  activation backend: {b}");
+    }
+    // Keyed by target in the JSON, so rendered per target here too — reading
+    // one hardcoded key would silently drop the second the day a second target
+    // gains a surface verdict.
+    for (target, ev) in &r.llm_surfaces {
+        let names: Vec<&str> = ev.detected.iter().map(|s| s.as_str()).collect();
+        // `source` is the machine word; say where an operator would go look.
+        let from = match ev.source {
+            "policy" => "keel.toml",
+            "static" => "sighted hosts",
+            // `"none"` is the third value of the type, and it never reaches
+            // here: it is produced only for an empty verdict, which
+            // `build_report` omits from the map entirely.
+            other => {
+                debug_assert!(false, "unexpected surface source: {other}");
+                other
+            }
+        };
+        let _ = writeln!(
+            out,
+            "  {target} surface: {} (from {from})",
+            names.join(" + ")
+        );
+    }
+    // The hedge, said out loud. Doctor still proposes both surfaces' blocks
+    // with a `delete if you use …` comment on each, but that label lives in
+    // generated TOML the operator may never read; this line is in the section
+    // where the answered case prints its verdict, so the two cases read as two
+    // answers rather than as one answer and one silence (D4).
+    for target in &r.unknown_surface_targets {
+        let _ = writeln!(
+            out,
+            "  {target} surface: could not determine — no Vertex \
+             (`*-aiplatform.googleapis.com`) or Gemini API \
+             (`generativelanguage.googleapis.com`) host appears in keel.toml or in source. \
+             Declaring the host you call in keel.toml settles it."
+        );
     }
 
     out.push_str("\njournal\n");
@@ -2976,10 +3532,11 @@ mod tests {
             unreachable: vec![],
             wrappable: vec!["llm:google-genai".to_owned()],
         };
-        let findings = simplification_findings(
+        let (findings, _) = simplification_findings(
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         let poll = findings
             .iter()
@@ -3016,9 +3573,13 @@ mod tests {
             "slice-1 caveat is gone: {}",
             poll.action
         );
-        // Already-present route key → that block is not proposed twice.
-        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\ntimeout = \"30s\"\n";
-        let f2 = simplification_findings(&scan, &topology, Some(present));
+        // Already-present route key → that block is not proposed twice. The
+        // document also names the Gemini host, so BOTH surfaces are detected
+        // and the surface filter keeps the other block in play — this case is
+        // about dedupe, not about surface narrowing (which
+        // `the_detected_surface_narrows_the_patch_the_finding_carries` owns).
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\ntimeout = \"30s\"\n\n[target.\"generativelanguage.googleapis.com\"]\ntimeout = \"30s\"\n";
+        let (f2, _) = simplification_findings(&scan, &topology, Some(present), true);
         let fix2 = f2[0].fix.as_ref().unwrap();
         assert!(
             !fix2.patch.contains("+[target.\"POST *-aiplatform"),
@@ -3043,10 +3604,11 @@ mod tests {
             interval_s: None,
             deadline_s: None,
         });
-        let dedup = simplification_findings(
+        let (dedup, _) = simplification_findings(
             &scan,
             &topology,
             Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
         );
         assert!(dedup[0].fix.is_some(), "first sighting carries the patch");
         assert!(
@@ -3073,17 +3635,948 @@ mod tests {
         );
         // An invalid (or absent) keel.toml has no base document to edit — the
         // policy finding's removal fix owns that file until it parses.
-        let invalid = simplification_findings(&scan, &topology, None);
+        let (invalid, _) = simplification_findings(&scan, &topology, None, true);
         assert!(invalid.iter().all(|f| f.fix.is_none()), "{invalid:?}");
+        // And an invalid file is NOT the same as no file: doctor cannot read
+        // what that document already declares, so it must not advise route keys
+        // back at a project that may already have them.
+        assert!(
+            invalid
+                .iter()
+                .all(|f| !f.action.contains("put `poll` on a route key")),
+            "{invalid:?}"
+        );
         scan.simplifications.pop();
         // URL-literal poll (no SDK shape) → no fix, action still updated.
         scan.simplifications[0].sdk_polls.clear();
-        let f3 = simplification_findings(&scan, &topology, Some(""));
+        let (f3, _) = simplification_findings(&scan, &topology, Some(""), true);
         assert!(f3[0].fix.is_none());
         assert!(
             !f3[0].action.contains("attached"),
             "no patch exists to point at: {}",
             f3[0].action
+        );
+    }
+
+    /// A google-genai SDK-poll sighting, with `scan.targets` carrying the raw
+    /// host so the surface inference has something to read. `host` picks which
+    /// surface the fixture represents; pass `None` for a project whose Google
+    /// host never appears as a literal (the Indeterminate case).
+    fn sdk_poll_fixture(host: Option<&str>) -> (ScanResult, Topology) {
+        use crate::scan::SimplificationSighting;
+        let mut scan = ScanResult::default();
+        scan.simplifications.push(SimplificationSighting {
+            file: "render.py".into(),
+            line: 8,
+            kind: "hand-rolled-poll".into(),
+            function: "poll_video_takes".into(),
+            targets: vec!["llm:google-genai".into()],
+            sdk_polls: vec!["operations.get".into()],
+            interval_s: None,
+            deadline_s: None,
+        });
+        let evidence = |class| TargetEvidence {
+            class,
+            sightings: [Sighting {
+                file: "render.py".into(),
+                line: 8,
+            }]
+            .into_iter()
+            .collect(),
+        };
+        scan.targets
+            .insert("llm:google-genai".to_owned(), evidence(TargetClass::Llm));
+        if let Some(h) = host {
+            scan.targets
+                .insert(h.to_owned(), evidence(TargetClass::Host));
+        }
+        let topology = Topology {
+            excluded: vec![],
+            external_processes: vec![],
+            unreachable: vec![],
+            wrappable: vec!["llm:google-genai".to_owned()],
+        };
+        (scan, topology)
+    }
+
+    #[test]
+    fn proposals_are_filtered_to_the_detected_surface() {
+        let polls = vec!["operations.get".to_owned()];
+
+        let vertex_only = route_key_proposals_for(
+            "llm:google-genai",
+            &polls,
+            &[crate::surface::Surface::Vertex],
+        );
+        let keys: Vec<&str> = vertex_only.iter().map(|p| p.key).collect();
+        assert_eq!(
+            keys,
+            vec!["POST *-aiplatform.googleapis.com/*:fetchPredictOperation"]
+        );
+
+        let gemini_only = route_key_proposals_for(
+            "llm:google-genai",
+            &polls,
+            &[crate::surface::Surface::GeminiApi],
+        );
+        let keys: Vec<&str> = gemini_only.iter().map(|p| p.key).collect();
+        assert_eq!(
+            keys,
+            vec!["GET generativelanguage.googleapis.com/*/operations/*"]
+        );
+
+        // Both detected, and nothing detected, each keep both blocks.
+        for set in [
+            vec![
+                crate::surface::Surface::GeminiApi,
+                crate::surface::Surface::Vertex,
+            ],
+            vec![],
+        ] {
+            assert_eq!(
+                route_key_proposals_for("llm:google-genai", &polls, &set).len(),
+                2,
+                "set {set:?} should keep both"
+            );
+        }
+    }
+
+    #[test]
+    fn non_google_proposals_are_never_filtered_by_surface() {
+        let polls = vec!["batches.retrieve".to_owned()];
+        // An OpenAI proposal must survive a Google surface verdict.
+        let got = route_key_proposals_for("llm:openai", &polls, &[crate::surface::Surface::Vertex]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "GET api.openai.com/v1/batches/*");
+    }
+
+    #[test]
+    fn the_delete_one_note_appears_only_when_the_surface_is_unknown() {
+        let polls = vec!["operations.get".to_owned()];
+
+        let unknown = route_key_proposals_for("llm:google-genai", &polls, &[]);
+        assert!(
+            unknown.iter().all(|p| p.note.contains("delete")),
+            "unknown surface should hedge: {:?}",
+            unknown.iter().map(|p| &p.note).collect::<Vec<_>>()
+        );
+
+        for set in [
+            vec![crate::surface::Surface::Vertex],
+            vec![
+                crate::surface::Surface::GeminiApi,
+                crate::surface::Surface::Vertex,
+            ],
+        ] {
+            let known = route_key_proposals_for("llm:google-genai", &polls, &set);
+            assert!(
+                known.iter().all(|p| !p.note.contains("delete")),
+                "known surface {set:?} must not tell the operator to delete anything: {:?}",
+                known.iter().map(|p| &p.note).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The detected surface reaches the emitted patch, not just the helper:
+    /// a project whose scan sighted a Vertex host gets the Vertex block alone,
+    /// and the evidence travels back out beside the findings.
+    #[test]
+    fn the_detected_surface_narrows_the_patch_the_finding_carries() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let (findings, surfaces) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
+        );
+        assert_eq!(surfaces.detected, vec![crate::surface::Surface::Vertex]);
+        let patch = &findings[0].fix.as_ref().expect("a patch is attached").patch;
+        assert!(
+            patch.contains("POST *-aiplatform.googleapis.com/*:fetchPredictOperation"),
+            "{patch}"
+        );
+        assert!(
+            !patch.contains("generativelanguage.googleapis.com"),
+            "the Gemini API block belongs to the other surface: {patch}"
+        );
+        assert!(
+            !patch.contains("delete if you use"),
+            "the surface is known — there is nothing to delete: {patch}"
+        );
+
+        // No Google host literal anywhere: the surface is indeterminate and
+        // doctor hedges with both blocks.
+        let (scan, topology) = sdk_poll_fixture(None);
+        let (findings, surfaces) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
+        );
+        assert!(surfaces.detected.is_empty());
+        let patch = &findings[0].fix.as_ref().expect("a patch is attached").patch;
+        assert!(patch.contains("*-aiplatform.googleapis.com"), "{patch}");
+        assert!(
+            patch.contains("generativelanguage.googleapis.com"),
+            "{patch}"
+        );
+        assert!(patch.contains("delete if you use"), "{patch}");
+    }
+
+    /// #139, the whole point of this program: an operator who already adopted
+    /// the Vertex route key with a pre-CCR-11 `poll` block has an INERT poll —
+    /// a running `google.longrunning.Operation` omits `done`, so the block
+    /// returns on attempt one. Doctor used to drop the proposal on the mere
+    /// presence of the section. It must amend it instead.
+    #[test]
+    fn an_existing_route_key_missing_absent_is_amended_not_suppressed() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        let fix = f[0].fix.as_ref().expect("an amend fix must be attached");
+
+        assert!(
+            fix.patch.contains("absent"),
+            "the inert block must be amended to add absent: {}",
+            fix.patch
+        );
+        assert!(
+            !fix.patch.contains("+[target.\"POST *-aiplatform"),
+            "must not append a duplicate section: {}",
+            fix.patch
+        );
+        // The applied document must carry the key where the poll layer reads
+        // it, not merely somewhere in the file.
+        assert!(
+            fix.new_text
+                .contains("until = { field = \"done\", terminal = [true], absent = \"pending\" }"),
+            "{}",
+            fix.new_text
+        );
+        assert!(
+            f[0].action.contains("returns on the FIRST response"),
+            "the finding must say the block the operator has does not poll: {}",
+            f[0].action
+        );
+    }
+
+    /// The case the original dedupe rule was actually written for: a route key
+    /// that is already configured CORRECTLY is left entirely alone.
+    #[test]
+    fn an_existing_route_key_that_already_has_absent_is_left_alone() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true], absent = \"pending\" } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        // Only ADDED lines count: the route key appears in the patch's context
+        // lines whenever anything else in the file moves.
+        let touches_vertex = |patch: &str| {
+            patch
+                .lines()
+                .any(|l| l.starts_with('+') && l.contains("aiplatform"))
+        };
+        assert!(
+            !f.iter()
+                .filter_map(|x| x.fix.as_ref())
+                .any(|fix| touches_vertex(&fix.patch)),
+            "a correctly-configured block must be left alone: {f:?}"
+        );
+
+        // A no-op `Set` writes an empty patch, so "no patch" alone would pass
+        // even if the amend fired. Give the same sighting a SECOND route that
+        // really is missing, and the prose has to stay honest about which of
+        // the two the patch touches.
+        let (mut scan, mut topology) =
+            sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.simplifications[0].targets.push("llm:openai".into());
+        scan.simplifications[0]
+            .sdk_polls
+            .push("batches.retrieve".into());
+        topology.wrappable.push("llm:openai".to_owned());
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        let fix = f[0].fix.as_ref().expect("the OpenAI block is still added");
+        assert!(fix.patch.contains("api.openai.com"), "{}", fix.patch);
+        assert!(
+            !touches_vertex(&fix.patch),
+            "the Vertex block is already correct: {}",
+            fix.patch
+        );
+        assert!(
+            !f[0].action.contains("returns on the FIRST response"),
+            "nothing was amended — the prose must not claim one was: {}",
+            f[0].action
+        );
+    }
+
+    /// One patch can carry both kinds of op — an appended block for a route
+    /// the project does not declare, and an amend to one it declares inertly.
+    /// Both clauses appear, and each is true of the patch.
+    #[test]
+    fn one_patch_can_both_append_a_block_and_amend_an_inert_one() {
+        let (mut scan, mut topology) =
+            sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.simplifications[0].targets.push("llm:openai".into());
+        scan.simplifications[0]
+            .sdk_polls
+            .push("batches.retrieve".into());
+        topology.wrappable.push("llm:openai".to_owned());
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        let fix = f[0].fix.as_ref().expect("a patch is attached");
+        assert!(
+            fix.new_text.contains("absent = \"pending\""),
+            "the inert Vertex block is amended: {}",
+            fix.new_text
+        );
+        assert!(
+            fix.new_text
+                .contains("[target.\"GET api.openai.com/v1/batches/*\"]"),
+            "the OpenAI block is appended: {}",
+            fix.new_text
+        );
+        // The amend leads (the operator already wrote a route key; the news is
+        // that it is inert), and the appended block is named in the same
+        // breath — each clause true of this one patch.
+        assert!(
+            f[0].action
+                .starts_with("The route-key `poll` block this project already declares does not"),
+            "{}",
+            f[0].action
+        );
+        assert!(
+            f[0].action.contains("ALSO adds the route-key"),
+            "{}",
+            f[0].action
+        );
+    }
+
+    /// A target section with no `poll` table at all is a different
+    /// conversation: appending the block would duplicate the section, so
+    /// doctor skips it — and SAYS it skipped it rather than going quiet.
+    #[test]
+    fn an_existing_route_key_with_no_poll_table_is_named_not_duplicated() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+                       timeout = \"30s\"\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        assert!(
+            f[0].fix.is_none(),
+            "nothing to propose for this route: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("no poll-until-terminal rule"),
+            "the skip must be stated: {}",
+            f[0].action
+        );
+    }
+
+    /// The other half of the same silence: a section that DOES declare a
+    /// `poll` table, but one with no `until`. [`route_key_plan`] classifies it
+    /// [`RouteKeyVerdict::Unpolled`] — there is no rule there to amend, and the
+    /// section must not fall out of the classification entirely.
+    ///
+    /// This state is NOT reachable through `keel doctor`: an `until`-less
+    /// `poll` fails schema validation, so `policy_text` is `None` by the time
+    /// `build_report` gets here and no proposal is made at all (see
+    /// [`RouteKeyVerdict::Unpolled`]'s own note). The test therefore drives
+    /// `simplification_findings` directly, and pins the arm's behavior rather
+    /// than a symptom an operator could ever have seen. The arm stays because
+    /// it makes the classification total at the one place the decision is
+    /// made, instead of depending on a validation gate two call sites away.
+    #[test]
+    fn an_existing_route_key_whose_poll_has_no_until_is_named_too() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+                       timeout = \"30s\"\n\
+                       poll    = { interval = \"10s\", deadline = \"30m\" }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        assert!(
+            f[0].fix.is_none(),
+            "nothing to propose for this route: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("no poll-until-terminal rule"),
+            "the skip must be stated: {}",
+            f[0].action
+        );
+        assert!(
+            f[0].action
+                .contains("POST *-aiplatform.googleapis.com/*:fetchPredictOperation"),
+            "the key doctor left alone must be named: {}",
+            f[0].action
+        );
+    }
+
+    /// #139's amend case: the operator already took the advice the generic
+    /// prose opens with, so leading with it buries the only news — that the
+    /// block they have is inert. The amend clause goes first.
+    #[test]
+    fn the_amend_case_leads_with_the_inert_block_not_with_route_key_advice() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        let action = &f[0].action;
+        assert!(action.contains("returns on the FIRST response"), "{action}");
+        let inert_at = action
+            .find("returns on the FIRST response")
+            .expect("the amend clause");
+        assert!(
+            action
+                .find("beats the LLM host map")
+                .is_none_or(|a| a > inert_at),
+            "the advice the operator already took must not lead: {action}"
+        );
+    }
+
+    /// D1, the headline case: the project declares the route key COMPLETELY —
+    /// the exact state case 1 lands in after applying doctor's own amend patch.
+    /// Doctor has nothing to propose, and the prose used to fill the silence by
+    /// telling the operator to write the key sitting in their file. It must now
+    /// say the opposite, and it must still say something: the finding is still
+    /// here (the loop is still hand-rolled), so an assertion that merely checks
+    /// the wrong sentence is gone would pass for the wrong reason.
+    #[test]
+    fn a_complete_route_key_is_reported_as_done_not_advised_again() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true], absent = \"pending\" } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        let poll = f
+            .iter()
+            .find(|x| x.topic == "hand-rolled-poll")
+            .expect("the loop is still hand-rolled, so the finding stands");
+        assert!(poll.detail.contains("render.py:8"), "{}", poll.detail);
+        assert!(poll.fix.is_none(), "nothing to propose: {:?}", poll.fix);
+        assert!(
+            poll.action.contains(
+                "already declares `[target.\"POST \
+                 *-aiplatform.googleapis.com/*:fetchPredictOperation\"]` with a \
+                 poll-until-terminal rule doctor has nothing to add to"
+            ),
+            "the done state must be stated: {}",
+            poll.action
+        );
+        assert!(
+            !poll.action.contains("put `poll` on a route key"),
+            "the operator must not be told to write the key they have: {}",
+            poll.action
+        );
+    }
+
+    /// D1, the contradiction case: a Gemini-only project. The prose used to
+    /// name the VERTEX key while the patch beside it added the Gemini one, in a
+    /// report whose policy section says `surface: gemini-api`. The advice may
+    /// name only what the patch contains.
+    #[test]
+    fn the_route_key_advice_names_the_surface_the_patch_proposes() {
+        let (scan, topology) = sdk_poll_fixture(Some("generativelanguage.googleapis.com"));
+        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"), true);
+        let poll = f
+            .iter()
+            .find(|x| x.topic == "hand-rolled-poll")
+            .expect("poll finding");
+        let patch = &poll.fix.as_ref().expect("a patch is attached").patch;
+        assert!(
+            patch.contains("GET generativelanguage.googleapis.com/*/operations/*")
+                && !patch.contains("aiplatform"),
+            "the Gemini patch is what the branch already does: {patch}"
+        );
+        assert!(
+            poll.action.contains(
+                "put `poll` on a route key (`[target.\"GET \
+                 generativelanguage.googleapis.com/*/operations/*\"]`)"
+            ),
+            "the advice names the key the patch adds: {}",
+            poll.action
+        );
+        assert!(
+            !poll.action.contains("aiplatform"),
+            "and names no Vertex key at all: {}",
+            poll.action
+        );
+    }
+
+    /// D1, the wrong-provider case: an OpenAI poll was told to write a Google
+    /// route key. It now gets its own — the advice is derived from the
+    /// proposals, so no provider can inherit another's route.
+    #[test]
+    fn a_non_google_poll_is_advised_its_own_route_key() {
+        let (mut scan, topology) = sdk_poll_fixture(None);
+        scan.simplifications[0].targets = vec!["llm:openai".into()];
+        scan.simplifications[0].sdk_polls = vec!["batches.retrieve".into()];
+        let (f, _) = simplification_findings(&scan, &topology, Some("[target.\"x\"]\n"), true);
+        let poll = f
+            .iter()
+            .find(|x| x.topic == "hand-rolled-poll")
+            .expect("poll finding");
+        assert!(
+            poll.action.contains(
+                "put `poll` on a route key (`[target.\"GET api.openai.com/v1/batches/*\"]`)"
+            ),
+            "{}",
+            poll.action
+        );
+        assert!(
+            !poll.action.contains("googleapis.com"),
+            "an OpenAI project is told nothing about Google: {}",
+            poll.action
+        );
+    }
+
+    /// D1, round 2: a project with NO `keel.toml` is the observe-first adoption
+    /// path — the commonest shape a first `keel doctor` runs against — and it
+    /// has no declarations to consult, but it does have a surface verdict. The
+    /// advice is narrowed to that verdict instead of being withheld. Each arm
+    /// asserts the finding is PRESENT and names the right key, so a vanished
+    /// finding cannot pass the negative half.
+    #[test]
+    fn with_no_policy_file_the_advice_follows_the_detected_surface() {
+        const VERTEX: &str = "`[target.\"POST \
+                              *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`";
+        const GEMINI: &str = "`[target.\"GET generativelanguage.googleapis.com/*/operations/*\"]`";
+        let poll_action = |host: Option<&str>, targets: &[&str], polls: &[&str]| {
+            let (mut scan, topology) = sdk_poll_fixture(host);
+            if !targets.is_empty() {
+                scan.simplifications[0].targets = targets.iter().map(|t| (*t).to_owned()).collect();
+                scan.simplifications[0].sdk_polls = polls.iter().map(|p| (*p).to_owned()).collect();
+            }
+            // `None` policy text with `policy_present: false` — no keel.toml.
+            let (f, _) = simplification_findings(&scan, &topology, None, false);
+            let poll = f
+                .iter()
+                .find(|x| x.topic == "hand-rolled-poll")
+                .expect("the finding stands with or without a policy file");
+            assert!(poll.detail.contains("render.py:8"), "{}", poll.detail);
+            assert!(
+                poll.fix.is_none(),
+                "no base document, so never a patch: {:?}",
+                poll.fix
+            );
+            poll.action.clone()
+        };
+
+        // {vertex}: a Vertex host literal in the scan.
+        let a = poll_action(Some("us-central1-aiplatform.googleapis.com"), &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({VERTEX})")),
+            "{a}"
+        );
+        assert!(!a.contains("generativelanguage"), "{a}");
+
+        // {gemini-api}: the twin, and the case 0.7.0 got outright wrong.
+        let a = poll_action(Some("generativelanguage.googleapis.com"), &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({GEMINI})")),
+            "{a}"
+        );
+        assert!(!a.contains("aiplatform"), "{a}");
+
+        // {}: no host anywhere. Both keys, as a pair — the same prose the
+        // document-backed unknown case emits. The hedge is not repeated here
+        // because the report already carries `surface: could not determine`
+        // for this exact project (D4).
+        let a = poll_action(None, &[], &[]);
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({GEMINI}, {VERTEX})")),
+            "{a}"
+        );
+
+        // Not Google at all: its own route key, and no Google key — 0.7.0 sent
+        // this project the Vertex one.
+        let a = poll_action(None, &["llm:openai"], &["batches.retrieve"]);
+        assert!(
+            a.contains(
+                "put `poll` on a route key (`[target.\"GET api.openai.com/v1/batches/*\"]`)"
+            ),
+            "{a}"
+        );
+        assert!(!a.contains("googleapis.com"), "{a}");
+
+        // A target with no route key in doctor's table proposes none, so the
+        // base sentence stands alone — with or without a policy file.
+        let a = poll_action(None, &["api.tavily.com"], &[]);
+        assert!(!a.contains("put `poll` on a route key"), "{a}");
+    }
+
+    /// The same two arms as above, but entered through `build_report` — which is
+    /// where the `policy.present` vs `policy.valid` decision is actually made,
+    /// and therefore the only level at which the round-1 regression can be
+    /// caught. The test above calls `simplification_findings` directly and
+    /// passes `policy_present` as a literal, so it cannot see that wiring at
+    /// all; the one pre-existing `build_report` case with `present: false` and a
+    /// poll sighting is against `api.tavily.com`, which proposes no route key
+    /// and so reads identically whichever arm runs.
+    ///
+    /// Both arms are asserted in both directions against one fixture, so
+    /// swapping the argument at the call site flips BOTH: a no-`keel.toml`
+    /// project would go silent (round 1's regression) and an unreadable
+    /// `keel.toml` would start being advised keys it may already declare (D1).
+    #[test]
+    fn build_report_routes_policy_presence_not_validity_into_the_advice() {
+        const VERTEX: &str = "`[target.\"POST \
+                              *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`";
+        let poll_action = |policy: PolicyValidation| {
+            // A Vertex host literal in the scan, so the surface verdict is
+            // unambiguous and exactly one Google key can be advised.
+            let (scan, _) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+            let r = build_report(
+                &scan,
+                &BTreeSet::new(),
+                policy,
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            );
+            r.findings
+                .iter()
+                .find(|f| f.topic == "hand-rolled-poll")
+                .expect("the poll finding stands in every policy state")
+                .action
+                .clone()
+        };
+
+        // Arm 2 — no `keel.toml` at all (`default_policy()` is already
+        // `present: false, valid: true`). Nothing declares the key, so the
+        // advice names it. Under `policy.valid` this project reads as
+        // "document doctor could not classify" and goes silent.
+        let a = poll_action(default_policy());
+        assert!(
+            a.contains(&format!("put `poll` on a route key ({VERTEX})")),
+            "no keel.toml → the surface-narrowed key: {a}"
+        );
+
+        // Arm 3 — a `keel.toml` doctor could not read. It may already declare
+        // this key, so nothing is advised. Under `policy.valid` this project
+        // reads as "no document at all" and gets advised the key anyway.
+        let mut invalid = default_policy();
+        invalid.check.present = true;
+        invalid.check.valid = false;
+        invalid.check.field = Some("target.\"llm:google-genai\".poll.until".to_owned());
+        invalid.check.message = Some("unknown key".to_owned());
+        invalid.text = Some("[target.\"llm:google-genai\"]\n".to_owned());
+        let a = poll_action(invalid);
+        assert!(
+            !a.contains("put `poll` on a route key"),
+            "an unreadable keel.toml may already declare it: {a}"
+        );
+    }
+
+    /// D3: when one patch carries a block for BOTH surfaces it also carries the
+    /// same provenance twice, and at most one of the two blocks is the surface
+    /// the sighted loop actually calls. The claim is qualified in that case —
+    /// and, the half that keeps this from being a blanket hedge, NOT qualified
+    /// when only one surface's block is proposed.
+    #[test]
+    fn a_two_surface_patch_qualifies_the_sighting_both_blocks_share() {
+        let base = "[target.\"llm:google-genai\"]\ntimeout = \"60s\"\n";
+
+        // No host anywhere: surface unknown, so both blocks are proposed.
+        let (scan, topology) = sdk_poll_fixture(None);
+        let (f, surfaces) = simplification_findings(&scan, &topology, Some(base), true);
+        assert!(
+            surfaces.detected.is_empty(),
+            "the premise: no host evidence"
+        );
+        let patch = &f[0].fix.as_ref().expect("a patch is attached").patch;
+        assert_eq!(
+            patch
+                .matches(
+                    "replaces the hand-rolled poll in render.py:8 (poll_video_takes), if \
+                          that loop calls this surface"
+                )
+                .count(),
+            2,
+            "both blocks qualify the one sighting they share: {patch}"
+        );
+
+        // One surface known: the block IS the surface that loop calls, so the
+        // provenance is stated outright.
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let (f, _) = simplification_findings(&scan, &topology, Some(base), true);
+        let patch = &f[0].fix.as_ref().expect("a patch is attached").patch;
+        assert!(
+            patch.contains("replaces the hand-rolled poll in render.py:8 (poll_video_takes)\n")
+                && !patch.contains("calls this surface"),
+            "a single-surface block asserts it: {patch}"
+        );
+    }
+
+    /// D4: the hedge, said in the report and not only inside the generated
+    /// TOML. The JSON contract is unchanged — `llm_surfaces` stays absent, by
+    /// design (an empty verdict is reported by saying nothing to a machine),
+    /// so this is a human-report line with no JSON twin.
+    #[test]
+    fn an_undetermined_surface_is_labelled_in_the_human_report() {
+        let scan = scan_with(GOOGLE_GENAI_TARGET, TargetClass::Llm, &["google-genai"]);
+        let r = build_report(
+            &scan,
+            &BTreeSet::new(),
+            default_policy(),
+            default_journal(),
+            None,
+            None,
+            empty_boundaries(),
+            &[],
+            &[],
+            &[],
+            "unverified",
+            None,
+        );
+        assert!(
+            r.llm_surfaces.is_empty(),
+            "the JSON contract is untouched: {:?}",
+            r.llm_surfaces
+        );
+        let text = human(&r);
+        assert!(
+            text.contains("llm:google-genai surface: could not determine"),
+            "the hedge is stated: {text}"
+        );
+        assert!(
+            text.contains("Declaring the host you call in keel.toml settles it."),
+            "and names what would settle it: {text}"
+        );
+    }
+
+    /// Declaring the Vertex route key is itself Vertex evidence (`policy_hosts`
+    /// reads the key), so the Gemini proposal is gone — #139's second half.
+    #[test]
+    fn declaring_the_vertex_route_key_stops_the_gemini_proposal() {
+        let (scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        let present = "[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n\
+             timeout = \"30s\"\n\
+             poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", \
+             terminal = [true] } }\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        for fix in f.iter().filter_map(|x| x.fix.as_ref()) {
+            assert!(
+                !fix.patch.contains("generativelanguage"),
+                "a Vertex project must not be handed a Gemini route: {}",
+                fix.patch
+            );
+        }
+    }
+
+    #[test]
+    fn a_gemini_only_project_is_offered_only_the_gemini_route() {
+        let (scan, topology) = sdk_poll_fixture(Some("generativelanguage.googleapis.com"));
+        let (f, _) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
+        );
+        let fix = f[0].fix.as_ref().expect("a proposal must be attached");
+        assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
+        assert!(!fix.patch.contains("aiplatform"), "{}", fix.patch);
+    }
+
+    #[test]
+    fn a_project_using_both_surfaces_is_offered_both_without_a_delete_hint() {
+        let (mut scan, topology) = sdk_poll_fixture(Some("us-central1-aiplatform.googleapis.com"));
+        scan.targets.insert(
+            "generativelanguage.googleapis.com".to_owned(),
+            TargetEvidence {
+                class: TargetClass::Host,
+                sightings: [Sighting {
+                    file: "render.py".into(),
+                    line: 8,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let (f, _) = simplification_findings(
+            &scan,
+            &topology,
+            Some("[target.\"llm:google-genai\"]\ntimeout = \"120s\"\n"),
+            true,
+        );
+        let fix = f[0].fix.as_ref().expect("a proposal must be attached");
+        assert!(fix.patch.contains("generativelanguage"), "{}", fix.patch);
+        assert!(fix.patch.contains("aiplatform"), "{}", fix.patch);
+        assert!(
+            !fix.patch.contains("delete"),
+            "both surfaces are in use — nothing to delete: {}",
+            fix.patch
+        );
+    }
+
+    /// The presence-only dedupe #139 replaced was never Google-scoped, and
+    /// neither is its replacement: an OpenAI route key the project declares
+    /// with no `poll` is named by the same sentence. Nothing in this arm
+    /// involves the surface verdict, so it is pinned deliberately here rather
+    /// than inherited from the Google cases above.
+    #[test]
+    fn a_non_google_route_key_declared_without_a_poll_is_named_too() {
+        let (mut scan, mut topology) = sdk_poll_fixture(None);
+        scan.simplifications[0].targets = vec!["llm:openai".into()];
+        scan.simplifications[0].sdk_polls = vec!["batches.retrieve".into()];
+        scan.targets.clear();
+        scan.targets.insert(
+            "llm:openai".to_owned(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "render.py".into(),
+                    line: 8,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        topology.wrappable = vec!["llm:openai".to_owned()];
+        let present = "[target.\"GET api.openai.com/v1/batches/*\"]\ntimeout = \"30s\"\n";
+        let (f, _) = simplification_findings(&scan, &topology, Some(present), true);
+        assert!(
+            f[0].fix.is_none(),
+            "the section exists with no poll — nothing to propose: {:?}",
+            f[0].fix
+        );
+        assert!(
+            f[0].action.contains("no poll-until-terminal rule"),
+            "the skip must be stated for a non-Google route too: {}",
+            f[0].action
+        );
+        assert!(
+            f[0].action.contains("GET api.openai.com/v1/batches/*"),
+            "the key doctor left alone must be named: {}",
+            f[0].action
+        );
+    }
+
+    /// `llm_surfaces` is keyed by target, so an entry is a claim ABOUT that
+    /// target — it may only appear when the project actually has it. A project
+    /// calling a Vertex URL through plain `requests` yields Vertex evidence
+    /// and no `llm:google-genai` anywhere: `coverage` and `topology` would
+    /// both carry the raw host, and inventing the SDK target here is the one
+    /// thing the skill reads to decide the project uses that SDK.
+    #[test]
+    fn llm_surfaces_needs_the_target_it_names_not_just_the_evidence() {
+        let mut scan = scan_with(
+            "us-central1-aiplatform.googleapis.com",
+            TargetClass::Host,
+            &["requests"],
+        );
+        let report = |scan: &ScanResult| {
+            build_report(
+                scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            )
+        };
+        let r = report(&scan);
+        assert!(
+            r.llm_surfaces.is_empty(),
+            "no google-genai target in this project: {:?}",
+            r.llm_surfaces
+        );
+        assert!(
+            !human(&r).contains("surface:"),
+            "the human report must not name it either: {}",
+            human(&r)
+        );
+
+        // Control: the same evidence, plus the target — now the claim is
+        // checkable against the rest of the report, so it is made.
+        scan.targets.insert(
+            GOOGLE_GENAI_TARGET.to_owned(),
+            TargetEvidence {
+                class: TargetClass::Llm,
+                sightings: [Sighting {
+                    file: "app.py".into(),
+                    line: 1,
+                }]
+                .into_iter()
+                .collect(),
+            },
+        );
+        let r = report(&scan);
+        assert_eq!(
+            r.llm_surfaces[GOOGLE_GENAI_TARGET].detected,
+            vec![crate::surface::Surface::Vertex]
+        );
+    }
+
+    /// The human line is per target and joins a multi-surface verdict — the
+    /// goldens only ever carry a single Vertex entry, so both the `gemini-api`
+    /// word and the `" + "` join are pinned here.
+    #[test]
+    fn the_human_report_names_each_target_and_joins_its_surfaces() {
+        let mut scan = scan_with(GOOGLE_GENAI_TARGET, TargetClass::Llm, &["google-genai"]);
+        let host = |file: &str| TargetEvidence {
+            class: TargetClass::Host,
+            sightings: [Sighting {
+                file: file.into(),
+                line: 1,
+            }]
+            .into_iter()
+            .collect(),
+        };
+        scan.targets.insert(
+            "generativelanguage.googleapis.com".to_owned(),
+            host("app.py"),
+        );
+        let report = |scan: &ScanResult| {
+            build_report(
+                scan,
+                &BTreeSet::new(),
+                default_policy(),
+                default_journal(),
+                None,
+                None,
+                empty_boundaries(),
+                &[],
+                &[],
+                &[],
+                "unverified",
+                None,
+            )
+        };
+        let text = human(&report(&scan));
+        assert!(
+            text.contains("llm:google-genai surface: gemini-api (from sighted hosts)"),
+            "{text}"
+        );
+
+        scan.targets.insert(
+            "us-central1-aiplatform.googleapis.com".to_owned(),
+            host("app.py"),
+        );
+        let text = human(&report(&scan));
+        assert!(
+            text.contains("llm:google-genai surface: gemini-api + vertex (from sighted hosts)"),
+            "both surfaces, joined: {text}"
         );
     }
 
@@ -3113,7 +4606,7 @@ mod tests {
         let patch_for = |s: SimplificationSighting| {
             let mut scan = ScanResult::default();
             scan.simplifications.push(s);
-            simplification_findings(&scan, &topology, Some("[flows]\n"))[0]
+            simplification_findings(&scan, &topology, Some("[flows]\n"), true).0[0]
                 .fix
                 .as_ref()
                 .expect("route-key proposal attached")
@@ -3168,7 +4661,7 @@ mod tests {
                 simplifications: sightings,
                 ..ScanResult::default()
             };
-            let findings = simplification_findings(&scan, &topology, Some("[flows]\n"));
+            let (findings, _) = simplification_findings(&scan, &topology, Some("[flows]\n"), true);
             findings
                 .iter()
                 .find_map(|f| f.fix.as_ref())
@@ -3335,13 +4828,14 @@ mod tests {
             .expect("poll finding");
         assert_eq!(poll.level, "info", "unreachable target → once-wrapped lead");
         assert!(poll.detail.contains("fetch_short_metrics.py:83"));
+        // D1: the sighting is against `api.tavily.com`, a target with no route
+        // key in doctor's table at all. The action is the advice that is true
+        // of every hand-rolled poll and nothing more — it used to append a
+        // Vertex route key here, to a project with no Google anything.
         assert_eq!(
             poll.action,
             "Wrap the target, then replace the loop with a `poll` policy — `poll.deadline` \
-             bounds the whole loop, `timeout` bounds one attempt. A POST-shaped operation read \
-             (Vertex `:fetch*Operation`) polls too: put `poll` on a route key \
-             (`[target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]`), which \
-             beats the LLM host map for that route."
+             bounds the whole loop, `timeout` bounds one attempt."
         );
         // The WS2 closed follow-up vocabulary is NOT extended by WS3.
         assert!(
@@ -3516,6 +5010,7 @@ mod tests {
             &ScanResult::default(),
             &[],
             &[("target.\"llm:google-genai\"".to_owned(), 1_800_000)],
+            true,
         );
         let fu = ups.iter().find(|u| u.code == "sdk-client-timeout").unwrap();
         assert_eq!(
@@ -3527,6 +5022,39 @@ mod tests {
              API a `poll` policy (whose `deadline` bounds the WHOLE loop) replaces the loop; a \
              POST-shaped operation read (Vertex `:fetch*Operation`) takes it on a route key — see \
              `hand-rolled-poll` findings for an applyable patch."
+        );
+    }
+
+    /// D5: the same follow-up in a report with NO applyable `hand-rolled-poll`
+    /// patch — the state every project reaches once it has applied doctor's
+    /// route-key patch. The cross-reference must not be printed, because there
+    /// is nothing in this report to follow it to; everything else the follow-up
+    /// says is unconditional and must survive, so the assertion is on the whole
+    /// string, not on the absence of a phrase.
+    #[test]
+    fn sdk_client_timeout_drops_the_patch_pointer_when_no_patch_exists() {
+        let ups = build_follow_ups(
+            &Topology {
+                excluded: vec![],
+                external_processes: vec![],
+                unreachable: vec![],
+                wrappable: vec![],
+            },
+            None,
+            &ScanResult::default(),
+            &[],
+            &[("target.\"llm:google-genai\"".to_owned(), 1_800_000)],
+            false,
+        );
+        let fu = ups.iter().find(|u| u.code == "sdk-client-timeout").unwrap();
+        assert_eq!(
+            fu.detail,
+            "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default \
+             deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise \
+             the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or \
+             the SDK gives up first and Keel just sees a retryable timeout. For a submit-then-poll \
+             API a `poll` policy (whose `deadline` bounds the WHOLE loop) replaces the loop; a \
+             POST-shaped operation read (Vertex `:fetch*Operation`) takes it on a route key."
         );
     }
 

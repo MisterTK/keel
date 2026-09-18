@@ -51,6 +51,7 @@ pub mod run;
 pub mod scan;
 pub mod sim;
 pub mod status;
+mod surface;
 pub mod tail;
 
 mod evidence;

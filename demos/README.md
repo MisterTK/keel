@@ -1,6 +1,6 @@
 # Keel demos
 
-Five runnable demos, each `./run.sh` self-contained and **deterministic** (no
+Six runnable demos, each `./run.sh` self-contained and **deterministic** (no
 real network — [`tools/faultproxy`](../tools/faultproxy) serves scripted fault
 sequences). They prefer the repo's `.venv` (which has the native core); set
 `KEEL_PYTHON=/path/to/python` to override.
@@ -11,6 +11,11 @@ call · 1 retry succeeded` is the receipt, and `keel ▸ 1 call · 1 served from
 cache` in `agent-demo`'s second run is the dev-cache claim proving itself. Set
 `KEEL_QUIET=1` if you want a demo's own output alone.
 
+The one exception is [`lro-poll`](lro-poll), and it is deliberate: the exit
+summary has **no poll counter** — a poll is one `call` whether it polled once
+or forty times — so that demo's receipt is `keel_outcome["attempts"]` plus
+faultproxy's own request log, not the summary line. See its README.
+
 | Demo | What it proves | Language | Needs native core |
 |------|----------------|----------|-------------------|
 | [`flaky-python`](flaky-python) | Bare httpx script dies on a 503; `keel run` retries it and it survives — zero code changes | Python | no |
@@ -18,6 +23,7 @@ cache` in `agent-demo`'s second run is the dev-cache claim proving itself. Set
 | [`agent-demo`](agent-demo) | Fake LLM endpoint: rides a 429 storm, then dev-cache replays so a 2nd run makes ~0 API calls | Python | for cross-run replay |
 | [`adk-demo`](adk-demo) | A real `google-adk` `LlmAgent`'s tool call rides out a 429 storm BELOW the agent loop — one agent turn, zero extra LLM tokens | Python (needs `google-adk`) | no |
 | [`durable-pipeline`](durable-pipeline) | 10-step flow `kill -9`'d mid-run resumes from the journal; each step runs exactly once | Python | yes (Tier 2) |
+| [`lro-poll`](lro-poll) | A poll block without `until.absent` never polls a running `google.longrunning.Operation` — it validates, it looks adopted, it does nothing; one added key fixes it | Python | no |
 
 [`STORYBOARD.md`](STORYBOARD.md) is the 40-second asciinema shooting script
 (dx-spec §6) — the README hero demo, backed by `flaky-python` + `durable-pipeline`.
@@ -26,7 +32,8 @@ cache` in `agent-demo`'s second run is the dev-cache claim proving itself. Set
 
 Each demo is executed by a test (not just documented):
 
-- `flaky-python`, `agent-demo`, `adk-demo` → `python/keel/tests/test_demos.py`
+- `flaky-python`, `agent-demo`, `adk-demo`, `lro-poll` →
+  `python/keel/tests/test_demos.py`
 - `node-service` → `node/keel/test/demo.e2e.test.mjs`
 - `durable-pipeline` → `python/keel/tests/test_resume_demo.py` (the real
   `kill -9` + resume assertion)

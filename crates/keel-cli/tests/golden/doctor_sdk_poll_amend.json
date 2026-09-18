@@ -2,7 +2,7 @@
   "activation_backend": null,
   "adapters": [
     {
-      "detected": true,
+      "detected": false,
       "lib": "httpx",
       "status": "pinned",
       "target": "host"
@@ -62,7 +62,7 @@
       "target": "tool:<name>"
     },
     {
-      "detected": false,
+      "detected": true,
       "lib": "google-genai",
       "status": "pinned",
       "target": "llm:google-genai"
@@ -160,14 +160,14 @@
   "coverage": {
     "invisible": [],
     "visible_unwrapped": [
-      "us-central1-aiplatform.googleapis.com"
+      "llm:google-genai"
     ],
     "wrapped": []
   },
   "findings": [
     {
       "action": "Run `keel run <script>` so Keel can confirm this target is wrapped at runtime.",
-      "detail": "`us-central1-aiplatform.googleapis.com` is visible in your code but has no observed runtime evidence.",
+      "detail": "`llm:google-genai` is visible in your code but has no observed runtime evidence.",
       "level": "warn",
       "topic": "visible-unwrapped"
     },
@@ -178,25 +178,39 @@
       "topic": "invisible"
     },
     {
-      "action": "Add `COPY keel.toml ./` (before the layer that runs the app). At runtime the policy is read from KEEL_CWD or the working directory; without the file Keel refuses to activate under KEEL_CWD and runs production defaults otherwise.",
-      "detail": "`Dockerfile` has no COPY/ADD directive that reaches keel.toml — the policy in this checkout will not be in the image.",
+      "action": "The route-key `poll` block this project already declares does not poll: as written it returns on the FIRST response, because a running `google.longrunning.Operation` omits the terminal field the block names rather than reporting it false (proto3 JSON drops a false bool). Apply the attached patch (`git apply`): it sets `until.absent = \"pending\"` on that block. Then delete the hand-rolled loop: `poll.deadline` bounds the whole loop, `timeout` bounds one attempt.",
+      "detail": "`poll_video_takes` (render.py:9) hand-rolls poll-until-terminal against `llm:google-genai` — Keel can wrap this target now, a `poll` policy (interval / deadline / until) replaces the whole loop.",
+      "fix": {
+        "changes": [
+          {
+            "after": "pending",
+            "before": null,
+            "path": "target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\".poll.until.absent"
+          }
+        ],
+        "patch": "--- a/keel.toml\n+++ b/keel.toml\n@@ -6,4 +6,4 @@\n # google.longrunning.Operation omits `done` entirely (#139).\n [target.\"POST *-aiplatform.googleapis.com/*:fetchPredictOperation\"]\n timeout = \"30s\"\n-poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true] } }\n+poll    = { interval = \"10s\", deadline = \"30m\", until = { field = \"done\", terminal = [true], absent = \"pending\" } }\n"
+      },
       "level": "warn",
-      "topic": "keel-toml-not-in-image"
+      "topic": "hand-rolled-poll"
     }
   ],
-  "follow_ups": [
-    {
-      "code": "sdk-client-timeout",
-      "detail": "timeout = 1800s bounds ONE attempt of ONE call, and is beyond the client-default deadline most SDKs enforce (often ~600s). Keel wraps the transport; it does not raise the SDK's own deadline — the call site must also pass a timeout >= the Keel value, or the SDK gives up first and Keel just sees a retryable timeout. For a submit-then-poll API a `poll` policy (whose `deadline` bounds the WHOLE loop) replaces the loop; a POST-shaped operation read (Vertex `:fetch*Operation`) takes it on a route key.",
-      "rank": 5,
-      "subject": "target.\"llm:google-genai\""
-    }
-  ],
+  "follow_ups": [],
   "journal": {
     "backend": "sqlite",
     "location": ".keel/journal.db",
     "source": "default",
     "supported": true
+  },
+  "llm_surfaces": {
+    "llm:google-genai": {
+      "detected": [
+        "vertex"
+      ],
+      "evidence": [
+        "*-aiplatform.googleapis.com"
+      ],
+      "source": "policy"
+    }
   },
   "ok": true,
   "policy": {
@@ -212,7 +226,7 @@
     "external_processes": [],
     "unreachable": [],
     "wrappable": [
-      "us-central1-aiplatform.googleapis.com"
+      "llm:google-genai"
     ]
   }
 }
